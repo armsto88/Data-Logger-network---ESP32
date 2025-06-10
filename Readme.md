@@ -1,38 +1,51 @@
 # Brainstorm: Wireless Data Logging Network
 
-This project explores the design and development of a modular, wireless data logging system using ESP32 microcontrollers and ESP-NOW for communication. The system is built for ecological field applications where distributed, low-power sensor nodes report to a central "mother ship" that logs the data and timestamps it.
+This project outlines a modular, low-power wireless sensor network using ESP32 microcontrollers and ESP-NOW. It is designed for environmental data collection, where multiple sensor nodes transmit readings to a central “mother ship” for timestamped logging.
+
+---
 
 ## Goals
-- Develop a robust wireless data logger using ESP32 boards.
-- Minimize power consumption to support solar-powered deployments.
-- Enable multiple sensor inputs per node using I2C or 1-Wire multiplexers.
-- Ensure modularity and small form factor (target size: 6 × 3 cm).
-- Allow timestamping and synchronized operation using RTCs.
+- Enable low-power, solar-powered sensor nodes
+- Wireless data transfer via ESP-NOW without a router
+- Compact PCB form factor (~6 × 3 cm per node)
+- Support up to 4 sensors per node using multiplexers
+- Accurate timestamping with onboard RTCs (e.g. DS3231)
+
+---
 
 ## Mother Ship
-- ESP32-WROVER module used for its larger memory and stability.
-- Receives data via ESP-NOW from multiple nodes.
-- Logs data to SD card in a structured, column-wise CSV format.
-- Uses DS3231 RTC to timestamp all data accurately.
-- Optionally remains powered for 30 seconds every 30 minutes to await node signals.
-- May transmit current time to nodes for RTC synchronization.
+- Based on an ESP32-WROVER for SD reliability and memory
+- Receives ESP-NOW packets from multiple nodes
+- Adds timestamps via DS3231 and logs to SD card (CSV format)
+- Wakes every 30 minutes, stays active for 30–60 seconds
+- Can broadcast its current time to synchronize node RTCs
+
+---
 
 ## Sensor Nodes
-- ESP32 Super Mini boards with one of:
-  - DS18B20 sensors (1–4 per node via 1-Wire).
-  - DHT22 sensors for temp and humidity (up to 4 per node via GPIO).
-- Wake periodically (e.g. every 10–30 seconds) to sniff for mother ship.
-- Transmit data when mother ship is detected.
-- Optional: light sleep between sniff cycles to save power.
-- Optional: DS3231 or other low-power RTC for scheduled wakeups.
+- Built around ESP32 Super Mini boards
+- Configurable to support:
+  - DS18B20 temperature sensors (up to 4 per node)
+  - DHT22 sensors for temp and humidity (up to 4 per node)
+- Operate in light sleep, waking periodically to “sniff” for the mother ship
+- Transmit data when the mother ship is detected
+- Optional RTC per node for consistent wake cycles and syncing
+
+---
 
 ## Power Strategy
-- Nodes and mother ship powered via small solar modules with LiPo batteries.
-- Charging handled by compact solar charging PCBs.
-- Nodes optimized for low power draw, aiming for weeks to months of uptime.
+- Each node and the mother ship powered by a LiPo battery + solar module
+- Charging handled by compact solar charge controllers
+- Optimized for low power draw and long unattended operation
 
-## Future Ideas
-- Investigate using DA16200MOD for Wi-Fi wake-on-network capabilities.
-- Explore 433 MHz wireless triggers as wake signals.
-- Replace DS3231 with AB1805 or smaller RTCs if size constraints arise.
-- Develop a custom PCB combining ESP32, RTC, mux, and power management in 6×3 cm form.
+---
+
+## Future Considerations
+- Evaluate DA16200MOD for persistent Wi-Fi connectivity and remote wake
+- Explore 433 MHz RX modules for low-power wake signaling
+- Consider smaller RTCs like AB1805 or RV3028 for tighter layouts
+- Develop custom PCB combining ESP32, RTC, mux, and charging circuit
+
+---
+
+> Next step: synchronize wake timing between mother ship and nodes, then prototype a 6 × 3 cm PCB layout for field deployment.
