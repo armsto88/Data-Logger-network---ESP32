@@ -1,51 +1,37 @@
-# Brainstorm: Wireless Data Logging Network
+# ESP32-S3 Mothership — Sensor Network Receiver
 
-This project outlines a modular, low-power wireless sensor network using ESP32 microcontrollers and ESP-NOW. It is designed for environmental data collection, where multiple sensor nodes transmit readings to a central “mother ship” for timestamped logging.
+## Hardware Wiring
 
----
+| Function      | Device      | ESP32-S3 Pin | Typical Arduino Name |
+|---------------|-------------|--------------|---------------------|
+| RTC SDA       | DS3231      | GPIO 42      | 42                  |
+| RTC SCL       | DS3231      | GPIO 41      | 41                  |
+| RTC INT/SQW   | DS3231      | GPIO 3       | 3                   |
+| SD CS         | SD module   | GPIO 10      | 10                  |
+| SD MOSI       | SD module   | GPIO 11      | 11                  |
+| SD MISO       | SD module   | GPIO 13      | 13                  |
+| SD SCK        | SD module   | GPIO 12      | 12                  |
+| Onboard LED   | ESP32-S3    | GPIO 48      | 48                  |
 
-## Goals
-- Enable low-power, solar-powered sensor nodes
-- Wireless data transfer via ESP-NOW without a router
-- Compact PCB form factor (~6 × 3 cm per node)
-- Support up to 4 sensors per node using multiplexers
-- Accurate timestamping with onboard RTCs (e.g. DS3231)
+Update pin numbers in `src/config.h` if needed for your board!
 
----
+## Features
 
-## Mother Ship
-- Based on an ESP32-WROVER for SD reliability and memory
-- Receives ESP-NOW packets from multiple nodes
-- Adds timestamps via DS3231 and logs to SD card (CSV format)
-- Wakes every 30 minutes, stays active for 30–60 seconds
-- Can broadcast its current time to synchronize node RTCs
+- Listens for ESP-NOW sensor node messages (e.g., soil node)
+- Adds RTC timestamp to all received data
+- Logs time-stamped CSV data to SD card
+- Easy to expand for WiFi/cloud forwarding
 
----
+## Build/Flash Instructions
 
-## Sensor Nodes
-- Built around ESP32 Super Mini boards
-- Configurable to support:
-  - DS18B20 temperature sensors (up to 4 per node)
-  - DHT22 sensors for temp and humidity (up to 4 per node)
-- Operate in light sleep, waking periodically to “sniff” for the mother ship
-- Transmit data when the mother ship is detected
-- Optional RTC per node for consistent wake cycles and syncing
+1. Install [Positron IDE](https://positron.host/) or PlatformIO/Arduino IDE.
+2. Clone this repo and open the project folder.
+3. Wire hardware as above.
+4. Build and flash firmware.
+5. Open Serial Monitor for logs.
 
----
+## Next Steps
 
-## Power Strategy
-- Each node and the mother ship powered by a LiPo battery + solar module
-- Charging handled by compact solar charge controllers
-- Optimized for low power draw and long unattended operation
-
----
-
-## Future Considerations
-- Evaluate DA16200MOD for persistent Wi-Fi connectivity and remote wake
-- Explore 433 MHz RX modules for low-power wake signaling
-- Consider smaller RTCs like AB1805 or RV3028 for tighter layouts
-- Develop custom PCB combining ESP32, RTC, mux, and charging circuit
-
----
-
-> Next step: synchronize wake timing between mother ship and nodes, then prototype a 6 × 3 cm PCB layout for field deployment.
+- Implement complete RTC alarm/time logic in `rtc_manager.cpp/.h`
+- Expand ESP-NOW data parsing and error handling
+- Add support for multiple sensor node message types
