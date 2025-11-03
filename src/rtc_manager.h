@@ -1,3 +1,3 @@
 #pragma once
 void setupRTC();
-String getTimestamp();
+void getRTCTimeString(char* buffer, size_t bufferSize);
