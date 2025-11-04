@@ -5,3 +5,5 @@
 
 void setupSD();
 bool logCSVRow(const String& row);
+bool createCSVHeader();
+String getCSVStats();
