@@ -3,8 +3,11 @@
 #include "rtc_manager.h"
 #include <esp_now.h>
 #include <WiFi.h>
+#include <esp_wifi.h>
+#include <esp_err.h>
 #include "config.h"
 #include <vector>
+#include <Preferences.h>
 
 // External reference to DEVICE_ID from main.cpp
 extern const char* DEVICE_ID;
@@ -51,16 +54,21 @@ void registerNode(const uint8_t* mac, const char* nodeId, const char* nodeType =
         memset(&peerInfo, 0, sizeof(peerInfo));
         memcpy(peerInfo.peer_addr, mac, 6);
         peerInfo.channel = 1;
+    peerInfo.ifidx = WIFI_IF_STA;
         peerInfo.encrypt = false;
         
         // Remove peer if it already exists, then add
         esp_now_del_peer(mac);
-        if (esp_now_add_peer(&peerInfo) == ESP_OK) {
+        esp_err_t padd_local = esp_now_add_peer(&peerInfo);
+        if (padd_local == ESP_OK) {
+            // small settle time after adding peer to allow ESP-NOW/driver to update
+            delay(30);
             Serial.print("✅ Node added as ESP-NOW peer: ");
             Serial.println(nodeId);
         } else {
             Serial.print("❌ Failed to add node as peer: ");
             Serial.println(nodeId);
+            Serial.print("    esp_err: "); Serial.print((int)padd_local); Serial.print(" ("); Serial.print(esp_err_to_name(padd_local)); Serial.println(")");
         }
         
         Serial.print("📡 New node discovered: ");
@@ -142,8 +150,9 @@ void OnDataRecv(const uint8_t * mac, const uint8_t *incomingBytes, int len) {
             Serial.print(discovery.nodeType);
             Serial.println(")");
             
-            // Register as unpaired node
-            registerNode(mac, discovery.nodeId, discovery.nodeType, UNPAIRED);
+            // Preserve existing state when re-registering to avoid overwriting PAIRED/DEPLOYED
+            NodeState existingState = getNodeState(discovery.nodeId);
+            registerNode(mac, discovery.nodeId, discovery.nodeType, existingState);
             
             // Send discovery response as broadcast so sensor node can receive it
             discovery_response_t response;
@@ -156,30 +165,75 @@ void OnDataRecv(const uint8_t * mac, const uint8_t *incomingBytes, int len) {
             Serial.println("📡 Sent discovery response");
         }
     }
+    // Handle legacy pairing_request_t (text command) from nodes
     else if (len == sizeof(pairing_request_t)) {
         pairing_request_t request;
         memcpy(&request, incomingBytes, sizeof(request));
-        
+
         if (strcmp(request.command, "PAIRING_REQUEST") == 0) {
             Serial.print("📞 Pairing status request from: ");
             Serial.println(request.nodeId);
-            
-            // Check if this node is in our paired list
+
+            // Preserve existing state when re-registering to avoid overwriting PAIRED/DEPLOYED
+            NodeState existingState = getNodeState(request.nodeId);
+            registerNode(mac, request.nodeId, "unknown", existingState);
+
+            // Check if this node is already paired
             NodeState currentState = getNodeState(request.nodeId);
-            
-            // Send pairing response
+
+            // Send pairing response (protocol-specific)
             pairing_response_t response;
             strcpy(response.command, "PAIRING_RESPONSE");
             strcpy(response.nodeId, request.nodeId);
             response.isPaired = (currentState == PAIRED || currentState == DEPLOYED);
-            response.alarmInterval = 30; // Default for now
-            
-            // Send back to specific node (use broadcast for now)
-            uint8_t broadcastAddress[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+            response.scheduleInterval = 30; // Default for now
+            strcpy(response.mothership_id, DEVICE_ID);
+
+            uint8_t broadcastAddress[] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
             esp_now_send(broadcastAddress, (uint8_t*)&response, sizeof(response));
-            
+
             Serial.print("📤 Sent pairing response - isPaired: ");
             Serial.println(response.isPaired ? "true" : "false");
+        }
+    }
+    // Handle RandomNerdTutorials compact pairing struct (rnt_pairing_t)
+    else if (len == sizeof(rnt_pairing_t)) {
+        rnt_pairing_t r;
+        memcpy(&r, incomingBytes, sizeof(r));
+        // If node is sending a pairing request (msgType == PAIR_REQUEST)
+        // In RNT example PAIR_REQUEST was represented by msgType value (we'll treat non-zero as pairing)
+        if (r.msgType == 0 || r.id >= 2) {
+            // Build nodeId from mac for display
+            char nid[20];
+            snprintf(nid, sizeof(nid), "NODE_%02X%02X", r.macAddr[4], r.macAddr[5]);
+            Serial.print("📞 RNT pairing packet from ");
+            for (int i=0;i<6;i++){ Serial.printf("%02X", r.macAddr[i]); if (i<5) Serial.print(":"); }
+            Serial.println();
+
+            // Preserve existing state when re-registering and record channel
+            NodeState existingState = getNodeState(nid);
+            registerNode(r.macAddr, nid, "rnt-node", existingState);
+            // find node and set channel
+            for (auto &node : registeredNodes) {
+                if (memcmp(node.mac, r.macAddr, 6) == 0) { node.channel = r.channel; break; }
+            }
+            // Update esp-now peer info to use the node's reported channel so responses
+            // sent to this peer use the correct channel
+            esp_now_peer_info_t peerInfo;
+            memset(&peerInfo, 0, sizeof(peerInfo));
+            memcpy(peerInfo.peer_addr, r.macAddr, 6);
+            peerInfo.channel = r.channel > 0 ? r.channel : 1;
+            peerInfo.ifidx = WIFI_IF_STA;
+            peerInfo.encrypt = false;
+            // Remove existing peer and add with updated channel
+            esp_err_t pdel = esp_now_del_peer(r.macAddr);
+            // Force fixed channel 1 for pairing
+            peerInfo.channel = 1;
+            esp_err_t padd = esp_now_add_peer(&peerInfo);
+            Serial.print("🔧 Updated peer channel for RNT node: ");
+            for (int i=0;i<6;i++){ Serial.printf("%02X", r.macAddr[i]); if (i<5) Serial.print(":"); }
+            Serial.print(" -> channel "); Serial.print(peerInfo.channel);
+            Serial.print(" (del="); Serial.print((int)pdel); Serial.print(", add="); Serial.print((int)padd); Serial.println(")");
         }
     }
     else if (len == sizeof(time_sync_request_t)) {
@@ -200,34 +254,55 @@ void setupESPNOW() {
     delay(100); // Small delay for WiFi stability
     
     // ESP-NOW initialization (works with AP mode)
-    if (esp_now_init() != ESP_OK) {
-        Serial.println("Error initializing ESP-NOW");
-        return;
-    }
-    
-    // Register for receive callback
-    esp_now_register_recv_cb(OnDataRecv);
-    
-    // Add broadcast peer for receiving discovery requests
+    // Fixed-channel pairing: always use channel 1 for pairing command
+    const uint8_t sendChannel = 1;
+    esp_wifi_set_channel(sendChannel, WIFI_SECOND_CHAN_NONE);
+
+    // Prepare broadcast peer info
     esp_now_peer_info_t peerInfo;
     memset(&peerInfo, 0, sizeof(peerInfo));
-    uint8_t broadcastAddress[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+    uint8_t broadcastAddress[] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
     memcpy(peerInfo.peer_addr, broadcastAddress, 6);
-    peerInfo.channel = 1; // Force channel 1
+    peerInfo.channel = 1;
+    peerInfo.ifidx = WIFI_IF_STA;
     peerInfo.encrypt = false;
-    
-    if (esp_now_add_peer(&peerInfo) != ESP_OK) {
-        Serial.println("Failed to add broadcast peer");
+
+    // Initialize ESP-NOW if not already initialized
+    if (esp_now_init() != ESP_OK) {
+        Serial.println("❌ ESP-NOW initialization failed");
+        // don't return here; some boards may still allow later init attempts
     } else {
+        Serial.println("✅ ESP-NOW initialized");
+        // register receive callback
+        esp_now_register_recv_cb(OnDataRecv);
+        // register send callback for delivery status
+        esp_now_register_send_cb([](const uint8_t *mac_addr, esp_now_send_status_t status){
+            Serial.print("📨 send_cb to ");
+            if (mac_addr) {
+                for (int i = 0; i < 6; i++) { Serial.printf("%02X", mac_addr[i]); if (i < 5) Serial.print(":"); }
+            } else Serial.print("(null)");
+            Serial.print(" status="); Serial.println(status == ESP_NOW_SEND_SUCCESS ? "OK" : "FAIL");
+        });
+    }
+
+    // Remove existing broadcast peer (if any) and add the configured broadcast peer
+    esp_err_t pdel_b = esp_now_del_peer(broadcastAddress);
+    esp_err_t padd_b = esp_now_add_peer(&peerInfo);
+    if (padd_b != ESP_OK) {
+        Serial.print("Failed to add broadcast peer: "); Serial.print((int)padd_b); Serial.print(" ("); Serial.print(esp_err_to_name(padd_b)); Serial.println(")");
+    } else {
+        // let the driver settle after adding broadcast peer
+        delay(30);
         Serial.println("✅ Broadcast peer added for discovery");
     }
     
     // Add known sensor nodes as peers for reliable communication
     for (int i = 0; i < NUM_KNOWN_SENSORS; i++) {
-        memset(&peerInfo, 0, sizeof(peerInfo));
-        memcpy(peerInfo.peer_addr, KNOWN_SENSOR_NODES[i], 6);
-        peerInfo.channel = 1;
-        peerInfo.encrypt = false;
+    memset(&peerInfo, 0, sizeof(peerInfo));
+    memcpy(peerInfo.peer_addr, KNOWN_SENSOR_NODES[i], 6);
+    peerInfo.channel = 1;
+    peerInfo.ifidx = WIFI_IF_STA;
+    peerInfo.encrypt = false;
         
         // Remove peer if it already exists, then add
         esp_now_del_peer(KNOWN_SENSOR_NODES[i]);
@@ -251,6 +326,9 @@ void setupESPNOW() {
     Serial.println("ESP-NOW initialized successfully");
     Serial.print("MAC Address: ");
     Serial.println(WiFi.macAddress());
+
+    // Load persisted paired nodes from NVS and pre-add as peers
+    loadPairedNodes();
 }
 
 void espnow_loop() {
@@ -353,12 +431,34 @@ bool sendDiscoveryBroadcast() {
     broadcast.acknowledged = false;
     
     esp_err_t result = esp_now_send(broadcastAddress, (uint8_t*)&broadcast, sizeof(broadcast));
-    
+
     if (result == ESP_OK) {
         Serial.println("📡 Discovery broadcast sent");
         return true;
     } else {
-        Serial.println("❌ Failed to send discovery broadcast");
+        Serial.print("❌ Failed to send discovery broadcast: "); Serial.print((int)result);
+        Serial.print(" ("); Serial.print(esp_err_to_name(result)); Serial.println(")");
+        // Try re-adding broadcast peer and retry once
+    esp_now_peer_info_t peerInfo;
+    memset(&peerInfo, 0, sizeof(peerInfo));
+    memcpy(peerInfo.peer_addr, broadcastAddress, 6);
+    peerInfo.channel = 1;
+    peerInfo.ifidx = WIFI_IF_STA;
+    peerInfo.encrypt = false;
+        esp_err_t pdel = esp_now_del_peer(broadcastAddress);
+        esp_err_t padd = esp_now_add_peer(&peerInfo);
+        Serial.print("🔁 Retried adding broadcast peer (del="); Serial.print((int)pdel);
+        Serial.print(", add="); Serial.print((int)padd); Serial.println(")");
+
+        // retry send
+        esp_err_t retry = esp_now_send(broadcastAddress, (uint8_t*)&broadcast, sizeof(broadcast));
+        if (retry == ESP_OK) {
+            Serial.println("📡 Discovery broadcast sent (after retry)");
+            return true;
+        }
+
+        Serial.print("❌ Retry failed: "); Serial.print((int)retry);
+        Serial.print(" ("); Serial.print(esp_err_to_name(retry)); Serial.println(")");
         return false;
     }
 }
@@ -376,18 +476,98 @@ bool pairNode(const String& nodeId, int scheduleInterval) {
             pairCmd.scheduleInterval = scheduleInterval;
             strcpy(pairCmd.mothership_id, DEVICE_ID);
             
-            esp_err_t result = esp_now_send(node.mac, (uint8_t*)&pairCmd, sizeof(pairCmd));
-            
+            // Ensure peer entry exists for this node on fixed pairing channel (1)
+            esp_now_peer_info_t peerInfo;
+            memset(&peerInfo, 0, sizeof(peerInfo));
+            memcpy(peerInfo.peer_addr, node.mac, 6);
+            peerInfo.channel = 1;
+            peerInfo.encrypt = false;
+
+            esp_err_t pdel = esp_now_del_peer(node.mac);
+            esp_err_t padd = esp_now_add_peer(&peerInfo);
+            Serial.print("🔧 Ensured peer for "); Serial.print(nodeId);
+            Serial.print(" (del="); Serial.print((int)pdel); Serial.print(", add="); Serial.print((int)padd); Serial.println(")");
+
+            // small settle time after adding peer
+            delay(30);
+
+            // Try sending pairing command with a small retry loop to mitigate IF errors
+            const int maxAttempts = 3;
+            esp_err_t result = ESP_ERR_ESPNOW_NOT_INIT;
+            for (int attempt = 1; attempt <= maxAttempts; ++attempt) {
+                // Ensure we're on the pairing channel
+                esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE);
+                delay(10);
+                result = esp_now_send(node.mac, (uint8_t*)&pairCmd, sizeof(pairCmd));
+                if (result == ESP_OK) break;
+                Serial.print("⚠️ pairNode attempt "); Serial.print(attempt); Serial.print(" failed: "); Serial.print((int)result); Serial.print(" ("); Serial.print(esp_err_to_name(result)); Serial.println(")");
+                delay(50);
+            }
+
             if (result == ESP_OK) {
                 Serial.print("✅ Node paired: ");
                 Serial.print(nodeId);
                 Serial.print(" (");
                 Serial.print(scheduleInterval);
                 Serial.println(" min interval)");
-                return true;
+
+                // Also send RandomNerdTutorials-style compact pairing response so
+                // RNT nodes can add the mothership as an ESP-NOW peer.
+                rnt_pairing_t rntResp;
+                memset(&rntResp, 0, sizeof(rntResp));
+                rntResp.msgType = 0; // PAIRING response
+                rntResp.id = 0; // mothership/server id = 0 per RNT convention
+
+                // Fill mothership MAC into response
+                uint8_t mothershipMac[6];
+                WiFi.macAddress(mothershipMac);
+                memcpy(rntResp.macAddr, mothershipMac, 6);
+
+                // Use pairing channel (fixed to 1)
+                uint8_t sendChannel = 1;
+
+                // Switch WiFi channel briefly so the node receives the packet
+                esp_wifi_set_channel(sendChannel, WIFI_SECOND_CHAN_NONE);
+                delay(10);
+                rntResp.channel = sendChannel;
+
+                // Ensure peer is present for rnt reply as well (set channel appropriately)
+                peerInfo.channel = sendChannel;
+                esp_now_del_peer(node.mac);
+                esp_now_add_peer(&peerInfo);
+                delay(20);
+
+                // Retry loop for RNT reply as well
+                esp_err_t rres = ESP_ERR_ESPNOW_NOT_INIT;
+                for (int attempt = 1; attempt <= maxAttempts; ++attempt) {
+                    esp_wifi_set_channel(sendChannel, WIFI_SECOND_CHAN_NONE);
+                    delay(10);
+                    rres = esp_now_send(node.mac, (uint8_t*)&rntResp, sizeof(rntResp));
+                    if (rres == ESP_OK) break;
+                    Serial.print("⚠️ RNT reply attempt "); Serial.print(attempt); Serial.print(" failed: "); Serial.print((int)rres); Serial.print(" ("); Serial.print(esp_err_to_name(rres)); Serial.println(")");
+                    delay(50);
+                }
+
+                if (rres == ESP_OK) {
+                    Serial.print("📤 Sent RNT pairing response to ");
+                    for (int i = 0; i < 6; i++) { Serial.printf("%02X", node.mac[i]); if (i < 5) Serial.print(":"); }
+                    Serial.println();
+                    // Persist paired nodes
+                    savePairedNodes();
+                    return true;
+                } else {
+                    Serial.print("❌ Failed to send RNT pairing response to: ");
+                    Serial.println(nodeId);
+                    Serial.print("    esp_err_t: "); Serial.print((int)rres);
+                    Serial.print(" ("); Serial.print(esp_err_to_name(rres)); Serial.println(")");
+                    node.state = UNPAIRED; // revert on failure
+                    return false;
+                }
             } else {
                 Serial.print("❌ Failed to pair node: ");
                 Serial.println(nodeId);
+                Serial.print("    esp_err_t: "); Serial.print((int)result);
+                Serial.print(" ("); Serial.print(esp_err_to_name(result)); Serial.println(")");
                 node.state = UNPAIRED; // revert on failure
                 return false;
             }
@@ -498,4 +678,127 @@ void printRegisteredNodes() {
         Serial.print(") - ");
         Serial.println(node.isActive ? "Active" : "Inactive");
     }
+}
+
+// Persist paired nodes using Preferences (NVS)
+void savePairedNodes() {
+    Preferences prefs;
+    if (!prefs.begin("paired_nodes", false)) {
+        Serial.println("❌ Failed to open NVS for saving paired nodes");
+        return;
+    }
+
+    // Store count
+    int count = 0;
+    for (const auto &n : registeredNodes) if (n.state == PAIRED || n.state == DEPLOYED) count++;
+    prefs.putInt("count", count);
+
+    int idx = 0;
+    for (const auto &n : registeredNodes) {
+        if (n.state == PAIRED || n.state == DEPLOYED) {
+            char key[16];
+            snprintf(key, sizeof(key), "mac%d", idx);
+            // store as hex string
+            char macs[18];
+            snprintf(macs, sizeof(macs), "%02X%02X%02X%02X%02X%02X", n.mac[0], n.mac[1], n.mac[2], n.mac[3], n.mac[4], n.mac[5]);
+            prefs.putString(key, macs);
+
+            snprintf(key, sizeof(key), "id%d", idx);
+            prefs.putString(key, n.nodeId);
+
+            snprintf(key, sizeof(key), "int%d", idx);
+            prefs.putInt(key, n.scheduleInterval);
+
+            idx++;
+        }
+    }
+
+    prefs.end();
+    Serial.print("✅ Saved "); Serial.print(count); Serial.println(" paired nodes to NVS");
+}
+
+void loadPairedNodes() {
+    Preferences prefs;
+    if (!prefs.begin("paired_nodes", true)) {
+        Serial.println("❌ Failed to open NVS for loading paired nodes");
+        return;
+    }
+
+    int count = prefs.getInt("count", 0);
+    Serial.print("🔁 Loading "); Serial.print(count); Serial.println(" paired nodes from NVS");
+
+    for (int i = 0; i < count; ++i) {
+        char key[16];
+        snprintf(key, sizeof(key), "mac%d", i);
+        String macs = prefs.getString(key, "");
+        if (macs.length() != 12) continue; // invalid
+
+        uint8_t mac[6];
+        for (int j = 0; j < 6; ++j) {
+            String byteStr = macs.substring(j*2, j*2+2);
+            mac[j] = (uint8_t) strtoul(byteStr.c_str(), NULL, 16);
+        }
+
+        snprintf(key, sizeof(key), "id%d", i);
+        String nid = prefs.getString(key, "NODE");
+
+        snprintf(key, sizeof(key), "int%d", i);
+        int interval = prefs.getInt(key, 5);
+
+        // Add node to registry as PAIRED
+        NodeInfo newNode;
+        memcpy(newNode.mac, mac, 6);
+        newNode.nodeId = nid;
+        newNode.nodeType = String("restored");
+        newNode.lastSeen = millis();
+        newNode.isActive = true;
+        newNode.state = PAIRED;
+        newNode.scheduleInterval = interval;
+        newNode.channel = 1;
+        registeredNodes.push_back(newNode);
+
+        // Add as ESP-NOW peer
+        esp_now_peer_info_t peerInfo;
+        memset(&peerInfo, 0, sizeof(peerInfo));
+        memcpy(peerInfo.peer_addr, mac, 6);
+        peerInfo.channel = 1;
+        peerInfo.ifidx = WIFI_IF_STA;
+        peerInfo.encrypt = false;
+        esp_now_del_peer(mac);
+        esp_now_add_peer(&peerInfo);
+    }
+
+    prefs.end();
+}
+
+bool unpairNode(const String& nodeId) {
+    for (auto it = registeredNodes.begin(); it != registeredNodes.end(); ++it) {
+        if (it->nodeId == nodeId) {
+            // Remove ESP-NOW peer locally
+            esp_now_del_peer(it->mac);
+            it->state = UNPAIRED;
+            it->isActive = true;
+            // Persist changes
+            savePairedNodes();
+            Serial.print("🗑️ Unpaired node: "); Serial.println(nodeId);
+            return true;
+        }
+    }
+    return false;
+}
+
+bool sendUnpairToNode(const String& nodeId) {
+    for (const auto &n : registeredNodes) {
+        if (n.nodeId == nodeId) {
+            unpair_command_t cmd;
+            memset(&cmd, 0, sizeof(cmd));
+            strcpy(cmd.command, "UNPAIR_NODE");
+            strcpy(cmd.mothership_id, DEVICE_ID);
+
+            esp_err_t res = esp_now_send(n.mac, (uint8_t*)&cmd, sizeof(cmd));
+            Serial.print("📤 Sent UNPAIR to "); Serial.print(nodeId); Serial.print(" -> "); Serial.print((int)res); Serial.print(" ("); Serial.print(esp_err_to_name(res)); Serial.println(")");
+            return (res == ESP_OK);
+        }
+    }
+    return false;
 }

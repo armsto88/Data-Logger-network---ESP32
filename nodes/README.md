@@ -1,78 +1,56 @@
-# Sensor Node Network
+# Sensor Node Projects
 
-This directory contains individual sensor nodes that communicate with the mothership via ESP-NOW.
+This folder contains example sensor node projects that communicate with the mothership via ESP-NOW. The primary example included is the air-temperature node (ESP32-C3).
 
-## Repository Structure
+## Layout
 
 ```
-📁 nodes/
-├── 📁 shared/
-│   └── protocol.h          # Communication protocol definitions
-├── 📁 air-temperature-node/
-│   ├── platformio.ini      # ESP32-C3 Mini configuration
-│   └── src/main.cpp        # DHT22 temperature/humidity sensor
-├── 📁 soil-moisture-node/
-│   └── (to be created)     # Soil moisture sensor
-└── 📁 other-nodes/
-    └── (future nodes)      # Light, pH, etc.
+nodes/
+├── shared/                   # (optional) shared protocol headers
+├── air-temperature-node/     # Example ESP32-C3 node
+└── (other nodes...)          # Future node types
 ```
 
-## Node Types Planned
+## air-temperature-node (ESP32-C3)
 
-| Node Type | Sensor | ESP32 Board | Status |
-|-----------|--------|-------------|---------|
-| Air Temperature | DHT22 | ESP32-C3 Mini | ✅ Ready |
-| Soil Moisture | Capacitive | ESP32-C3 Mini | 🔄 Planned |
-| Light Level | LDR/BH1750 | ESP32-C3 Mini | 🔄 Planned |
-| pH Level | pH Probe | ESP32-C3 Mini | 🔄 Planned |
+This example node (`nodes/air-temperature-node`) is a simple air-temperature sender. It:
 
-## Current Air Temperature Node
+- Broadcasts discovery requests when UNPAIRED.
+- Accepts pairing commands and pairing responses from the mothership.
+- Responds to `DEPLOY_NODE` to set RTC, schedule, and enter DEPLOYED state.
+- Handles a best-effort `UNPAIR_NODE` command to clear its stored mothership MAC and return to UNPAIRED.
 
-### Hardware Requirements:
-- **ESP32-C3 Mini** development board
-- **DHT22** temperature/humidity sensor
-- **3.3V power supply** (or USB for testing)
-- **Jumper wires**
+### Quick build & upload (PlatformIO)
 
-### Wiring:
-```
-DHT22 Pin    ESP32-C3 Mini Pin
-VCC          3.3V
-GND          GND
-DATA         GPIO 2
+From the repository root (PowerShell):
+
+```powershell
+& "$env:USERPROFILE\.platformio\penv\Scripts\platformio.exe" run -d .\nodes\air-temperature-node -e esp32c3 -t upload --upload-port COM7
 ```
 
-### Features:
-- 🌡️ **Reads temperature and humidity** every wake cycle
-- 📡 **Sends data to mothership** via ESP-NOW
-- 😴 **Deep sleep mode** for power efficiency
-- 📅 **Configurable wake intervals** (controlled by mothership)
-- 🔋 **Low power design** for battery operation
+Adjust the COM port as needed.
 
-### Configuration:
-- **Node ID**: `TEMP_001`
-- **Default wake interval**: 5 minutes
-- **Mothership MAC**: `30:ed:a0:aa:67:84` (update if different)
+### Node configuration
 
-## Getting Started
+- Node ID: `TEMP_001` (edit `src/main.cpp` to change)
+- Default wake interval: 5 minutes
+- The node stores a preloaded `mothershipMAC` in RTC memory for testing—discovery/pairing will overwrite it when the node finds the mothership.
 
-1. **Wire the DHT22 sensor** to the ESP32-C3 Mini
-2. **Update the mothership MAC address** in the node code if needed
-3. **Compile and upload** using PlatformIO
-4. **Place the node** in your monitoring location
-5. **Check the mothership web interface** to see incoming data
+### How pairing & unpairing works
 
-## Power Consumption
+- Discovery: node broadcasts a `DISCOVER_REQUEST`; the mothership responds with a discovery response.
+- Pairing: node sends/receives pairing messages. The mothership sends both a textual `PAIR_NODE` command and an RNT compact reply; the node stores the mothership MAC and marks itself PAIRED.
+- Deploy: mothership sends `DEPLOY_NODE` with time and schedule; node sets RTC, records schedule, and becomes DEPLOYED.
+- Unpair: mothership will send a best-effort `UNPAIR_NODE` command and also remove the peer locally. The node's code listens for `UNPAIR_NODE`, clears its stored mothership MAC, sets state to UNPAIRED, and re-enters discovery.
 
-The air temperature node is designed for battery operation:
-- **Active time**: ~2-3 seconds per wake cycle
-- **Deep sleep current**: ~10-20µA
-- **Estimated battery life**: Several months on 18650 battery (depending on wake interval)
+### Known issues
 
-## Next Steps
+- Undeploy (moving a node from DEPLOYED back to PAIRED/UNPAIRED) is not implemented yet. If you need an 'undeploy' action, we can add it so the mothership sends a specific `UNDEPLOY_NODE` command and the node transitions back and optionally clears scheduled behavior.
+- ESP-NOW channel/interface sensitivity: pairing uses channel 1 and peers are bound to the STA interface to avoid ESP_ERR_ESPNOW_IF errors. If you see send failures, ensure devices are on channel 1 during pairing and check serial logs for `esp_err` text.
 
-1. Test the air temperature node with your mothership
-2. Create soil moisture node
-3. Add more sensor types as needed
-4. Implement battery monitoring
-5. Add solar charging capability
+### Troubleshooting
+
+- Check serial logs on both node and mothership. The mothership prints `📨 send_cb to <MAC> status=OK/FAIL` for delivery status. Use those lines to determine whether commands reached the node.
+- If the node doesn't persist pairing, ensure the mothership saved paired nodes to NVS (mothership serial shows "✅ Saved X paired nodes to NVS").
+
+If you'd like, I can add a small test harness or scripts to simulate many nodes for load testing.

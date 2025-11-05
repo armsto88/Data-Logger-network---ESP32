@@ -146,7 +146,7 @@ void handleRoot() {
     // Paired nodes section
     if (pairedNodes.size() > 0) {
         html += "<div style='background:#fff8e1;padding:15px;border-radius:5px;margin:15px 0;'>";
-        html += "<h4 style='margin-top:0;color:#f57c00;'>� Paired Nodes (" + String(pairedNodes.size()) + ")</h4>";
+        html += "<h4 style='margin-top:0;color:#f57c00;'>Paired Nodes (" + String(pairedNodes.size()) + ")</h4>";
         html += "<p style='font-size:14px;margin:10px 0;'>Ready for deployment with RTC sync</p>";
         html += "<form action='/deploy-nodes' method='POST'>";
         
@@ -164,6 +164,22 @@ void handleRoot() {
         }
         
         html += "<button type='submit' style='background:#4CAF50;color:white;padding:12px 20px;border:none;border-radius:4px;font-size:16px;width:100%;margin:10px 0;'>🚀 Deploy Selected Nodes</button>";
+        html += "</form>";
+        html += "</div>";
+    }
+
+    // Unpair section (show paired nodes with unpair option)
+    if (pairedNodes.size() > 0) {
+        html += "<div style='background:#fff1f0;padding:15px;border-radius:5px;margin:15px 0;'>";
+        html += "<h4 style='margin-top:0;color:#d32f2f;'>Unpair Nodes</h4>";
+        html += "<form action='/unpair-nodes' method='POST'>";
+        for (const auto& node : pairedNodes) {
+            html += "<label style='display:block;padding:8px;border:1px solid #eee;margin:6px 0;border-radius:4px;background:white;'>";
+            html += "<input type='checkbox' name='unpair_nodes' value='" + node.nodeId + "' style='margin-right:8px;'>";
+            html += "<strong>" + node.nodeId + "</strong> — " + node.nodeType + " <small style='color:#666;'>(" + String(node.scheduleInterval) + " min)</small>";
+            html += "</label>";
+        }
+        html += "<button type='submit' style='background:#f44336;color:white;padding:10px 20px;border:none;border-radius:4px;font-size:14px;width:100%;margin:10px 0;'>🗑️ Unpair Selected</button>";
         html += "</form>";
         html += "</div>";
     }
@@ -471,7 +487,9 @@ void setup() {
     Serial.println("Starting SD Card setup...");
     setupSD();
     
-    Serial.println("Starting WiFi AP...");
+    Serial.println("Starting WiFi AP (AP+STA mode)...");
+    // Use AP+STA mode so ESP-NOW (which uses the STA iface) and the softAP can coexist
+    WiFi.mode(WIFI_AP_STA);
     WiFi.softAP(ssid.c_str(), password, 1); // Force channel 1
     Serial.print("SoftAP IP: ");
     Serial.println(WiFi.softAPIP());
@@ -497,6 +515,35 @@ void setup() {
     server.on("/discover-nodes", HTTP_POST, handleDiscoverNodes);
     server.on("/pair-nodes", HTTP_POST, handlePairNodes);
     server.on("/deploy-nodes", HTTP_POST, handleDeployNodes);
+    server.on("/unpair-nodes", HTTP_POST, [](){
+        int removed = 0;
+        // Build HTML response with per-node send status
+        String html = "<!DOCTYPE html><html><head>";
+        html += "<meta charset='UTF-8'>";
+        html += "<meta name='viewport' content='width=device-width, initial-scale=1'>";
+        html += "<style>body{font-family:Arial,sans-serif;margin:20px;background:#f5f5f5;} .button{padding:10px 16px;margin:10px;font-size:14px;background:#2196F3;color:white;text-decoration:none;border-radius:4px;display:inline-block;} .status-ok{color:green;font-weight:bold;} .status-fail{color:red;font-weight:bold;} .node-row{background:white;padding:10px;margin:8px;border-radius:6px;}</style>";
+        html += "</head><body><div class='container'><h2>Unpair Results</h2>";
+
+        for (int i = 0; i < server.args(); i++) {
+            if (server.argName(i) == "unpair_nodes") {
+                String nid = server.arg(i);
+                bool sendOk = sendUnpairToNode(nid);
+                bool removedLocal = unpairNode(nid);
+                html += "<div class='node-row'>";
+                html += "<strong>" + nid + "</strong> - ";
+                if (sendOk) html += "<span class='status-ok'>Remote UNPAIR sent</span>"; else html += "<span class='status-fail'>Remote UNPAIR failed</span>";
+                html += "<br/>";
+                if (removedLocal) { html += "<span class='status-ok'>Locally unpaired</span>"; removed++; }
+                else html += "<span class='status-fail'>Failed to locally unpair</span>";
+                html += "</div>";
+            }
+        }
+
+        if (removed == 0) html += "<p>⚠️ No nodes were locally unpaired.</p>";
+        html += "<br/><a href='/' class='button'>Back to Dashboard</a>";
+        html += "</div></body></html>";
+        server.send(200, "text/html", html);
+    });
     server.begin();
     Serial.println("✅ Web server started!");
 }

@@ -23,6 +23,7 @@ struct NodeInfo {
     bool isActive;
     NodeState state;
     int scheduleInterval;  // minutes between sensor readings
+    int channel; // WiFi channel the node is on (for RNT pairing)
 };
 
 // Message structures (matching the node protocol)
@@ -92,7 +93,8 @@ typedef struct pairing_response {
     char command[20];       // "PAIRING_RESPONSE"
     char nodeId[16];
     bool isPaired;
-    int alarmInterval;      // minutes
+    int scheduleInterval;   // minutes
+    char mothership_id[16];
 } pairing_response_t;
 
 void setupESPNOW();
@@ -102,9 +104,31 @@ bool sendTimeSync(const uint8_t* mac, const char* nodeId);
 bool sendDiscoveryBroadcast();
 bool pairNode(const String& nodeId, int scheduleInterval);
 bool deploySelectedNodes(const std::vector<String>& nodeIds);
+bool unpairNode(const String& nodeId);
 std::vector<NodeInfo> getRegisteredNodes();
 std::vector<NodeInfo> getUnpairedNodes();
 std::vector<NodeInfo> getPairedNodes();
 NodeState getNodeState(const char* nodeId);
 String getMothershipsMAC();
 void printRegisteredNodes();
+
+// Persistence (NVS) for paired nodes
+void savePairedNodes();
+void loadPairedNodes();
+
+// RNT-compatible pairing struct (for RandomNerdTutorials example)
+typedef struct rnt_pairing_t {
+    uint8_t msgType; // 0 = PAIRING, 1 = DATA
+    uint8_t id;      // device id (node sets board id, server responds with 0)
+    uint8_t macAddr[6];
+    uint8_t channel;
+} rnt_pairing_t;
+
+// Remote unpair command
+typedef struct unpair_command {
+    char command[16]; // "UNPAIR_NODE"
+    char mothership_id[16];
+} unpair_command_t;
+
+// Send an UNPAIR command to a node (best-effort)
+bool sendUnpairToNode(const String& nodeId);

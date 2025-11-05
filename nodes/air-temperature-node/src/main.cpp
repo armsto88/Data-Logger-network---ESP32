@@ -4,6 +4,7 @@
 #include <esp_sleep.h>
 #include <Wire.h>
 #include <RTClib.h>
+#include <esp_wifi.h>
 
 // Node States
 enum NodeState {
@@ -45,6 +46,12 @@ typedef struct pairing_response {
     int scheduleInterval;   // minutes
     char mothership_id[16];
 } pairing_response_t;
+
+// Remote unpair command struct (must match mothership)
+typedef struct unpair_command {
+    char command[16]; // "UNPAIR_NODE"
+    char mothership_id[16];
+} unpair_command_t;
 
 typedef struct deployment_command {
     char command[20];       // "DEPLOY_NODE" - increased size
@@ -119,6 +126,7 @@ void onDataReceived(const uint8_t *mac, const uint8_t *incomingData, int len) {
             memset(&peerInfo, 0, sizeof(peerInfo));
             memcpy(peerInfo.peer_addr, mac, 6);
             peerInfo.channel = 1;
+            peerInfo.ifidx = WIFI_IF_STA;
             peerInfo.encrypt = false;
             
             // Remove peer if it already exists, then add
@@ -186,6 +194,20 @@ void onDataReceived(const uint8_t *mac, const uint8_t *incomingData, int len) {
             Serial.println("✅ Node deployed! Starting data collection...");
         }
     }
+    // Handle remote unpair command
+    else if (len == sizeof(unpair_command_t)) {
+        // lightweight struct for command
+        struct unpair_command_t_local { char command[16]; char mothership_id[16]; } uc;
+        memcpy(&uc, incomingData, sizeof(uc));
+        if (strcmp(uc.command, "UNPAIR_NODE") == 0) {
+            Serial.println("🗑️ Received UNPAIR from mothership");
+            // Clear stored mothership MAC and mark unpaired
+            memset(mothershipMAC, 0, sizeof(mothershipMAC));
+            nodeState = STATE_UNPAIRED;
+            // Optionally, trigger discovery immediately
+            sendDiscoveryRequest();
+        }
+    }
 }
 
 // Send discovery request to find motherships
@@ -199,6 +221,8 @@ void sendDiscoveryRequest() {
     strcpy(discovery.command, "DISCOVER_REQUEST");
     discovery.timestamp = millis();
     
+    // Ensure we are on the fixed pairing channel
+    esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE);
     esp_err_t result = esp_now_send(broadcastAddress, (uint8_t*)&discovery, sizeof(discovery));
     
     if (result == ESP_OK) {
@@ -217,6 +241,8 @@ void sendPairingRequest() {
     strcpy(pairingReq.command, "PAIRING_REQUEST");
     strcpy(pairingReq.nodeId, NODE_ID);
     
+    // Ensure we are on the fixed pairing channel
+    esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE);
     esp_err_t result = esp_now_send(broadcastAddress, (uint8_t*)&pairingReq, sizeof(pairingReq));
     
     if (result == ESP_OK) {
@@ -242,6 +268,8 @@ void sendSensorData() {
     sensorMsg.value = temperature;
     sensorMsg.nodeTimestamp = rtc.now().unixtime();
     
+    // Ensure sending on pairing/comm channel
+    esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE);
     esp_err_t result = esp_now_send(mothershipMAC, (uint8_t*)&sensorMsg, sizeof(sensorMsg));
     
     if (result == ESP_OK) {
@@ -306,18 +334,20 @@ void setup() {
     esp_now_register_recv_cb(onDataReceived);
     
     // Add broadcast peer for discovery
-    esp_now_peer_info_t peerInfo;
-    memset(&peerInfo, 0, sizeof(peerInfo));
-    uint8_t broadcastAddress[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
-    memcpy(peerInfo.peer_addr, broadcastAddress, 6);
-    peerInfo.channel = 1; // Force channel 1
-    peerInfo.encrypt = false;
-    esp_now_add_peer(&peerInfo);
+            esp_now_peer_info_t peerInfo;
+            memset(&peerInfo, 0, sizeof(peerInfo));
+            uint8_t broadcastAddress[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+            memcpy(peerInfo.peer_addr, broadcastAddress, 6);
+            peerInfo.channel = 1; // Force channel 1
+            peerInfo.ifidx = WIFI_IF_STA;
+            peerInfo.encrypt = false;
+            esp_now_add_peer(&peerInfo);
     
     // Add preloaded mothership as peer for reliable communication
     memset(&peerInfo, 0, sizeof(peerInfo));
     memcpy(peerInfo.peer_addr, mothershipMAC, 6);
     peerInfo.channel = 1; // Force channel 1
+    peerInfo.ifidx = WIFI_IF_STA;
     peerInfo.encrypt = false;
     
     // Remove peer if it already exists, then add
