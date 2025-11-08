@@ -1,17 +1,54 @@
+// Includes
 #include <Arduino.h>
+#include <vector>
 #include <WiFi.h>
 #include <WebServer.h>
 #include "rtc_manager.h"
 #include "sd_manager.h"
 #include "espnow_manager.h"
 
-// Device identification
+// Device identification and WiFi
 const char* DEVICE_ID = "001";  // Simplified ID
 const char* BASE_SSID = "Logger";
 String ssid = String(BASE_SSID) + String(DEVICE_ID);  // Will be "Logger001"
 const char* password = "logger123";
 
+// Web server instance
 WebServer server(80);
+
+// Revert a deployed node to paired state
+void handleRevertNode() {
+    String nodeId = server.arg("node_id");
+    bool found = false;
+    // Use the global registeredNodes vector from espnow_manager.cpp
+    extern std::vector<NodeInfo> registeredNodes;
+    for (auto& node : registeredNodes) {
+        if (node.nodeId == nodeId && node.state == DEPLOYED) {
+            node.state = PAIRED;
+            savePairedNodes();
+            found = true;
+            Serial.print("[MOTHERSHIP] Node reverted to PAIRED state: ");
+            Serial.println(nodeId);
+            break;
+        }
+    }
+    String html = "<!DOCTYPE html><html><head>";
+    html += "<meta charset='UTF-8'>";
+    html += "<meta name='viewport' content='width=device-width, initial-scale=1'>";
+    html += "<style>body{font-family:Arial,sans-serif;margin:20px;text-align:center;background:#f5f5f5;} .container{max-width:400px;margin:50px auto;background:white;padding:30px;border-radius:8px;box-shadow:0 2px 10px rgba(0,0,0,0.1);} .success{color:#2196F3;font-size:24px;margin-bottom:20px;} .button{padding:15px 25px;margin:10px;font-size:16px;background:#2196F3;color:white;text-decoration:none;border-radius:4px;display:inline-block;}</style>";
+    html += "</head><body><div class='container'>";
+    if (found) {
+        html += "<div class='success'>Node reverted to paired state!</div>";
+        html += "<p>Node <strong>" + nodeId + "</strong> is now in the paired state and can be redeployed.</p>";
+    } else {
+        html += "<div class='success'>Node not found or not deployed.</div>";
+        html += "<p>No action taken.</p>";
+    }
+    html += "<a href='/' class='button'>Back to Dashboard</a>";
+    html += "</div></body></html>";
+    server.send(200, "text/html", html);
+}
+
 
 void handleRoot() {
     char currentTime[24];
@@ -184,11 +221,28 @@ void handleRoot() {
         html += "</div>";
     }
     
-    // Deployed nodes status
+    // Deployed nodes status and revert option
     if (deployedNodes > 0) {
         html += "<div style='background:#e8f5e8;padding:15px;border-radius:5px;margin:15px 0;'>";
         html += "<h4 style='margin-top:0;color:#4CAF50;'>🟢 Active Deployed Nodes (" + String(deployedNodes) + ")</h4>";
         html += "<p style='font-size:14px;margin:10px 0;'>Nodes are collecting data and sending to mothership</p>";
+        // List deployed nodes with revert button
+        for (const auto& node : allNodes) {
+            if (node.state == DEPLOYED && node.isActive) {
+                html += "<div style='border:1px solid #b2dfdb;border-radius:4px;padding:10px;margin:8px 0;background:white;display:flex;align-items:center;justify-content:space-between;'>";
+                html += "<span><strong>" + node.nodeId + "</strong> (" + node.nodeType + ")<br><small>MAC: ";
+                for (int i = 0; i < 6; i++) {
+                    html += String(node.mac[i], HEX);
+                    if (i < 5) html += ":";
+                }
+                html += "</small></span>";
+                html += "<form action='/revert-node' method='POST' style='margin:0;display:inline;'>";
+                html += "<input type='hidden' name='node_id' value='" + node.nodeId + "'>";
+                html += "<button type='submit' style='background:#1976D2;color:white;padding:8px 16px;border:none;border-radius:4px;font-size:14px;cursor:pointer;'>↩️ Revert to Paired</button>";
+                html += "</form>";
+                html += "</div>";
+            }
+        }
         html += "</div>";
     }
     
@@ -515,6 +569,7 @@ void setup() {
     server.on("/discover-nodes", HTTP_POST, handleDiscoverNodes);
     server.on("/pair-nodes", HTTP_POST, handlePairNodes);
     server.on("/deploy-nodes", HTTP_POST, handleDeployNodes);
+    server.on("/revert-node", HTTP_POST, handleRevertNode);
     server.on("/unpair-nodes", HTTP_POST, [](){
         int removed = 0;
         // Build HTML response with per-node send status

@@ -386,16 +386,16 @@ void loop() {
     else if (nodeState == STATE_PAIRED) {
         // Wait for deployment - just listen for commands
         if (currentTime - lastAction > 5000) {
-            Serial.println("� Paired - waiting for deployment...");
+            Serial.println("🟡 Paired - not deployed. Not transmitting data. Waiting for deployment command from mothership...");
             lastAction = currentTime;
         }
     }
     else if (nodeState == STATE_DEPLOYED) {
         // Send sensor data according to schedule (for testing, every 30 seconds)
         if (currentTime - lastAction > 30000) {
+            Serial.println("🟢 Deployed - transmitting sensor data to mothership...");
             sendSensorData();
             lastAction = currentTime;
-            
             // In production, would enter deep sleep here:
             // Serial.println("😴 Entering deep sleep...");
             // esp_deep_sleep(wakeIntervalMinutes * 60 * 1000000ULL);
