@@ -22,7 +22,7 @@ struct NodeInfo {
     unsigned long lastSeen;
     bool isActive;
     NodeState state;
-    int scheduleInterval;  // minutes between sensor readings
+    // int scheduleInterval;  // removed: minutes between sensor readings
     int channel; // WiFi channel the node is on (for RNT pairing)
 };
 
@@ -50,7 +50,6 @@ typedef struct discovery_response {
 typedef struct pairing_command {
     char command[20];       // "PAIR_NODE" - increased size
     char nodeId[16];
-    int scheduleInterval;   // minutes
     char mothership_id[16];
 } pairing_command_t;
 
@@ -63,7 +62,6 @@ typedef struct deployment_command {
     unsigned long hour;
     unsigned long minute;
     unsigned long second;
-    int scheduleInterval;
     char mothership_id[16];
 } deployment_command_t;
 
@@ -93,7 +91,6 @@ typedef struct pairing_response {
     char command[20];       // "PAIRING_RESPONSE"
     char nodeId[16];
     bool isPaired;
-    int scheduleInterval;   // minutes
     char mothership_id[16];
 } pairing_response_t;
 
@@ -102,7 +99,7 @@ void espnow_loop();
 bool broadcastSchedule(int intervalMinutes);
 bool sendTimeSync(const uint8_t* mac, const char* nodeId);
 bool sendDiscoveryBroadcast();
-bool pairNode(const String& nodeId, int scheduleInterval);
+bool pairNode(const String& nodeId);
 bool deploySelectedNodes(const std::vector<String>& nodeIds);
 bool unpairNode(const String& nodeId);
 std::vector<NodeInfo> getRegisteredNodes();

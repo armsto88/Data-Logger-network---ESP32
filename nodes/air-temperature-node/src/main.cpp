@@ -43,7 +43,6 @@ typedef struct pairing_response {
     char command[20];       // "PAIRING_RESPONSE"
     char nodeId[16];
     bool isPaired;
-    int scheduleInterval;   // minutes
     char mothership_id[16];
 } pairing_response_t;
 
@@ -62,11 +61,9 @@ typedef struct deployment_command {
     unsigned long hour;
     unsigned long minute;
     unsigned long second;
-    int scheduleInterval;
     char mothership_id[16];
 } deployment_command_t;
 
-#define DEFAULT_WAKE_INTERVAL_MINUTES 5
 #define RTC_SDA_PIN 8
 #define RTC_SCL_PIN 9
 
@@ -76,7 +73,6 @@ typedef struct deployment_command {
 
 // Node state persistence
 RTC_DATA_ATTR NodeState nodeState = STATE_UNPAIRED;
-RTC_DATA_ATTR int wakeIntervalMinutes = DEFAULT_WAKE_INTERVAL_MINUTES;
 RTC_DATA_ATTR int bootCount = 0;
 RTC_DATA_ATTR bool rtcSynced = false;
 RTC_DATA_ATTR uint8_t mothershipMAC[6] = {0x30, 0xED, 0xA0, 0xAA, 0x67, 0x84}; // Preloaded mothership MAC
@@ -152,13 +148,8 @@ void onDataReceived(const uint8_t *mac, const uint8_t *incomingData, int len) {
         
         if (strcmp(pairResp.command, "PAIRING_RESPONSE") == 0 && 
             strcmp(pairResp.nodeId, NODE_ID) == 0) {
-            
             if (pairResp.isPaired) {
-                Serial.print("📋 Pairing confirmed! Interval: ");
-                Serial.print(pairResp.scheduleInterval);
-                Serial.println(" minutes");
-                
-                wakeIntervalMinutes = pairResp.scheduleInterval;
+                Serial.println("📋 Pairing confirmed!");
                 nodeState = STATE_PAIRED;
                 memcpy(mothershipMAC, mac, 6);
             } else {
@@ -173,24 +164,15 @@ void onDataReceived(const uint8_t *mac, const uint8_t *incomingData, int len) {
         
         if (strcmp(deployCmd.command, "DEPLOY_NODE") == 0 && 
             strcmp(deployCmd.nodeId, NODE_ID) == 0) {
-            
             Serial.println("🚀 Deployment command received!");
-            
             // Set RTC time
             rtc.adjust(DateTime(deployCmd.year, deployCmd.month, deployCmd.day, 
                               deployCmd.hour, deployCmd.minute, deployCmd.second));
-            
-            wakeIntervalMinutes = deployCmd.scheduleInterval;
             rtcSynced = true;
             nodeState = STATE_DEPLOYED;
             memcpy(mothershipMAC, mac, 6);
-            
             Serial.print("RTC synchronized to: ");
             Serial.println(rtc.now().timestamp());
-            Serial.print("Schedule: Every ");
-            Serial.print(wakeIntervalMinutes);
-            Serial.println(" minutes");
-            
             Serial.println("✅ Node deployed! Starting data collection...");
         }
     }
@@ -391,14 +373,14 @@ void loop() {
         }
     }
     else if (nodeState == STATE_DEPLOYED) {
-        // Send sensor data according to schedule (for testing, every 30 seconds)
+        // Send sensor data every 30 seconds (fixed, no schedule/interval logic)
         if (currentTime - lastAction > 30000) {
             Serial.println("🟢 Deployed - transmitting sensor data to mothership...");
             sendSensorData();
             lastAction = currentTime;
             // In production, would enter deep sleep here:
             // Serial.println("😴 Entering deep sleep...");
-            // esp_deep_sleep(wakeIntervalMinutes * 60 * 1000000ULL);
+            // esp_deep_sleep(30 * 1000000ULL); // 30 seconds
         }
     }
     

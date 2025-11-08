@@ -153,7 +153,6 @@ void handleRoot() {
         html += "<div style='background:#ffebee;padding:15px;border-radius:5px;margin:15px 0;'>";
         html += "<h4 style='margin-top:0;color:#d32f2f;'>🔴 Unpaired Nodes (" + String(unpairedNodes.size()) + ")</h4>";
         html += "<form action='/pair-nodes' method='POST'>";
-        
         for (const auto& node : unpairedNodes) {
             html += "<div style='border:1px solid #ddd;border-radius:4px;padding:10px;margin:8px 0;background:white;'>";
             html += "<input type='checkbox' name='selected_nodes' value='" + node.nodeId + "' style='margin-right:8px;'>";
@@ -164,17 +163,8 @@ void handleRoot() {
                 if (i < 5) html += ":";
             }
             html += " | Last seen: " + String((millis() - node.lastSeen) / 1000) + "s ago</small><br>";
-            html += "<label>Interval: <select name='interval_" + node.nodeId + "' style='padding:4px;margin:4px 0;'>";
-            html += "<option value='1'>1 min</option>";
-            html += "<option value='5' selected>5 min</option>";
-            html += "<option value='10'>10 min</option>";
-            html += "<option value='15'>15 min</option>";
-            html += "<option value='30'>30 min</option>";
-            html += "<option value='60'>60 min</option>";
-            html += "</select></label>";
             html += "</div>";
         }
-        
         html += "<button type='submit' style='background:#ff9800;color:white;padding:10px 20px;border:none;border-radius:4px;font-size:14px;width:100%;margin:10px 0;'>📋 Pair Selected Nodes</button>";
         html += "</form>";
         html += "</div>";
@@ -186,20 +176,16 @@ void handleRoot() {
         html += "<h4 style='margin-top:0;color:#f57c00;'>Paired Nodes (" + String(pairedNodes.size()) + ")</h4>";
         html += "<p style='font-size:14px;margin:10px 0;'>Ready for deployment with RTC sync</p>";
         html += "<form action='/deploy-nodes' method='POST'>";
-        
         for (const auto& node : pairedNodes) {
             html += "<div style='border:1px solid #ddd;border-radius:4px;padding:10px;margin:8px 0;background:white;'>";
             html += "<input type='checkbox' name='deploy_nodes' value='" + node.nodeId + "' checked style='margin-right:8px;'>";
             html += "<strong>" + node.nodeId + "</strong> (" + node.nodeType + ")<br>";
-            html += "<small>Interval: " + String(node.scheduleInterval) + " minutes | ";
             for (int i = 0; i < 6; i++) {
                 html += String(node.mac[i], HEX);
                 if (i < 5) html += ":";
             }
-            html += "</small>";
             html += "</div>";
         }
-        
         html += "<button type='submit' style='background:#4CAF50;color:white;padding:12px 20px;border:none;border-radius:4px;font-size:16px;width:100%;margin:10px 0;'>🚀 Deploy Selected Nodes</button>";
         html += "</form>";
         html += "</div>";
@@ -213,8 +199,7 @@ void handleRoot() {
         for (const auto& node : pairedNodes) {
             html += "<label style='display:block;padding:8px;border:1px solid #eee;margin:6px 0;border-radius:4px;background:white;'>";
             html += "<input type='checkbox' name='unpair_nodes' value='" + node.nodeId + "' style='margin-right:8px;'>";
-            html += "<strong>" + node.nodeId + "</strong> — " + node.nodeType + " <small style='color:#666;'>(" + String(node.scheduleInterval) + " min)</small>";
-            html += "</label>";
+            html += "<strong>" + node.nodeId + "</strong> — " + node.nodeType + "</label>";
         }
         html += "<button type='submit' style='background:#f44336;color:white;padding:10px 20px;border:none;border-radius:4px;font-size:14px;width:100%;margin:10px 0;'>🗑️ Unpair Selected</button>";
         html += "</form>";
@@ -353,52 +338,6 @@ void handleDownloadCSV() {
     Serial.println("✅ CSV file downloaded by client");
 }
 
-void handleNodeSchedule() {
-    String interval = server.arg("interval");
-    int intervalMinutes = interval.toInt();
-    
-    if (intervalMinutes > 0 && intervalMinutes <= 1440) { // Max 24 hours
-        if (broadcastSchedule(intervalMinutes)) {
-            String html = "<!DOCTYPE html><html><head>";
-            html += "<meta charset='UTF-8'>";
-            html += "<meta name='viewport' content='width=device-width, initial-scale=1'>";
-            html += "<style>";
-            html += "body{font-family:Arial,sans-serif;margin:20px;text-align:center;background:#f5f5f5;}";
-            html += ".container{max-width:400px;margin:50px auto;background:white;padding:30px;border-radius:8px;box-shadow:0 2px 10px rgba(0,0,0,0.1);}";
-            html += ".success{color:#4CAF50;font-size:24px;margin-bottom:20px;}";
-            html += ".button{padding:15px 25px;margin:10px;font-size:16px;background:#2196F3;color:white;text-decoration:none;border-radius:4px;display:inline-block;}";
-            html += "</style>";
-            html += "</head><body>";
-            html += "<div class='container'>";
-            html += "<div class='success'>📡 Schedule Broadcast Successful!</div>";
-            html += "<p>All sensor nodes have been instructed to wake every <strong>" + String(intervalMinutes) + " minutes</strong></p>";
-            html += "<p>Node data will be collected automatically</p>";
-            html += "<a href='/' class='button'>Back to Dashboard</a>";
-            html += "</div>";
-            html += "</body></html>";
-            server.send(200, "text/html", html);
-        } else {
-            server.send(500, "text/plain", "Failed to broadcast schedule");
-        }
-    } else {
-        String html = "<!DOCTYPE html><html><head>";
-        html += "<meta charset='UTF-8'>";
-        html += "<style>";
-        html += "body{font-family:Arial,sans-serif;margin:20px;text-align:center;background:#f5f5f5;}";
-        html += ".container{max-width:400px;margin:50px auto;background:white;padding:30px;border-radius:8px;box-shadow:0 2px 10px rgba(0,0,0,0.1);}";
-        html += ".error{color:#ff9800;font-size:24px;margin-bottom:20px;}";
-        html += ".button{padding:15px 25px;margin:10px;font-size:16px;background:#2196F3;color:white;text-decoration:none;border-radius:4px;display:inline-block;}";
-        html += "</style>";
-        html += "</head><body>";
-        html += "<div class='container'>";
-        html += "<div class='error'>⚠️ Invalid Interval</div>";
-        html += "<p>Please enter a value between 1 and 1440 minutes (24 hours)</p>";
-        html += "<a href='/' class='button'>Try Again</a>";
-        html += "</div>";
-        html += "</body></html>";
-        server.send(400, "text/html", html);
-    }
-}
 
 void handleDiscoverNodes() {
     Serial.println("🔍 Starting node discovery...");
@@ -447,7 +386,7 @@ void handlePairNodes() {
                 }
             }
             
-            if (pairNode(argValue, interval)) {
+            if (pairNode(argValue)) {
                 pairedCount++;
                 pairedNodes += argValue + " (" + String(interval) + " min), ";
             }
@@ -565,7 +504,6 @@ void setup() {
     server.on("/", handleRoot);
     server.on("/set-time", HTTP_POST, handleSetTime);
     server.on("/download-csv", HTTP_GET, handleDownloadCSV);
-    server.on("/set-schedule", HTTP_POST, handleNodeSchedule);
     server.on("/discover-nodes", HTTP_POST, handleDiscoverNodes);
     server.on("/pair-nodes", HTTP_POST, handlePairNodes);
     server.on("/deploy-nodes", HTTP_POST, handleDeployNodes);

@@ -12,12 +12,6 @@
 // External reference to DEVICE_ID from main.cpp
 extern const char* DEVICE_ID;
 
-// Structure to send schedule commands to nodes
-typedef struct struct_schedule_command {
-    char command[16];        // "SET_SCHEDULE"
-    int intervalMinutes;     // Alarm interval in minutes
-    char mothership_id[16];  // Mothership identifier
-} struct_schedule_command;
 
 std::vector<NodeInfo> registeredNodes;
 
@@ -39,15 +33,14 @@ void registerNode(const uint8_t* mac, const char* nodeId, const char* nodeType =
     }
     
     if (!found) {
-        NodeInfo newNode;
-        memcpy(newNode.mac, mac, 6);
-        newNode.nodeId = String(nodeId);
-        newNode.nodeType = String(nodeType);
-        newNode.lastSeen = millis();
-        newNode.isActive = true;
-        newNode.state = state;
-        newNode.scheduleInterval = 5; // default 5 minutes
-        registeredNodes.push_back(newNode);
+    NodeInfo newNode;
+    memcpy(newNode.mac, mac, 6);
+    newNode.nodeId = String(nodeId);
+    newNode.nodeType = String(nodeType);
+    newNode.lastSeen = millis();
+    newNode.isActive = true;
+    newNode.state = state;
+    registeredNodes.push_back(newNode);
         
         // Add node as ESP-NOW peer for sending pairing commands
         esp_now_peer_info_t peerInfo;
@@ -186,7 +179,6 @@ void OnDataRecv(const uint8_t * mac, const uint8_t *incomingBytes, int len) {
             strcpy(response.command, "PAIRING_RESPONSE");
             strcpy(response.nodeId, request.nodeId);
             response.isPaired = (currentState == PAIRED || currentState == DEPLOYED);
-            response.scheduleInterval = 30; // Default for now
             strcpy(response.mothership_id, DEVICE_ID);
 
             uint8_t broadcastAddress[] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
@@ -359,27 +351,6 @@ void espnow_loop() {
     }
 }
 
-// Broadcast schedule command to all registered nodes
-bool broadcastSchedule(int intervalMinutes) {
-    struct_schedule_command command;
-    strcpy(command.command, "SET_SCHEDULE");
-    command.intervalMinutes = intervalMinutes;
-    strcpy(command.mothership_id, "MOTHERSHIP001");
-    
-    uint8_t broadcastAddress[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
-    
-    esp_err_t result = esp_now_send(broadcastAddress, (uint8_t *) &command, sizeof(command));
-    
-    if (result == ESP_OK) {
-        Serial.print("📡 Broadcast schedule command: ");
-        Serial.print(intervalMinutes);
-        Serial.println(" minutes to all nodes");
-        return true;
-    } else {
-        Serial.println("❌ Failed to broadcast schedule command");
-        return false;
-    }
-}
 
 // Send current time to a specific node
 bool sendTimeSync(const uint8_t* mac, const char* nodeId) {
@@ -464,38 +435,28 @@ bool sendDiscoveryBroadcast() {
 }
 
 // Pair a specific node
-bool pairNode(const String& nodeId, int scheduleInterval) {
+bool pairNode(const String& nodeId) {
     for (auto& node : registeredNodes) {
         if (node.nodeId == nodeId && node.state == UNPAIRED) {
             node.state = PAIRED;
-            node.scheduleInterval = scheduleInterval;
-            
             pairing_command_t pairCmd;
             strcpy(pairCmd.command, "PAIR_NODE");
             strcpy(pairCmd.nodeId, nodeId.c_str());
-            pairCmd.scheduleInterval = scheduleInterval;
             strcpy(pairCmd.mothership_id, DEVICE_ID);
-            
             // Ensure peer entry exists for this node on fixed pairing channel (1)
             esp_now_peer_info_t peerInfo;
             memset(&peerInfo, 0, sizeof(peerInfo));
             memcpy(peerInfo.peer_addr, node.mac, 6);
             peerInfo.channel = 1;
             peerInfo.encrypt = false;
-
             esp_err_t pdel = esp_now_del_peer(node.mac);
             esp_err_t padd = esp_now_add_peer(&peerInfo);
             Serial.print("🔧 Ensured peer for "); Serial.print(nodeId);
             Serial.print(" (del="); Serial.print((int)pdel); Serial.print(", add="); Serial.print((int)padd); Serial.println(")");
-
-            // small settle time after adding peer
             delay(30);
-
-            // Try sending pairing command with a small retry loop to mitigate IF errors
             const int maxAttempts = 3;
             esp_err_t result = ESP_ERR_ESPNOW_NOT_INIT;
             for (int attempt = 1; attempt <= maxAttempts; ++attempt) {
-                // Ensure we're on the pairing channel
                 esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE);
                 delay(10);
                 result = esp_now_send(node.mac, (uint8_t*)&pairCmd, sizeof(pairCmd));
@@ -503,40 +464,28 @@ bool pairNode(const String& nodeId, int scheduleInterval) {
                 Serial.print("⚠️ pairNode attempt "); Serial.print(attempt); Serial.print(" failed: "); Serial.print((int)result); Serial.print(" ("); Serial.print(esp_err_to_name(result)); Serial.println(")");
                 delay(50);
             }
-
             if (result == ESP_OK) {
                 Serial.print("✅ Node paired: ");
-                Serial.print(nodeId);
-                Serial.print(" (");
-                Serial.print(scheduleInterval);
-                Serial.println(" min interval)");
-
-                // Also send RandomNerdTutorials-style compact pairing response so
-                // RNT nodes can add the mothership as an ESP-NOW peer.
+                Serial.println(nodeId);
                 rnt_pairing_t rntResp;
                 memset(&rntResp, 0, sizeof(rntResp));
                 rntResp.msgType = 0; // PAIRING response
                 rntResp.id = 0; // mothership/server id = 0 per RNT convention
-
                 // Fill mothership MAC into response
                 uint8_t mothershipMac[6];
                 WiFi.macAddress(mothershipMac);
                 memcpy(rntResp.macAddr, mothershipMac, 6);
-
                 // Use pairing channel (fixed to 1)
                 uint8_t sendChannel = 1;
-
                 // Switch WiFi channel briefly so the node receives the packet
                 esp_wifi_set_channel(sendChannel, WIFI_SECOND_CHAN_NONE);
                 delay(10);
                 rntResp.channel = sendChannel;
-
                 // Ensure peer is present for rnt reply as well (set channel appropriately)
                 peerInfo.channel = sendChannel;
                 esp_now_del_peer(node.mac);
                 esp_now_add_peer(&peerInfo);
                 delay(20);
-
                 // Retry loop for RNT reply as well
                 esp_err_t rres = ESP_ERR_ESPNOW_NOT_INIT;
                 for (int attempt = 1; attempt <= maxAttempts; ++attempt) {
@@ -547,7 +496,6 @@ bool pairNode(const String& nodeId, int scheduleInterval) {
                     Serial.print("⚠️ RNT reply attempt "); Serial.print(attempt); Serial.print(" failed: "); Serial.print((int)rres); Serial.print(" ("); Serial.print(esp_err_to_name(rres)); Serial.println(")");
                     delay(50);
                 }
-
                 if (rres == ESP_OK) {
                     Serial.print("📤 Sent RNT pairing response to ");
                     for (int i = 0; i < 6; i++) { Serial.printf("%02X", node.mac[i]); if (i < 5) Serial.print(":"); }
@@ -587,7 +535,7 @@ bool deploySelectedNodes(const std::vector<String>& nodeIds) {
                 strcpy(deployCmd.command, "DEPLOY_NODE");
                 strcpy(deployCmd.nodeId, nodeId.c_str());
                 strcpy(deployCmd.mothership_id, DEVICE_ID);
-                deployCmd.scheduleInterval = node.scheduleInterval;
+                // removed: deployCmd.scheduleInterval = node.scheduleInterval;
                 
                 // Get current RTC time
                 char timeBuffer[24];
@@ -706,9 +654,6 @@ void savePairedNodes() {
             snprintf(key, sizeof(key), "id%d", idx);
             prefs.putString(key, n.nodeId);
 
-            snprintf(key, sizeof(key), "int%d", idx);
-            prefs.putInt(key, n.scheduleInterval);
-
             idx++;
         }
     }
@@ -742,9 +687,6 @@ void loadPairedNodes() {
         snprintf(key, sizeof(key), "id%d", i);
         String nid = prefs.getString(key, "NODE");
 
-        snprintf(key, sizeof(key), "int%d", i);
-        int interval = prefs.getInt(key, 5);
-
         // Add node to registry as PAIRED
         NodeInfo newNode;
         memcpy(newNode.mac, mac, 6);
@@ -753,7 +695,6 @@ void loadPairedNodes() {
         newNode.lastSeen = millis();
         newNode.isActive = true;
         newNode.state = PAIRED;
-        newNode.scheduleInterval = interval;
         newNode.channel = 1;
         registeredNodes.push_back(newNode);
 
