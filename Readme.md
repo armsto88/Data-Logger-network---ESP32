@@ -7,17 +7,18 @@ This repository contains a small sensor-network system built using ESP-NOW:
 
 This README documents the current state of the code, how to build and test it, and known issues.
 
-## Current status (2025-11-05)
+## Project status (2025-11-08)
 
-- Core flows implemented and tested locally: discovery → pair → deploy → persist paired nodes → unpair.
-- Persistence of paired nodes stored in ESP-NVS on the mothership (survives reboot).
-- RNT-compatible compact pairing reply implemented so RandomNerdTutorials-style nodes can auto-add the mothership.
-- Remote UNPAIR command implemented: mothership sends `UNPAIR_NODE` to instruct a node to clear its stored mothership MAC and return to UNPAIRED.
-- Known issue: undeploy (reverting from DEPLOYED back to PAIRED) is not implemented—if you need that flow, see the 'Known issues' section.
+- **All schedule/interval logic has been fully removed** from both mothership and node firmware. The only time sync is RTC on deploy.
+- **UI reverted to classic style** for clarity and user preference.
+- **'Undeploy' (revert to paired) feature is implemented**: You can now revert a deployed node to the paired state from the web UI. Node stops transmitting when reverted.
+- **All code builds and uploads cleanly** for both mothership (ESP32-S3) and node (ESP32-C3) using PlatformIO.
+- **Web UI and backend are consistent and minimal**: Only core flows (discovery, pair, deploy, unpair, revert) are present. No schedule, alarm, or interval logic remains.
+- **Serial output and protocol are clean**: No schedule/interval/alarm messages are sent or displayed.
 
 ## Repository layout
 
-```
+```text
 Data-Logger-network---ESP32/
 ├── platformio.ini                # Mothership PlatformIO envs (esp32s3)
 ├── Readme.md                     # This file
@@ -31,7 +32,6 @@ Data-Logger-network---ESP32/
 └── nodes/
     ├── README.md                 # Node-level docs
     └── air-temperature-node/     # Example node project (esp32c3)
-
 ```
 
 ## Key concepts and protocols
@@ -59,17 +59,17 @@ Build and upload the example node (ESP32-C3):
 
 Open serial monitors for both devices (set correct COM ports and 115200 baud) while testing pairing/deploy flows.
 
-## How to test pairing & unpair
+## How to test pairing, deploy, unpair, and revert
 
 1. Put mothership online (flash and open the web UI; web server runs on the AP interface).
 2. Flash and power the node(s). Watch node serial for discovery messages.
 3. On the mothership web UI, click 'Discover' then 'Pair selected nodes' for any discovered nodes. The UI will send both a pairing command and an RNT-style compact reply so nodes that expect that format will auto-add the mothership.
 4. After a successful pair, deploy the node with the 'Deploy' action. The node should set its RTC, change to DEPLOYED state, and start sending sensor data.
 5. To unpair remotely, use the Unpair UI. The mothership will send a best-effort `UNPAIR_NODE` command and then remove the peer and persist the change locally. The UI now shows per-node send status (Remote UNPAIR sent/failed) and local unpair status.
+6. To revert a deployed node to paired, use the 'Revert to Paired' button in the deployed node list. The node will stop transmitting and return to the paired state.
 
 ## Known issues and caveats
 
-- Undeploy (moving a node from DEPLOYED back to PAIRED or UNPAIRED) is not implemented yet. You mentioned you can't undeploy deployed nodes; we'll address this next session.
 - ESP-NOW is sensitive to WiFi interface/channel state; the code forces channel 1 for pairing and binds ESP-NOW peers to the STA interface to avoid ESP_ERR_ESPNOW_IF. If you see send failures, confirm both devices use channel 1 during pairing.
 - The remote unpair is best-effort: if the node is asleep or out of range, the mothership will still remove the peer locally and persist the change. When the node wakes and discovers no mothership, it will continue discovery.
 
@@ -81,9 +81,15 @@ Open serial monitors for both devices (set correct COM ports and 115200 baud) wh
 
 ## Next steps (planned)
 
-- Implement undeploy/reset flow
 - Add better UI feedback (AJAX, progress bar) and per-node logs
 - Add secure pairing/encryption option for ESP-NOW peers
 - Add more node types and a shared protocol header
 
-If you'd like, I can also prepare release builds and a small test harness to simulate many nodes locally.
+---
+
+**Session summary (2025-11-08):**
+- Removed all alarm, schedule, and interval logic from both mothership and node firmware, including all UI and protocol fields.
+- Added 'undeploy' (revert to paired) feature to the web UI and backend; node stops transmitting when reverted.
+- Cleaned up all serial output and protocol messages for clarity.
+- Reverted UI to classic style for user preference.
+- All code builds and uploads cleanly for both boards.
