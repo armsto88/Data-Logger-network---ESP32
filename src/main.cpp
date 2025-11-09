@@ -17,6 +17,10 @@
 #include "rtc_manager.h"
 #include "sd_manager.h"
 #include "espnow_manager.h"
+#include "protocol.h"
+#include <Preferences.h>
+
+
 
 // ---------- Device identification and WiFi ----------
 const char* DEVICE_ID = "001";  // Simplified ID
@@ -25,6 +29,11 @@ String ssid = String(BASE_SSID) + String(DEVICE_ID);  // "Logger001"
 const char* password = "logger123";
 #define FW_VERSION "v1.0.0"
 #define FW_BUILD   __DATE__ " " __TIME__
+
+Preferences gPrefs;
+int gWakeIntervalMin = 5;          // default shown in UI & used at boot
+const int kAllowedIntervals[] = {1,5,10,20,30,60};
+const size_t kAllowedCount = sizeof(kAllowedIntervals)/sizeof(kAllowedIntervals[0]);
 
 // ---------- Web server ----------
 WebServer server(80);
@@ -36,6 +45,23 @@ static String formatMac(const uint8_t mac[6]) {
            mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
   return String(b);
 }
+
+static void loadWakeIntervalFromNVS() {
+  if (gPrefs.begin("ui", true)) {
+    int v = gPrefs.getInt("wake_min", gWakeIntervalMin);
+    gPrefs.end();
+    bool ok=false; for (size_t i=0;i<kAllowedCount;i++) if (v==kAllowedIntervals[i]) { ok=true; break; }
+    gWakeIntervalMin = ok ? v : 5;
+  }
+}
+
+static void saveWakeIntervalToNVS(int mins) {
+  if (gPrefs.begin("ui", false)) {
+    gPrefs.putInt("wake_min", mins);
+    gPrefs.end();
+  }
+}
+
 
 // (4) Common CSS/JS in PROGMEM (saves RAM)
 const char COMMON_CSS[] PROGMEM = R"CSS(
@@ -249,6 +275,32 @@ void handleRoot() {
 
   char currentTime[24];
   getRTCTimeString(currentTime, sizeof(currentTime));
+    // Wake Interval control
+  html += F("<div class='section'><h3>⏰ Wake Interval</h3>");
+  html += F("<p class='muted'>This sets the DS3231 alarm interval on all paired/deployed nodes.</p>");
+  html += F("<form action='/set-wake-interval' method='POST' class='row'>"
+            "<div class='col'><label class='label'><strong>Interval (minutes)</strong></label>"
+            "<select class='input' name='interval'>");
+
+  // build <option> list with current selected
+  for (size_t i=0; i<kAllowedCount; ++i) {
+    int v = kAllowedIntervals[i];
+    html += F("<option value='");
+    html += String(v);
+    html += "'";
+    if (v == gWakeIntervalMin) html += F(" selected");
+    html += F(">");
+    html += String(v);
+    html += F("</option>");
+  }
+  html += F("</select></div>"
+            "<div class='col' style='align-self:end'><button type='submit' class='btn btn--primary'>Broadcast</button></div>"
+            "</form>");
+
+  html += F("<div class='help'>Current interval: <strong>");
+  html += String(gWakeIntervalMin);
+  html += F(" min</strong></div></div>");
+
   String csvStats = getCSVStats();
 
   auto allNodes      = getRegisteredNodes();
@@ -554,6 +606,35 @@ void handleUnpairNodes() {
   server.send(200, "text/html", html);
 }
 
+void handleSetWakeInterval() {
+  // read & validate input
+  int interval = server.hasArg("interval") ? server.arg("interval").toInt() : 0;
+  bool ok = false;
+  for (size_t i=0; i<kAllowedCount; ++i) if (interval == kAllowedIntervals[i]) { ok = true; break; }
+  if (!ok) interval = 5;
+
+  // broadcast to nodes
+  bool sent = broadcastWakeInterval(interval);
+
+  // persist & update in-memory current value
+  gWakeIntervalMin = interval;
+  saveWakeIntervalToNVS(interval);
+
+  Serial.printf("[UI] Wake interval set to %d min → broadcast %s\n", interval, sent ? "SENT" : "NOT_SENT");
+
+  // simple result page
+  String html = F("<!doctype html><meta name='viewport' content='width=device-width,initial-scale=1'>"
+                  "<body style='font-family:sans-serif;padding:20px;text-align:center'>"
+                  "<h3>⏰ Wake Interval</h3><p>Broadcasted ");
+  html += String(interval);
+  html += F(" min to nodes.</p><p style='color:#666'>");
+  html += sent ? F("At least one node accepted the packet.") : F("No eligible nodes (PAIRED/DEPLOYED) were found.");
+  html += F("</p><a href='/' style='display:inline-block;padding:10px 16px;"
+            "background:#2196F3;color:#fff;text-decoration:none;border-radius:6px'>Back</a></body>");
+  server.send(200, "text/html", html);
+}
+
+
 // ---------- Setup / Loop ----------
 void setup() {
   Serial.begin(115200);
@@ -579,6 +660,12 @@ void setup() {
   char timeStr[32];
   getRTCTimeString(timeStr, sizeof(timeStr));
   Serial.print("Current RTC Time: "); Serial.println(timeStr);
+
+  loadWakeIntervalFromNVS();
+Serial.printf("Current wake interval (from NVS): %d min\n", gWakeIntervalMin);
+// Optional: rebroadcast at boot
+// broadcastWakeInterval(gWakeIntervalMin);
+
 
 #if ENABLE_SPIFFS_ASSETS
   // (5) Optional: serve pre-gzipped assets
@@ -611,6 +698,8 @@ void setup() {
   server.on("/deploy-nodes", HTTP_POST, handleDeployNodes);
   server.on("/revert-node", HTTP_POST, handleRevertNode);
   server.on("/unpair-nodes", HTTP_POST, handleUnpairNodes);
+  server.on("/set-wake-interval", HTTP_POST, handleSetWakeInterval);
+
 
   server.begin();
   Serial.println("✅ Web server started!");

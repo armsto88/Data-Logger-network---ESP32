@@ -1,131 +1,96 @@
+// include/espnow_manager.h
 #pragma once
 #include <Arduino.h>
 #include <vector>
+#include "protocol.h"   // all wire-level message structs & shared constants
 
-// Known sensor node MAC addresses for preloading peers
-const uint8_t KNOWN_SENSOR_NODES[][6] = {
-    {0x94, 0xA9, 0x90, 0x96, 0xD9, 0xFC},  // TEMP_001 - air temperature node
-    // Add more sensor node MACs here as needed
-};
-const int NUM_KNOWN_SENSORS = sizeof(KNOWN_SENSOR_NODES) / sizeof(KNOWN_SENSOR_NODES[0]);
+// -----------------------------------------------------------------------------
+// Known peers (declare here, define once in a .cpp — e.g., src/espnow_manager_globals.cpp)
+// -----------------------------------------------------------------------------
+extern const uint8_t KNOWN_SENSOR_NODES[][6];
+extern const int NUM_KNOWN_SENSORS;
 
-enum NodeState {
-    UNPAIRED = 0,
-    PAIRED = 1,
-    DEPLOYED = 2
+// Optional: standard channel the mothership uses for pairing/commands
+#ifndef ESPNOW_PAIRING_CHANNEL
+#define ESPNOW_PAIRING_CHANNEL 1
+#endif
+
+// -----------------------------------------------------------------------------
+// Registry model
+// -----------------------------------------------------------------------------
+enum NodeState : uint8_t {
+  UNPAIRED = 0,
+  PAIRED   = 1,
+  DEPLOYED = 2
 };
 
 struct NodeInfo {
-    uint8_t mac[6];
-    String nodeId;
-    String nodeType;  // e.g., "temperature", "humidity", "pressure"
-    unsigned long lastSeen;
-    bool isActive;
-    NodeState state;
-    // int scheduleInterval;  // removed: minutes between sensor readings
-    int channel; // WiFi channel the node is on (for RNT pairing)
+  uint8_t     mac[6]        = {0};
+  String      nodeId;                     // e.g. "TEMP_001"
+  String      nodeType;                   // e.g. "temperature", "humidity"
+  unsigned long lastSeen    = 0;          // millis()
+  bool        isActive      = false;      // seen recently
+  NodeState   state         = UNPAIRED;
+  int         channel       = ESPNOW_PAIRING_CHANNEL; // known/assumed WiFi channel
 };
 
-// Message structures (matching the node protocol)
-typedef struct sensor_data_message {
-    char nodeId[16];
-    char sensorType[16];
-    float value;
-    unsigned long nodeTimestamp;
-} sensor_data_message_t;
-
-typedef struct discovery_message {
-    char nodeId[16];
-    char nodeType[16];  // "temperature", "humidity", etc.
-    char command[20];   // "DISCOVER_REQUEST" - increased size
-    unsigned long timestamp;
-} discovery_message_t;
-
-typedef struct discovery_response {
-    char command[20];       // "DISCOVER_RESPONSE" - increased size
-    char mothership_id[16];
-    bool acknowledged;
-} discovery_response_t;
-
-typedef struct pairing_command {
-    char command[20];       // "PAIR_NODE" - increased size
-    char nodeId[16];
-    char mothership_id[16];
-} pairing_command_t;
-
-typedef struct deployment_command {
-    char command[20];       // "DEPLOY_NODE" - increased size
-    char nodeId[16];
-    unsigned long year;
-    unsigned long month;
-    unsigned long day;
-    unsigned long hour;
-    unsigned long minute;
-    unsigned long second;
-    char mothership_id[16];
-} deployment_command_t;
-
-typedef struct time_sync_request {
-    char nodeId[16];
-    char command[16];
-    unsigned long requestTime;
-} time_sync_request_t;
-
-typedef struct time_sync_response {
-    char command[16];
-    unsigned long year;
-    unsigned long month;
-    unsigned long day;
-    unsigned long hour;
-    unsigned long minute;
-    unsigned long second;
-    char mothership_id[16];
-} time_sync_response_t;
-
-typedef struct pairing_request {
-    char command[20];       // "PAIRING_REQUEST"
-    char nodeId[16];
-} pairing_request_t;
-
-typedef struct pairing_response {
-    char command[20];       // "PAIRING_RESPONSE"
-    char nodeId[16];
-    bool isPaired;
-    char mothership_id[16];
-} pairing_response_t;
-
+// -----------------------------------------------------------------------------
+// Lifecycle
+// -----------------------------------------------------------------------------
 void setupESPNOW();
 void espnow_loop();
-bool broadcastSchedule(int intervalMinutes);
+
+// -----------------------------------------------------------------------------
+// Commands / broadcasts (mothership -> nodes)
+// -----------------------------------------------------------------------------
+/**
+ * Send a time sync packet to a specific node (uses RTC time from mothership).
+ */
 bool sendTimeSync(const uint8_t* mac, const char* nodeId);
+
+/**
+ * Broadcast a discovery “scan” so unpaired nodes respond.
+ */
 bool sendDiscoveryBroadcast();
+
+/**
+ * Broadcast a wake interval (in minutes) to all PAIRED/DEPLOYED nodes.
+ * Nodes should program their DS3231 alarm accordingly.
+ */
+bool broadcastWakeInterval(int intervalMinutes);
+
+/**
+ * Set node to PAIRED and notify it.
+ */
 bool pairNode(const String& nodeId);
+
+/**
+ * Send deployment command (with current RTC time) to selected nodes.
+ */
 bool deploySelectedNodes(const std::vector<String>& nodeIds);
+
+/**
+ * Locally unpair a node (registry + peer removal + persist).
+ */
 bool unpairNode(const String& nodeId);
+
+/**
+ * Send an UNPAIR command to a node (best-effort).
+ */
+bool sendUnpairToNode(const String& nodeId);
+
+// -----------------------------------------------------------------------------
+// Queries
+// -----------------------------------------------------------------------------
 std::vector<NodeInfo> getRegisteredNodes();
 std::vector<NodeInfo> getUnpairedNodes();
 std::vector<NodeInfo> getPairedNodes();
 NodeState getNodeState(const char* nodeId);
-String getMothershipsMAC();
-void printRegisteredNodes();
+String    getMothershipsMAC();
+void      printRegisteredNodes();
 
-// Persistence (NVS) for paired nodes
+// -----------------------------------------------------------------------------
+// Persistence (NVS)
+// -----------------------------------------------------------------------------
 void savePairedNodes();
 void loadPairedNodes();
-
-// RNT-compatible pairing struct (for RandomNerdTutorials example)
-typedef struct rnt_pairing_t {
-    uint8_t msgType; // 0 = PAIRING, 1 = DATA
-    uint8_t id;      // device id (node sets board id, server responds with 0)
-    uint8_t macAddr[6];
-    uint8_t channel;
-} rnt_pairing_t;
-
-// Remote unpair command
-typedef struct unpair_command {
-    char command[16]; // "UNPAIR_NODE"
-    char mothership_id[16];
-} unpair_command_t;
-
-// Send an UNPAIR command to a node (best-effort)
-bool sendUnpairToNode(const String& nodeId);
