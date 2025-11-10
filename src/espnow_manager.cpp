@@ -105,45 +105,55 @@ static void OnDataRecv(const uint8_t * mac, const uint8_t *incomingBytes, int le
     if (logCSVRow(row)) Serial.println("✅ Node data logged");
     else                Serial.println("❌ Failed to log node data");
   }
-  else if (len == sizeof(discovery_message_t)) {
-    discovery_message_t d{};
-    memcpy(&d, incomingBytes, sizeof(d));
-    if (strcmp(d.command, "DISCOVER_REQUEST") == 0) {
-      Serial.printf("🔍 Discovery req from %s (%s)\n", d.nodeId, d.nodeType);
+else if (len == sizeof(discovery_message_t)) {
+  discovery_message_t discovery;
+  memcpy(&discovery, incomingBytes, sizeof(discovery));
 
-      NodeState existing = getNodeState(d.nodeId);
-      registerNode(mac, d.nodeId, d.nodeType, existing);
+  if (strcmp(discovery.command, "DISCOVER_REQUEST") == 0) {
+    Serial.printf("🔍 Discovery from %s (%s)\n", discovery.nodeId, discovery.nodeType);
 
-      discovery_response_t resp{};
-      strcpy(resp.command, "DISCOVER_RESPONSE");
-      strcpy(resp.mothership_id, DEVICE_ID);
-      resp.acknowledged = true;
+    // ⬇️ Force node to UNPAIRED when it announces itself
+    registerNode(mac, discovery.nodeId, discovery.nodeType, UNPAIRED);
 
-      uint8_t bcast[6] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
-      esp_now_send(bcast, (uint8_t*)&resp, sizeof(resp));
-      Serial.println("📡 Sent discovery response");
-    }
+    discovery_response_t response{};
+    strcpy(response.command, "DISCOVER_RESPONSE");
+    strcpy(response.mothership_id, DEVICE_ID);
+    response.acknowledged = true;
+
+    uint8_t bcast[6] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
+    esp_now_send(bcast, (uint8_t*)&response, sizeof(response));
+    Serial.println("📡 Sent discovery response");
+    
+    // Persist change so UI reflects immediately
+    savePairedNodes();
   }
-  else if (len == sizeof(pairing_request_t)) {
-    pairing_request_t req{};
-    memcpy(&req, incomingBytes, sizeof(req));
-    if (strcmp(req.command, "PAIRING_REQUEST") == 0) {
-      Serial.printf("📞 Pairing status request from %s\n", req.nodeId);
-      NodeState existing = getNodeState(req.nodeId);
-      registerNode(mac, req.nodeId, "unknown", existing);
+}
 
-      NodeState st = getNodeState(req.nodeId);
-      pairing_response_t resp{};
-      strcpy(resp.command, "PAIRING_RESPONSE");
-      strcpy(resp.nodeId,  req.nodeId);
-      resp.isPaired = (st == PAIRED || st == DEPLOYED);
-      strcpy(resp.mothership_id, DEVICE_ID);
+ else if (len == sizeof(pairing_request_t)) {
+  pairing_request_t request;
+  memcpy(&request, incomingBytes, sizeof(request));
 
-      uint8_t bcast[6] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
-      esp_now_send(bcast, (uint8_t*)&resp, sizeof(resp));
-      Serial.printf("📤 Pairing response isPaired=%s\n", resp.isPaired ? "true" : "false");
-    }
+  if (strcmp(request.command, "PAIRING_REQUEST") == 0) {
+    Serial.printf("📞 Pairing status poll from %s\n", request.nodeId);
+
+    // ⬇️ Treat a poll as a node that's not deployed yet
+    registerNode(mac, request.nodeId, "unknown", UNPAIRED);
+
+    NodeState current = getNodeState(request.nodeId);
+
+    pairing_response_t response{};
+    strcpy(response.command, "PAIRING_RESPONSE");
+    strcpy(response.nodeId, request.nodeId);
+    response.isPaired = (current == PAIRED || current == DEPLOYED);
+    strcpy(response.mothership_id, DEVICE_ID);
+
+    uint8_t bcast[6] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
+    esp_now_send(bcast, (uint8_t*)&response, sizeof(response));
+
+    savePairedNodes();
   }
+}
+
   else if (len == sizeof(rnt_pairing_t)) {
     rnt_pairing_t r{};
     memcpy(&r, incomingBytes, sizeof(r));

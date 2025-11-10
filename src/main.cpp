@@ -22,6 +22,7 @@
 
 
 
+
 // ---------- Device identification and WiFi ----------
 const char* DEVICE_ID = "001";  // Simplified ID
 const char* BASE_SSID = "Logger";
