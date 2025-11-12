@@ -16,11 +16,17 @@ extern const char* DEVICE_ID;
 std::vector<NodeInfo> registeredNodes;
 
 // ----------------- internal helpers -----------------
+static inline void forceChannel(uint8_t ch = ESPNOW_CHANNEL) {
+  esp_wifi_set_promiscuous(true);
+  esp_wifi_set_channel(ch, WIFI_SECOND_CHAN_NONE);
+  esp_wifi_set_promiscuous(false);
+}
+
 static void ensurePeerOnChannel(const uint8_t mac[6], uint8_t channel) {
   esp_now_peer_info_t peer{};
   memcpy(peer.peer_addr, mac, 6);
   peer.channel = channel;
-  peer.ifidx   = WIFI_IF_STA;
+  peer.ifidx   = WIFI_IF_AP;    // bind to AP interface (AP+STA runs radio on AP channel)
   peer.encrypt = false;
   esp_now_del_peer(mac);
   esp_now_add_peer(&peer);
@@ -105,55 +111,56 @@ static void OnDataRecv(const uint8_t * mac, const uint8_t *incomingBytes, int le
     if (logCSVRow(row)) Serial.println("✅ Node data logged");
     else                Serial.println("❌ Failed to log node data");
   }
-else if (len == sizeof(discovery_message_t)) {
-  discovery_message_t discovery;
-  memcpy(&discovery, incomingBytes, sizeof(discovery));
+  else if (len == sizeof(discovery_message_t)) {
+    discovery_message_t discovery;
+    memcpy(&discovery, incomingBytes, sizeof(discovery));
 
-  if (strcmp(discovery.command, "DISCOVER_REQUEST") == 0) {
-    Serial.printf("🔍 Discovery from %s (%s)\n", discovery.nodeId, discovery.nodeType);
+    if (strcmp(discovery.command, "DISCOVER_REQUEST") == 0) {
+      Serial.printf("🔍 Discovery from %s (%s)\n", discovery.nodeId, discovery.nodeType);
 
-    // ⬇️ Force node to UNPAIRED when it announces itself
-    registerNode(mac, discovery.nodeId, discovery.nodeType, UNPAIRED);
+      registerNode(mac, discovery.nodeId, discovery.nodeType, UNPAIRED);
 
-    discovery_response_t response{};
-    strcpy(response.command, "DISCOVER_RESPONSE");
-    strcpy(response.mothership_id, DEVICE_ID);
-    response.acknowledged = true;
+      discovery_response_t response{};
+      strcpy(response.command, "DISCOVER_RESPONSE");
+      strcpy(response.mothership_id, DEVICE_ID);
+      response.acknowledged = true;
 
-    uint8_t bcast[6] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
-    esp_now_send(bcast, (uint8_t*)&response, sizeof(response));
-    Serial.println("📡 Sent discovery response");
-    
-    // Persist change so UI reflects immediately
-    savePairedNodes();
+      // Unicast the response back to sender (AP iface, fixed channel)
+      ensurePeerOnChannel(mac, ESPNOW_CHANNEL);
+      forceChannel(ESPNOW_CHANNEL);
+      esp_err_t r = esp_now_send(mac, (uint8_t*)&response, sizeof(response));
+      Serial.println(r == ESP_OK ? "📡 Sent discovery response (unicast)"
+                                 : "❌ Discovery response failed");
+
+      savePairedNodes();
+    }
   }
-}
+  else if (len == sizeof(pairing_request_t)) {
+    pairing_request_t request;
+    memcpy(&request, incomingBytes, sizeof(request));
 
- else if (len == sizeof(pairing_request_t)) {
-  pairing_request_t request;
-  memcpy(&request, incomingBytes, sizeof(request));
+    if (strcmp(request.command, "PAIRING_REQUEST") == 0) {
+      Serial.printf("📞 Pairing status poll from %s\n", request.nodeId);
 
-  if (strcmp(request.command, "PAIRING_REQUEST") == 0) {
-    Serial.printf("📞 Pairing status poll from %s\n", request.nodeId);
+      registerNode(mac, request.nodeId, "unknown", UNPAIRED);
 
-    // ⬇️ Treat a poll as a node that's not deployed yet
-    registerNode(mac, request.nodeId, "unknown", UNPAIRED);
+      NodeState current = getNodeState(request.nodeId);
 
-    NodeState current = getNodeState(request.nodeId);
+      pairing_response_t response{};
+      strcpy(response.command, "PAIRING_RESPONSE");
+      strcpy(response.nodeId, request.nodeId);
+      response.isPaired = (current == PAIRED || current == DEPLOYED);
+      strcpy(response.mothership_id, DEVICE_ID);
 
-    pairing_response_t response{};
-    strcpy(response.command, "PAIRING_RESPONSE");
-    strcpy(response.nodeId, request.nodeId);
-    response.isPaired = (current == PAIRED || current == DEPLOYED);
-    strcpy(response.mothership_id, DEVICE_ID);
+      // broadcast is okay for a status ping
+      const uint8_t bcast[6] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
+      ensurePeerOnChannel(bcast, ESPNOW_CHANNEL);
+      forceChannel(ESPNOW_CHANNEL);
+      esp_now_send(bcast, (uint8_t*)&response, sizeof(response));
 
-    uint8_t bcast[6] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
-    esp_now_send(bcast, (uint8_t*)&response, sizeof(response));
-
-    savePairedNodes();
+      savePairedNodes();
+    }
   }
-}
-
   else if (len == sizeof(rnt_pairing_t)) {
     rnt_pairing_t r{};
     memcpy(&r, incomingBytes, sizeof(r));
@@ -185,14 +192,9 @@ else if (len == sizeof(discovery_message_t)) {
 // ----------------- ESPNOW lifecycle -----------------
 void setupESPNOW() {
   delay(100);
-  esp_wifi_set_channel(ESPNOW_CHANNEL, WIFI_SECOND_CHAN_NONE);
 
-  esp_now_peer_info_t peer{};
-  uint8_t bcast[6] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
-  memcpy(peer.peer_addr, bcast, 6);
-  peer.channel = ESPNOW_CHANNEL;
-  peer.ifidx   = WIFI_IF_STA;
-  peer.encrypt = false;
+  // Fix radio on our AP channel (1)
+  forceChannel(ESPNOW_CHANNEL);
 
   if (esp_now_init() != ESP_OK) {
     Serial.println("❌ ESP-NOW init failed");
@@ -207,15 +209,23 @@ void setupESPNOW() {
     });
   }
 
+  // Broadcast peer via AP interface
+  esp_now_peer_info_t peer{};
+  const uint8_t bcast[6] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
+  memcpy(peer.peer_addr, bcast, 6);
+  peer.channel = ESPNOW_CHANNEL;
+  peer.ifidx   = WIFI_IF_AP;   // AP
+  peer.encrypt = false;
+
   esp_now_del_peer(bcast);
   if (esp_now_add_peer(&peer) == ESP_OK) {
     delay(30);
-    Serial.println("✅ Broadcast peer added");
+    Serial.println("✅ Broadcast peer (AP) added");
   } else {
     Serial.println("❌ Failed to add broadcast peer");
   }
 
-  // Preload known peers (defined in espnow_manager_globals.cpp)
+  // Preload known peers as AP peers
   for (int i = 0; i < NUM_KNOWN_SENSORS; i++) {
     ensurePeerOnChannel(KNOWN_SENSOR_NODES[i], ESPNOW_CHANNEL);
     Serial.print("✅ Preloaded peer: ");
@@ -223,7 +233,8 @@ void setupESPNOW() {
   }
 
   Serial.println("ESP-NOW ready");
-  Serial.print("MAC Address: "); Serial.println(WiFi.macAddress());
+  Serial.print("AP MAC:  "); Serial.println(WiFi.softAPmacAddress()); // AP MAC used for ESP-NOW in AP+STA
+  Serial.print("STA MAC: "); Serial.println(WiFi.macAddress());
 
   loadPairedNodes();
 }
@@ -259,9 +270,9 @@ bool broadcastWakeInterval(int intervalMinutes) {
     if (node.state != PAIRED && node.state != DEPLOYED) continue;
 
     ensurePeerOnChannel(node.mac, ESPNOW_CHANNEL);
-    esp_wifi_set_channel(ESPNOW_CHANNEL, WIFI_SECOND_CHAN_NONE);
-
+    forceChannel(ESPNOW_CHANNEL);
     esp_err_t res = esp_now_send(node.mac, (uint8_t*)&cmd, sizeof(cmd));
+
     Serial.printf("📤 SET_SCHEDULE %d min -> %s : %s\n",
                   intervalMinutes, node.nodeId.c_str(),
                   (res==ESP_OK) ? "OK" : esp_err_to_name(res));
@@ -283,9 +294,9 @@ bool sendTimeSync(const uint8_t* mac, const char* nodeId) {
     resp.year=y; resp.month=m; resp.day=d; resp.hour=H; resp.minute=M; resp.second=S;
 
     ensurePeerOnChannel(mac, ESPNOW_CHANNEL);
-    esp_wifi_set_channel(ESPNOW_CHANNEL, WIFI_SECOND_CHAN_NONE);
-
+    forceChannel(ESPNOW_CHANNEL);
     esp_err_t r = esp_now_send(mac, (uint8_t*)&resp, sizeof(resp));
+
     if (r == ESP_OK) {
       Serial.printf("✅ Time sync sent to %s : %s\n", nodeId, ts);
       return true;
@@ -298,7 +309,7 @@ bool sendTimeSync(const uint8_t* mac, const char* nodeId) {
 }
 
 bool sendDiscoveryBroadcast() {
-  uint8_t bcast[6] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
+  const uint8_t bcast[6] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
 
   discovery_response_t pkt{};
   strcpy(pkt.command, "DISCOVERY_SCAN");
@@ -306,323 +317,337 @@ bool sendDiscoveryBroadcast() {
   pkt.acknowledged = false;
 
   ensurePeerOnChannel(bcast, ESPNOW_CHANNEL);
-  esp_wifi_set_channel(ESPNOW_CHANNEL, WIFI_SECOND_CHAN_NONE);
+  forceChannel(ESPNOW_CHANNEL);
 
   esp_err_t r = esp_now_send(bcast, (uint8_t*)&pkt, sizeof(pkt));
   if (r == ESP_OK) return true;
 
   // try re-add and retry once
   ensurePeerOnChannel(bcast, ESPNOW_CHANNEL);
+  forceChannel(ESPNOW_CHANNEL);
   esp_err_t r2 = esp_now_send(bcast, (uint8_t*)&pkt, sizeof(pkt));
   return (r2 == ESP_OK);
 }
-
 // Pair a specific node
 bool pairNode(const String& nodeId) {
-    for (auto& node : registeredNodes) {
-        if (node.nodeId == nodeId && node.state == UNPAIRED) {
-            node.state = PAIRED;
-            pairing_command_t pairCmd;
-            strcpy(pairCmd.command, "PAIR_NODE");
-            strcpy(pairCmd.nodeId, nodeId.c_str());
-            strcpy(pairCmd.mothership_id, DEVICE_ID);
-            // Ensure peer entry exists for this node on fixed pairing channel (1)
-            esp_now_peer_info_t peerInfo;
-            memset(&peerInfo, 0, sizeof(peerInfo));
-            memcpy(peerInfo.peer_addr, node.mac, 6);
-            peerInfo.channel = 1;
-            peerInfo.encrypt = false;
-            esp_err_t pdel = esp_now_del_peer(node.mac);
-            esp_err_t padd = esp_now_add_peer(&peerInfo);
-            Serial.print("🔧 Ensured peer for "); Serial.print(nodeId);
-            Serial.print(" (del="); Serial.print((int)pdel); Serial.print(", add="); Serial.print((int)padd); Serial.println(")");
-            delay(30);
-            const int maxAttempts = 3;
-            esp_err_t result = ESP_ERR_ESPNOW_NOT_INIT;
-            for (int attempt = 1; attempt <= maxAttempts; ++attempt) {
-                esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE);
-                delay(10);
-                result = esp_now_send(node.mac, (uint8_t*)&pairCmd, sizeof(pairCmd));
-                if (result == ESP_OK) break;
-                Serial.print("⚠️ pairNode attempt "); Serial.print(attempt); Serial.print(" failed: "); Serial.print((int)result); Serial.print(" ("); Serial.print(esp_err_to_name(result)); Serial.println(")");
-                delay(50);
-            }
-            if (result == ESP_OK) {
-                Serial.print("✅ Node paired: ");
-                Serial.println(nodeId);
-                rnt_pairing_t rntResp;
-                memset(&rntResp, 0, sizeof(rntResp));
-                rntResp.msgType = 0; // PAIRING response
-                rntResp.id = 0; // mothership/server id = 0 per RNT convention
-                // Fill mothership MAC into response
-                uint8_t mothershipMac[6];
-                WiFi.macAddress(mothershipMac);
-                memcpy(rntResp.macAddr, mothershipMac, 6);
-                // Use pairing channel (fixed to 1)
-                uint8_t sendChannel = 1;
-                // Switch WiFi channel briefly so the node receives the packet
-                esp_wifi_set_channel(sendChannel, WIFI_SECOND_CHAN_NONE);
-                delay(10);
-                rntResp.channel = sendChannel;
-                // Ensure peer is present for rnt reply as well (set channel appropriately)
-                peerInfo.channel = sendChannel;
-                esp_now_del_peer(node.mac);
-                esp_now_add_peer(&peerInfo);
-                delay(20);
-                // Retry loop for RNT reply as well
-                esp_err_t rres = ESP_ERR_ESPNOW_NOT_INIT;
-                for (int attempt = 1; attempt <= maxAttempts; ++attempt) {
-                    esp_wifi_set_channel(sendChannel, WIFI_SECOND_CHAN_NONE);
-                    delay(10);
-                    rres = esp_now_send(node.mac, (uint8_t*)&rntResp, sizeof(rntResp));
-                    if (rres == ESP_OK) break;
-                    Serial.print("⚠️ RNT reply attempt "); Serial.print(attempt); Serial.print(" failed: "); Serial.print((int)rres); Serial.print(" ("); Serial.print(esp_err_to_name(rres)); Serial.println(")");
-                    delay(50);
-                }
-                if (rres == ESP_OK) {
-                    Serial.print("📤 Sent RNT pairing response to ");
-                    for (int i = 0; i < 6; i++) { Serial.printf("%02X", node.mac[i]); if (i < 5) Serial.print(":"); }
-                    Serial.println();
-                    // Persist paired nodes
-                    savePairedNodes();
-                    return true;
-                } else {
-                    Serial.print("❌ Failed to send RNT pairing response to: ");
-                    Serial.println(nodeId);
-                    Serial.print("    esp_err_t: "); Serial.print((int)rres);
-                    Serial.print(" ("); Serial.print(esp_err_to_name(rres)); Serial.println(")");
-                    node.state = UNPAIRED; // revert on failure
-                    return false;
-                }
-            } else {
-                Serial.print("❌ Failed to pair node: ");
-                Serial.println(nodeId);
-                Serial.print("    esp_err_t: "); Serial.print((int)result);
-                Serial.print(" ("); Serial.print(esp_err_to_name(result)); Serial.println(")");
-                node.state = UNPAIRED; // revert on failure
-                return false;
-            }
+  for (auto& node : registeredNodes) {
+    if (node.nodeId == nodeId && node.state == UNPAIRED) {
+      node.state = PAIRED;
+
+      pairing_command_t pairCmd{};
+      strcpy(pairCmd.command, "PAIR_NODE");
+      strcpy(pairCmd.nodeId, nodeId.c_str());
+      strcpy(pairCmd.mothership_id, DEVICE_ID);
+
+      // Ensure peer entry exists for this node on fixed pairing channel (1)
+      esp_now_peer_info_t peerInfo{};
+      memcpy(peerInfo.peer_addr, node.mac, 6);
+      peerInfo.channel = 1;
+      peerInfo.ifidx   = WIFI_IF_AP;     // AP iface
+      peerInfo.encrypt = false;
+
+      esp_err_t pdel = esp_now_del_peer(node.mac);
+      esp_err_t padd = esp_now_add_peer(&peerInfo);
+      Serial.print("🔧 Ensured peer for "); Serial.print(nodeId);
+      Serial.print(" (del="); Serial.print((int)pdel); Serial.print(", add="); Serial.print((int)padd); Serial.println(")");
+      delay(30);
+
+      const int maxAttempts = 3;
+      esp_err_t result = ESP_ERR_ESPNOW_NOT_INIT;
+      for (int attempt = 1; attempt <= maxAttempts; ++attempt) {
+        forceChannel(1);
+        delay(10);
+        result = esp_now_send(node.mac, (uint8_t*)&pairCmd, sizeof(pairCmd));
+        if (result == ESP_OK) break;
+        Serial.print("⚠️ pairNode attempt "); Serial.print(attempt);
+        Serial.print(" failed: "); Serial.print((int)result);
+        Serial.print(" ("); Serial.print(esp_err_to_name(result)); Serial.println(")");
+        delay(50);
+      }
+
+      if (result == ESP_OK) {
+        Serial.print("✅ Node paired: ");
+        Serial.println(nodeId);
+
+        // Send an RNT-style pairing response (optional)
+        rnt_pairing_t rntResp{};
+        rntResp.msgType = 0; // PAIRING response
+        rntResp.id      = 0; // mothership/server id = 0 per RNT convention
+
+        // Fill mothership MAC (use AP MAC since radio is on AP iface)
+        uint8_t apMac[6];
+        WiFi.softAPmacAddress(apMac);            // <-- get AP MAC as bytes
+        memcpy(rntResp.macAddr, apMac, 6);       // copy into payload
+
+        uint8_t sendChannel = 1;
+        forceChannel(sendChannel);
+        delay(10);
+        rntResp.channel = sendChannel;
+
+        // Make sure peer matches the channel/interface we’re using
+        peerInfo.channel = sendChannel;
+        peerInfo.ifidx   = WIFI_IF_AP;
+        esp_now_del_peer(node.mac);
+        esp_now_add_peer(&peerInfo);
+        delay(20);
+
+        esp_err_t rres = ESP_ERR_ESPNOW_NOT_INIT;
+        for (int attempt = 1; attempt <= maxAttempts; ++attempt) {
+          forceChannel(sendChannel);
+          delay(10);
+          rres = esp_now_send(node.mac, (uint8_t*)&rntResp, sizeof(rntResp));
+          if (rres == ESP_OK) break;
+          Serial.print("⚠️ RNT reply attempt "); Serial.print(attempt);
+          Serial.print(" failed: "); Serial.print((int)rres);
+          Serial.print(" ("); Serial.print(esp_err_to_name(rres)); Serial.println(")");
+          delay(50);
         }
+        if (rres == ESP_OK) {
+          Serial.print("📤 Sent RNT pairing response to ");
+          for (int i = 0; i < 6; i++) { Serial.printf("%02X", node.mac[i]); if (i < 5) Serial.print(":"); }
+          Serial.println();
+          savePairedNodes();
+          return true;
+        } else {
+          Serial.print("❌ Failed to send RNT pairing response to: ");
+          Serial.println(nodeId);
+          Serial.print("    esp_err_t: "); Serial.print((int)rres);
+          Serial.print(" ("); Serial.print(esp_err_to_name(rres)); Serial.println(")");
+          node.state = UNPAIRED; // revert on failure
+          return false;
+        }
+      } else {
+        Serial.print("❌ Failed to pair node: ");
+        Serial.println(nodeId);
+        Serial.print("    esp_err_t: "); Serial.print((int)result);
+        Serial.print(" ("); Serial.print(esp_err_to_name(result)); Serial.println(")");
+        node.state = UNPAIRED; // revert on failure
+        return false;
+      }
     }
-    return false;
+  }
+  return false;
 }
+
 
 // Deploy selected paired nodes with RTC time and schedule
 bool deploySelectedNodes(const std::vector<String>& nodeIds) {
-    bool allSuccess = true;
-    
-    for (const String& nodeId : nodeIds) {
-        for (auto& node : registeredNodes) {
-            if (node.nodeId == nodeId && node.state == PAIRED) {
-                deployment_command_t deployCmd;
-                strcpy(deployCmd.command, "DEPLOY_NODE");
-                strcpy(deployCmd.nodeId, nodeId.c_str());
-                strcpy(deployCmd.mothership_id, DEVICE_ID);
-                // removed: deployCmd.scheduleInterval = node.scheduleInterval;
-                
-                // Get current RTC time
-                char timeBuffer[24];
-                getRTCTimeString(timeBuffer, sizeof(timeBuffer));
-                
-                int year, month, day, hour, minute, second;
-                if (sscanf(timeBuffer, "%d-%d-%d %d:%d:%d", &year, &month, &day, &hour, &minute, &second) == 6) {
-                    deployCmd.year = year;
-                    deployCmd.month = month;
-                    deployCmd.day = day;
-                    deployCmd.hour = hour;
-                    deployCmd.minute = minute;
-                    deployCmd.second = second;
-                    
-                    esp_err_t result = esp_now_send(node.mac, (uint8_t*)&deployCmd, sizeof(deployCmd));
-                    
-                    if (result == ESP_OK) {
-                        node.state = DEPLOYED;
-                        Serial.print("🚀 Node deployed: ");
-                        Serial.print(nodeId);
-                        Serial.print(" with time: ");
-                        Serial.println(timeBuffer);
-                    } else {
-                        Serial.print("❌ Failed to deploy node: ");
-                        Serial.println(nodeId);
-                        allSuccess = false;
-                    }
-                } else {
-                    Serial.println("❌ Failed to parse time for deployment");
-                    allSuccess = false;
-                }
-                break;
-            }
+  bool allSuccess = true;
+
+  for (const String& nodeId : nodeIds) {
+    for (auto& node : registeredNodes) {
+      if (node.nodeId == nodeId && node.state == PAIRED) {
+        deployment_command_t deployCmd{};
+        strcpy(deployCmd.command, "DEPLOY_NODE");
+        strcpy(deployCmd.nodeId, nodeId.c_str());
+        strcpy(deployCmd.mothership_id, DEVICE_ID);
+
+        // Get current RTC time
+        char timeBuffer[24];
+        getRTCTimeString(timeBuffer, sizeof(timeBuffer));
+
+        int year, month, day, hour, minute, second;
+        if (sscanf(timeBuffer, "%d-%d-%d %d:%d:%d", &year, &month, &day, &hour, &minute, &second) == 6) {
+          deployCmd.year = year;
+          deployCmd.month = month;
+          deployCmd.day = day;
+          deployCmd.hour = hour;
+          deployCmd.minute = minute;
+          deployCmd.second = second;
+
+          ensurePeerOnChannel(node.mac, ESPNOW_CHANNEL);
+          forceChannel(ESPNOW_CHANNEL);
+          esp_err_t result = esp_now_send(node.mac, (uint8_t*)&deployCmd, sizeof(deployCmd));
+
+          if (result == ESP_OK) {
+            node.state = DEPLOYED;
+            Serial.print("🚀 Node deployed: ");
+            Serial.print(nodeId);
+            Serial.print(" with time: ");
+            Serial.println(timeBuffer);
+          } else {
+            Serial.print("❌ Failed to deploy node: ");
+            Serial.println(nodeId);
+            allSuccess = false;
+          }
+        } else {
+          Serial.println("❌ Failed to parse time for deployment");
+          allSuccess = false;
         }
+        break;
+      }
     }
-    
-    return allSuccess;
+  }
+
+  return allSuccess;
 }
 
 // Get unpaired nodes
 std::vector<NodeInfo> getUnpairedNodes() {
-    std::vector<NodeInfo> unpaired;
-    for (const auto& node : registeredNodes) {
-        if (node.state == UNPAIRED && node.isActive) {
-            unpaired.push_back(node);
-        }
+  std::vector<NodeInfo> unpaired;
+  for (const auto& node : registeredNodes) {
+    if (node.state == UNPAIRED && node.isActive) {
+      unpaired.push_back(node);
     }
-    return unpaired;
+  }
+  return unpaired;
 }
 
 // Get paired nodes
 std::vector<NodeInfo> getPairedNodes() {
-    std::vector<NodeInfo> paired;
-    for (const auto& node : registeredNodes) {
-        if (node.state == PAIRED && node.isActive) {
-            paired.push_back(node);
-        }
+  std::vector<NodeInfo> paired;
+  for (const auto& node : registeredNodes) {
+    if (node.state == PAIRED && node.isActive) {
+      paired.push_back(node);
     }
-    return paired;
+  }
+  return paired;
 }
 
 // Get list of registered nodes
 std::vector<NodeInfo> getRegisteredNodes() {
-    return registeredNodes;
+  return registeredNodes;
 }
 
-// Get mothership MAC address
+// Get mothership MAC address (AP MAC, which nodes actually see)
 String getMothershipsMAC() {
-    return WiFi.macAddress();
+  return WiFi.softAPmacAddress();
 }
 
 // Print all registered nodes
 void printRegisteredNodes() {
-    Serial.println("📋 Registered Nodes:");
-    if (registeredNodes.empty()) {
-        Serial.println("   No nodes registered yet");
-        return;
+  Serial.println("📋 Registered Nodes:");
+  if (registeredNodes.empty()) {
+    Serial.println("   No nodes registered yet");
+    return;
+  }
+
+  for (const auto& node : registeredNodes) {
+    Serial.print("   ");
+    Serial.print(node.nodeId);
+    Serial.print(" (");
+    for (int i = 0; i < 6; i++) {
+      Serial.printf("%02X", node.mac[i]);
+      if (i < 5) Serial.print(":");
     }
-    
-    for (const auto& node : registeredNodes) {
-        Serial.print("   ");
-        Serial.print(node.nodeId);
-        Serial.print(" (");
-        for (int i = 0; i < 6; i++) {
-            Serial.printf("%02X", node.mac[i]);
-            if (i < 5) Serial.print(":");
-        }
-        Serial.print(") - ");
-        Serial.println(node.isActive ? "Active" : "Inactive");
-    }
+    Serial.print(") - ");
+    Serial.println(node.isActive ? "Active" : "Inactive");
+  }
 }
 
 // Persist paired nodes using Preferences (NVS)
 void savePairedNodes() {
-    Preferences prefs;
-    if (!prefs.begin("paired_nodes", false)) {
-        Serial.println("❌ Failed to open NVS for saving paired nodes");
-        return;
+  Preferences prefs;
+  if (!prefs.begin("paired_nodes", false)) {
+    Serial.println("❌ Failed to open NVS for saving paired nodes");
+    return;
+  }
+
+  // Store count
+  int count = 0;
+  for (const auto &n : registeredNodes) if (n.state == PAIRED || n.state == DEPLOYED) count++;
+  prefs.putInt("count", count);
+
+  int idx = 0;
+  for (const auto &n : registeredNodes) {
+    if (n.state == PAIRED || n.state == DEPLOYED) {
+      char key[16];
+      snprintf(key, sizeof(key), "mac%d", idx);
+      // store as hex string
+      char macs[18];
+      snprintf(macs, sizeof(macs), "%02X%02X%02X%02X%02X%02X", n.mac[0], n.mac[1], n.mac[2], n.mac[3], n.mac[4], n.mac[5]);
+      prefs.putString(key, macs);
+
+      snprintf(key, sizeof(key), "id%d", idx);
+      prefs.putString(key, n.nodeId);
+
+      idx++;
     }
+  }
 
-    // Store count
-    int count = 0;
-    for (const auto &n : registeredNodes) if (n.state == PAIRED || n.state == DEPLOYED) count++;
-    prefs.putInt("count", count);
-
-    int idx = 0;
-    for (const auto &n : registeredNodes) {
-        if (n.state == PAIRED || n.state == DEPLOYED) {
-            char key[16];
-            snprintf(key, sizeof(key), "mac%d", idx);
-            // store as hex string
-            char macs[18];
-            snprintf(macs, sizeof(macs), "%02X%02X%02X%02X%02X%02X", n.mac[0], n.mac[1], n.mac[2], n.mac[3], n.mac[4], n.mac[5]);
-            prefs.putString(key, macs);
-
-            snprintf(key, sizeof(key), "id%d", idx);
-            prefs.putString(key, n.nodeId);
-
-            idx++;
-        }
-    }
-
-    prefs.end();
-    Serial.print("✅ Saved "); Serial.print(count); Serial.println(" paired nodes to NVS");
+  prefs.end();
+  Serial.print("✅ Saved "); Serial.print(count); Serial.println(" paired nodes to NVS");
 }
 
 void loadPairedNodes() {
-    Preferences prefs;
-    if (!prefs.begin("paired_nodes", true)) {
-        Serial.println("❌ Failed to open NVS for loading paired nodes");
-        return;
+  Preferences prefs;
+  if (!prefs.begin("paired_nodes", true)) {
+    Serial.println("❌ Failed to open NVS for loading paired nodes");
+    return;
+  }
+
+  int count = prefs.getInt("count", 0);
+  Serial.print("🔁 Loading "); Serial.print(count); Serial.println(" paired nodes from NVS");
+
+  for (int i = 0; i < count; ++i) {
+    char key[16];
+    snprintf(key, sizeof(key), "mac%d", i);
+    String macs = prefs.getString(key, "");
+    if (macs.length() != 12) continue; // invalid
+
+    uint8_t mac[6];
+    for (int j = 0; j < 6; ++j) {
+      String byteStr = macs.substring(j*2, j*2+2);
+      mac[j] = (uint8_t) strtoul(byteStr.c_str(), NULL, 16);
     }
 
-    int count = prefs.getInt("count", 0);
-    Serial.print("🔁 Loading "); Serial.print(count); Serial.println(" paired nodes from NVS");
+    snprintf(key, sizeof(key), "id%d", i);
+    String nid = prefs.getString(key, "NODE");
 
-    for (int i = 0; i < count; ++i) {
-        char key[16];
-        snprintf(key, sizeof(key), "mac%d", i);
-        String macs = prefs.getString(key, "");
-        if (macs.length() != 12) continue; // invalid
+    // Add node to registry as PAIRED
+    NodeInfo newNode;
+    memcpy(newNode.mac, mac, 6);
+    newNode.nodeId = nid;
+    newNode.nodeType = String("restored");
+    newNode.lastSeen = millis();
+    newNode.isActive = true;
+    newNode.state = PAIRED;
+    newNode.channel = 1;
+    registeredNodes.push_back(newNode);
 
-        uint8_t mac[6];
-        for (int j = 0; j < 6; ++j) {
-            String byteStr = macs.substring(j*2, j*2+2);
-            mac[j] = (uint8_t) strtoul(byteStr.c_str(), NULL, 16);
-        }
+    // Add as ESP-NOW peer on AP interface
+    esp_now_peer_info_t peerInfo{};
+    memcpy(peerInfo.peer_addr, mac, 6);
+    peerInfo.channel = 1;
+    peerInfo.ifidx   = WIFI_IF_AP;   // AP iface (important)
+    peerInfo.encrypt = false;
+    esp_now_del_peer(mac);
+    esp_now_add_peer(&peerInfo);
+  }
 
-        snprintf(key, sizeof(key), "id%d", i);
-        String nid = prefs.getString(key, "NODE");
-
-        // Add node to registry as PAIRED
-        NodeInfo newNode;
-        memcpy(newNode.mac, mac, 6);
-        newNode.nodeId = nid;
-        newNode.nodeType = String("restored");
-        newNode.lastSeen = millis();
-        newNode.isActive = true;
-        newNode.state = PAIRED;
-        newNode.channel = 1;
-        registeredNodes.push_back(newNode);
-
-        // Add as ESP-NOW peer
-        esp_now_peer_info_t peerInfo;
-        memset(&peerInfo, 0, sizeof(peerInfo));
-        memcpy(peerInfo.peer_addr, mac, 6);
-        peerInfo.channel = 1;
-        peerInfo.ifidx = WIFI_IF_STA;
-        peerInfo.encrypt = false;
-        esp_now_del_peer(mac);
-        esp_now_add_peer(&peerInfo);
-    }
-
-    prefs.end();
+  prefs.end();
 }
 
 bool unpairNode(const String& nodeId) {
-    for (auto it = registeredNodes.begin(); it != registeredNodes.end(); ++it) {
-        if (it->nodeId == nodeId) {
-            // Remove ESP-NOW peer locally
-            esp_now_del_peer(it->mac);
-            it->state = UNPAIRED;
-            it->isActive = true;
-            // Persist changes
-            savePairedNodes();
-            Serial.print("🗑️ Unpaired node: "); Serial.println(nodeId);
-            return true;
-        }
+  for (auto it = registeredNodes.begin(); it != registeredNodes.end(); ++it) {
+    if (it->nodeId == nodeId) {
+      // Remove ESP-NOW peer locally
+      esp_now_del_peer(it->mac);
+      it->state = UNPAIRED;
+      it->isActive = true;
+      // Persist changes
+      savePairedNodes();
+      Serial.print("🗑️ Unpaired node: "); Serial.println(nodeId);
+      return true;
     }
-    return false;
+  }
+  return false;
 }
 
 bool sendUnpairToNode(const String& nodeId) {
-    for (const auto &n : registeredNodes) {
-        if (n.nodeId == nodeId) {
-            unpair_command_t cmd;
-            memset(&cmd, 0, sizeof(cmd));
-            strcpy(cmd.command, "UNPAIR_NODE");
-            strcpy(cmd.mothership_id, DEVICE_ID);
+  for (const auto &n : registeredNodes) {
+    if (n.nodeId == nodeId) {
+      unpair_command_t cmd{};
+      strcpy(cmd.command, "UNPAIR_NODE");
+      strcpy(cmd.mothership_id, DEVICE_ID);
 
-            esp_err_t res = esp_now_send(n.mac, (uint8_t*)&cmd, sizeof(cmd));
-            Serial.print("📤 Sent UNPAIR to "); Serial.print(nodeId); Serial.print(" -> "); Serial.print((int)res); Serial.print(" ("); Serial.print(esp_err_to_name(res)); Serial.println(")");
-            return (res == ESP_OK);
-        }
+      ensurePeerOnChannel(n.mac, ESPNOW_CHANNEL);
+      forceChannel(ESPNOW_CHANNEL);
+      esp_err_t res = esp_now_send(n.mac, (uint8_t*)&cmd, sizeof(cmd));
+      Serial.print("📤 Sent UNPAIR to "); Serial.print(nodeId); Serial.print(" -> ");
+      Serial.print((int)res); Serial.print(" ("); Serial.print(esp_err_to_name(res)); Serial.println(")");
+      return (res == ESP_OK);
     }
-    return false;
+  }
+  return false;
 }

@@ -1,28 +1,34 @@
 #pragma once
-#include <Arduino.h>
+
+#include <stdint.h>
+#include <stdbool.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
 
 // ===== Wire protocol messages (single source of truth) =====
 
 // Sensor -> Mothership data
 typedef struct sensor_data_message {
-    char nodeId[16];            // e.g., "TEMP_001"
-    char sensorType[16];        // e.g., "TEMPERATURE"
-    float value;                // reading
-    unsigned long nodeTimestamp;// node-side timestamp (unix or millis)
+    char     nodeId[16];        // e.g., "TEMP_001"
+    char     sensorType[16];    // e.g., "TEMPERATURE"
+    float    value;             // reading
+    uint32_t nodeTimestamp;     // node-side timestamp (unix or millis)
 } sensor_data_message_t;
 
 // Discovery (node -> broadcast) and response (mothership -> broadcast)
 typedef struct discovery_message {
-    char nodeId[16];
-    char nodeType[16];          // "temperature", "humidity", etc.
-    char command[20];           // "DISCOVER_REQUEST"
-    unsigned long timestamp;
+    char     nodeId[16];
+    char     nodeType[16];      // "temperature", "humidity", etc.
+    char     command[20];       // "DISCOVER_REQUEST"
+    uint32_t timestamp;
 } discovery_message_t;
 
 typedef struct discovery_response {
-    char command[20];           // "DISCOVER_RESPONSE" or "DISCOVERY_SCAN"
-    char mothership_id[16];
-    bool acknowledged;
+    char  command[20];          // "DISCOVER_RESPONSE" or "DISCOVERY_SCAN"
+    char  mothership_id[16];
+    bool  acknowledged;
 } discovery_response_t;
 
 // Pairing (legacy request/response) + explicit “pair”
@@ -46,23 +52,23 @@ typedef struct pairing_command {
 
 // Deployment (server -> node) with time payload
 typedef struct deployment_command {
-    char command[20];           // "DEPLOY_NODE"
-    char nodeId[16];
-    unsigned long year, month, day, hour, minute, second;
-    char mothership_id[16];
+    char     command[20];       // "DEPLOY_NODE"
+    char     nodeId[16];
+    uint32_t year, month, day, hour, minute, second;
+    char     mothership_id[16];
 } deployment_command_t;
 
 // Time sync request/response
 typedef struct time_sync_request {
-    char nodeId[16];
-    char command[16];           // "REQUEST_TIME"
-    unsigned long requestTime;
+    char     nodeId[16];
+    char     command[16];       // "REQUEST_TIME"
+    uint32_t requestTime;
 } time_sync_request_t;
 
 typedef struct time_sync_response {
-    char command[16];           // "TIME_SYNC"
-    unsigned long year, month, day, hour, minute, second;
-    char mothership_id[16];
+    char     command[16];       // "TIME_SYNC"
+    uint32_t year, month, day, hour, minute, second;
+    char     mothership_id[16];
 } time_sync_response_t;
 
 // Unpair (server -> node)
@@ -96,9 +102,14 @@ typedef struct rnt_pairing_t {
 #define NODE_TYPE_LIGHT         "LIGHT"
 #define NODE_TYPE_PH            "PH"
 
+// ESPNOW channel for both node & mothership
 #define ESPNOW_CHANNEL 1
 
 // I2C pins (ESP32-C3 Mini) — used by node builds
 #define RTC_SDA_PIN 8
 #define RTC_SCL_PIN 9
 #define RTC_INT_PIN 3
+
+#ifdef __cplusplus
+} // extern "C"
+#endif
