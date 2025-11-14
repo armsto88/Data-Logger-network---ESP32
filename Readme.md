@@ -18,7 +18,7 @@ The system is built around:
   - wake on an RTC alarm interval
   - send sensor readings when deployed
 
-The whole “pair / deploy / unpair” saga is now simplified to a clean state model and is robust across reboots and power loss.
+
 
 ---
 
