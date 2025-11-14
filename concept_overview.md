@@ -113,9 +113,3 @@ The mothership also logs a simple “I’m alive” status row every minute, whi
 - Data is reliably logged to the SD card in a simple format that can be opened with Excel, R, Python, etc.
 
 ---
-
-If you’d like, next step we can:
-
-- Add your **real sensors** (e.g. DS18B20, soil moisture, PAR) to the node firmware.
-- Add some **lightweight charts** to the web UI (e.g. last 24h temperature trends).
-- Sketch out how this plugs into your ecoPi / R Shiny workflow.
