@@ -20,9 +20,6 @@
 #include "protocol.h"
 #include <Preferences.h>
 
-
-
-
 // ---------- Device identification and WiFi ----------
 const char* DEVICE_ID = "001";  // Simplified ID
 const char* BASE_SSID = "Logger";
@@ -51,7 +48,9 @@ static void loadWakeIntervalFromNVS() {
   if (gPrefs.begin("ui", true)) {
     int v = gPrefs.getInt("wake_min", gWakeIntervalMin);
     gPrefs.end();
-    bool ok=false; for (size_t i=0;i<kAllowedCount;i++) if (v==kAllowedIntervals[i]) { ok=true; break; }
+    bool ok=false; 
+    for (size_t i=0;i<kAllowedCount;i++) 
+      if (v==kAllowedIntervals[i]) { ok=true; break; }
     gWakeIntervalMin = ok ? v : 5;
   }
 }
@@ -63,7 +62,6 @@ static void saveWakeIntervalToNVS(int mins) {
   }
 }
 
-
 // (4) Common CSS/JS in PROGMEM (saves RAM)
 const char COMMON_CSS[] PROGMEM = R"CSS(
 :root{
@@ -72,8 +70,8 @@ const char COMMON_CSS[] PROGMEM = R"CSS(
   --radius:10px; --sp-1:8px; --sp-2:12px; --sp-3:16px; --sp-4:20px;
   --shadow:0 2px 10px rgba(0,0,0,.08);
 }
-*{box-sizing:border-box;-webkit-tap-highlight-color:transparent} /* (6) */
-html{scroll-behavior:smooth} /* (6) */
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+html{scroll-behavior:smooth}
 html,body{margin:0;padding:0;background:var(--bg);color:var(--text);
   font:16px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,system-ui,sans-serif}
 a{color:var(--primary);text-decoration:none}
@@ -126,7 +124,7 @@ a{color:var(--primary);text-decoration:none}
 .card{background:var(--panel);border:1px solid var(--border);border-radius:var(--radius);padding:var(--sp-3);box-shadow:var(--shadow)}
 .log{background:#111;color:#eaeaea;border-radius:8px;padding:12px;max-height:40vh;overflow:auto;font:13px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace}
 
-/* (3) Safe-area aware footer bar */
+/* Safe-area aware footer bar */
 .footer-bar{
   position:sticky;bottom:0;background:var(--panel);border:1px solid var(--border);
   padding:calc(var(--sp-2) + env(safe-area-inset-bottom)) var(--sp-3);
@@ -137,7 +135,7 @@ a{color:var(--primary);text-decoration:none}
 )CSS";
 
 const char COMMON_JS[] PROGMEM = R"JS(
-// (1) Prevent double submits
+// Prevent double submits
 document.addEventListener('submit', function (e) {
   const btn = e.target.querySelector('button[type="submit"],input[type="submit"]');
   if (btn && !btn.disabled) {
@@ -163,16 +161,14 @@ function toggleSettings(){
 }
 window.onload=setCurrentTime;
 
-// Live 1s ticking of the displayed RTC time (DOM-ready, Safari-safe)
+// Live 1s ticking of the displayed RTC time
 (function(){
   const pad = n => String(n).padStart(2,'0');
   function parseYMDHMS(str){
-    // expects "YYYY-MM-DD HH:MM:SS"
     if (!str || str.length < 19) return NaN;
     const y = +str.slice(0,4), m = +str.slice(5,7), d = +str.slice(8,10);
     const H = +str.slice(11,13), M = +str.slice(14,16), S = +str.slice(17,19);
-    // Build LOCAL date (avoids Safari ISO quirks)
-    const dt = new Date(y, m-1, d, H, M, S);
+    const dt = new Date(y, m-1, d, H, M, S); // local
     return isNaN(dt) ? NaN : dt.getTime();
   }
   function formatYMDHMS(ms){
@@ -185,9 +181,7 @@ window.onload=setCurrentTime;
     if (!el) return;
     const initial = (el.textContent || '').trim();
     const rtcMs   = parseYMDHMS(initial);
-    // If parsing fails, fall back to client clock
     const offset  = isNaN(rtcMs) ? 0 : (rtcMs - Date.now());
-    // Draw immediately, then tick each second
     function draw(){
       const nowMs = Date.now() + offset;
       el.textContent = formatYMDHMS(nowMs);
@@ -195,21 +189,18 @@ window.onload=setCurrentTime;
     draw();
     setInterval(draw, 1000);
   }
-  // Wait until the DOM exists (script is in <head>)
   if (document.readyState === 'loading'){
     document.addEventListener('DOMContentLoaded', startClock);
   } else {
     startClock();
   }
 })();
-
-
 )JS";
 
 // ---------- Common page frame ----------
 static String headCommon(const String& title){
   String h;
-  h.reserve(4500); // (7) a bit bigger reserve for fewer reallocs
+  h.reserve(4500);
   h += F("<!DOCTYPE html><html><head>");
   h += F("<meta charset='UTF-8'><meta name='viewport' content='width=device-width, initial-scale=1'>");
 
@@ -227,7 +218,6 @@ static String headCommon(const String& title){
   h += F("<div class='badge'>Device ID: <strong>");
   h += DEVICE_ID;
   h += F("</strong></div>");
-  // (7) Version/build badge
   h += F("<div class='muted'>Wi-Fi: ");
   h += ssid;
   h += F(" • ");
@@ -241,17 +231,28 @@ static inline String footCommon(){ return String(F("</div></body></html>")); }
 
 // ---------- Routes / Handlers ----------
 
-// (reused from your version) Revert node
 void handleRevertNode() {
   String nodeId = server.arg("node_id");
-  bool found = false;
+  bool found   = false;
+  bool sentCmd = false;
+
   extern std::vector<NodeInfo> registeredNodes;
+
   for (auto& node : registeredNodes) {
     if (node.nodeId == nodeId && node.state == DEPLOYED) {
+      // 1) Update local/UI state and persist
       node.state = PAIRED;
       savePairedNodes();
       found = true;
-      Serial.print("[MOTHERSHIP] Node reverted to PAIRED state: ");
+
+      // 2) Tell the *actual node* to go back to PAIRED (stop sending data)
+      sentCmd = pairNode(nodeId);  // will send PAIR_NODE + PAIRING_RESPONSE
+
+      if (sentCmd) {
+        Serial.print("[MOTHERSHIP] Node reverted to PAIRED + PAIR_NODE sent: ");
+      } else {
+        Serial.print("[MOTHERSHIP] Node reverted to PAIRED (local only; PAIR_NODE send failed): ");
+      }
       Serial.println(nodeId);
       break;
     }
@@ -262,7 +263,10 @@ void handleRevertNode() {
   if (found) {
     html += F("<h3>Node reverted to paired state</h3><p>Node <strong>");
     html += nodeId;
-    html += F("</strong> is now paired and can be redeployed.</p>");
+    html += F("</strong> is now marked as paired.</p>");
+    if (!sentCmd) {
+      html += F("<p class='muted'>Warning: could not send PAIR_NODE command to the node – if it keeps sending data the UI may flip back to DEPLOYED.</p>");
+    }
   } else {
     html += F("<h3>Node not found or not deployed</h3><p>No action taken.</p>");
   }
@@ -271,19 +275,20 @@ void handleRevertNode() {
   server.send(200, "text/html", html);
 }
 
+
 void handleRoot() {
   String html = headCommon("ESP32 Data Logger");
 
   char currentTime[24];
   getRTCTimeString(currentTime, sizeof(currentTime));
-    // Wake Interval control
+
+  // Wake Interval control
   html += F("<div class='section'><h3>⏰ Wake Interval</h3>");
   html += F("<p class='muted'>This sets the DS3231 alarm interval on all paired/deployed nodes.</p>");
   html += F("<form action='/set-wake-interval' method='POST' class='row'>"
             "<div class='col'><label class='label'><strong>Interval (minutes)</strong></label>"
             "<select class='input' name='interval'>");
 
-  // build <option> list with current selected
   for (size_t i=0; i<kAllowedCount; ++i) {
     int v = kAllowedIntervals[i];
     html += F("<option value='");
@@ -313,15 +318,13 @@ void handleRoot() {
     if (node.state == DEPLOYED && node.isActive) deployedNodes++;
 
   // RTC section
- 
-    html += F(
+  html += F(
     "<div class='section center' aria-live='polite'>"
-        "<strong>Current RTC Time</strong><br>"
-        "<div id='rtc-now' style='font-size:18px;color:#1976D2;margin-top:6px'>"
-    );
-    html += currentTime; // "YYYY-MM-DD HH:MM:SS"
-    html += F("</div></div>");
-
+      "<strong>Current RTC Time</strong><br>"
+      "<div id='rtc-now' style='font-size:18px;color:#1976D2;margin-top:6px'>"
+  );
+  html += currentTime;
+  html += F("</div></div>");
 
   // Data logging
   html += F("<div class='section'><h3>📊 Data Logging</h3><p class='muted'><strong>Status:</strong> ");
@@ -346,10 +349,11 @@ void handleRoot() {
 
   // Unpaired
   if (unpairedNodes.size() > 0) {
-    html.reserve(html.length() + 500 + unpairedNodes.size()*140); // (7) reserve bump
+    html.reserve(html.length() + 500 + unpairedNodes.size()*140);
     html += F("<div class='section'><h3>🔴 Unpaired Nodes (");
     html += String(unpairedNodes.size());
-    html += F(")</h3><form action='/pair-nodes' method='POST' class='list'>");
+    html += F(")</h3><p class='muted'>Discovered nodes that are not yet bound to this mothership.</p>"
+              "<form action='/pair-nodes' method='POST' class='list'>");
     for (const auto& node : unpairedNodes) {
       html += F("<label class='item item-row'><div style='display:flex;align-items:center;gap:10px'>"
                 "<input type='checkbox' name='selected_nodes' value='");
@@ -371,10 +375,10 @@ void handleRoot() {
 
   // Paired -> Deploy
   if (pairedNodes.size() > 0) {
-    html.reserve(html.length() + 500 + pairedNodes.size()*110); // (7)
+    html.reserve(html.length() + 500 + pairedNodes.size()*110);
     html += F("<div class='section'><h3>🟠 Paired Nodes (");
     html += String(pairedNodes.size());
-    html += F(")</h3><p class='muted'>Ready for deployment with RTC sync</p>"
+    html += F(")</h3><p class='muted'>Bound to this mothership; ready for deployment with RTC sync.</p>"
               "<form action='/deploy-nodes' method='POST' class='list'>");
     for (const auto& node : pairedNodes) {
       html += F("<label class='item item-row'><div style='display:flex;align-items:center;gap:10px'>"
@@ -392,6 +396,7 @@ void handleRoot() {
   // Unpair
   if (pairedNodes.size() > 0) {
     html += F("<div class='section'><h3>Unpair Nodes</h3>"
+              "<p class='muted'>Clear the binding on both mothership and node.</p>"
               "<form action='/unpair-nodes' method='POST' class='list'>");
     for (const auto& node : pairedNodes) {
       html += F("<label class='item item-row'><div style='display:flex;align-items:center;gap:10px'>"
@@ -408,10 +413,10 @@ void handleRoot() {
 
   // Active deployed + revert
   if (deployedNodes > 0) {
-    html.reserve(html.length() + 500 + deployedNodes*130); // (7)
+    html.reserve(html.length() + 500 + deployedNodes*130);
     html += F("<div class='section'><h3>🟢 Active Deployed Nodes (");
     html += String(deployedNodes);
-    html += F(")</h3><p class='muted'>Nodes are collecting data and sending to mothership</p>"
+    html += F(")</h3><p class='muted'>Nodes that are deployed and have sent data recently.</p>"
               "<div class='list'>");
     for (const auto& node : allNodes) {
       if (node.state == DEPLOYED && node.isActive) {
@@ -424,7 +429,7 @@ void handleRoot() {
         html += F("</small></div><form action='/revert-node' method='POST'>"
                   "<input type='hidden' name='node_id' value='");
         html += node.nodeId;
-        html += F("'><button class='btn btn--primary' type='submit'>↩️ Revert to Paired</button>"
+        html += F("'><button class='btn btn--primary' type='submit'>↩️ Mark as Paired</button>"
                   "</form></div></div>");
       }
     }
@@ -435,7 +440,7 @@ void handleRoot() {
   html += F("<button id='settings-btn' class='btn' onclick='toggleSettings()'>Show RTC Settings</button>"
             "<div id='settings-panel' class='section' style='display:none'>"
             "<h3>⚙️ RTC Time Configuration</h3>"
-            "<p class='muted'>Only needed for initial setup or time correction</p>"
+            "<p class='muted'>Only needed for initial setup or time correction.</p>"
             "<form action='/set-time' method='POST'>"
             "<label class='label' for='datetime'><strong>Set New Time</strong></label>"
             "<input class='input' id='datetime' name='datetime' type='text' "
@@ -446,14 +451,14 @@ void handleRoot() {
             "</div><div class='help'>Format: 2025-11-09 14:26:00</div>"
             "</form></div>");
 
-  // (3) Safe-area footer bar replacing single refresh button
+  // Footer bar
   html += F("<div class='footer-bar'>"
             "<a href='/' class='btn'>🔄 Refresh</a>"
             "<a href='/download-csv' class='btn btn--success'>⬇️ CSV</a>"
             "</div>");
 
-  // (2) Auto-refresh every 15s (dashboard only)
-  html += F("<script>setTimeout(()=>location.reload(),10000);</script>");
+  // Auto-refresh every 15s (dashboard only)
+  html += F("<script>setTimeout(()=>location.reload(),15000);</script>");
 
   html += footCommon();
   server.send(200, "text/html", html);
@@ -534,7 +539,7 @@ void handlePairNodes() {
     html += F(" node(s) paired</strong></p><p>");
     if (pairedList.length() >= 2) pairedList.remove(pairedList.length()-2);
     html += pairedList;
-    html += F("</p><p>Nodes are ready for deployment with RTC synchronization</p>");
+    html += F("</p><p>Nodes are ready for deployment with RTC synchronization.</p>");
   } else {
     html += F("<h3>⚠️ No Nodes Selected</h3><p>Please select at least one node to pair.</p>");
   }
@@ -564,7 +569,7 @@ void handleDeployNodes() {
       }
       html += F("<p>RTC Time synchronized: <strong>");
       html += timeStr;
-      html += F("</strong></p><p>Nodes are now collecting data automatically</p>");
+      html += F("</strong></p><p>Nodes are now collecting data automatically.</p>");
     } else {
       html += F("<h3>⚠️ Partial Deployment</h3><p>Some nodes may not have deployed successfully.</p>"
                 "<p>Check serial monitor for details.</p>");
@@ -608,22 +613,18 @@ void handleUnpairNodes() {
 }
 
 void handleSetWakeInterval() {
-  // read & validate input
   int interval = server.hasArg("interval") ? server.arg("interval").toInt() : 0;
   bool ok = false;
   for (size_t i=0; i<kAllowedCount; ++i) if (interval == kAllowedIntervals[i]) { ok = true; break; }
   if (!ok) interval = 5;
 
-  // broadcast to nodes
   bool sent = broadcastWakeInterval(interval);
 
-  // persist & update in-memory current value
   gWakeIntervalMin = interval;
   saveWakeIntervalToNVS(interval);
 
   Serial.printf("[UI] Wake interval set to %d min → broadcast %s\n", interval, sent ? "SENT" : "NOT_SENT");
 
-  // simple result page
   String html = F("<!doctype html><meta name='viewport' content='width=device-width,initial-scale=1'>"
                   "<body style='font-family:sans-serif;padding:20px;text-align:center'>"
                   "<h3>⏰ Wake Interval</h3><p>Broadcasted ");
@@ -634,7 +635,6 @@ void handleSetWakeInterval() {
             "background:#2196F3;color:#fff;text-decoration:none;border-radius:6px'>Back</a></body>");
   server.send(200, "text/html", html);
 }
-
 
 // ---------- Setup / Loop ----------
 void setup() {
@@ -663,24 +663,18 @@ void setup() {
   Serial.print("Current RTC Time: "); Serial.println(timeStr);
 
   loadWakeIntervalFromNVS();
-Serial.printf("Current wake interval (from NVS): %d min\n", gWakeIntervalMin);
-// Optional: rebroadcast at boot
-// broadcastWakeInterval(gWakeIntervalMin);
-
+  Serial.printf("Current wake interval (from NVS): %d min\n", gWakeIntervalMin);
 
 #if ENABLE_SPIFFS_ASSETS
-  // (5) Optional: serve pre-gzipped assets
   if (!SPIFFS.begin(true)) {
     Serial.println("SPIFFS mount failed; falling back to inline assets.");
   } else {
-    // /style.css -> serve /style.css.gz with gzip header
     server.on("/style.css", HTTP_GET, [](){
       File f = SPIFFS.open("/style.css.gz", "r");
       if (!f) { server.send(404, "text/plain", "style.css.gz not found"); return; }
       server.sendHeader("Content-Encoding", "gzip");
       server.streamFile(f, "text/css"); f.close();
     });
-    // /app.js -> serve /app.js.gz with gzip header
     server.on("/app.js", HTTP_GET, [](){
       File f = SPIFFS.open("/app.js.gz", "r");
       if (!f) { server.send(404, "text/plain", "app.js.gz not found"); return; }
@@ -700,7 +694,6 @@ Serial.printf("Current wake interval (from NVS): %d min\n", gWakeIntervalMin);
   server.on("/revert-node", HTTP_POST, handleRevertNode);
   server.on("/unpair-nodes", HTTP_POST, handleUnpairNodes);
   server.on("/set-wake-interval", HTTP_POST, handleSetWakeInterval);
-
 
   server.begin();
   Serial.println("✅ Web server started!");
