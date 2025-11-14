@@ -1,95 +1,284 @@
-# Data Logger Network — ESP32 Mothership and Sensor Nodes
+# ESP32 Sensor Network – Mothership + Nodes
 
-This repository contains a small sensor-network system built using ESP-NOW:
-
-- Mothership: ESP32-S3 running a web UI, handling discovery, pairing, deployment, logging to SD, and persisting paired nodes.
-- Sensor nodes: ESP32-C3 devices that auto-discover the mothership, pair, receive deployment commands, and send sensor data.
-
-This README documents the current state of the code, how to build and test it, and known issues.
-
-## Project status (2025-11-08)
-
-- **All schedule/interval logic has been fully removed** from both mothership and node firmware. The only time sync is RTC on deploy.
-- **UI reverted to classic style** for clarity and user preference.
-- **'Undeploy' (revert to paired) feature is implemented**: You can now revert a deployed node to the paired state from the web UI. Node stops transmitting when reverted.
-- **All code builds and uploads cleanly** for both mothership (ESP32-S3) and node (ESP32-C3) using PlatformIO.
-- **Web UI and backend are consistent and minimal**: Only core flows (discovery, pair, deploy, unpair, revert) are present. No schedule, alarm, or interval logic remains.
-- **Serial output and protocol are clean**: No schedule/interval/alarm messages are sent or displayed.
-
-## Repository layout
-
-```text
-Data-Logger-network---ESP32/
-├── platformio.ini                # Mothership PlatformIO envs (esp32s3)
-├── Readme.md                     # This file
-├── BrainStorm.md                 # Notes / ideas
-├── src/                          # Mothership source
-│   ├── main.cpp                  # Web UI, WiFi, routes
-│   ├── espnow_manager.cpp/.h     # ESP-NOW logic, persistence
-│   ├── sd_manager.cpp/.h         # CSV logging helper
-│   ├── rtc_manager.cpp/.h        # RTC helper
-│   └── config.h                  # Pin and build-time config
-└── nodes/
-    ├── README.md                 # Node-level docs
-    └── air-temperature-node/     # Example node project (esp32c3)
-```
-
-## Key concepts and protocols
-
-- Communication uses ESP-NOW (no WiFi AP client traffic required).
-- The mothership runs in AP+STA mode and uses a fixed pairing channel (channel 1) for discovery/pairing to improve reliability.
-- Message types: discovery, pairing request/response, deploy, time sync, sensor data, UNPAIR.
-- Paired nodes are stored in NVS via Preferences and re-added as peers on startup.
-
-## Quick build & upload (PlatformIO)
-
-From the repository root (PowerShell examples):
-
-Build and upload the mothership (ESP32-S3):
-
-```powershell
-& "$env:USERPROFILE\.platformio\penv\Scripts\platformio.exe" run -e esp32s3 -t upload --upload-port COM4
-```
-
-Build and upload the example node (ESP32-C3):
-
-```powershell
-& "$env:USERPROFILE\.platformio\penv\Scripts\platformio.exe" run -d .\nodes\air-temperature-node -e esp32c3 -t upload --upload-port COM7
-```
-
-Open serial monitors for both devices (set correct COM ports and 115200 baud) while testing pairing/deploy flows.
-
-## How to test pairing, deploy, unpair, and revert
-
-1. Put mothership online (flash and open the web UI; web server runs on the AP interface).
-2. Flash and power the node(s). Watch node serial for discovery messages.
-3. On the mothership web UI, click 'Discover' then 'Pair selected nodes' for any discovered nodes. The UI will send both a pairing command and an RNT-style compact reply so nodes that expect that format will auto-add the mothership.
-4. After a successful pair, deploy the node with the 'Deploy' action. The node should set its RTC, change to DEPLOYED state, and start sending sensor data.
-5. To unpair remotely, use the Unpair UI. The mothership will send a best-effort `UNPAIR_NODE` command and then remove the peer and persist the change locally. The UI now shows per-node send status (Remote UNPAIR sent/failed) and local unpair status.
-6. To revert a deployed node to paired, use the 'Revert to Paired' button in the deployed node list. The node will stop transmitting and return to the paired state.
-
-## Known issues and caveats
-
-- ESP-NOW is sensitive to WiFi interface/channel state; the code forces channel 1 for pairing and binds ESP-NOW peers to the STA interface to avoid ESP_ERR_ESPNOW_IF. If you see send failures, confirm both devices use channel 1 during pairing.
-- The remote unpair is best-effort: if the node is asleep or out of range, the mothership will still remove the peer locally and persist the change. When the node wakes and discovers no mothership, it will continue discovery.
-
-## Troubleshooting tips
-
-- If pairing fails with esp-now send errors, open serial on both devices and ensure the `📨 send_cb to ... status=OK/FAIL` lines are shown. Try increasing delays in `espnow_manager.cpp` around peer add/send.
-- If nodes don't persist pairing, check that NVS (Preferences) writes succeed on the mothership (Serial logs show saved counts).
-- If you change board hardware or MAC addresses, update preloaded `mothershipMAC` in node code or use discovery flow.
-
-## Next steps (planned)
-
-- Add better UI feedback (AJAX, progress bar) and per-node logs
-- Add secure pairing/encryption option for ESP-NOW peers
-- Add more node types and a shared protocol header
+A small **ESP-NOW**–based sensor network for environmental data logging.
 
 ---
 
-**Session summary (2025-11-08):**
-- Removed all alarm, schedule, and interval logic from both mothership and node firmware, including all UI and protocol fields.
-- Added 'undeploy' (revert to paired) feature to the web UI and backend; node stops transmitting when reverted.
-- Cleaned up all serial output and protocol messages for clarity.
-- Reverted UI to classic style for user preference.
-- All code builds and uploads cleanly for both boards.
+## System Overview
+
+The system is built around:
+
+- **Mothership (ESP32-S3):**
+  - Runs a Wi-Fi access point (`Logger001`)
+  - Exposes a web UI dashboard
+  - Manages node discovery, pairing and deployment
+  - Stores incoming sensor data to CSV on an SD card
+  - Keeps time via a DS3231 RTC
+
+- **Sensor Nodes (ESP32-C3 Mini, one or more):**
+  - Measure environmental variables (e.g., air temperature)
+  - Communicate with the mothership using ESP-NOW
+  - Wake on an RTC alarm interval
+  - Send sensor readings when deployed
+
+---
+
+## Features
+
+- **ESP-NOW mesh** style communication (unidirectional: node → mothership data; control: mothership → nodes)
+- **DS3231 RTC integration** (both mothership & nodes):
+  - Accurate timestamps on measurements
+  - Configurable wake/sampling intervals via DS3231 Alarm 1
+- **CSV logging to SD card** (mothership):
+  - Single `datalog.csv` (timestamp, node ID, MAC, sensor type, value)
+  - Periodic “MOTHERSHIP STATUS” heartbeats
+- **Web UI dashboard** (from mothership):
+  - View RTC time
+  - Node discovery, pairing, deployment & unpairing
+  - Set global wake interval (1–60 mins)
+  - Download CSV log
+- **Persistent state in NVS** (both sides):
+  - Mothership remembers paired/deployed nodes across reboots
+  - Nodes remember their mothership, wake interval & RTC sync status
+
+---
+
+## High-Level Architecture
+
+```text
++---------------------+                     +--------------------------+
+|   Sensor Node(s)    |  ESP-NOW (channel)  |        Mothership        |
+|  (ESP32-C3 Mini)    | <-----------------> |      (ESP32-S3, AP)      |
++---------------------+                     +--------------------------+
+  - NODE_ID, NODE_TYPE                         - Wi-Fi AP "Logger001"
+  - DS3231 RTC                                  - DS3231 RTC
+  - RTC INT pin wake (future deep-sleep)        - SD card (datalog.csv)
+  - ESP-NOW: DISCOVER_REQUEST                   - ESP-NOW manager
+             SENSOR_DATA                        - Web UI (HTTP server)
+             REQUEST_TIME / TIME_SYNC           - Pair / Deploy / Unpair
+             SET_SCHEDULE
+```
+
+---
+
+### Node "Belonging" States
+
+- **Unpaired**: No mothership MAC known
+- **Paired / Bound**: Mothership MAC known, RTC not yet synced
+- **Deployed**: Mothership MAC known & RTC synced — node sends data on each wake
+
+**Node effective state:**
+- `mothershipMAC` (all zeros = not bound)
+- `rtcSynced` (true once deployment time is received)
+
+```cpp
+enum NodeState {
+  STATE_UNPAIRED = 0,   // no mothership MAC known
+  STATE_PAIRED   = 1,   // has mothership MAC, RTC not synced
+  STATE_DEPLOYED = 2    // has mothership MAC + RTC synced
+};
+```
+
+**Mothership tracks each node as:**
+```cpp
+struct NodeInfo {
+  uint8_t   mac[6];
+  String    nodeId;
+  String    nodeType;
+  uint32_t  lastSeen;
+  bool      isActive;
+  NodeState state; // UNPAIRED / PAIRED / DEPLOYED
+  uint8_t   channel;
+};
+```
+
+---
+
+### State Transitions
+
+#### Discovery → Unpaired → Paired:
+1. Node broadcasts `DISCOVER_REQUEST`
+2. Mothership replies with `DISCOVER_RESPONSE`
+3. Node appears in “Unpaired Nodes”
+4. User selects node(s) → _Pair Selected Nodes_
+5. Mothership sends `PAIR_NODE` + `PAIRING_RESPONSE`
+6. Node saves mothershipMAC, sets `STATE_PAIRED`, `rtcSynced=false`
+
+#### Paired → Deployed:
+1. User selects paired nodes → _Deploy Selected Nodes_
+2. Mothership sends `DEPLOY_NODE` with RTC time
+3. Node sets DS3231 time, `rtcSynced=true`, state = `STATE_DEPLOYED`
+4. Node starts sending sensor data
+
+#### Deployed → Paired (Revert):
+1. User clicks _Revert to Paired_
+2. Mothership sets state to `PAIRED`, sends `PAIR_NODE`
+3. Node keeps mothershipMAC, sets `rtcSynced=false`, `STATE_PAIRED`  
+   (Node stops sending data)
+
+#### Unpair:
+1. User selects nodes in _Unpair Nodes_
+2. Mothership sends `UNPAIR_NODE`, removes from registry
+3. Node clears mothershipMAC, sets `rtcSynced=false`, `STATE_UNPAIRED`;  
+   node resumes discovery broadcasts
+
+---
+
+## Node Firmware & Hardware
+
+**Example Node Hardware:**
+- **MCU:** ESP32-C3 Mini
+- **RTC:** DS3231 (I²C: SDA=8, SCL=9, INT=3)
+- **Sensor:** Dummy temperature (easily swapped for another sensor)
+
+**Lifecycle:**
+1. Load persisted config from NVS (`mothershipMAC`, `rtcSynced`, wake interval)
+2. Initialise I²C + DS3231  
+   (if `rtc.lostPower()` → `rtcSynced=false`)
+3. Start ESP-NOW; add:
+   - Broadcast peer (`FF:FF:FF:FF:FF:FF`)
+   - Pre-configured mothership (if known)
+
+**In loop():**
+- If **UNPAIRED**: Periodically send `DISCOVER_REQUEST`, `PAIRING_REQUEST`
+- If **PAIRED**: Log waiting for DEPLOY; if RTC unsynced, send `REQUEST_TIME` occasionally
+- If **DEPLOYED**: On interval tick:
+    - Read sensor
+    - Send data
+    - Log status
+
+**Node message types:**
+- _To mothership:_ `DISCOVER_REQUEST`, `PAIRING_REQUEST`, `REQUEST_TIME`, `sensor_data_message_t`
+- _From mothership:_ `DISCOVER_RESPONSE`, `PAIR_NODE`, `PAIRING_RESPONSE`,  
+  `DEPLOY_NODE`, `UNPAIR_NODE`, `SET_SCHEDULE`, `TIME_SYNC`
+
+---
+
+## Mothership Firmware & Hardware
+
+**Example Mothership Hardware:**
+- **MCU:** ESP32-S3
+- **RTC:** DS3231 (I²C)
+- **SD:** datalog.csv (SPI)
+- **Wi-Fi:** Soft AP (`Logger001`, pw: `logger123`)
+
+**On Boot:**
+- Initialise RTC, SD card, Wi-Fi AP (+ web server)
+- Start ESP-NOW, add broadcast & known peers
+- Load previous pair/deploy state from NVS
+- Print current RTC time & wake interval  
+  (start auto-discovery)
+
+**Main tasks in loop():**
+- Handle HTTP web UI
+- Auto discovery & node liveness via `espnow_loop`:
+    - Send `DISCOVERY_SCAN` every 30s
+    - Mark inactive nodes
+- Log `MOTHERSHIP,STATUS,ACTIVE` every 60s
+
+**On ESP-NOW packets:**
+- **sensor_data_message_t:** Ensure node is `DEPLOYED`, log CSV record
+- **DISCOVER_REQUEST:** Register/refresh node, send `DISCOVER_RESPONSE`
+- **PAIRING_REQUEST:** Send `PAIRING_RESPONSE` reflecting current state
+- **REQUEST_TIME:** Send current time via `TIME_SYNC`
+- Other control: actioned via Web UI
+
+---
+
+## Web UI Dashboard
+
+- Served at: [http://192.168.4.1/](http://192.168.4.1/) (connect to Logger001)
+
+### Dashboard Sections
+
+| Section                   | Actions                                                                      |
+|---------------------------|------------------------------------------------------------------------------|
+| **Wake Interval**         | Dropdown: 1, 5, 10, 20, 30, 60 mins; Broadcast to all nodes                  |
+| **Current RTC Time**      | Shows DS3231 time; live browser-ticking                                      |
+| **Data Logging**          | Logging status, Download CSV button                                          |
+| **Node Discovery & Stats**| Mothership MAC, node counts, Discover Nodes button                           |
+| **Unpaired Nodes**        | List: Pair selected nodes                                                    |
+| **Paired (Ready to Deploy)** | List: Deploy nodes {"RTC not synced"}                                     |
+| **Unpair Nodes**          | List: Unpair selected nodes                                                  |
+| **Deployed (Active)**     | List: Revert to Paired button                                                |
+| **RTC Settings Panel**    | Manual DS3231 setting, auto-detect button                                    |
+| **Footer**                | Sticky bar: Refresh, CSV Download (auto-refreshes ~10s)                      |
+
+<details>
+<summary>Dashboard UI Preview (placeholders):</summary>
+
+- ![Dashboard overview](docs/img/dashboard-overview.png)
+- ![Node lists](docs/img/dashboard-nodes.png)
+- ![RTC settings](docs/img/dashboard-rtc-settings.png)
+- ![Wake interval section](docs/img/ui-wake-interval.png)
+- ![RTC time section](docs/img/ui-rtc-time.png)
+- ![Data logging section](docs/img/ui-data-logging.png)
+- ![Discovery & stats](docs/img/ui-discovery-stats.png)
+- ![Unpaired nodes](docs/img/ui-unpaired.png)
+- ![Paired nodes](docs/img/ui-paired.png)
+- ![Unpair nodes](docs/img/ui-unpair.png)
+- ![Deployed nodes](docs/img/ui-deployed.png)
+- ![RTC settings panel](docs/img/ui-rtc-settings-panel.png)
+</details>
+
+---
+
+## Build & Flash
+
+_Note: Assumes PlatformIO, but can adapt for Arduino IDE._
+
+### Mothership
+
+- **Board:** ESP32-S3 dev module
+- **Project:** `mothership/`
+- **Key Files:**
+  - `src/main.cpp`        (Web UI + ESP-NOW + RTC + SD)
+  - `src/espnow_manager.cpp`
+  - `src/rtc_manager.cpp`
+  - `src/sd_manager.cpp`
+  - `include/protocol.h`  (message defs, pins, channel)
+
+**Flash & Monitor:**
+```sh
+pio run -t upload
+pio device monitor
+```
+Connect to Wi-Fi `Logger001`, open `http://192.168.4.1/`.
+
+---
+
+### Node(s)
+
+- **Board:** ESP32-C3 Mini
+- **Project:** e.g., `nodes/air-temperature-node/`
+- **Key Files:**
+  - `src/main.cpp`       (node logic)
+  - `include/protocol.h` (shared)
+  - `rtc_manager.h`      (optional)
+
+**Flash & Monitor:**
+```sh
+pio run -t upload
+pio device monitor
+```
+First boot: Node prints _Searching for motherships…_  
+Mothership should show node under “Unpaired Nodes”.
+
+---
+
+## Current Status & Next Steps
+
+**Current:**
+- ✅ Robust node state model (Unpaired / Paired / Deployed)
+- ✅ Pair / Deploy / Revert / Unpair flows end-to-end
+- ✅ CSV logging to SD card
+- ✅ Web UI for basic ops
+- ✅ NVS persistence (mothership & nodes)
+
+**Future:**
+- DS3231 alarm-based deep sleep on nodes (wake, send, sleep)
+- Real sensor integration (DS18B20, BME280, etc.)
+- Per-node schedule overrides
+- Additional Web UI charts / metrics
+
+---
