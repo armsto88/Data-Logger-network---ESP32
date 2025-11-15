@@ -1,8 +1,7 @@
-// ====== ESP-NOW Web UI (refactored + UX upgrades 1–7) ======
-// Routes, field names, and core logic unchanged.
+// ====== ESP-NOW Web UI – main.cpp with Node Manager & Node Meta ======
 
 // ---------- Config toggles ----------
-#define ENABLE_SPIFFS_ASSETS 0  // (5) set to 1 if you upload /style.css.gz and /app.js.gz
+#define ENABLE_SPIFFS_ASSETS 0  // set to 1 if you upload /style.css.gz and /app.js.gz
 
 // ---------- Includes ----------
 #include <Arduino.h>
@@ -30,11 +29,14 @@ const char* password = "logger123";
 
 Preferences gPrefs;
 int gWakeIntervalMin = 5;          // default shown in UI & used at boot
-const int kAllowedIntervals[] = {1,5,10,20,30,60};
-const size_t kAllowedCount = sizeof(kAllowedIntervals)/sizeof(kAllowedIntervals[0]);
+const int kAllowedIntervals[] = {1, 5, 10, 20, 30, 60};
+const size_t kAllowedCount = sizeof(kAllowedIntervals) / sizeof(kAllowedIntervals[0]);
 
 // ---------- Web server ----------
 WebServer server(80);
+
+// NodeInfo is defined in your ESP-NOW / protocol headers
+extern std::vector<NodeInfo> registeredNodes;
 
 // ---------- UI helpers ----------
 static String formatMac(const uint8_t mac[6]) {
@@ -48,9 +50,9 @@ static void loadWakeIntervalFromNVS() {
   if (gPrefs.begin("ui", true)) {
     int v = gPrefs.getInt("wake_min", gWakeIntervalMin);
     gPrefs.end();
-    bool ok=false; 
-    for (size_t i=0;i<kAllowedCount;i++) 
-      if (v==kAllowedIntervals[i]) { ok=true; break; }
+    bool ok = false;
+    for (size_t i = 0; i < kAllowedCount; i++)
+      if (v == kAllowedIntervals[i]) { ok = true; break; }
     gWakeIntervalMin = ok ? v : 5;
   }
 }
@@ -62,7 +64,103 @@ static void saveWakeIntervalToNVS(int mins) {
   }
 }
 
-// (4) Common CSS/JS in PROGMEM (saves RAM)
+// ---------- Node meta helpers (numeric ID + Name in NVS) ----------
+//
+// Each real nodeId (from firmware) can have:
+//   - userId  → numeric string like "001" (shown as "Node ID", used in CSV)
+//   - name    → free-text name like "North Hedge 01"
+//
+// Both are stored in NVS under namespace "node_meta" as:
+//   id_<nodeId>   and   name_<nodeId>
+
+static String loadNodeMeta(const String& nodeId, const char* fieldPrefix) {
+  Preferences prefs;
+  // readOnly = true is fine *once the namespace exists*
+  if (!prefs.begin("node_meta", /*readOnly=*/true)) {
+    return "";
+  }
+  String key = String(fieldPrefix) + nodeId;  // e.g. "id_TEMP_001"
+  String value = prefs.getString(key.c_str(), "");
+  prefs.end();
+  return value;
+}
+
+
+static void storeNodeMeta(const String& nodeId, const char* fieldPrefix, String value) {
+  Preferences prefs;
+  // readOnly = false → read/write, can create the namespace
+  if (!prefs.begin("node_meta", /*readOnly=*/false)) {
+    Serial.println("⚠️ storeNodeMeta: NVS begin failed");
+    return;
+  }
+
+  String key = String(fieldPrefix) + nodeId;  // e.g. "name_TEMP_001"
+
+  value.trim();
+  if (value.length() == 0) {
+    prefs.remove(key.c_str());  // empty → clear key
+    Serial.printf("[NODES] Cleared %s for %s\n", fieldPrefix, nodeId.c_str());
+  } else {
+    prefs.putString(key.c_str(), value);
+    Serial.printf("[NODES] Set %s for %s → '%s'\n",
+                  fieldPrefix, nodeId.c_str(), value.c_str());
+  }
+  prefs.end();
+}
+
+
+// Numeric Node ID (user-facing, e.g. "001")
+static String getNodeUserId(const String& nodeId) {
+  return loadNodeMeta(nodeId, "id_");
+}
+
+// Enforce "purely numeric" up to 3 chars, e.g. "001", "012", "120"
+static void setNodeUserId(const String& nodeId, String userId) {
+  String cleaned;
+  cleaned.reserve(4);
+  userId.trim();
+  for (size_t i = 0; i < userId.length(); ++i) {
+    char c = userId[i];
+    if (c >= '0' && c <= '9') {
+      cleaned += c;
+      if (cleaned.length() >= 3) break;  // max 3 chars
+    }
+  }
+
+  // Left-pad to 3 digits if non-empty (optional but nice UX)
+  if (cleaned.length() > 0 && cleaned.length() < 3) {
+    while (cleaned.length() < 3) cleaned = "0" + cleaned;
+  }
+
+  storeNodeMeta(nodeId, "id_", cleaned);
+}
+
+// Friendly Name (free text)
+static String getNodeName(const String& nodeId) {
+  return loadNodeMeta(nodeId, "name_");
+}
+
+static void setNodeName(const String& nodeId, String name) {
+  // You could truncate here if you want a hard max length, e.g. 32 chars:
+  const size_t kMaxLen = 32;
+  if (name.length() > kMaxLen) name = name.substring(0, kMaxLen);
+  storeNodeMeta(nodeId, "name_", name);
+}
+
+// Helpers intended for CSV logging (non-static so espnow_manager.cpp can use them)
+String getCsvNodeId(const String& nodeId) {
+  String userId = getNodeUserId(nodeId);
+  if (userId.length() > 0) return userId;
+  return nodeId;         // fallback to firmware ID
+}
+
+String getCsvNodeName(const String& nodeId) {
+  String nm = getNodeName(nodeId);
+  return nm;             // may be empty; CSV can handle blank names
+}
+
+
+// ---------- CSS / JS ----------
 const char COMMON_CSS[] PROGMEM = R"CSS(
 :root{
   --bg:#f5f5f5; --panel:#ffffff; --text:#1b1f23; --sub:#5f6b7a; --border:#e5e7eb;
@@ -94,14 +192,18 @@ a{color:var(--primary);text-decoration:none}
 
 /* Lists/cards */
 .list{display:grid;gap:var(--sp-1)}
-.item{background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:12px}
+.item{background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:12px;display:block;color:inherit}
 .item-row{display:flex;align-items:center;justify-content:space-between;gap:12px}
-.meta{display:flex;gap:6px;flex-wrap:wrap;margin-top:6px}
+
+/* Chips */
 .chip{display:inline-block;padding:2px 8px;border-radius:999px;border:1px solid var(--border);font-size:.85rem;color:var(--sub)}
+.chip--state-deployed{border-color:#c8e6c9;background:#f1f8e9;color:#256029}
+.chip--state-paired{border-color:#ffe0b2;background:#fff3e0;color:#e65100}
+.chip--state-unpaired{border-color:#ffcdd2;background:#ffebee;color:#b71c1c}
 
 /* Forms */
 .label{display:block;margin:8px 0 6px;color:var(--sub);font-size:.95rem}
-.input, input[type="text"], input[type="number"]{
+.input, input[type="text"], input[type="number"], select{
   width:100%;padding:12px;border:1px solid var(--border);border-radius:8px;background:#fff
 }
 .help{color:var(--sub);font-size:.85rem;margin-top:6px}
@@ -115,16 +217,11 @@ a{color:var(--primary);text-decoration:none}
 .btn--primary{background:var(--primary);color:#fff;border-color:transparent}
 .btn--success{background:var(--success);color:#fff;border-color:transparent}
 .btn--warn{background:var(--warn);color:#fff;border-color:transparent}
-.btn--danger{background:var(--danger);color:#fff;border-color:transparent}
 .btn:disabled{opacity:.6;cursor:not-allowed}
 
 /* Utility */
 .center{text-align:center}
 .badge{display:inline-block;padding:2px 8px;border:1px solid var(--border);border-radius:999px;color:var(--sub);font-size:.85rem}
-.card{background:var(--panel);border:1px solid var(--border);border-radius:var(--radius);padding:var(--sp-3);box-shadow:var(--shadow)}
-.log{background:#111;color:#eaeaea;border-radius:8px;padding:12px;max-height:40vh;overflow:auto;font:13px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace}
-
-/* Safe-area aware footer bar */
 .footer-bar{
   position:sticky;bottom:0;background:var(--panel);border:1px solid var(--border);
   padding:calc(var(--sp-2) + env(safe-area-inset-bottom)) var(--sp-3);
@@ -145,7 +242,7 @@ document.addEventListener('submit', function (e) {
   }
 }, {capture:true});
 
-// Existing helpers
+// Set datetime input to browser time
 function setCurrentTime(){
   const n=new Date();
   const z=n=>String(n).padStart(2,'0');
@@ -154,10 +251,9 @@ function setCurrentTime(){
 }
 function toggleSettings(){
   const panel=document.getElementById('settings-panel');
-  const btn=document.getElementById('settings-btn');
+  if(!panel) return;
   const showing=panel.style.display==='block';
-  panel.style.display= showing ? 'none' : 'block';
-  if(btn) btn.textContent = showing ? 'Show RTC Settings' : 'Hide RTC Settings';
+  panel.style.display = showing ? 'none' : 'block';
 }
 window.onload=setCurrentTime;
 
@@ -229,6 +325,11 @@ static String headCommon(const String& title){
 }
 static inline String footCommon(){ return String(F("</div></body></html>")); }
 
+// ---------- Routes / Handlers fwd decl ----------
+void handleNodeConfigForm();
+void handleNodeConfigSave();
+void handleNodesPage();
+
 // ---------- Routes / Handlers ----------
 
 void handleRevertNode() {
@@ -236,16 +337,12 @@ void handleRevertNode() {
   bool found   = false;
   bool sentCmd = false;
 
-  extern std::vector<NodeInfo> registeredNodes;
-
   for (auto& node : registeredNodes) {
     if (node.nodeId == nodeId && node.state == DEPLOYED) {
-      // 1) Update local/UI state and persist
       node.state = PAIRED;
       savePairedNodes();
       found = true;
 
-      // 2) Tell the *actual node* to go back to PAIRED (stop sending data)
       sentCmd = pairNode(nodeId);  // will send PAIR_NODE + PAIRING_RESPONSE
 
       if (sentCmd) {
@@ -265,47 +362,22 @@ void handleRevertNode() {
     html += nodeId;
     html += F("</strong> is now marked as paired.</p>");
     if (!sentCmd) {
-      html += F("<p class='muted'>Warning: could not send PAIR_NODE command to the node – if it keeps sending data the UI may flip back to DEPLOYED.</p>");
+      html += F("<p class='muted'>Warning: could not send PAIR_NODE command to the node.</p>");
     }
   } else {
     html += F("<h3>Node not found or not deployed</h3><p>No action taken.</p>");
   }
-  html += F("<a href='/' class='btn btn--primary'>Back to Dashboard</a></div>");
+  html += F("<a href='/nodes' class='btn btn--primary'>Back to Node Manager</a></div>");
   html += footCommon();
   server.send(200, "text/html", html);
 }
 
-
 void handleRoot() {
   String html = headCommon("ESP32 Data Logger");
 
+  // Current RTC time
   char currentTime[24];
   getRTCTimeString(currentTime, sizeof(currentTime));
-
-  // Wake Interval control
-  html += F("<div class='section'><h3>⏰ Wake Interval</h3>");
-  html += F("<p class='muted'>This sets the DS3231 alarm interval on all paired/deployed nodes.</p>");
-  html += F("<form action='/set-wake-interval' method='POST' class='row'>"
-            "<div class='col'><label class='label'><strong>Interval (minutes)</strong></label>"
-            "<select class='input' name='interval'>");
-
-  for (size_t i=0; i<kAllowedCount; ++i) {
-    int v = kAllowedIntervals[i];
-    html += F("<option value='");
-    html += String(v);
-    html += "'";
-    if (v == gWakeIntervalMin) html += F(" selected");
-    html += F(">");
-    html += String(v);
-    html += F("</option>");
-  }
-  html += F("</select></div>"
-            "<div class='col' style='align-self:end'><button type='submit' class='btn btn--primary'>Broadcast</button></div>"
-            "</form>");
-
-  html += F("<div class='help'>Current interval: <strong>");
-  html += String(gWakeIntervalMin);
-  html += F(" min</strong></div></div>");
 
   String csvStats = getCSVStats();
 
@@ -314,144 +386,111 @@ void handleRoot() {
   auto pairedNodes   = getPairedNodes();
 
   int deployedNodes = 0;
-  for (const auto& node : allNodes)
+  for (const auto& node : allNodes) {
     if (node.state == DEPLOYED && node.isActive) deployedNodes++;
+  }
 
-  // RTC section
-  html += F(
-    "<div class='section center' aria-live='polite'>"
-      "<strong>Current RTC Time</strong><br>"
-      "<div id='rtc-now' style='font-size:18px;color:#1976D2;margin-top:6px'>"
-  );
+  // --- Timing & RTC section ---
+  html += F("<div class='section' aria-live='polite'>"
+            "<h3>⏱ Timing &amp; RTC</h3>"
+            "<p class='muted'>Live DS3231 clock plus the wake interval used by nodes.</p>"
+            "<div class='row'>");
+
+  // Left: RTC
+  html += F("<div class='col'>"
+              "<strong>Current RTC Time</strong><br>"
+              "<div id='rtc-now' style='font-size:18px;color:#1976D2;margin-top:6px'>");
   html += currentTime;
-  html += F("</div></div>");
+  html += F("</div>"
+            "<div class='help'>Clock is driven by the DS3231 on this mothership.</div>"
+            "</div>");
 
-  // Data logging
-  html += F("<div class='section'><h3>📊 Data Logging</h3><p class='muted'><strong>Status:</strong> ");
-  html += csvStats;
-  html += F("</p><a href='/download-csv' class='btn btn--success'>⬇️ Download CSV Data</a>"
-            "<div class='help'>Downloads all logged sensor data</div></div>");
+  // Right: wake interval
+  html += F("<div class='col'>"
+              "<form action='/set-wake-interval' method='POST'>"
+              "<label class='label'><strong>Wake interval (minutes)</strong></label>"
+              "<select class='input' name='interval'>");
 
-  // Discovery + stats
-  html += F("<div class='section'><h3>📡 Node Discovery &amp; Pairing</h3><p class='muted'><strong>Mothership MAC:</strong> ");
-  html += getMothershipsMAC();
-  html += F("</p><div class='stats' style='margin:12px 0'>"
-            "<div class='stat'><strong>Deployed</strong><span class='num'>");
-  html += String(deployedNodes);
-  html += F("</span></div><div class='stat'><strong>Paired</strong><span class='num'>");
-  html += String(pairedNodes.size());
-  html += F("</span></div><div class='stat'><strong>Unpaired</strong><span class='num'>");
-  html += String(unpairedNodes.size());
-  html += F("</span></div></div>"
-            "<form action='/discover-nodes' method='POST'>"
-            "<button type='submit' class='btn btn--primary'>🔍 Discover New Nodes</button>"
-            "</form></div>");
-
-  // Unpaired
-  if (unpairedNodes.size() > 0) {
-    html.reserve(html.length() + 500 + unpairedNodes.size()*140);
-    html += F("<div class='section'><h3>🔴 Unpaired Nodes (");
-    html += String(unpairedNodes.size());
-    html += F(")</h3><p class='muted'>Discovered nodes that are not yet bound to this mothership.</p>"
-              "<form action='/pair-nodes' method='POST' class='list'>");
-    for (const auto& node : unpairedNodes) {
-      html += F("<label class='item item-row'><div style='display:flex;align-items:center;gap:10px'>"
-                "<input type='checkbox' name='selected_nodes' value='");
-      html += node.nodeId;
-      html += F("' aria-label='Select ");
-      html += node.nodeId;
-      html += F("'><div><strong>");
-      html += node.nodeId;
-      html += F("</strong> <span class='muted'>(");
-      html += node.nodeType;
-      html += F(")</span><br><small class='muted'>MAC ");
-      html += formatMac(node.mac);
-      html += F(" • Seen ");
-      html += String((millis() - node.lastSeen) / 1000);
-      html += F(" s ago</small></div></div></label>");
-    }
-    html += F("<button type='submit' class='btn btn--warn'>📋 Pair Selected Nodes</button></form></div>");
+  for (size_t i = 0; i < kAllowedCount; ++i) {
+    int v = kAllowedIntervals[i];
+    html += F("<option value='");
+    html += String(v);
+    html += F("'");
+    if (v == gWakeIntervalMin) html += F(" selected");
+    html += F(">");
+    html += String(v);
+    html += F("</option>");
   }
 
-  // Paired -> Deploy
-  if (pairedNodes.size() > 0) {
-    html.reserve(html.length() + 500 + pairedNodes.size()*110);
-    html += F("<div class='section'><h3>🟠 Paired Nodes (");
-    html += String(pairedNodes.size());
-    html += F(")</h3><p class='muted'>Bound to this mothership; ready for deployment with RTC sync.</p>"
-              "<form action='/deploy-nodes' method='POST' class='list'>");
-    for (const auto& node : pairedNodes) {
-      html += F("<label class='item item-row'><div style='display:flex;align-items:center;gap:10px'>"
-                "<input type='checkbox' name='deploy_nodes' value='");
-      html += node.nodeId;
-      html += F("' checked><div><strong>");
-      html += node.nodeId;
-      html += F("</strong> <span class='muted'>(");
-      html += node.nodeType;
-      html += F(")</span></div></div></label>");
-    }
-    html += F("<button type='submit' class='btn btn--success'>🚀 Deploy Selected Nodes</button></form></div>");
-  }
+  html += F("</select>"
+            "<button type='submit' class='btn btn--primary' style='margin-top:8px'>"
+            "Broadcast to nodes</button>"
+            "<div class='help'>Current default: <strong>");
+  html += String(gWakeIntervalMin);
+  html += F(" min</strong></div>"
+            "</form>"
+            "</div>"); // end col
 
-  // Unpair
-  if (pairedNodes.size() > 0) {
-    html += F("<div class='section'><h3>Unpair Nodes</h3>"
-              "<p class='muted'>Clear the binding on both mothership and node.</p>"
-              "<form action='/unpair-nodes' method='POST' class='list'>");
-    for (const auto& node : pairedNodes) {
-      html += F("<label class='item item-row'><div style='display:flex;align-items:center;gap:10px'>"
-                "<input type='checkbox' name='unpair_nodes' value='");
-      html += node.nodeId;
-      html += F("'><div><strong>");
-      html += node.nodeId;
-      html += F("</strong> <span class='muted'>— ");
-      html += node.nodeType;
-      html += F("</span></div></div></label>");
-    }
-    html += F("<button type='submit' class='btn btn--danger'>🗑️ Unpair Selected</button></form></div>");
-  }
+  html += F("</div>"); // end row
 
-  // Active deployed + revert
-  if (deployedNodes > 0) {
-    html.reserve(html.length() + 500 + deployedNodes*130);
-    html += F("<div class='section'><h3>🟢 Active Deployed Nodes (");
-    html += String(deployedNodes);
-    html += F(")</h3><p class='muted'>Nodes that are deployed and have sent data recently.</p>"
-              "<div class='list'>");
-    for (const auto& node : allNodes) {
-      if (node.state == DEPLOYED && node.isActive) {
-        html += F("<div class='item'><div class='item-row'><div><strong>");
-        html += node.nodeId;
-        html += F("</strong> <span class='muted'>(");
-        html += node.nodeType;
-        html += F(")</span><br><small class='muted'>MAC ");
-        html += formatMac(node.mac);
-        html += F("</small></div><form action='/revert-node' method='POST'>"
-                  "<input type='hidden' name='node_id' value='");
-        html += node.nodeId;
-        html += F("'><button class='btn btn--primary' type='submit'>↩️ Mark as Paired</button>"
-                  "</form></div></div>");
-      }
-    }
-    html += F("</div></div>");
-  }
+  // RTC settings toggle + panel
+  html += F("<div style='margin-top:12px'>"
+            "<button id='settings-btn' class='btn' type='button' onclick='toggleSettings()'>"
+            "⚙️ Set RTC time…"
+            "</button>"
+            "</div>");
 
-  // Settings
-  html += F("<button id='settings-btn' class='btn' onclick='toggleSettings()'>Show RTC Settings</button>"
-            "<div id='settings-panel' class='section' style='display:none'>"
+  html += F("<div id='settings-panel' class='section' style='display:none;margin-top:12px'>"
             "<h3>⚙️ RTC Time Configuration</h3>"
-            "<p class='muted'>Only needed for initial setup or time correction.</p>"
+            "<p class='muted'>Only needed for initial setup or DS3231 correction.</p>"
             "<form action='/set-time' method='POST'>"
-            "<label class='label' for='datetime'><strong>Set New Time</strong></label>"
+            "<label class='label' for='datetime'><strong>Set new time</strong></label>"
             "<input class='input' id='datetime' name='datetime' type='text' "
             "placeholder='YYYY-MM-DD HH:MM:SS' inputmode='numeric' autocomplete='off'>"
             "<div class='row'>"
-            "<button type='button' class='btn' onclick='setCurrentTime()'>Auto-Detect Current Time</button>"
-            "<button type='submit' class='btn btn--success'>Set RTC Time</button>"
-            "</div><div class='help'>Format: 2025-11-09 14:26:00</div>"
-            "</form></div>");
+            "<button type='button' class='btn' onclick='setCurrentTime()'>Use browser time</button>"
+            "<button type='submit' class='btn btn--success'>Set RTC</button>"
+            "</div>"
+            "<div class='help'>Example: 2025-11-14 21:05:00</div>"
+            "</form>"
+            "</div>");
 
-  // Footer bar
+  html += F("</div>"); // end Timing & RTC section
+
+  // --- Data logging section ---
+  html += F("<div class='section'>"
+            "<h3>📊 Data Logging</h3>"
+            "<p class='muted'><strong>Status:</strong> ");
+  html += csvStats;
+  html += F("</p>"
+            "<a href='/download-csv' class='btn btn--success'>⬇️ Download CSV Data</a>"
+            "<div class='help'>Downloads all logged sensor data from /datalog.csv.</div>"
+            "</div>");
+
+  // --- Node discovery & fleet overview ---
+  html += F("<div class='section'>"
+            "<h3>📡 Node Discovery &amp; Fleet Overview</h3>"
+            "<p class='muted'><strong>Mothership MAC:</strong> ");
+  html += getMothershipsMAC();
+  html += F("</p>"
+            "<div class='stats' style='margin:12px 0'>"
+              "<div class='stat'><strong>Deployed</strong><span class='num'>");
+  html += String(deployedNodes);
+  html += F("</span></div>"
+              "<div class='stat'><strong>Paired</strong><span class='num'>");
+  html += String(pairedNodes.size());
+  html += F("</span></div>"
+              "<div class='stat'><strong>Unpaired</strong><span class='num'>");
+  html += String(unpairedNodes.size());
+  html += F("</span></div>"
+            "</div>"
+            "<form action='/discover-nodes' method='POST'>"
+            "<button type='submit' class='btn btn--primary'>🔍 Discover New Nodes</button>"
+            "</form>"
+            "<a href='/nodes' class='btn btn--success' style='margin-top:8px'>🧩 Open Node Manager</a>"
+            "</div>");
+
+  // --- Footer bar ---
   html += F("<div class='footer-bar'>"
             "<a href='/' class='btn'>🔄 Refresh</a>"
             "<a href='/download-csv' class='btn btn--success'>⬇️ CSV</a>"
@@ -495,7 +534,10 @@ void handleSetTime() {
 
 void handleDownloadCSV() {
   File file = SD.open("/datalog.csv");
-  if (!file) { server.send(404, "text/plain", "CSV file not found"); return; }
+  if (!file) {
+    server.send(404, "text/plain", "CSV file not found");
+    return;
+  }
   server.sendHeader("Content-Type", "text/csv");
   server.sendHeader("Content-Disposition", "attachment; filename=datalog.csv");
   server.sendHeader("Connection", "close");
@@ -520,102 +562,11 @@ void handleDiscoverNodes() {
   server.send(200, "text/html", html);
 }
 
-void handlePairNodes() {
-  int pairedCount = 0;
-  String pairedList;
-
-  for (int i = 0; i < server.args(); i++) {
-    if (server.argName(i) == "selected_nodes") {
-      String id = server.arg(i);
-      if (pairNode(id)) { pairedCount++; pairedList += id + ", "; }
-    }
-  }
-
-  String html = headCommon("ESP32 Data Logger");
-  html += F("<div class='section center'>");
-  if (pairedCount > 0) {
-    html += F("<h3>📋 Nodes Paired Successfully</h3><p><strong>");
-    html += String(pairedCount);
-    html += F(" node(s) paired</strong></p><p>");
-    if (pairedList.length() >= 2) pairedList.remove(pairedList.length()-2);
-    html += pairedList;
-    html += F("</p><p>Nodes are ready for deployment with RTC synchronization.</p>");
-  } else {
-    html += F("<h3>⚠️ No Nodes Selected</h3><p>Please select at least one node to pair.</p>");
-  }
-  html += F("<a href='/' class='btn btn--primary'>Back to Dashboard</a></div>");
-  html += footCommon();
-  server.send(200, "text/html", html);
-}
-
-void handleDeployNodes() {
-  std::vector<String> selectedNodes;
-  for (int i = 0; i < server.args(); i++)
-    if (server.argName(i) == "deploy_nodes") selectedNodes.push_back(server.arg(i));
-
-  String html = headCommon("ESP32 Data Logger");
-  html += F("<div class='section center'>");
-
-  if (!selectedNodes.empty()) {
-    char timeStr[32];
-    getRTCTimeString(timeStr, sizeof(timeStr));
-
-    if (deploySelectedNodes(selectedNodes)) {
-      html += F("<h3>🚀 Deployment Successful</h3><p><strong>");
-      html += String(selectedNodes.size());
-      html += F(" node(s) deployed:</strong></p>");
-      for (const auto& id : selectedNodes) {
-        html += F("<p>✅ "); html += id; html += F("</p>");
-      }
-      html += F("<p>RTC Time synchronized: <strong>");
-      html += timeStr;
-      html += F("</strong></p><p>Nodes are now collecting data automatically.</p>");
-    } else {
-      html += F("<h3>⚠️ Partial Deployment</h3><p>Some nodes may not have deployed successfully.</p>"
-                "<p>Check serial monitor for details.</p>");
-    }
-  } else {
-    html += F("<h3>⚠️ No Nodes Selected</h3><p>Please select at least one node to deploy.</p>");
-  }
-
-  html += F("<a href='/' class='btn btn--primary'>Back to Dashboard</a></div>");
-  html += footCommon();
-  server.send(200, "text/html", html);
-}
-
-void handleUnpairNodes() {
-  int removed = 0;
-  String html = headCommon("ESP32 Data Logger");
-  html += F("<div class='section'><h3>Unpair Results</h3><div class='list'>");
-
-  for (int i = 0; i < server.args(); i++) {
-    if (server.argName(i) == "unpair_nodes") {
-      String nid = server.arg(i);
-      bool sendOk = sendUnpairToNode(nid);
-      bool removedLocal = unpairNode(nid);
-
-      html += F("<div class='item'><strong>");
-      html += nid;
-      html += F("</strong><br>");
-      html += sendOk
-        ? F("<span class='chip' style='border-color:#cce5cc;color:#2e7d32'>Remote UNPAIR sent</span> ")
-        : F("<span class='chip' style='border-color:#f5c6cb;color:#b71c1c'>Remote UNPAIR failed</span> ");
-      if (removedLocal) { html += F("<span class='chip' style='border-color:#cce5cc;color:#2e7d32'>Locally unpaired</span>"); removed++; }
-      else              { html += F("<span class='chip' style='border-color:#f5c6cb;color:#b71c1c'>Failed to locally unpair</span>"); }
-      html += F("</div>");
-    }
-  }
-
-  if (removed == 0) html += F("<div class='muted'>⚠️ No nodes were locally unpaired.</div>");
-  html += F("</div><a href='/' class='btn btn--primary' style='margin-top:12px'>Back to Dashboard</a></div>");
-  html += footCommon();
-  server.send(200, "text/html", html);
-}
-
 void handleSetWakeInterval() {
   int interval = server.hasArg("interval") ? server.arg("interval").toInt() : 0;
   bool ok = false;
-  for (size_t i=0; i<kAllowedCount; ++i) if (interval == kAllowedIntervals[i]) { ok = true; break; }
+  for (size_t i = 0; i < kAllowedCount; ++i)
+    if (interval == kAllowedIntervals[i]) { ok = true; break; }
   if (!ok) interval = 5;
 
   bool sent = broadcastWakeInterval(interval);
@@ -635,6 +586,304 @@ void handleSetWakeInterval() {
             "background:#2196F3;color:#fff;text-decoration:none;border-radius:6px'>Back</a></body>");
   server.send(200, "text/html", html);
 }
+
+
+// ---------- Configure & Start: form and handler ----------
+
+void handleNodeConfigForm() {
+  String nodeId = server.arg("node_id");
+
+  NodeInfo* target = nullptr;
+  for (auto& n : registeredNodes) {
+    if (n.nodeId == nodeId) { target = &n; break; }
+  }
+
+  String html = headCommon("Configure Node");
+  html += F("<div class='section'>");
+
+  if (!target) {
+    html += F("<h3>Node not found</h3>"
+              "<p class='muted'>No node with that ID is currently registered.</p>"
+              "<a href='/nodes' class='btn btn--primary'>Back to Node Manager</a>");
+    html += F("</div>");
+    html += footCommon();
+    server.send(404, "text/html", html);
+    return;
+  }
+
+  String userId  = getNodeUserId(target->nodeId);
+  String name    = getNodeName(target->nodeId);
+
+  const char* stateLabel = "Unknown";
+  if (target->state == UNPAIRED) stateLabel = "Unpaired";
+  else if (target->state == PAIRED) stateLabel = "Paired";
+  else if (target->state == DEPLOYED) stateLabel = "Deployed";
+
+  html += F("<h3>⚙️ Configure &amp; Start</h3>"
+            "<p class='muted'>Set a numeric Node ID and a descriptive name, then start or stop the node.</p>");
+
+  html += F("<p><strong>Firmware ID:</strong> ");
+  html += target->nodeId;
+  html += F("<br><strong>Current state:</strong> ");
+  html += stateLabel;
+  html += F("</p>");
+
+  html += F("<form action='/node-config' method='POST'>"
+            "<input type='hidden' name='node_id' value='");
+  html += target->nodeId;
+  html += F("'>"
+
+            "<label class='label'>Node ID (numeric, e.g. 001)</label>"
+            "<input class='input' type='text' name='user_id' maxlength='3' "
+            "placeholder='001' value='");
+  html += userId;
+  html += F("'>"
+
+            "<label class='label'>Name</label>"
+            "<input class='input' type='text' name='name' "
+            "placeholder='e.g. North Hedge 01' value='");
+  html += name;
+  html += F("'>"
+
+            "<label class='label'>Interval (minutes)</label>"
+            "<select class='input' name='interval'>");
+
+  for (size_t i = 0; i < kAllowedCount; ++i) {
+    int v = kAllowedIntervals[i];
+    html += F("<option value='");
+    html += String(v);
+    html += F("'");
+    if (v == gWakeIntervalMin) html += F(" selected");
+    html += F(">");
+    html += String(v);
+    html += F("</option>");
+  }
+
+  html += F("</select>"
+
+            "<label class='label'>Action</label>"
+            "<div class='row'>"
+              "<label style='flex:1'><input type='radio' name='action' value='start' checked> Start / deploy</label>"
+              "<label style='flex:1'><input type='radio' name='action' value='stop'> Stop / keep paired</label>"
+            "</div>"
+
+            "<button type='submit' class='btn btn--success' style='margin-top:12px'>"
+            "Apply &amp; send</button>"
+
+            "</form>"
+            "<div class='help'>"
+            "If the node is unpaired, <em>Start</em> will attempt to pair then deploy. "
+            "If it is deployed, <em>Stop</em> will revert it to the paired state."
+            "</div>");
+
+  html += F("<a href='/nodes' class='btn' style='margin-top:12px'>↩️ Back to Node Manager</a>");
+  html += F("</div>");
+  html += footCommon();
+  server.send(200, "text/html", html);
+}
+
+
+void handleNodeConfigSave() {
+  String nodeId   = server.arg("node_id");   // firmware ID
+  String userId   = server.arg("user_id");   // numeric
+  String name     = server.arg("name");      // friendly name
+  String action   = server.arg("action");
+  int interval    = server.hasArg("interval") ? server.arg("interval").toInt() : gWakeIntervalMin;
+
+  // --- 1) Persist numeric ID + name to NVS ---
+  setNodeUserId(nodeId, userId);
+  setNodeName(nodeId, name);
+
+  // --- 2) Clamp interval ---
+  bool intervalOk = false;
+  for (size_t i = 0; i < kAllowedCount; ++i) {
+    if (interval == kAllowedIntervals[i]) {
+      intervalOk = true;
+      break;
+    }
+  }
+  if (!intervalOk) interval = gWakeIntervalMin;
+
+  // --- 3) Find node entry ---
+  NodeInfo* target = nullptr;
+  for (auto &n : registeredNodes) {
+    if (n.nodeId == nodeId) {
+      target = &n;
+      break;
+    }
+  }
+
+  // --- 4) Apply interval (fleet-wide for now) ---
+  bool scheduleSent = broadcastWakeInterval(interval);
+  gWakeIntervalMin  = interval;
+  saveWakeIntervalToNVS(interval);
+  Serial.printf("[CONFIG] Interval via Configure & Start set to %d min, broadcast=%s\n",
+                interval, scheduleSent ? "OK" : "NO_ELIGIBLE_NODES");
+
+  bool deployOk = false;
+  bool revertOk = false;
+  bool pairOk   = false;
+
+  // --- 5) Start / stop logic ---
+  if (action == "start") {
+    if (target && target->state == UNPAIRED) {
+      pairOk = pairNode(nodeId);
+      if (pairOk) {
+        target->state = PAIRED;
+        savePairedNodes();
+        Serial.printf("[CONFIG] Node %s paired before deployment\n", nodeId.c_str());
+      } else {
+        Serial.printf("[CONFIG] Node %s failed to pair\n", nodeId.c_str());
+      }
+    }
+
+    std::vector<String> ids;
+    ids.push_back(nodeId);
+    deployOk = deploySelectedNodes(ids);
+    Serial.printf("[CONFIG] Start action for %s → deploySelectedNodes: %s\n",
+                  nodeId.c_str(), deployOk ? "OK" : "FAIL");
+
+  } else if (action == "stop") {
+    if (target && target->state == DEPLOYED) {
+      target->state = PAIRED;
+      savePairedNodes();
+      revertOk = pairNode(nodeId);
+      Serial.printf("[CONFIG] Stop action for %s → revert to PAIRED: %s\n",
+                    nodeId.c_str(), revertOk ? "OK" : "FAIL");
+    }
+  }
+
+  // --- 6) Resolve final values for display + NodeInfo ---
+  // Read back from NVS, but fall back to raw form input if empty
+  String finalUserId = getNodeUserId(nodeId);
+  String finalName   = getNodeName(nodeId);
+
+  if (finalUserId.isEmpty()) finalUserId = userId;
+  if (finalName.isEmpty())   finalName   = name;
+
+  // If NodeInfo has userId / name fields, keep them in sync
+  if (target) {
+    target->userId = finalUserId;
+    target->name   = finalName;
+  }
+
+  // --- 7) Feedback page ---
+  String html = headCommon("Configure Node");
+  html += F("<div class='section center'>"
+            "<h3>Node configuration applied</h3>");
+
+  if (!target) {
+    html += F("<p class='muted'>Warning: this node ID is not currently in the registered list. "
+              "Commands may not have reached any device.</p>");
+  }
+
+  html += F("<p><strong>Firmware ID:</strong> ");
+  html += nodeId;
+  html += F("<br><strong>Node ID (numeric):</strong> ");
+  html += (finalUserId.length() ? finalUserId : String("-"));
+  html += F("<br><strong>Name:</strong> ");
+  html += (finalName.length() ? finalName : String("-"));
+  html += F("<br><strong>Interval:</strong> ");
+  html += String(interval);
+  html += F(" min<br><strong>Action:</strong> ");
+  html += action;
+  html += F("</p>");
+
+  html += F("<p class='muted'>"
+            "Schedule broadcast: ");
+  html += scheduleSent ? "OK" : "no eligible PAIRED/DEPLOYED nodes";
+  html += F("<br>Pair (if unpaired): ");
+  html += pairOk ? "OK" : "not requested / failed";
+  html += F("<br>Start / deploy: ");
+  html += deployOk ? "OK" : "not requested / failed";
+  html += F("<br>Stop / revert: ");
+  html += revertOk ? "OK" : "not requested / failed";
+  html += F("</p>"
+            "<a href='/nodes' class='btn btn--primary'>Back to Node Manager</a>"
+            "</div>");
+
+  html += footCommon();
+  server.send(200, "text/html", html);
+}
+
+
+void handleNodesPage() {
+  String html = headCommon("Node Manager");
+
+  auto allNodes = getRegisteredNodes();
+
+  html += F("<div class='section'>"
+            "<h3>🧩 Node Manager</h3>"
+            "<p class='muted'>Tap a node to configure its ID, name, interval and start/stop state.</p>");
+
+  if (allNodes.empty()) {
+    html += F("<p class='muted'>No nodes registered yet. Try discovering and pairing first.</p>");
+  } else {
+    html += F("<div class='list'>");
+
+    for (auto &node : allNodes) {
+      const char* stateLabel = "Unknown";
+      const char* stateClass = "chip";
+
+      if (node.state == UNPAIRED) {
+        stateLabel = "Unpaired";
+        stateClass = "chip chip--state-unpaired";
+      } else if (node.state == PAIRED) {
+        stateLabel = "Paired";
+        stateClass = "chip chip--state-paired";
+      } else if (node.state == DEPLOYED) {
+        stateLabel = "Deployed";
+        stateClass = "chip chip--state-deployed";
+      }
+
+      String userId = getNodeUserId(node.nodeId);  // numeric e.g. "001"
+      String name   = getNodeName(node.nodeId);    // free-text
+
+      html += F("<a href='/node-config?node_id=");
+      html += node.nodeId;
+      html += F("' class='item'>"
+                "<div class='item-row'>"
+                  "<div>");
+
+      // First line: Node ID (numeric if set) + firmware ID in muted text
+      html += F("<strong>");
+      if (userId.length()) {
+        html += userId;
+      } else {
+        html += node.nodeId;
+      }
+      html += F("</strong>");
+
+      html += F("<br><span class='muted'>FW: ");
+      html += node.nodeId;
+      html += F("</span>");
+
+      // Third line: name (if any)
+      if (name.length()) {
+        html += F("<br><span class='muted'>");
+        html += name;
+        html += F("</span>");
+      }
+
+      html += F("</div><div><span class='");
+      html += stateClass;
+      html += F("'>");
+      html += stateLabel;
+      html += F("</span></div>"
+                "</div>"
+              "</a>");
+    }
+
+    html += F("</div>"); // .list
+  }
+
+  html += F("<a href='/' class='btn' style='margin-top:12px'>↩️ Back to Dashboard</a>");
+  html += F("</div>"); // .section
+
+  html += footCommon();
+  server.send(200, "text/html", html);
+}
+
 
 // ---------- Setup / Loop ----------
 void setup() {
@@ -685,15 +934,17 @@ void setup() {
 #endif
 
   // Routes
-  server.on("/", handleRoot);
+  server.on("/", HTTP_GET, handleRoot);
   server.on("/set-time", HTTP_POST, handleSetTime);
   server.on("/download-csv", HTTP_GET, handleDownloadCSV);
   server.on("/discover-nodes", HTTP_POST, handleDiscoverNodes);
-  server.on("/pair-nodes", HTTP_POST, handlePairNodes);
-  server.on("/deploy-nodes", HTTP_POST, handleDeployNodes);
-  server.on("/revert-node", HTTP_POST, handleRevertNode);
-  server.on("/unpair-nodes", HTTP_POST, handleUnpairNodes);
   server.on("/set-wake-interval", HTTP_POST, handleSetWakeInterval);
+
+  // Node manager + config routes
+  server.on("/nodes", HTTP_GET, handleNodesPage);
+  server.on("/node-config", HTTP_GET, handleNodeConfigForm);
+  server.on("/node-config", HTTP_POST, handleNodeConfigSave);
+  server.on("/revert-node", HTTP_POST, handleRevertNode); // still available if you use it elsewhere
 
   server.begin();
   Serial.println("✅ Web server started!");
@@ -718,6 +969,7 @@ void loop() {
   if (millis() - lastMothershipLog > 60000) {
     char timeBuffer[24];
     getRTCTimeString(timeBuffer, sizeof(timeBuffer));
+    // Note: CSV schema for mothership is still the old one – fine for now.
     String csvRow = String(timeBuffer) + ",MOTHERSHIP," + getMothershipsMAC() + ",STATUS,ACTIVE";
     if (logCSVRow(csvRow)) Serial.println("✅ Mothership status logged");
     lastMothershipLog = millis();

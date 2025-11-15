@@ -24,14 +24,19 @@ enum NodeState : uint8_t {
   DEPLOYED = 2
 };
 
+// e.g. in protocol.h or espnow_manager.h
 struct NodeInfo {
-  uint8_t     mac[6]        = {0};
-  String      nodeId;                     // e.g. "TEMP_001"
-  String      nodeType;                   // e.g. "temperature", "humidity"
-  unsigned long lastSeen    = 0;          // millis()
-  bool        isActive      = false;      // seen recently
-  NodeState   state         = UNPAIRED;
-  int         channel       = ESPNOW_PAIRING_CHANNEL; // known/assumed WiFi channel
+    uint8_t  mac[6];
+    String   nodeId;      // firmware ID, e.g. "TEMP_001"
+    String   nodeType;
+    uint32_t lastSeen;
+    bool     isActive;
+    NodeState state;
+    uint8_t  channel;
+
+    // NEW: user-facing metadata
+    String   userId;      // numeric, e.g. "001"
+    String   name;        // friendly name, e.g. "North Hedge 01"
 };
 
 // -----------------------------------------------------------------------------

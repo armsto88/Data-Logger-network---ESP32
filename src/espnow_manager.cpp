@@ -19,6 +19,15 @@ extern const int     NUM_KNOWN_SENSORS;
 
 std::vector<NodeInfo> registeredNodes;
 
+// From main.cpp – helpers that map firmware nodeId -> CSV ID + name
+String getCsvNodeId(const String& nodeId);
+String getCsvNodeName(const String& nodeId);
+
+// Also import raw meta (for NodeInfo)
+String getNodeUserId(const String& nodeId);
+String getNodeName(const String& nodeId);
+
+
 // ----------------- small helpers -----------------
 static void ensurePeerOnChannel(const uint8_t mac[6], uint8_t channel) {
     esp_now_peer_info_t peer{};
@@ -43,7 +52,7 @@ void registerNode(const uint8_t* mac,
                   const char* nodeType /*= "unknown"*/,
                   NodeState state     /*= UNPAIRED*/)
 {
-    bool found = false;
+    bool found    = false;
     bool upgraded = false;
 
     for (auto& node : registeredNodes) {
@@ -54,7 +63,7 @@ void registerNode(const uint8_t* mac,
             // Only ever upgrade: UNPAIRED < PAIRED < DEPLOYED
             if (state > node.state) {
                 node.state = state;
-                upgraded = true;
+                upgraded   = true;
             }
 
             node.nodeType = String(nodeType);  // keep type fresh
@@ -63,25 +72,24 @@ void registerNode(const uint8_t* mac,
         }
     }
 
-    if (!found) {
-        NodeInfo n{};
-        memcpy(n.mac, mac, 6);
-        n.nodeId   = String(nodeId);
-        n.nodeType = String(nodeType);
-        n.lastSeen = millis();
-        n.isActive = true;
-        n.state    = state;
-        n.channel  = ESPNOW_CHANNEL;
+if (!found) {
+    NodeInfo n{};
+    memcpy(n.mac, mac, 6);
+    n.nodeId   = String(nodeId);
+    n.nodeType = String(nodeType);
+    n.lastSeen = millis();
+    n.isActive = true;
+    n.state    = state;
+    n.channel  = ESPNOW_CHANNEL;
 
-        registeredNodes.push_back(n);
+  
+    registeredNodes.push_back(n);
 
-        ensurePeerOnChannel(mac, ESPNOW_CHANNEL);
-        Serial.printf("✅ New node: %s (%s) state=%d\n",
-                      nodeId, macToStr(mac).c_str(), (int)state);
-    } else if (upgraded) {
-        Serial.printf("🔼 Node %s upgraded to state=%d\n",
-                      nodeId, (int)state);
-    }
+    ensurePeerOnChannel(mac, ESPNOW_CHANNEL);
+    Serial.printf("✅ New node: %s (%s) state=%d\n",
+                  nodeId, macToStr(mac).c_str(), (int)state);
+}
+
 }
 
 NodeState getNodeState(const char* nodeId) {
@@ -109,23 +117,47 @@ static void OnDataRecv(const uint8_t * mac,
         char ts[24];
         getRTCTimeString(ts, sizeof(ts));
 
-        // Log MAC in lowercase colon format for CSV (keep your existing style)
-        String macStr;
-        for (int i = 0; i < 6; i++) {
-            if (i) macStr += ":";
-            char bb[3];
-            snprintf(bb, sizeof(bb), "%02x", mac[i]);
-            macStr += bb;
+           // MAC in lowercase colon format (as before)
+    String macStr;
+    for (int i = 0; i < 6; i++) {
+        if (i) macStr += ":";
+        char bb[3];
+        snprintf(bb, sizeof(bb), "%02x", mac[i]);
+        macStr += bb;
+    }
+
+    // Map firmware nodeId -> CSV node_id (numeric) + node_name (friendly)
+    String fwId    = String(incoming.nodeId);        // e.g. "TEMP_001"
+    String csvId   = getCsvNodeId(fwId);             // e.g. "001"
+    String csvName = getCsvNodeName(fwId);           // e.g. "North Hedge 01"
+
+    // If we have a NodeInfo with in-memory meta, prefer that
+    for (auto &n : registeredNodes) {
+        if (n.nodeId == fwId) {
+            if (!n.userId.isEmpty()) csvId   = n.userId;
+            if (!n.name.isEmpty())   csvName = n.name;
+            break;
         }
+    }
 
-        String row = String(ts) + "," +
-                     incoming.nodeId + "," +
-                     macStr + "," +
-                     incoming.sensorType + "," +
-                     String(incoming.value);
+    String row;
+    row.reserve(160);
+    row  = ts;              // timestamp
+    row += ",";
+    row += csvId;           // node_id (numeric, falls back to fwId if empty)
+    row += ",";
+    row += csvName;         // node_name (may be empty)
+    row += ",";
+    row += macStr;          // raw MAC
+    row += ",";
+    row += incoming.sensorType;
+    row += ",";
+    row += String(incoming.value);
 
-        if (logCSVRow(row)) Serial.println("✅ Node data logged");
-        else                Serial.println("❌ Failed to log node data");
+    if (logCSVRow(row)) Serial.println("✅ Node data logged");
+    else                Serial.println("❌ Failed to log node data");
+
+
         return;
     }
 
@@ -380,7 +412,6 @@ void loadPairedNodes() {
 }
 
 // ----------------- Commands / broadcasts -----------------
-
 bool broadcastWakeInterval(int intervalMinutes) {
     schedule_command_message_t cmd{};
     strcpy(cmd.command, "SET_SCHEDULE");
@@ -461,50 +492,48 @@ bool sendDiscoveryBroadcast() {
 
 // Pair a specific node (deterministic + immediate ack)
 bool pairNode(const String& nodeId) {
-  for (auto& node : registeredNodes) {
-    if (node.nodeId == nodeId) {   // 👈 no state filter
+    for (auto& node : registeredNodes) {
+        if (node.nodeId == nodeId) {   // 👈 no state filter
 
-      // Ensure peer is present and on the right channel
-      ensurePeerOnChannel(node.mac, ESPNOW_CHANNEL);
-      esp_wifi_set_channel(ESPNOW_CHANNEL, WIFI_SECOND_CHAN_NONE);
-      delay(10);
+            // Ensure peer is present and on the right channel
+            ensurePeerOnChannel(node.mac, ESPNOW_CHANNEL);
+            esp_wifi_set_channel(ESPNOW_CHANNEL, WIFI_SECOND_CHAN_NONE);
+            delay(10);
 
-      // 1) Explicit PAIR_NODE command
-      pairing_command_t pairCmd{};
-      strcpy(pairCmd.command, "PAIR_NODE");
-      strcpy(pairCmd.nodeId, nodeId.c_str());
-      strncpy(pairCmd.mothership_id, DEVICE_ID, sizeof(pairCmd.mothership_id) - 1);
+            // 1) Explicit PAIR_NODE command
+            pairing_command_t pairCmd{};
+            strcpy(pairCmd.command, "PAIR_NODE");
+            strcpy(pairCmd.nodeId, nodeId.c_str());
+            strncpy(pairCmd.mothership_id, DEVICE_ID, sizeof(pairCmd.mothership_id) - 1);
 
-      esp_err_t sendPairCmd = esp_now_send(node.mac, (uint8_t*)&pairCmd, sizeof(pairCmd));
+            esp_err_t sendPairCmd = esp_now_send(node.mac, (uint8_t*)&pairCmd, sizeof(pairCmd));
 
-      // 2) Flip local state and persist
-      node.state = PAIRED;
+            // 2) Flip local state and persist
+            node.state = PAIRED;
 
-      // 3) Immediate PAIRING_RESPONSE (legacy / extra confirmation)
-      pairing_response_t resp{};
-      strcpy(resp.command, "PAIRING_RESPONSE");
-      strcpy(resp.nodeId, nodeId.c_str());
-      resp.isPaired = true;
-      strncpy(resp.mothership_id, DEVICE_ID, sizeof(resp.mothership_id) - 1);
+            // 3) Immediate PAIRING_RESPONSE (legacy / extra confirmation)
+            pairing_response_t resp{};
+            strcpy(resp.command, "PAIRING_RESPONSE");
+            strcpy(resp.nodeId, nodeId.c_str());
+            resp.isPaired = true;
+            strncpy(resp.mothership_id, DEVICE_ID, sizeof(resp.mothership_id) - 1);
 
-      esp_err_t sendResp = esp_now_send(node.mac, (uint8_t*)&resp, sizeof(resp));
+            esp_err_t sendResp = esp_now_send(node.mac, (uint8_t*)&resp, sizeof(resp));
 
-      Serial.printf("📤 pairNode(%s): PAIR_NODE=%s, PAIRING_RESPONSE=%s\n",
-                    nodeId.c_str(),
-                    (sendPairCmd == ESP_OK ? "OK" : esp_err_to_name(sendPairCmd)),
-                    (sendResp   == ESP_OK ? "OK" : esp_err_to_name(sendResp)));
+            Serial.printf("📤 pairNode(%s): PAIR_NODE=%s, PAIRING_RESPONSE=%s\n",
+                          nodeId.c_str(),
+                          (sendPairCmd == ESP_OK ? "OK" : esp_err_to_name(sendPairCmd)),
+                          (sendResp   == ESP_OK ? "OK" : esp_err_to_name(sendResp)));
 
-      savePairedNodes();
+            savePairedNodes();
 
-      // Success if either packet went out
-      return (sendPairCmd == ESP_OK) || (sendResp == ESP_OK);
+            // Success if either packet went out
+            return (sendPairCmd == ESP_OK) || (sendResp == ESP_OK);
+        }
     }
-  }
-  Serial.printf("⚠️ pairNode(%s): nodeId not found\n", nodeId.c_str());
-  return false;
+    Serial.printf("⚠️ pairNode(%s): nodeId not found\n", nodeId.c_str());
+    return false;
 }
-
-
 
 // Deploy selected paired nodes with RTC time
 bool deploySelectedNodes(const std::vector<String>& nodeIds) {
