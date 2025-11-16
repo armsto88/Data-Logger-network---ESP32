@@ -5,9 +5,12 @@
 #include <Wire.h>
 #include <RTClib.h>
 #include <esp_wifi.h>
+#include <Preferences.h>
+#include <nvs_flash.h>
+#include <nvs.h>
+#include "esp_system.h"
 
 #include "protocol.h"     // pins, ESPNOW_CHANNEL, protocol structs
-#include <Preferences.h>
 
 #ifndef FW_BUILD
   #define FW_BUILD __DATE__ " " __TIME__
@@ -24,6 +27,21 @@ static inline void formatTime(const DateTime& dt, char* out, size_t n) {
   snprintf(out, n, "%04d-%02d-%02d %02d:%02d:%02d",
            dt.year(), dt.month(), dt.day(),
            dt.hour(), dt.minute(), dt.second());
+}
+
+static void initNVS()
+{
+  esp_err_t err = nvs_flash_init();
+  if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+    Serial.printf("[NVS] init err: %s → erasing NVS partition...\n", esp_err_to_name(err));
+    ESP_ERROR_CHECK(nvs_flash_erase());
+    err = nvs_flash_init();
+  }
+  if (err == ESP_OK) {
+    Serial.println("[NVS] init OK");
+  } else {
+    Serial.printf("[NVS] init FAILED: %s\n", esp_err_to_name(err));
+  }
 }
 
 // ---- DS3231 INT/SQW monitoring (active-LOW, open-drain) ----
@@ -86,8 +104,7 @@ static bool ds3231EveryMinute() {
   uint8_t A1HOUR = 0b10000000;               // ignore hours
   uint8_t A1DAY  = 0b10000000;               // ignore day/date
 
-  // Enable interrupt on alarm
-  // CTRL: INTCN=1 (bit2), A1IE=1 (bit0)
+  // Enable interrupt on alarm: CTRL: INTCN=1 (bit2), A1IE=1 (bit0)
   Wire.beginTransmission(0x68);
   Wire.write(0x0E); // CTRL
   Wire.endTransmission(false);
@@ -138,7 +155,7 @@ static bool ds3231ArmNextInNMinutes(uint8_t intervalMin, DateTime* nextOut = nul
   Wire.beginTransmission(0x68); Wire.write(0x0E); Wire.endTransmission(false);
   Wire.requestFrom(0x68, 1);
   uint8_t ctrl = Wire.available() ? Wire.read() : 0;
-  ctrl |= 0b00000101;
+  ctrl |= 0b00000101;  // INTCN (bit2) + A1IE (bit0)
   Wire.beginTransmission(0x68); Wire.write(0x0E); Wire.write(ctrl); Wire.endTransmission();
 
   // Clear pending alarm
@@ -151,22 +168,25 @@ static bool ds3231ArmNextInNMinutes(uint8_t intervalMin, DateTime* nextOut = nul
   if (nextOut) *nextOut = next;
   return ds3231WriteA1(secBCD, minBCD, hourBCD, dayReg);
 }
-// Node States (for logging / loop logic only – no separate stored state)
+
+// -------------------- Node state --------------------
 enum NodeState {
   STATE_UNPAIRED = 0,   // no mothership MAC known
   STATE_PAIRED   = 1,   // has mothership MAC, but not deployed
-  STATE_DEPLOYED = 2    // has mothership MAC + RTC synced (deployed)
+  STATE_DEPLOYED = 2    // has mothership MAC + deployed flag set
 };
 
+// ✅ actual stored state (for logging / NVS only, logic uses currentNodeState())
+static NodeState nodeState = STATE_UNPAIRED;
+
 // -------------------- Persistent config in RTC RAM --------------------
-RTC_DATA_ATTR int       bootCount     = 0;
-RTC_DATA_ATTR bool      rtcSynced     = false;     // true once DEPLOY_NODE or TIME_SYNC sets RTC
-RTC_DATA_ATTR uint8_t   mothershipMAC[6] = {0};    // 0 = not bound to any mothership yet
-RTC_DATA_ATTR uint8_t   g_intervalMin = 1;         // default 1 minute
-RTC_DATA_ATTR NodeState nodeState = STATE_UNPAIRED;
+RTC_DATA_ATTR int       bootCount       = 0;
+RTC_DATA_ATTR bool      rtcSynced       = false;
+RTC_DATA_ATTR uint8_t   mothershipMAC[6] = {0};
+RTC_DATA_ATTR uint8_t   g_intervalMin   = 1;
+RTC_DATA_ATTR bool      deployedFlag    = false;
 
-
-// --- Derived state helpers (simpler model) ---
+// --- Derived state helpers ---
 static bool hasMothershipMAC() {
   for (int i = 0; i < 6; ++i) {
     if (mothershipMAC[i] != 0) return true;
@@ -174,24 +194,46 @@ static bool hasMothershipMAC() {
   return false;
 }
 
-
 static NodeState currentNodeState() {
   if (!hasMothershipMAC()) return STATE_UNPAIRED;
-  if (!rtcSynced)          return STATE_PAIRED;    // bound but not deployed
-  return STATE_DEPLOYED;                           // bound + deployed
+  if (!deployedFlag)       return STATE_PAIRED;   // bound but not deployed
+  return STATE_DEPLOYED;                          // bound + deployed
+}
+
+// Optional: tiny helper for debugging
+static void debugState(const char* where) {
+  NodeState s = currentNodeState();
+  Serial.print("[STATE] ");
+  Serial.print(where);
+  Serial.print(" hasMS=");
+  Serial.print(hasMothershipMAC());
+  Serial.print(" rtcSynced=");
+  Serial.print(rtcSynced);
+  Serial.print(" deployedFlag=");
+  Serial.print(deployedFlag);
+  Serial.print(" -> ");
+  if (s == STATE_UNPAIRED)      Serial.println("UNPAIRED");
+  else if (s == STATE_PAIRED)   Serial.println("PAIRED");
+  else                          Serial.println("DEPLOYED");
 }
 
 // ---------- Persistent config (NVS) ----------
 static void persistNodeConfig() {
   Preferences p;
-  if (!p.begin("node_cfg", /*readWrite=*/true)) {
+
+  // ✅ open in read/write (second arg = readOnly, so must be false)
+  if (!p.begin("node_cfg", false /* readWrite */)) {
     Serial.println("⚠️ persistNodeConfig: begin() failed");
     return;
   }
 
-  p.putString("fw", FW_BUILD);
-  p.putBool("rtc_synced", rtcSynced);
-  p.putUChar("interval", g_intervalMin);
+  // Keep nodeState in sync with the derived state
+  nodeState = currentNodeState();  // ✅
+
+  p.putUChar("state",      (uint8_t)nodeState);
+  p.putBool ("rtc_synced", rtcSynced);
+  p.putBool ("deployed",   deployedFlag);
+  p.putUChar("interval",   g_intervalMin);
 
   // store mothership MAC as 12-char hex string
   char macHex[13];
@@ -203,49 +245,59 @@ static void persistNodeConfig() {
 
   p.end();
   Serial.println("💾 Node config persisted to NVS");
+
+  // --- immediate re-read sanity check ---
+  Preferences p2;
+  if (p2.begin("node_cfg", true /* readOnly */)) {  // ✅
+    uint8_t st = p2.getUChar("state", 255);
+    String ms  = p2.getString("msmac", "");
+    bool dep   = p2.getBool("deployed", false);
+    bool rs    = p2.getBool("rtc_synced", false);
+    p2.end();
+    Serial.printf("🔍 NVS verify: state=%u deployed=%d rtc_synced=%d msmac='%s'\n",
+                  st, dep, rs, ms.c_str());
+  } else {
+    Serial.println("⚠️ NVS verify: begin() failed");
+  }
 }
 
 static void loadNodeConfig() {
   Preferences p;
-  if (!p.begin("node_cfg", /*readWrite=*/true)) {
-    Serial.println("⚠️ loadNodeConfig: begin() failed");
-    return;
-  }
 
-  String prevFw = p.getString("fw", "");
-  if (prevFw != String(FW_BUILD)) {
-    // New firmware → reset soft state
-    Serial.println("🧽 New firmware detected — resetting node binding + RTC sync");
-    rtcSynced = false;
+  // ✅ open in read-only (safer)
+  if (!p.begin("node_cfg", true /* readOnly */)) {
+    Serial.println("⚠️ loadNodeConfig: begin() failed (read-only)");
+    nodeState     = STATE_UNPAIRED;
+    rtcSynced     = false;
+    deployedFlag  = false;
     g_intervalMin = 1;
     memset(mothershipMAC, 0, sizeof(mothershipMAC));
-    p.putString("fw", FW_BUILD);
-    p.putBool("rtc_synced", rtcSynced);
-    p.putUChar("interval", g_intervalMin);
-    p.putString("msmac", "");
-    p.end();
     return;
   }
 
-  rtcSynced     = p.getBool("rtc_synced", false);
-  g_intervalMin = p.getUChar("interval", g_intervalMin);
+  // These get default values if keys are missing
+  uint8_t rawState = p.getUChar("state", (uint8_t)STATE_UNPAIRED);
+  rtcSynced        = p.getBool ("rtc_synced", false);
+  deployedFlag     = p.getBool ("deployed",   false);
+  g_intervalMin    = p.getUChar("interval",   1);
 
   String macHex = p.getString("msmac", "");
+  p.end();
+
+  if (rawState <= (uint8_t)STATE_DEPLOYED) nodeState = (NodeState)rawState;
+  else                                     nodeState = STATE_UNPAIRED;
+
   if (macHex.length() == 12) {
     for (int i = 0; i < 6; ++i) {
       String b = macHex.substring(i*2, i*2+2);
       mothershipMAC[i] = (uint8_t) strtoul(b.c_str(), nullptr, 16);
     }
+  } else {
+    memset(mothershipMAC, 0, sizeof(mothershipMAC));
   }
 
-  p.end();
-
-  NodeState st = currentNodeState();
-  Serial.print("💾 Node config loaded from NVS: state=");
-  if (st == STATE_UNPAIRED) Serial.print("UNPAIRED");
-  else if (st == STATE_PAIRED) Serial.print("PAIRED");
-  else Serial.print("DEPLOYED");
-  Serial.print(", interval="); Serial.println(g_intervalMin);
+  Serial.printf("💾 Node config loaded from NVS: state=%u, rtcSynced=%d, deployed=%d, interval=%u, msmac='%s'\n",
+                (unsigned)nodeState, rtcSynced, deployedFlag, g_intervalMin, macHex.c_str());
 }
 
 // -------------------- ESP-NOW --------------------
@@ -265,7 +317,7 @@ static void onDataReceived(const uint8_t *mac, const uint8_t *incomingData, int 
   Serial.print("📨 ESP-NOW message received, len=");
   Serial.println(len);
 
-  // 1) Discovery response
+  // 1) Discovery-type messages
   if (len == sizeof(discovery_response_t)) {
     discovery_response_t resp;
     memcpy(&resp, incomingData, sizeof(resp));
@@ -290,7 +342,9 @@ static void onDataReceived(const uint8_t *mac, const uint8_t *incomingData, int 
       } else {
         Serial.println("❌ Failed to add mothership as peer");
       }
+
       persistNodeConfig();
+      debugState("after DISCOVER_RESPONSE");
     }
     else if (strcmp(resp.command, "DISCOVERY_SCAN") == 0) {
       // Always respond so UI can see us even if states drift
@@ -309,7 +363,9 @@ static void onDataReceived(const uint8_t *mac, const uint8_t *incomingData, int 
       if (pr.isPaired) {
         Serial.println("📋 Pairing confirmed via PAIRING_RESPONSE");
         memcpy(mothershipMAC, mac, 6);
+        // PAIRED but not yet deployed
         persistNodeConfig();
+        debugState("after PAIRING_RESPONSE");
       } else {
         Serial.println("📋 Still unpaired; continuing discovery…");
       }
@@ -317,31 +373,28 @@ static void onDataReceived(const uint8_t *mac, const uint8_t *incomingData, int 
     return;
   }
 
-if (len == sizeof(pairing_command_t)) {
-  pairing_command_t pc;
-  memcpy(&pc, incomingData, sizeof(pc));
+  // 3) Direct PAIR_NODE command
+  if (len == sizeof(pairing_command_t)) {
+    pairing_command_t pc;
+    memcpy(&pc, incomingData, sizeof(pc));
 
-  if (strcmp(pc.command, "PAIR_NODE") == 0 && strcmp(pc.nodeId, NODE_ID) == 0) {
-    Serial.println("📋 Direct PAIR_NODE command received");
+    if (strcmp(pc.command, "PAIR_NODE") == 0 && strcmp(pc.nodeId, NODE_ID) == 0) {
+      Serial.println("📋 Direct PAIR_NODE command received");
 
-    // We’re still bound to this mothership
-    memcpy(mothershipMAC, mac, 6);
+      memcpy(mothershipMAC, mac, 6);
 
-    // ⇩⇩ KEY LINES ⇩⇩
-    // Going back to "paired but NOT deployed":
-    rtcSynced = false;           // deployment is no longer valid
-    nodeState = STATE_PAIRED;    // if you still use nodeState in your loop
+      // back to "paired but NOT deployed"
+      rtcSynced    = false;
+      deployedFlag = false;
+      persistNodeConfig();
+      Serial.println("💾 Node state persisted after PAIR_NODE (rtcSynced=false, deployed=false)");
 
-    // Persist updated config/state
-    persistNodeConfig();
-    Serial.println("💾 Node state persisted after PAIR_NODE (rtcSynced=false, STATE_PAIRED)");
+      debugState("after PAIR_NODE");
+    }
+    return;
   }
-  return;
-}
 
-
-
-  // 3) Deployment command (RTC time set)
+  // 4) Deployment command (RTC time set)
   if (len == sizeof(deployment_command_t)) {
     deployment_command_t dc;
     memcpy(&dc, incomingData, sizeof(dc));
@@ -350,39 +403,40 @@ if (len == sizeof(pairing_command_t)) {
       Serial.println("🚀 Deployment command received");
 
       rtc.adjust(DateTime(dc.year, dc.month, dc.day, dc.hour, dc.minute, dc.second));
-      rtcSynced = true;
+      rtcSynced    = true;      // time is now good
+      deployedFlag = true;      // mark as deployed
       memcpy(mothershipMAC, mac, 6);
-      persistNodeConfig();      // ensure we remember RTC synced + MAC
+      persistNodeConfig();
 
       Serial.print("RTC synchronized to: ");
       Serial.println(rtc.now().timestamp());
       Serial.println("✅ Node deployed; will start transmitting data");
+
+      debugState("after DEPLOY");
     }
     return;
   }
 
-  // 4) Remote unpair
-if (len == sizeof(unpair_command_t)) {
-  unpair_command_t uc;
-  memcpy(&uc, incomingData, sizeof(uc));
+  // 5) Remote unpair
+  if (len == sizeof(unpair_command_t)) {
+    unpair_command_t uc;
+    memcpy(&uc, incomingData, sizeof(uc));
 
-  if (strcmp(uc.command, "UNPAIR_NODE") == 0) {
-    Serial.println("🗑️ UNPAIR received");
+    if (strcmp(uc.command, "UNPAIR_NODE") == 0) {
+      Serial.println("🗑️ UNPAIR received");
 
-    memset(mothershipMAC, 0, sizeof(mothershipMAC)); // forget who we belong to
-    rtcSynced = false;                                // definitely not deployed
-    nodeState = STATE_UNPAIRED;                       // for any code using nodeState
-
-    persistNodeConfig();
-    Serial.println("💾 Node config persisted after UNPAIR");
-    sendDiscoveryRequest();                           // announce ourselves again
+      memset(mothershipMAC, 0, sizeof(mothershipMAC));
+      rtcSynced    = false;
+      deployedFlag = false;
+      persistNodeConfig();
+      Serial.println("💾 Node config persisted after UNPAIR");
+      sendDiscoveryRequest();
+      debugState("after UNPAIR");
+    }
+    return;
   }
-  return;
-}
 
-
-
-  // 5) Schedule / interval command (set DS3231 Alarm)
+  // 6) Schedule / interval command (set DS3231 Alarm)
   if (len == sizeof(schedule_command_message_t)) {
     schedule_command_message_t cmd;
     memcpy(&cmd, incomingData, sizeof(cmd));
@@ -424,7 +478,7 @@ if (len == sizeof(unpair_command_t)) {
     return;
   }
 
-  // 6) Time sync response from mothership
+  // 7) Time sync response from mothership
   if (len == sizeof(time_sync_response_t)) {
     time_sync_response_t resp;
     memcpy(&resp, incomingData, sizeof(resp));
@@ -447,6 +501,7 @@ if (len == sizeof(unpair_command_t)) {
       formatTime(dt, buf, sizeof(buf));
       Serial.print("⏰ TIME_SYNC received, RTC set to ");
       Serial.println(buf);
+      debugState("after TIME_SYNC");
     }
     return;
   }
@@ -499,10 +554,10 @@ static void sendPairingRequest() {
 }
 
 static void sendSensorData() {
-  NodeState s = currentNodeState();   // uses hasMothershipMAC() + rtcSynced
+  NodeState s = currentNodeState();
 
-  if (s != STATE_DEPLOYED) {
-    Serial.println("⚠️ Not deployed — skipping data");
+  if (s != STATE_DEPLOYED || !rtcSynced) {
+    Serial.println("⚠️ Not deployed or RTC unsynced — skipping data");
     return;
   }
 
@@ -526,13 +581,14 @@ static void sendSensorData() {
   }
 }
 
-
 // ==================== Setup/Loop ====================
 void setup() {
   Serial.begin(115200);
   delay(2000); // CDC on C3 needs a moment
 
-  // Load persisted config (rtcSynced / interval / mothership MAC / fw)
+  initNVS();
+
+  // Load persisted config
   loadNodeConfig();
   bootCount++;
 
@@ -540,11 +596,7 @@ void setup() {
   Serial.print("🌡️ Air Temperature Node: "); Serial.println(NODE_ID);
   Serial.print("Boot #"); Serial.println(bootCount);
   Serial.print("MAC: "); Serial.println(WiFi.macAddress());
-  Serial.print("State: ");
-  NodeState st = currentNodeState();
-  if (st == STATE_UNPAIRED)      Serial.println("UNPAIRED");
-  else if (st == STATE_PAIRED)   Serial.println("PAIRED");
-  else                           Serial.println("DEPLOYED");
+  debugState("after setup load");
   Serial.println("====================================");
 
   // I2C + RTC
@@ -556,8 +608,9 @@ void setup() {
 
     if (rtc.lostPower()) {
       Serial.println("⚠️ RTC lost power since last run");
-      rtcSynced = false;         // whatever was saved is now stale
-      persistNodeConfig();       // update NVS
+      rtcSynced    = false;
+      deployedFlag = false;   // if RTC lost power, deployment time is suspect
+      persistNodeConfig();
     } else if (rtcSynced) {
       Serial.print("RTC Time: ");
       Serial.println(rtc.now().timestamp());
@@ -620,19 +673,25 @@ void setup() {
       Serial.println("❌ Failed to add mothership peer");
     }
   }
+
+  // ✅ Make sure we *always* write at least once per boot
+  persistNodeConfig();
+  Serial.println("🔁 Setup persisted baseline node config");
+
+  debugState("end of setup");
 }
 
 void loop() {
-  static unsigned long lastAction = 0;
-  static unsigned long lastTimeSyncReq = 0;
+  static unsigned long lastAction       = 0;
+  static unsigned long lastTimeSyncReq  = 0;
   unsigned long nowMs = millis();
 
   NodeState st = currentNodeState();
 
   // If we are bound but RTC isn't synced (e.g. RTC lost power),
   // occasionally ask the mothership for time.
-  if (st == STATE_PAIRED && !rtcSynced && hasMothershipMAC()) {
-    if (nowMs - lastTimeSyncReq > 30000UL) { // every 30s max
+  if (hasMothershipMAC() && !rtcSynced) {
+    if (nowMs - lastTimeSyncReq > 30000UL) {
       Serial.println("⏰ Bound but RTC unsynced → requesting TIME_SYNC");
       sendTimeSyncRequest();
       lastTimeSyncReq = nowMs;
@@ -670,8 +729,10 @@ void loop() {
     }
   }
 
+  // Simple state machine
   if (st == STATE_UNPAIRED) {
     if (nowMs - lastAction > 10000UL) {
+      debugState("loop");
       Serial.println("🔍 Searching for motherships…");
       sendDiscoveryRequest();
       delay(1000);
@@ -681,11 +742,13 @@ void loop() {
     }
   } else if (st == STATE_PAIRED) {
     if (nowMs - lastAction > 5000UL) {
+      debugState("loop");
       Serial.println("🟡 Bound, waiting for DEPLOY command…");
       lastAction = nowMs;
     }
   } else { // STATE_DEPLOYED
     if (nowMs - lastAction > 30000UL) { // demo fixed 30s
+      debugState("loop");
       Serial.println("🟢 Deployed — sending sensor data…");
       sendSensorData();
       lastAction = nowMs;

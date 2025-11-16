@@ -542,7 +542,10 @@ bool deploySelectedNodes(const std::vector<String>& nodeIds) {
 
     for (const String& nodeId : nodeIds) {
         for (auto& node : registeredNodes) {
-            if (node.nodeId == nodeId && node.state == PAIRED) {
+            // ✅ allow both PAIRED and DEPLOYED
+            if (node.nodeId == nodeId &&
+                (node.state == PAIRED || node.state == DEPLOYED)) {
+
                 deployment_command_t deployCmd{};
                 strcpy(deployCmd.command, "DEPLOY_NODE");
                 strcpy(deployCmd.nodeId,  nodeId.c_str());
@@ -587,11 +590,14 @@ bool deploySelectedNodes(const std::vector<String>& nodeIds) {
         }
     }
 
-    if (anyDeployed) {
-        savePairedNodes();   // persist DEPLOYED states
+    if (!anyDeployed) {
+        Serial.println("⚠️ deploySelectedNodes: no matching nodes in PAIRED/DEPLOYED state");
+    } else {
+        savePairedNodes();
     }
     return allSuccess;
 }
+
 
 // ----------------- Queries & unpair -----------------
 std::vector<NodeInfo> getUnpairedNodes() {
