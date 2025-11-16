@@ -92,12 +92,18 @@ From there you can:
 - See which nodes are currently deployed and actively sending data.
 - Download the full **CSV log** of all data recorded to date.
 
-Screenshots can be added to illustrate:
+#### Screenshots
 
-- The main dashboard view
-- The lists of unpaired / paired / deployed nodes
-- The RTC settings panel
-- The CSV download button
+![Main dashboard view](UI_Images/1.png)
+
+![Unpaired / Paired / Deployed node lists](UI_Images/2.png)
+
+![RTC settings panel](UI_Images/3.png)
+
+![CSV download section](UI_Images/4.png)
+
+![Additional dashboard detail](UI_Images/5.png)
+
 
 ---
 
