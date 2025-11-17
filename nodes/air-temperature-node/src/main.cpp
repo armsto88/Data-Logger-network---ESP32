@@ -422,17 +422,19 @@ static void onDataReceived(const uint8_t *mac, const uint8_t *incomingData, int 
     unpair_command_t uc;
     memcpy(&uc, incomingData, sizeof(uc));
 
-    if (strcmp(uc.command, "UNPAIR_NODE") == 0) {
-      Serial.println("🗑️ UNPAIR received");
+  if (strcmp(uc.command, "UNPAIR_NODE") == 0) {
+  Serial.println("🗑️ UNPAIR received");
 
-      memset(mothershipMAC, 0, sizeof(mothershipMAC));
-      rtcSynced    = false;
-      deployedFlag = false;
-      persistNodeConfig();
-      Serial.println("💾 Node config persisted after UNPAIR");
-      sendDiscoveryRequest();
-      debugState("after UNPAIR");
-    }
+  memset(mothershipMAC, 0, sizeof(mothershipMAC));
+  rtcSynced    = false;
+  deployedFlag = false;
+  persistNodeConfig();
+  Serial.println("💾 Node config persisted after UNPAIR");
+
+  // No automatic rediscovery here – wait for DISCOVERY_SCAN from mothership
+  debugState("after UNPAIR");
+}
+
     return;
   }
 
@@ -698,7 +700,7 @@ void loop() {
     }
   }
 
-  // Handle RTC alarm interrupt line toggling LOW
+    // Handle RTC alarm interrupt line toggling LOW
   if (g_alarmFallingISR) {
     g_alarmFallingISR = false;
 
@@ -709,9 +711,11 @@ void loop() {
 
     Serial.printf("⏰ INT fell @ %s  | A1F(before)=%u\n", firedStr, a1fBefore);
 
-    clearDS3231_A1F();  // release INT line
+    // 1) Clear alarm flag so INT/SQW goes HIGH again
+    clearDS3231_A1F();
     delay(2);
 
+    // 2) Re-arm the next alarm based on g_intervalMin
     if (g_intervalMin > 1) {
       DateTime next;
       bool ok = ds3231ArmNextInNMinutes(g_intervalMin, &next);
@@ -723,21 +727,30 @@ void loop() {
       DateTime now = rtc.now();
       DateTime nxt = (now.second() == 0)
           ? now + TimeSpan(0,0,1,0)
-          : DateTime(now.year(),now.month(),now.day(),now.hour(),now.minute(),0) + TimeSpan(0,0,1,0);
+          : DateTime(now.year(),now.month(),now.day(),now.hour(),now.minute(),0)
+              + TimeSpan(0,0,1,0);
       char nextStr[24]; formatTime(nxt, nextStr, sizeof(nextStr));
       Serial.printf("   1-min mode re-armed → next %s\n", nextStr);
     }
+
+    // 3) 🔔 Use this alarm as the trigger to send data
+    NodeState s = currentNodeState();
+    if (s == STATE_DEPLOYED && rtcSynced && hasMothershipMAC()) {
+      Serial.println("📤 Alarm fired → sending sensor data now");
+      sendSensorData();
+    } else {
+      Serial.println("⚠️ Alarm fired but node not ready (not DEPLOYED / RTC unsynced / no mothership)");
+    }
+
+    // (no deep sleep yet – that comes in Stage 2)
   }
 
-  // Simple state machine
+
+  // Simple state machine (now mostly for debug / control, not timing)
   if (st == STATE_UNPAIRED) {
-    if (nowMs - lastAction > 10000UL) {
+    if (nowMs - lastAction > 15000UL) {
       debugState("loop");
-      Serial.println("🔍 Searching for motherships…");
-      sendDiscoveryRequest();
-      delay(1000);
-      Serial.println("📞 Polling pairing status…");
-      sendPairingRequest();
+      Serial.println("🟡 Unpaired – idle, waiting for discovery scan…");
       lastAction = nowMs;
     }
   } else if (st == STATE_PAIRED) {
@@ -747,16 +760,14 @@ void loop() {
       lastAction = nowMs;
     }
   } else { // STATE_DEPLOYED
-    if (nowMs - lastAction > 30000UL) { // demo fixed 30s
+    if (nowMs - lastAction > 20000UL) {
+      // Just periodic debug so we know it's alive; sending is alarm-driven now
       debugState("loop");
-      Serial.println("🟢 Deployed — sending sensor data…");
-      sendSensorData();
+      Serial.println("🟢 Deployed — waiting for DS3231 alarm to send data…");
       lastAction = nowMs;
-
-      // In production you’d deep sleep and use RTC INT pin wake.
-      // esp_deep_sleep(intervalSeconds * 1000000ULL);
     }
   }
+
 
   delay(100);
 }

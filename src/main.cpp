@@ -665,15 +665,16 @@ void handleNodeConfigForm() {
             "<div class='row'>"
               "<label style='flex:1'><input type='radio' name='action' value='start' checked> Start / deploy</label>"
               "<label style='flex:1'><input type='radio' name='action' value='stop'> Stop / keep paired</label>"
+              "<label style='flex:1'><input type='radio' name='action' value='unpair'> Unpair / forget</label>"
             "</div>"
-
             "<button type='submit' class='btn btn--success' style='margin-top:12px'>"
             "Apply &amp; send</button>"
 
             "</form>"
-            "<div class='help'>"
+           "<div class='help'>"
             "If the node is unpaired, <em>Start</em> will attempt to pair then deploy. "
-            "If it is deployed, <em>Stop</em> will revert it to the paired state."
+            "If it is deployed, <em>Stop</em> will revert it to the paired state. "
+            "<em>Unpair</em> will forget this node on the mothership and tell the node to reset itself."
             "</div>");
 
   html += F("<a href='/nodes' class='btn' style='margin-top:12px'>↩️ Back to Node Manager</a>");
@@ -723,6 +724,7 @@ void handleNodeConfigSave() {
   bool deployOk = false;
   bool revertOk = false;
   bool pairOk   = false;
+  bool unpairOk = false;
 
   // --- 5) Start / stop logic ---
   if (action == "start") {
@@ -751,7 +753,39 @@ void handleNodeConfigSave() {
       Serial.printf("[CONFIG] Stop action for %s → revert to PAIRED: %s\n",
                     nodeId.c_str(), revertOk ? "OK" : "FAIL");
     }
+  }  else if (action == "unpair") {
+  if (target) {
+    // 1) Tell the node to reset its own state (best-effort)
+    bool sent  = sendUnpairToNode(nodeId);
+
+    // 2) Locally unpair (delete peer, set UNPAIRED, persist)
+    bool local = unpairNode(nodeId);
+
+    unpairOk = sent && local;
+
+    // 3) Clear user-facing metadata
+    setNodeUserId(nodeId, "");  // removes id_<nodeId> key
+    setNodeName(nodeId, "");    // removes name_<nodeId> key
+    target->userId = "";
+    target->name   = "";
+
+    // 4) Log an UNPAIR event to CSV
+    char timeBuffer[24];
+    getRTCTimeString(timeBuffer, sizeof(timeBuffer));
+    String csvRow = String(timeBuffer) + ",MOTHERSHIP," +
+                    getMothershipsMAC() + ",UNPAIR," + nodeId;
+    logCSVRow(csvRow);
+
+    Serial.printf("[CONFIG] Unpair action for %s → send=%s, local=%s\n",
+                  nodeId.c_str(),
+                  sent  ? "OK" : "FAIL",
+                  local ? "OK" : "FAIL");
+  } else {
+    Serial.printf("[CONFIG] Unpair action requested for %s but node not found\n",
+                  nodeId.c_str());
   }
+}
+
 
   // --- 6) Resolve final values for display + NodeInfo ---
   // Read back from NVS, but fall back to raw form input if empty
@@ -798,6 +832,8 @@ void handleNodeConfigSave() {
   html += deployOk ? "OK" : "not requested / failed";
   html += F("<br>Stop / revert: ");
   html += revertOk ? "OK" : "not requested / failed";
+  html += F("<br>Unpair / forget: ");
+  html += unpairOk ? "OK" : "not requested / failed";
   html += F("</p>"
             "<a href='/nodes' class='btn btn--primary'>Back to Node Manager</a>"
             "</div>");

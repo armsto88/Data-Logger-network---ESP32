@@ -280,16 +280,9 @@ void setupESPNOW() {
 }
 
 void espnow_loop() {
-    static unsigned long lastDiscovery = 0;
     unsigned long now = millis();
 
-    // Periodic discovery scan so new / reset nodes find us
-    if (now - lastDiscovery > 30000) {
-        Serial.println("🔍 Auto discovery broadcast…");
-        if (sendDiscoveryBroadcast()) Serial.println("✅ Discovery broadcast sent");
-        else                          Serial.println("❌ Discovery broadcast failed");
-        lastDiscovery = now;
-    }
+    // (No auto discovery anymore – discovery is manual via /discover-nodes UI)
 
     // Mark nodes inactive if not seen for 5 min
     for (auto& n : registeredNodes) {
@@ -299,6 +292,7 @@ void espnow_loop() {
         }
     }
 }
+
 
 // ----------------- Persistence (paired/deployed list) -----------------
 void savePairedNodes() {
@@ -665,14 +659,19 @@ bool sendUnpairToNode(const String& nodeId) {
     for (const auto &n : registeredNodes) {
         if (n.nodeId == nodeId) {
             unpair_command_t cmd{};
-            strcpy(cmd.command, "UNPAIR_NODE");
-            strcpy(cmd.mothership_id, DEVICE_ID);
+            strncpy(cmd.command, "UNPAIR_NODE", sizeof(cmd.command) - 1);
+            strncpy(cmd.mothership_id, DEVICE_ID, sizeof(cmd.mothership_id) - 1);
+
+            ensurePeerOnChannel(n.mac, ESPNOW_CHANNEL);
+            esp_wifi_set_channel(ESPNOW_CHANNEL, WIFI_SECOND_CHAN_NONE);
 
             esp_err_t res = esp_now_send(n.mac, (uint8_t*)&cmd, sizeof(cmd));
-            Serial.printf("📤 Sent UNPAIR to %s -> %s\n",
+            Serial.printf("📤 UNPAIR_NODE -> %s (%s)\n",
                           nodeId.c_str(), esp_err_to_name(res));
             return (res == ESP_OK);
         }
     }
+    Serial.printf("⚠️ sendUnpairToNode: node %s not found\n", nodeId.c_str());
     return false;
 }
+
