@@ -1,7 +1,6 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include <esp_now.h>
-#include <esp_sleep.h>
 #include <Wire.h>
 #include <RTClib.h>
 #include <esp_wifi.h>
@@ -23,6 +22,7 @@
 // Hardware
 RTC_DS3231 rtc;
 
+// -------------------- DS3231 helpers --------------------
 static inline void formatTime(const DateTime& dt, char* out, size_t n) {
   snprintf(out, n, "%04d-%02d-%02d %02d:%02d:%02d",
            dt.year(), dt.month(), dt.day(),
@@ -44,8 +44,7 @@ static void initNVS()
   }
 }
 
-// ---- DS3231 INT/SQW monitoring (active-LOW, open-drain) ----
-volatile bool g_alarmFallingISR = false;  // set by ISR when INT goes LOW
+// ---- DS3231 helpers ----
 
 // Read DS3231 A1F (Alarm1 Flag). Returns 0 or 1, or 0xFF on I2C error.
 static uint8_t readDS3231_A1F() {
@@ -62,26 +61,35 @@ static uint8_t readDS3231_A1F() {
 
 // Clear A1F (Alarm1 Flag) while preserving other status bits.
 static void clearDS3231_A1F() {
-  // read STATUS
   Wire.beginTransmission(0x68);
-  Wire.write(0x0F);
+  Wire.write(0x0F);      // STATUS
   Wire.endTransmission(false);
   Wire.requestFrom(0x68, 1);
   uint8_t s = Wire.available() ? Wire.read() : 0;
 
-  // clear A1F (bit0)
-  s &= ~0x01;
+  // Clear A1F (bit0) AND A2F (bit1) to be safe
+  s &= ~0x03;
 
-  // write STATUS back
   Wire.beginTransmission(0x68);
   Wire.write(0x0F);
   Wire.write(s);
   Wire.endTransmission();
 }
 
-// INT/SQW falling-edge ISR
-void IRAM_ATTR rtcIntISR() {
-  g_alarmFallingISR = true;
+// Enable INTCN + A1IE (Alarm1 interrupt)
+static void ds3231EnableAlarmInterrupt() {
+  Wire.beginTransmission(0x68);
+  Wire.write(0x0E);  // CTRL
+  Wire.endTransmission(false);
+  Wire.requestFrom(0x68, 1);
+  uint8_t ctrl = Wire.available() ? Wire.read() : 0;
+
+  ctrl |= 0b00000101;  // INTCN (bit2) + A1IE (bit0)
+
+  Wire.beginTransmission(0x68);
+  Wire.write(0x0E);
+  Wire.write(ctrl);
+  Wire.endTransmission();
 }
 
 // Low-level: write DS3231 Alarm1 registers
@@ -104,27 +112,10 @@ static bool ds3231EveryMinute() {
   uint8_t A1HOUR = 0b10000000;               // ignore hours
   uint8_t A1DAY  = 0b10000000;               // ignore day/date
 
-  // Enable interrupt on alarm: CTRL: INTCN=1 (bit2), A1IE=1 (bit0)
-  Wire.beginTransmission(0x68);
-  Wire.write(0x0E); // CTRL
-  Wire.endTransmission(false);
-  Wire.requestFrom(0x68, 1);
-  uint8_t ctrl = Wire.available() ? Wire.read() : 0;
-  ctrl |= 0b00000101; // INTCN|A1IE
-
-  Wire.beginTransmission(0x68);
-  Wire.write(0x0E);
-  Wire.write(ctrl);
-  Wire.endTransmission();
-
-  // Clear A1F before arming
-  clearDS3231_A1F();
-
   return ds3231WriteA1(A1SEC, A1MIN, A1HOUR, A1DAY);
 }
 
-// Compute next trigger (aligned to interval; seconds=00), program A1,
-// and optionally return the computed "next" DateTime via *nextOut.
+// Compute next trigger (aligned to interval; seconds=00), program A1.
 static bool ds3231ArmNextInNMinutes(uint8_t intervalMin, DateTime* nextOut = nullptr) {
   DateTime now = rtc.now();
 
@@ -145,29 +136,18 @@ static bool ds3231ArmNextInNMinutes(uint8_t intervalMin, DateTime* nextOut = nul
   DateTime chk = rtc.now();
   if (next <= chk) next = next + TimeSpan(0, 0, 1, 0);
 
-  // ---- Program A1: match sec=00, min, hour; ignore day/date ----
-  const uint8_t secBCD  = 0x00; // A1M1=0
+  const uint8_t secBCD  = 0x00; // A1M1=0 (match seconds)
   const uint8_t minBCD  = uint8_t(((next.minute()/10)<<4) | (next.minute()%10)); // A1M2=0
   const uint8_t hourBCD = uint8_t(((next.hour()/10)<<4)   | (next.hour()%10));   // A1M3=0 (24h)
   const uint8_t dayReg  = 0b10000000; // A1M4=1 ignore day/date
 
-  // Enable INTCN|A1IE (preserve other bits)
-  Wire.beginTransmission(0x68); Wire.write(0x0E); Wire.endTransmission(false);
-  Wire.requestFrom(0x68, 1);
-  uint8_t ctrl = Wire.available() ? Wire.read() : 0;
-  ctrl |= 0b00000101;  // INTCN (bit2) + A1IE (bit0)
-  Wire.beginTransmission(0x68); Wire.write(0x0E); Wire.write(ctrl); Wire.endTransmission();
-
-  // Clear pending alarm
-  clearDS3231_A1F();
-
-  // Debug: print the next time
   char buf[24]; formatTime(next, buf, sizeof(buf));
   Serial.print("[A1] Next alarm at "); Serial.println(buf);
 
   if (nextOut) *nextOut = next;
   return ds3231WriteA1(secBCD, minBCD, hourBCD, dayReg);
 }
+
 
 // -------------------- Node state --------------------
 enum NodeState {
@@ -176,15 +156,16 @@ enum NodeState {
   STATE_DEPLOYED = 2    // has mothership MAC + deployed flag set
 };
 
-// ✅ actual stored state (for logging / NVS only, logic uses currentNodeState())
 static NodeState nodeState = STATE_UNPAIRED;
 
 // -------------------- Persistent config in RTC RAM --------------------
-RTC_DATA_ATTR int       bootCount       = 0;
-RTC_DATA_ATTR bool      rtcSynced       = false;
+RTC_DATA_ATTR int       bootCount        = 0;
+RTC_DATA_ATTR bool      rtcSynced        = false;
 RTC_DATA_ATTR uint8_t   mothershipMAC[6] = {0};
-RTC_DATA_ATTR uint8_t   g_intervalMin   = 1;
-RTC_DATA_ATTR bool      deployedFlag    = false;
+RTC_DATA_ATTR uint8_t   g_intervalMin    = 1;
+RTC_DATA_ATTR bool      deployedFlag     = false;
+// New: unix time of last successful TIME_SYNC (also mirrored into NVS)
+RTC_DATA_ATTR uint32_t  lastTimeSyncUnix = 0;
 
 // --- Derived state helpers ---
 static bool hasMothershipMAC() {
@@ -200,7 +181,6 @@ static NodeState currentNodeState() {
   return STATE_DEPLOYED;                          // bound + deployed
 }
 
-// Optional: tiny helper for debugging
 static void debugState(const char* where) {
   NodeState s = currentNodeState();
   Serial.print("[STATE] ");
@@ -221,19 +201,18 @@ static void debugState(const char* where) {
 static void persistNodeConfig() {
   Preferences p;
 
-  // ✅ open in read/write (second arg = readOnly, so must be false)
   if (!p.begin("node_cfg", false /* readWrite */)) {
     Serial.println("⚠️ persistNodeConfig: begin() failed");
     return;
   }
 
-  // Keep nodeState in sync with the derived state
-  nodeState = currentNodeState();  // ✅
+  nodeState = currentNodeState();
 
   p.putUChar("state",      (uint8_t)nodeState);
   p.putBool ("rtc_synced", rtcSynced);
   p.putBool ("deployed",   deployedFlag);
   p.putUChar("interval",   g_intervalMin);
+  p.putULong("lastSync",   lastTimeSyncUnix);
 
   // store mothership MAC as 12-char hex string
   char macHex[13];
@@ -248,14 +227,15 @@ static void persistNodeConfig() {
 
   // --- immediate re-read sanity check ---
   Preferences p2;
-  if (p2.begin("node_cfg", true /* readOnly */)) {  // ✅
-    uint8_t st = p2.getUChar("state", 255);
-    String ms  = p2.getString("msmac", "");
-    bool dep   = p2.getBool("deployed", false);
-    bool rs    = p2.getBool("rtc_synced", false);
+  if (p2.begin("node_cfg", true /* readOnly */)) {
+    uint8_t  st = p2.getUChar("state", 255);
+    String   ms = p2.getString("msmac", "");
+    bool     dep= p2.getBool("deployed", false);
+    bool     rs = p2.getBool("rtc_synced", false);
+    uint32_t ls = p2.getULong("lastSync", 0);
     p2.end();
-    Serial.printf("🔍 NVS verify: state=%u deployed=%d rtc_synced=%d msmac='%s'\n",
-                  st, dep, rs, ms.c_str());
+    Serial.printf("🔍 NVS verify: state=%u deployed=%d rtc_synced=%d msmac='%s' lastSyncUnix=%lu\n",
+                  st, dep, rs, ms.c_str(), (unsigned long)ls);
   } else {
     Serial.println("⚠️ NVS verify: begin() failed");
   }
@@ -264,22 +244,22 @@ static void persistNodeConfig() {
 static void loadNodeConfig() {
   Preferences p;
 
-  // ✅ open in read-only (safer)
   if (!p.begin("node_cfg", true /* readOnly */)) {
     Serial.println("⚠️ loadNodeConfig: begin() failed (read-only)");
-    nodeState     = STATE_UNPAIRED;
-    rtcSynced     = false;
-    deployedFlag  = false;
-    g_intervalMin = 1;
+    nodeState        = STATE_UNPAIRED;
+    rtcSynced        = false;
+    deployedFlag     = false;
+    g_intervalMin    = 1;
+    lastTimeSyncUnix = 0;
     memset(mothershipMAC, 0, sizeof(mothershipMAC));
     return;
   }
 
-  // These get default values if keys are missing
-  uint8_t rawState = p.getUChar("state", (uint8_t)STATE_UNPAIRED);
-  rtcSynced        = p.getBool ("rtc_synced", false);
-  deployedFlag     = p.getBool ("deployed",   false);
-  g_intervalMin    = p.getUChar("interval",   1);
+  uint8_t rawState   = p.getUChar("state", (uint8_t)STATE_UNPAIRED);
+  rtcSynced          = p.getBool ("rtc_synced", false);
+  deployedFlag       = p.getBool ("deployed",   false);
+  g_intervalMin      = p.getUChar("interval",   1);
+  lastTimeSyncUnix   = p.getULong("lastSync",   0);
 
   String macHex = p.getString("msmac", "");
   p.end();
@@ -298,6 +278,15 @@ static void loadNodeConfig() {
 
   Serial.printf("💾 Node config loaded from NVS: state=%u, rtcSynced=%d, deployed=%d, interval=%u, msmac='%s'\n",
                 (unsigned)nodeState, rtcSynced, deployedFlag, g_intervalMin, macHex.c_str());
+
+  if (lastTimeSyncUnix > 0) {
+    DateTime ls(lastTimeSyncUnix);
+    char buf[24]; formatTime(ls, buf, sizeof(buf));
+    Serial.printf("   ↪ lastTimeSyncUnix=%lu (%s)\n",
+                  (unsigned long)lastTimeSyncUnix, buf);
+  } else {
+    Serial.println("   ↪ lastTimeSyncUnix=0 (no previous TIME_SYNC recorded)");
+  }
 }
 
 // -------------------- ESP-NOW --------------------
@@ -326,10 +315,8 @@ static void onDataReceived(const uint8_t *mac, const uint8_t *incomingData, int 
       Serial.print("📡 Discovered by: ");
       Serial.println(resp.mothership_id);
 
-      // Remember mothership MAC
       memcpy(mothershipMAC, mac, 6);
 
-      // Ensure we have the mothership as a peer
       esp_now_peer_info_t pi{};
       memcpy(pi.peer_addr, mac, 6);
       pi.channel = ESPNOW_CHANNEL;
@@ -347,14 +334,13 @@ static void onDataReceived(const uint8_t *mac, const uint8_t *incomingData, int 
       debugState("after DISCOVER_RESPONSE");
     }
     else if (strcmp(resp.command, "DISCOVERY_SCAN") == 0) {
-      // Always respond so UI can see us even if states drift
       Serial.println("🔍 Responding to discovery scan…");
       sendDiscoveryRequest();
     }
     return;
   }
 
-  // 2) Pairing response (poll-based pairing status)
+  // 2) Pairing response
   if (len == sizeof(pairing_response_t)) {
     pairing_response_t pr;
     memcpy(&pr, incomingData, sizeof(pr));
@@ -363,7 +349,6 @@ static void onDataReceived(const uint8_t *mac, const uint8_t *incomingData, int 
       if (pr.isPaired) {
         Serial.println("📋 Pairing confirmed via PAIRING_RESPONSE");
         memcpy(mothershipMAC, mac, 6);
-        // PAIRED but not yet deployed
         persistNodeConfig();
         debugState("after PAIRING_RESPONSE");
       } else {
@@ -383,9 +368,9 @@ static void onDataReceived(const uint8_t *mac, const uint8_t *incomingData, int 
 
       memcpy(mothershipMAC, mac, 6);
 
-      // back to "paired but NOT deployed"
-      rtcSynced    = false;
-      deployedFlag = false;
+      rtcSynced        = false;
+      deployedFlag     = false;
+      lastTimeSyncUnix = 0;
       persistNodeConfig();
       Serial.println("💾 Node state persisted after PAIR_NODE (rtcSynced=false, deployed=false)");
 
@@ -394,7 +379,7 @@ static void onDataReceived(const uint8_t *mac, const uint8_t *incomingData, int 
     return;
   }
 
-  // 4) Deployment command (RTC time set)
+  // 4) Deployment command (RTC time set + first alarm arm)
   if (len == sizeof(deployment_command_t)) {
     deployment_command_t dc;
     memcpy(&dc, incomingData, sizeof(dc));
@@ -403,16 +388,43 @@ static void onDataReceived(const uint8_t *mac, const uint8_t *incomingData, int 
       Serial.println("🚀 Deployment command received");
 
       rtc.adjust(DateTime(dc.year, dc.month, dc.day, dc.hour, dc.minute, dc.second));
-      rtcSynced    = true;      // time is now good
-      deployedFlag = true;      // mark as deployed
+      rtcSynced        = true;
+      deployedFlag     = true;
+      lastTimeSyncUnix = rtc.now().unixtime();   // treat deploy time as fresh sync
       memcpy(mothershipMAC, mac, 6);
       persistNodeConfig();
 
       Serial.print("RTC synchronized to: ");
       Serial.println(rtc.now().timestamp());
-      Serial.println("✅ Node deployed; will start transmitting data");
-
+      Serial.printf("⏰ lastTimeSyncUnix set to %lu at DEPLOY\n",
+                    (unsigned long)lastTimeSyncUnix);
+      Serial.println("✅ Node deployed; ready for alarm-driven sends");
       debugState("after DEPLOY");
+
+      // Arm first RTC alarm based on current interval
+      bool ok = false;
+      DateTime next;
+      if (g_intervalMin <= 1) {
+        ok = ds3231EveryMinute();
+        DateTime now = rtc.now();
+        DateTime nextDisplay = (now.second() == 0)
+            ? now + TimeSpan(0,0,1,0)
+            : DateTime(now.year(),now.month(),now.day(),now.hour(),now.minute(),0)
+              + TimeSpan(0,0,1,0);
+        next = nextDisplay;
+      } else {
+        ok = ds3231ArmNextInNMinutes(g_intervalMin, &next);
+      }
+      ds3231EnableAlarmInterrupt();
+      clearDS3231_A1F();  // ensure flag low until first alarm
+
+      char nextStr[24]; formatTime(next, nextStr, sizeof(nextStr));
+      Serial.printf("[DEPLOY] First alarm armed for %s (ok=%d, interval=%u min)\n",
+                    nextStr, ok, g_intervalMin);
+
+      // Optional: initial reading right after deploy
+      Serial.println("📤 Initial post-deploy reading…");
+      sendSensorData();
     }
     return;
   }
@@ -422,19 +434,18 @@ static void onDataReceived(const uint8_t *mac, const uint8_t *incomingData, int 
     unpair_command_t uc;
     memcpy(&uc, incomingData, sizeof(uc));
 
-  if (strcmp(uc.command, "UNPAIR_NODE") == 0) {
-  Serial.println("🗑️ UNPAIR received");
+    if (strcmp(uc.command, "UNPAIR_NODE") == 0) {
+      Serial.println("🗑️ UNPAIR received");
 
-  memset(mothershipMAC, 0, sizeof(mothershipMAC));
-  rtcSynced    = false;
-  deployedFlag = false;
-  persistNodeConfig();
-  Serial.println("💾 Node config persisted after UNPAIR");
+      memset(mothershipMAC, 0, sizeof(mothershipMAC));
+      rtcSynced        = false;
+      deployedFlag     = false;
+      lastTimeSyncUnix = 0;
+      persistNodeConfig();
+      Serial.println("💾 Node config persisted after UNPAIR");
 
-  // No automatic rediscovery here – wait for DISCOVERY_SCAN from mothership
-  debugState("after UNPAIR");
-}
-
+      debugState("after UNPAIR");
+    }
     return;
   }
 
@@ -447,32 +458,31 @@ static void onDataReceived(const uint8_t *mac, const uint8_t *incomingData, int 
       uint8_t oldInterval = g_intervalMin;
       g_intervalMin = (uint8_t)cmd.intervalMinutes;
 
-      String dbg;
-      bool ok;
+      bool ok = false;
       DateTime next;
       if (g_intervalMin <= 1) {
         ok = ds3231EveryMinute();
-        dbg += F("Mode: every minute (sec==00, ignore min/hour/day)\n");
-        // Predict next (:00) for display only
         DateTime now = rtc.now();
         DateTime nextDisplay = (now.second() == 0)
-            ? now + TimeSpan(0,0,1,0)  // if exactly at :00, show next minute
-            : DateTime(now.year(),now.month(),now.day(),now.hour(),now.minute(),0) + TimeSpan(0,0,1,0);
+            ? now + TimeSpan(0,0,1,0)
+            : DateTime(now.year(),now.month(),now.day(),now.hour(),now.minute(),0)
+              + TimeSpan(0,0,1,0);
         next = nextDisplay;
       } else {
         ok = ds3231ArmNextInNMinutes(g_intervalMin, &next);
-        dbg += F("Mode: N-minute interval with re-arm on each alarm\n");
       }
+
+      ds3231EnableAlarmInterrupt();
+      clearDS3231_A1F();   // flag low until first match
 
       char nowStr[24], nextStr[24];
       formatTime(rtc.now(), nowStr, sizeof(nowStr));
-      formatTime(next,        nextStr, sizeof(nextStr));
+      formatTime(next,       nextStr, sizeof(nextStr));
 
       Serial.println("[SET_SCHEDULE] received");
       Serial.printf("   interval: %u -> %u minutes\n", oldInterval, g_intervalMin);
       Serial.printf("   now:  %s\n",  nowStr);
       Serial.printf("   next: %s\n",  nextStr);
-      Serial.print(dbg);
       Serial.printf("   status: %s\n", ok ? "OK" : "FAIL");
 
       persistNodeConfig();
@@ -495,15 +505,29 @@ static void onDataReceived(const uint8_t *mac, const uint8_t *incomingData, int 
         (int)resp.second
       );
 
+      uint32_t prevSync = lastTimeSyncUnix;
       rtc.adjust(dt);
-      rtcSynced = true;
+      rtcSynced        = true;
+      lastTimeSyncUnix = dt.unixtime();
+
       persistNodeConfig();
 
-      char buf[24];
-      formatTime(dt, buf, sizeof(buf));
+      char buf[24]; formatTime(dt, buf, sizeof(buf));
       Serial.print("⏰ TIME_SYNC received, RTC set to ");
       Serial.println(buf);
+
+      if (prevSync > 0) {
+        DateTime prev(prevSync);
+        char prevStr[24]; formatTime(prev, prevStr, sizeof(prevStr));
+        Serial.printf("   ↪ Previous sync: %lu (%s)\n",
+                      (unsigned long)prevSync, prevStr);
+      }
+      Serial.printf("   ↪ New lastTimeSyncUnix: %lu (%s)\n",
+                    (unsigned long)lastTimeSyncUnix, buf);
+
       debugState("after TIME_SYNC");
+
+      // NOTE: we do NOT touch alarms here.
     }
     return;
   }
@@ -558,12 +582,19 @@ static void sendPairingRequest() {
 static void sendSensorData() {
   NodeState s = currentNodeState();
 
-  if (s != STATE_DEPLOYED || !rtcSynced) {
-    Serial.println("⚠️ Not deployed or RTC unsynced — skipping data");
+  // Timestamp for logs
+  char nowStr[24];
+  formatTime(rtc.now(), nowStr, sizeof(nowStr));
+
+  Serial.printf("📤 sendSensorData() @ %s | state=%d rtcSynced=%d hasMS=%d\n",
+                nowStr, (int)s, rtcSynced, hasMothershipMAC());
+
+  if (s != STATE_DEPLOYED || !rtcSynced || !hasMothershipMAC()) {
+    Serial.println("⚠️ Not DEPLOYED / RTC unsynced / no mothership — skipping data send");
     return;
   }
 
-  // dummy reading
+  // Dummy reading
   float temperature = 20.0 + (random(0, 200) / 10.0f);
 
   sensor_data_message_t msg{};
@@ -574,23 +605,82 @@ static void sendSensorData() {
 
   esp_wifi_set_channel(ESPNOW_CHANNEL, WIFI_SECOND_CHAN_NONE);
   esp_err_t res = esp_now_send(mothershipMAC, (uint8_t*)&msg, sizeof(msg));
+
   if (res == ESP_OK) {
-    Serial.print("📊 Sent temp = ");
+    Serial.print("📊 Sensor packet sent → temp = ");
     Serial.print(temperature);
     Serial.println(" °C");
+
+    Serial.printf("   → sent to mothership MAC %02X:%02X:%02X:%02X:%02X:%02X\n",
+                  mothershipMAC[0], mothershipMAC[1], mothershipMAC[2],
+                  mothershipMAC[3], mothershipMAC[4], mothershipMAC[5]);
+    Serial.println("   (Mothership should now log this row to CSV)");
   } else {
-    Serial.println("❌ Failed to send data");
+    Serial.print("❌ Failed to send data, esp_err = ");
+    Serial.println(esp_err_to_name(res));
   }
 }
+
+
+// -------------------- Per-alarm handler --------------------
+static void handleRtcAlarmEvent() {
+  DateTime fired = rtc.now();
+  char firedStr[24];
+  formatTime(fired, firedStr, sizeof(firedStr));
+  uint8_t a1fBefore = readDS3231_A1F();
+
+  Serial.println("⚡ DS3231 alarm detected → "
+                 "simulating FET ON / LED ON / node power APPLIED");
+  Serial.printf("⏰ RTC alarm context @ %s  | A1F(before)=%u\n",
+                firedStr, a1fBefore);
+
+  // 1) Use this alarm as the trigger to send data (while "power is ON")
+  NodeState s = currentNodeState();
+  if (s == STATE_DEPLOYED && rtcSynced && hasMothershipMAC()) {
+    Serial.println("📤 Alarm → sending sensor data (node is 'powered' in simulation)");
+    sendSensorData();
+  } else {
+    Serial.println("⚠️ Alarm but node not ready (not DEPLOYED / RTC unsynced / no mothership)");
+  }
+
+  // 2) Re-arm the next alarm based on g_intervalMin
+  bool ok = false;
+  DateTime next;
+  if (g_intervalMin <= 1) {
+    ok = ds3231EveryMinute();
+    DateTime now = rtc.now();
+    DateTime nextDisplay = (now.second() == 0)
+        ? now + TimeSpan(0,0,1,0)
+        : DateTime(now.year(),now.month(),now.day(),now.hour(),now.minute(),0)
+          + TimeSpan(0,0,1,0);
+    next = nextDisplay;
+  } else {
+    ok = ds3231ArmNextInNMinutes(g_intervalMin, &next);
+  }
+  ds3231EnableAlarmInterrupt();
+
+  char nextStr[24];
+  formatTime(next, nextStr, sizeof(nextStr));
+  Serial.printf("   🔁 Next alarm armed at %s (%s)\n",
+                nextStr, ok ? "OK" : "FAIL");
+
+  // 3) NOW clear A1F so INT/SQW goes HIGH again
+  clearDS3231_A1F();
+  delay(5);
+
+  uint8_t a1fAfter = readDS3231_A1F();
+  Serial.printf("🔚 DS3231 A1F cleared → A1F(after)=%u\n", a1fAfter);
+  Serial.println("   → Simulated behaviour: FET OFF / LED OFF / node power CUT");
+}
+
+
 
 // ==================== Setup/Loop ====================
 void setup() {
   Serial.begin(115200);
-  delay(2000); // CDC on C3 needs a moment
+  delay(2000);
 
   initNVS();
-
-  // Load persisted config
   loadNodeConfig();
   bootCount++;
 
@@ -610,8 +700,9 @@ void setup() {
 
     if (rtc.lostPower()) {
       Serial.println("⚠️ RTC lost power since last run");
-      rtcSynced    = false;
-      deployedFlag = false;   // if RTC lost power, deployment time is suspect
+      rtcSynced        = false;
+      deployedFlag     = false;
+      lastTimeSyncUnix = 0;
       persistNodeConfig();
     } else if (rtcSynced) {
       Serial.print("RTC Time: ");
@@ -619,16 +710,22 @@ void setup() {
     } else {
       Serial.println("RTC not synchronized yet");
     }
+
+    // Normalise A1F at boot so we don't start on a stale alarm
+    uint8_t a1fInit = readDS3231_A1F();
+    if (a1fInit == 0xFF) {
+      Serial.println("⚠️ readDS3231_A1F() at boot returned 0xFF (I2C error?)");
+    } else if (a1fInit == 1) {
+      Serial.println("⚠️ A1F was already set at boot → clearing so next alarm edge is visible");
+      clearDS3231_A1F();
+      uint8_t a1fPost = readDS3231_A1F();
+      Serial.printf("   ↪ A1F(after clear)=%u\n", a1fPost);
+    } else {
+      Serial.println("[RTC] A1F=0 at boot (idle)");
+    }
   }
 
-  // INT/SQW -> GPIO input with pull-up (INT is open-drain, idle HIGH, active LOW)
-  pinMode(RTC_INT_PIN, INPUT_PULLUP);
-  attachInterrupt(digitalPinToInterrupt(RTC_INT_PIN), rtcIntISR, FALLING);
-
-  // Optional boot diagnostics
-  uint8_t a1f0 = readDS3231_A1F();
-  Serial.printf("[RTC_INT] boot: pin=%d level=%d A1F=%u\n",
-                RTC_INT_PIN, digitalRead(RTC_INT_PIN), a1f0);
+  // No RTC_INT_PIN or ISR — INT only drives FET + LED in hardware.
 
   // WiFi / ESPNOW
   WiFi.mode(WIFI_STA);
@@ -676,77 +773,62 @@ void setup() {
     }
   }
 
-  // ✅ Make sure we *always* write at least once per boot
   persistNodeConfig();
   Serial.println("🔁 Setup persisted baseline node config");
-
   debugState("end of setup");
 }
 
 void loop() {
-  static unsigned long lastAction       = 0;
-  static unsigned long lastTimeSyncReq  = 0;
+  static unsigned long lastAction      = 0;
+  static unsigned long lastTimeSyncReq = 0;
   unsigned long nowMs = millis();
 
   NodeState st = currentNodeState();
 
-  // If we are bound but RTC isn't synced (e.g. RTC lost power),
-  // occasionally ask the mothership for time.
+  // If we are bound but RTC isn't synced, occasionally ask for time.
   if (hasMothershipMAC() && !rtcSynced) {
     if (nowMs - lastTimeSyncReq > 30000UL) {
-      Serial.println("⏰ Bound but RTC unsynced → requesting TIME_SYNC");
+      Serial.println("⏰ Bound but RTC unsynced → requesting initial TIME_SYNC");
       sendTimeSyncRequest();
       lastTimeSyncReq = nowMs;
     }
   }
 
-    // Handle RTC alarm interrupt line toggling LOW
-  if (g_alarmFallingISR) {
-    g_alarmFallingISR = false;
+  // If we are bound *and* RTC is synced, check if 24h have passed since last sync
+  if (hasMothershipMAC() && rtcSynced && lastTimeSyncUnix > 0) {
+    uint32_t nowUnix = rtc.now().unixtime();
+    const uint32_t SYNC_PERIOD = 24UL * 3600UL;   // 24 hours in seconds
 
-    // Timestamp when we noticed the interrupt
-    DateTime fired = rtc.now();
-    char firedStr[24]; formatTime(fired, firedStr, sizeof(firedStr));
-    uint8_t a1fBefore = readDS3231_A1F();
+    if (nowUnix > lastTimeSyncUnix &&
+        (nowUnix - lastTimeSyncUnix) > SYNC_PERIOD) {
 
-    Serial.printf("⏰ INT fell @ %s  | A1F(before)=%u\n", firedStr, a1fBefore);
-
-    // 1) Clear alarm flag so INT/SQW goes HIGH again
-    clearDS3231_A1F();
-    delay(2);
-
-    // 2) Re-arm the next alarm based on g_intervalMin
-    if (g_intervalMin > 1) {
-      DateTime next;
-      bool ok = ds3231ArmNextInNMinutes(g_intervalMin, &next);
-      char nextStr[24]; formatTime(next, nextStr, sizeof(nextStr));
-      Serial.printf("   re-armed +%u min → next %s (%s)\n",
-                    g_intervalMin, nextStr, ok ? "OK" : "FAIL");
-    } else {
-      // Every-minute mode—next will be the next :00
-      DateTime now = rtc.now();
-      DateTime nxt = (now.second() == 0)
-          ? now + TimeSpan(0,0,1,0)
-          : DateTime(now.year(),now.month(),now.day(),now.hour(),now.minute(),0)
-              + TimeSpan(0,0,1,0);
-      char nextStr[24]; formatTime(nxt, nextStr, sizeof(nextStr));
-      Serial.printf("   1-min mode re-armed → next %s\n", nextStr);
+      if (nowMs - lastTimeSyncReq > 30000UL) {  // don't spam, max 1 req / 30s
+        uint32_t delta = nowUnix - lastTimeSyncUnix;
+        Serial.printf("⏰ >24h since last TIME_SYNC (Δ=%lu s) → requesting periodic TIME_SYNC\n",
+                      (unsigned long)delta);
+        sendTimeSyncRequest();
+        lastTimeSyncReq = nowMs;
+      }
     }
-
-    // 3) 🔔 Use this alarm as the trigger to send data
-    NodeState s = currentNodeState();
-    if (s == STATE_DEPLOYED && rtcSynced && hasMothershipMAC()) {
-      Serial.println("📤 Alarm fired → sending sensor data now");
-      sendSensorData();
-    } else {
-      Serial.println("⚠️ Alarm fired but node not ready (not DEPLOYED / RTC unsynced / no mothership)");
-    }
-
-    // (no deep sleep yet – that comes in Stage 2)
   }
 
+  // --- RTC alarm handling (simple A1F poll, like old version) ---
+  {
+    uint8_t a1 = readDS3231_A1F();
+    if (a1 == 0xFF) {
+      static unsigned long lastErr = 0;
+      if (nowMs - lastErr > 5000UL) {
+        Serial.println("⚠️ readDS3231_A1F() error (0xFF)");
+        lastErr = nowMs;
+      }
+    } else if (a1 == 1) {
+      Serial.println("⚡ A1F=1 → handleRtcAlarmEvent()");
+      handleRtcAlarmEvent();
+      // handleRtcAlarmEvent() will clear A1F, so next poll should see 0
+    }
+  }
 
-  // Simple state machine (now mostly for debug / control, not timing)
+  // Simple state machine logs (for bench)
   if (st == STATE_UNPAIRED) {
     if (nowMs - lastAction > 15000UL) {
       debugState("loop");
@@ -761,13 +843,11 @@ void loop() {
     }
   } else { // STATE_DEPLOYED
     if (nowMs - lastAction > 20000UL) {
-      // Just periodic debug so we know it's alive; sending is alarm-driven now
       debugState("loop");
-      Serial.println("🟢 Deployed — waiting for DS3231 alarm to send data…");
+      Serial.println("🟢 Deployed — work happens on each DS3231 alarm.");
       lastAction = nowMs;
     }
   }
-
 
   delay(100);
 }

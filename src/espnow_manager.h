@@ -24,20 +24,21 @@ enum NodeState : uint8_t {
   DEPLOYED = 2
 };
 
-// e.g. in protocol.h or espnow_manager.h
 struct NodeInfo {
-    uint8_t  mac[6];
-    String   nodeId;      // firmware ID, e.g. "TEMP_001"
-    String   nodeType;
-    uint32_t lastSeen;
-    bool     isActive;
+    uint8_t   mac[6];
+    String    nodeId;
+    String    nodeType;
+    uint32_t  lastSeen;
+    bool      isActive;
     NodeState state;
-    uint8_t  channel;
+    uint8_t   channel;
+    String    userId;
+    String    name;
 
-    // NEW: user-facing metadata
-    String   userId;      // numeric, e.g. "001"
-    String   name;        // friendly name, e.g. "North Hedge 01"
+    // NEW: millis() at last TIME_SYNC sent from mothership to this node (0 = never)
+    uint32_t  lastTimeSyncMs;
 };
+
 
 // -----------------------------------------------------------------------------
 // Lifecycle
@@ -48,6 +49,10 @@ void espnow_loop();
 // -----------------------------------------------------------------------------
 // Commands / broadcasts (mothership -> nodes)
 // -----------------------------------------------------------------------------
+
+bool broadcastTimeSyncAll();
+bool broadcastTimeSyncIfDue(bool force = false);
+
 /**
  * Send a time sync packet to a specific node (uses RTC time from mothership).
  */

@@ -101,4 +101,4 @@ typedef struct rnt_pairing_t {
 // I2C pins (ESP32-C3 Mini) — used by node builds
 #define RTC_SDA_PIN 8
 #define RTC_SCL_PIN 9
-#define RTC_INT_PIN 3
+#define RTC_INT_PIN 4

@@ -110,7 +110,7 @@ static void storeNodeMeta(const String& nodeId, const char* fieldPrefix, String 
 
 
 // Numeric Node ID (user-facing, e.g. "001")
-static String getNodeUserId(const String& nodeId) {
+String getNodeUserId(const String& nodeId) {
   return loadNodeMeta(nodeId, "id_");
 }
 
@@ -136,7 +136,7 @@ static void setNodeUserId(const String& nodeId, String userId) {
 }
 
 // Friendly Name (free text)
-static String getNodeName(const String& nodeId) {
+String getNodeName(const String& nodeId) {
   return loadNodeMeta(nodeId, "name_");
 }
 
@@ -160,6 +160,83 @@ String getCsvNodeName(const String& nodeId) {
 }
 
 
+// ---------- Logging helpers (for serial clarity) ----------
+
+// State → text for logs
+static const char* nodeStateToString(int s) {
+  switch (s) {
+    case UNPAIRED: return "UNPAIRED";
+    case PAIRED:   return "PAIRED";
+    case DEPLOYED: return "DEPLOYED";
+    default:       return "UNKNOWN";
+  }
+}
+
+// Command logger: one line per ESP-NOW command from mothership
+static void logCommandSend(const char* cmd,
+                           const String& nodeId,
+                           bool ok,
+                           const char* extra = nullptr)
+{
+  Serial.printf("📤 CMD %-14s → %-10s status=%s",
+                cmd,
+                nodeId.c_str(),
+                ok ? "OK" : "FAIL");
+  if (extra && extra[0] != '\0') {
+    Serial.print(" | ");
+    Serial.print(extra);
+  }
+  Serial.println();
+}
+
+// Boot summary once everything is initialised
+static void logBootSummary() {
+  Serial.println();
+  Serial.println("=============== MOTHERSHIP SUMMARY ===============");
+  Serial.printf("Device ID: %s\n", DEVICE_ID);
+  Serial.printf("SSID: %s\n", ssid.c_str());
+  Serial.printf("MAC: %s\n", WiFi.macAddress().c_str());
+  Serial.printf("Firmware: %s %s\n", FW_VERSION, FW_BUILD);
+
+  char timeStr[32];
+  getRTCTimeString(timeStr, sizeof(timeStr));
+  Serial.printf("RTC Time: %s\n", timeStr);
+  Serial.printf("Default wake interval: %d min\n", gWakeIntervalMin);
+  Serial.printf("Mothership MAC (ESP-NOW): %s\n", getMothershipsMAC().c_str());
+
+  auto allNodes      = getRegisteredNodes();
+  auto unpairedNodes = getUnpairedNodes();
+  auto pairedNodes   = getPairedNodes();
+
+  size_t deployedCount = 0;
+  for (const auto& n : allNodes) {
+    if (n.state == DEPLOYED) deployedCount++;
+  }
+
+  Serial.printf("Fleet: total=%u  unpaired=%u  paired=%u  deployed=%u\n",
+                (unsigned)allNodes.size(),
+                (unsigned)unpairedNodes.size(),
+                (unsigned)pairedNodes.size(),
+                (unsigned)deployedCount);
+
+  for (const auto& node : allNodes) {
+    String userId = getNodeUserId(node.nodeId);
+    String name   = getNodeName(node.nodeId);
+
+    Serial.print("  ↪ FW=");
+    Serial.print(node.nodeId);
+    Serial.print(" | ID=");
+    Serial.print(userId.length() ? userId : String("-"));
+    Serial.print(" | Name=");
+    Serial.print(name.length() ? name : String("-"));
+    Serial.print(" | State=");
+    Serial.println(nodeStateToString(node.state));
+  }
+
+  Serial.println("==================================================");
+}
+
+
 // ---------- CSS / JS ----------
 const char COMMON_CSS[] PROGMEM = R"CSS(
 :root{
@@ -169,7 +246,7 @@ const char COMMON_CSS[] PROGMEM = R"CSS(
   --shadow:0 2px 10px rgba(0,0,0,.08);
 }
 *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
-html{scroll-behavior:smooth}
+html{scroll-behior:smooth}
 html,body{margin:0;padding:0;background:var(--bg);color:var(--text);
   font:16px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,system-ui,sans-serif}
 a{color:var(--primary);text-decoration:none}
@@ -227,6 +304,35 @@ a{color:var(--primary);text-decoration:none}
   padding:calc(var(--sp-2) + env(safe-area-inset-bottom)) var(--sp-3);
   border-radius:12px;box-shadow:var(--shadow);display:flex;gap:12px;justify-content:space-between
 }
+
+/* Time health pills in Node Manager */
+.time-health{
+  display:flex;
+  flex-direction:column;
+  align-items:flex-start;
+  gap:2px;
+  font-size:.85rem;
+}
+.health-pill{
+  display:inline-flex;
+  align-items:center;
+  justify-content:center;
+  padding:2px 8px;
+  border-radius:999px;
+  font-size:.75rem;
+  font-weight:600;
+  color:#ffffff;
+  white-space:nowrap;
+}
+.health-fresh{background:#16a34a;}
+.health-ok{background:#f97316;}
+.health-stale{background:#dc2626;}
+.health-unknown{background:#6b7280;}
+.health-subtext{
+  font-size:.7rem;
+  color:#6b7280;
+}
+
 
 @media(min-width:768px){.container{max-width:720px}}
 )CSS";
@@ -344,6 +450,8 @@ void handleRevertNode() {
       found = true;
 
       sentCmd = pairNode(nodeId);  // will send PAIR_NODE + PAIRING_RESPONSE
+
+      logCommandSend("PAIR_NODE", nodeId, sentCmd, "revert to PAIRED via /revert-node");
 
       if (sentCmd) {
         Serial.print("[MOTHERSHIP] Node reverted to PAIRED + PAIR_NODE sent: ");
@@ -574,7 +682,10 @@ void handleSetWakeInterval() {
   gWakeIntervalMin = interval;
   saveWakeIntervalToNVS(interval);
 
-  Serial.printf("[UI] Wake interval set to %d min → broadcast %s\n", interval, sent ? "SENT" : "NOT_SENT");
+  // Log with richer serial output
+  Serial.printf("[UI] Wake interval set to %d min → broadcast %s\n",
+                interval, sent ? "SENT" : "NOT_SENT");
+  logCommandSend("SET_SCHEDULE", String("ALL"), sent, "via /set-wake-interval");
 
   String html = F("<!doctype html><meta name='viewport' content='width=device-width,initial-scale=1'>"
                   "<body style='font-family:sans-serif;padding:20px;text-align:center'>"
@@ -664,7 +775,7 @@ void handleNodeConfigForm() {
             "<label class='label'>Action</label>"
             "<div class='row'>"
               "<label style='flex:1'><input type='radio' name='action' value='start' checked> Start / deploy</label>"
-              "<label style='flex:1'><input type='radio' name='action' value='stop'> Stop / keep paired</label>"
+              "<label style='flex:1'><input type='radio' name='action' value='stop'>  Stop / keep paired (or pair-only if currently unpaired)</label>"
               "<label style='flex:1'><input type='radio' name='action' value='unpair'> Unpair / forget</label>"
             "</div>"
             "<button type='submit' class='btn btn--success' style='margin-top:12px'>"
@@ -720,6 +831,7 @@ void handleNodeConfigSave() {
   saveWakeIntervalToNVS(interval);
   Serial.printf("[CONFIG] Interval via Configure & Start set to %d min, broadcast=%s\n",
                 interval, scheduleSent ? "OK" : "NO_ELIGIBLE_NODES");
+  logCommandSend("SET_SCHEDULE", String("ALL"), scheduleSent, "via Configure & Start");
 
   bool deployOk = false;
   bool revertOk = false;
@@ -730,6 +842,7 @@ void handleNodeConfigSave() {
   if (action == "start") {
     if (target && target->state == UNPAIRED) {
       pairOk = pairNode(nodeId);
+      logCommandSend("PAIR_NODE", nodeId, pairOk, "auto-pair before deploy");
       if (pairOk) {
         target->state = PAIRED;
         savePairedNodes();
@@ -742,49 +855,56 @@ void handleNodeConfigSave() {
     std::vector<String> ids;
     ids.push_back(nodeId);
     deployOk = deploySelectedNodes(ids);
+    logCommandSend("DEPLOY_NODE", nodeId, deployOk, "Configure & Start");
     Serial.printf("[CONFIG] Start action for %s → deploySelectedNodes: %s\n",
                   nodeId.c_str(), deployOk ? "OK" : "FAIL");
 
-  } else if (action == "stop") {
-    if (target && target->state == DEPLOYED) {
-      target->state = PAIRED;
-      savePairedNodes();
-      revertOk = pairNode(nodeId);
-      Serial.printf("[CONFIG] Stop action for %s → revert to PAIRED: %s\n",
-                    nodeId.c_str(), revertOk ? "OK" : "FAIL");
-    }
-  }  else if (action == "unpair") {
+} else if (action == "stop") {
   if (target) {
-    // 1) Tell the node to reset its own state (best-effort)
-    bool sent  = sendUnpairToNode(nodeId);
-
-    // 2) Locally unpair (delete peer, set UNPAIRED, persist)
-    bool local = unpairNode(nodeId);
-
-    unpairOk = sent && local;
-
-    // 3) Clear user-facing metadata
-    setNodeUserId(nodeId, "");  // removes id_<nodeId> key
-    setNodeName(nodeId, "");    // removes name_<nodeId> key
-    target->userId = "";
-    target->name   = "";
-
-    // 4) Log an UNPAIR event to CSV
-    char timeBuffer[24];
-    getRTCTimeString(timeBuffer, sizeof(timeBuffer));
-    String csvRow = String(timeBuffer) + ",MOTHERSHIP," +
-                    getMothershipsMAC() + ",UNPAIR," + nodeId;
-    logCSVRow(csvRow);
-
-    Serial.printf("[CONFIG] Unpair action for %s → send=%s, local=%s\n",
-                  nodeId.c_str(),
-                  sent  ? "OK" : "FAIL",
-                  local ? "OK" : "FAIL");
+    NodeState prev = target->state;
+    target->state = PAIRED;
+    savePairedNodes();
+    revertOk = pairNode(nodeId);
+    Serial.printf("[CONFIG] Stop action for %s from state %d → PAIRED: %s\n",
+                  nodeId.c_str(), (int)prev, revertOk ? "OK" : "FAIL");
   } else {
-    Serial.printf("[CONFIG] Unpair action requested for %s but node not found\n",
+    Serial.printf("[CONFIG] Stop action requested for %s but node not found\n",
                   nodeId.c_str());
   }
 }
+ else if (action == "unpair") {
+    if (target) {
+      // 1) Tell the node to reset its own state (best-effort)
+      bool sent  = sendUnpairToNode(nodeId);
+      bool local = unpairNode(nodeId);
+
+      logCommandSend("UNPAIR_NODE", nodeId, sent,  "remote reset");
+      logCommandSend("UNPAIR_LOCAL", nodeId, local, "remove from registry");
+
+      unpairOk = sent && local;
+
+      // 3) Clear user-facing metadata
+      setNodeUserId(nodeId, "");  // removes id_<nodeId> key
+      setNodeName(nodeId, "");    // removes name_<nodeId> key
+      target->userId = "";
+      target->name   = "";
+
+      // 4) Log an UNPAIR event to CSV
+      char timeBuffer[24];
+      getRTCTimeString(timeBuffer, sizeof(timeBuffer));
+      String csvRow = String(timeBuffer) + ",MOTHERSHIP," +
+                      getMothershipsMAC() + ",UNPAIR," + nodeId;
+      logCSVRow(csvRow);
+
+      Serial.printf("[CONFIG] Unpair action for %s → send=%s, local=%s\n",
+                    nodeId.c_str(),
+                    sent  ? "OK" : "FAIL",
+                    local ? "OK" : "FAIL");
+    } else {
+      Serial.printf("[CONFIG] Unpair action requested for %s but node not found\n",
+                    nodeId.c_str());
+    }
+  }
 
 
   // --- 6) Resolve final values for display + NodeInfo ---
@@ -845,6 +965,8 @@ void handleNodeConfigSave() {
 
 void handleNodesPage() {
   String html = headCommon("Node Manager");
+    unsigned long nowMsUi = millis();
+
 
   auto allNodes = getRegisteredNodes();
 
@@ -857,7 +979,7 @@ void handleNodesPage() {
   } else {
     html += F("<div class='list'>");
 
-    for (auto &node : allNodes) {
+        for (auto &node : allNodes) {
       const char* stateLabel = "Unknown";
       const char* stateClass = "chip";
 
@@ -874,6 +996,29 @@ void handleNodesPage() {
 
       String userId = getNodeUserId(node.nodeId);  // numeric e.g. "001"
       String name   = getNodeName(node.nodeId);    // free-text
+
+      // ---- Time health classification (based on lastTimeSyncMs) ----
+      String healthClass = "health-unknown";
+      String healthLabel = "Unknown";
+      String healthSub   = "No TIME_SYNC info yet.";
+
+      if (node.lastTimeSyncMs > 0 && nowMsUi >= node.lastTimeSyncMs) {
+        float hours = (nowMsUi - node.lastTimeSyncMs) / 3600000.0f;
+        String hStr = String(hours, 1);
+
+        if (hours < 6.0f) {
+          healthClass = "health-fresh";
+          healthLabel = "Fresh (" + hStr + " h)";
+        } else if (hours < 24.0f) {
+          healthClass = "health-ok";
+          healthLabel = "OK (" + hStr + " h)";
+        } else {
+          healthClass = "health-stale";
+          healthLabel = "Stale (" + hStr + " h)";
+        }
+
+        healthSub = "Last TIME_SYNC ≈ " + hStr + " h ago";
+      }
 
       html += F("<a href='/node-config?node_id=");
       html += node.nodeId;
@@ -894,21 +1039,36 @@ void handleNodesPage() {
       html += node.nodeId;
       html += F("</span>");
 
-      // Third line: name (if any)
+      // Name (if any)
       if (name.length()) {
         html += F("<br><span class='muted'>");
         html += name;
         html += F("</span>");
       }
 
-      html += F("</div><div><span class='");
+      // NEW: time health block
+      html += F("<br><div class='time-health'>"
+                  "<span class='health-pill ");
+      html += healthClass;
+      html += F("'>");
+      html += healthLabel;
+      html += F("</span>"
+                "<div class='health-subtext'>");
+      html += healthSub;
+      html += F("</div></div>");
+
+      html += F("</div>"); // left column
+
+      // Right column: state chip
+      html += F("<div><span class='");
       html += stateClass;
       html += F("'>");
       html += stateLabel;
       html += F("</span></div>"
-                "</div>"
+                "</div>"   // .item-row
               "</a>");
     }
+
 
     html += F("</div>"); // .list
   }
@@ -949,6 +1109,9 @@ void setup() {
 
   loadWakeIntervalFromNVS();
   Serial.printf("Current wake interval (from NVS): %d min\n", gWakeIntervalMin);
+
+  // 🔎 One-shot boot summary so you can see the fleet state in one block
+  logBootSummary();
 
 #if ENABLE_SPIFFS_ASSETS
   if (!SPIFFS.begin(true)) {
