@@ -19,7 +19,9 @@ The system is built around:
   - Tracks **time health** per node (how fresh the last TIME_SYNC is)
 
 - **Sensor Nodes (ESP32-C3 Mini, one or more):**
-  - Measure environmental variables (e.g. air temperature)
+  - Measure environmental variables such as:
+    - Air temperature (DS18B20 backend)
+    - Soil volumetric water content + soil temperature (ADS1115 + thermistors backend)
   - Communicate with the mothership using ESP-NOW
   - Use a DS3231 RTC + Alarm 1 to drive their sampling interval
   - Persist state in NVS:
@@ -52,13 +54,43 @@ The system is built around:
   - Mothership can also broadcast fleet-wide time sync periodically
   - UI shows “Fresh / OK / Stale / Unknown” time health per node
 
+- **Sensor backend abstraction**
+  - Nodes use a small registry of logical “sensor slots”:
+    ```c++
+    struct SensorSlot {
+      const char* label;      // e.g. "DS18B20_TEMP_1", "SOIL1_VWC"
+      const char* sensorType; // e.g. "DS18B20", "SOIL_VWC", "SOIL_TEMP"
+    };
+
+    extern SensorSlot g_sensors[];
+    extern size_t     g_numSensors;
+    ```
+  - Each backend populates slots and implements `read(index, float&)`:
+    - **DS18B20 backend** (`sensors_ds18b20.*`)
+      - Scans a OneWire bus and registers one slot per DS18B20:
+        - Labels like `DS18B20_TEMP_1`, `DS18B20_TEMP_2`, …
+        - Type string typically `DS18B20`
+    - **Soil moisture + temperature backend** (`soil_moist_temp.*`)
+      - Uses one ADS1115 on the root I²C bus (no mux) to provide:
+        - `SOIL1_VWC` (ADS ch0) – θv from mV via polynomial calibration
+        - `SOIL2_VWC` (ADS ch1)
+        - `SOIL1_TEMP` (ADS ch2) – thermistor with Steinhart–Hart fit
+        - `SOIL2_TEMP` (ADS ch3)
+  - `sendSensorData()` walks `g_sensors[0..g_numSensors-1]` and sends one
+    `SENSOR_DATA` packet per slot; the CSV uses the `label`/`sensorType`
+    string as the `sensor_type` column.
+
 - **CSV logging to SD card (mothership)**
   - Single `datalog.csv` with rows:
-    ```
+    ```text
     timestamp,node_id,node_name,mac,sensor_type,value
     ```
+  - `sensor_type` is a free string such as:
+    - `DS18B20_TEMP_1`, `DS18B20_TEMP_2`
+    - `SOIL1_VWC`, `SOIL2_VWC`
+    - `SOIL1_TEMP`, `SOIL2_TEMP`
   - Periodic mothership heartbeats:
-    ```
+    ```text
     timestamp,MOTHERSHIP,<mac>,STATUS,ACTIVE
     ```
   - Optional TIME_SYNC fleet events logged as `TIME_SYNC_FLEET`
@@ -94,54 +126,58 @@ The system is built around:
 
 ## High-Level Architecture
 
-```
+```text
 +---------------------------+               +------------------------------+
 |       Sensor Node(s)      |  ESP-NOW      |          Mothership          |
 |       (ESP32-C3 Mini)     | <-----------> |       (ESP32-S3, AP)         |
 +---------------------------+               +------------------------------+
   - Firmware ID (e.g. TEMP_001)              - Wi-Fi AP "Logger001"
   - DS3231 RTC + Alarm 1                      - DS3231 RTC
-  - RTC INT pin → FET / wake (hardware)       - SD card (datalog.csv)
+  - (Future) RTC INT → FET/wake               - SD card (datalog.csv)
   - NVS   (MAC, deployedFlag, etc.)          - ESP-NOW manager
-  - Packets:                                  - Web UI (HTTP server)
-      DISCOVER_REQUEST                        - Node Manager + TIME_SYNC
-      PAIRING_REQUEST
-      REQUEST_TIME
-      SENSOR_DATA
-                                             Control packets:
-                                              DISCOVER_RESPONSE / SCAN
-                                              PAIR_NODE / PAIRING_RESPONSE
-                                              DEPLOY_NODE
-                                              SET_SCHEDULE
+  - Sensor backends:                          - Web UI (HTTP server)
+      DS18B20                                 - Node Manager + TIME_SYNC
+      soil_moist_temp (ADS1115)              
+  - Packets:                                 Control packets:
+      DISCOVER_REQUEST                        DISCOVER_RESPONSE / SCAN
+      PAIRING_REQUEST                         PAIR_NODE / PAIRING_RESPONSE
+      REQUEST_TIME                            DEPLOY_NODE
+      SENSOR_DATA                             SET_SCHEDULE
                                               UNPAIR_NODE
                                               TIME_SYNC (+ fleet broadcast)
 ```
-
-(Current implementation polls the DS3231 Alarm 1 flag in firmware; no GPIO wiring to INT is required yet, but the design is ready for INT→FET / wake pin.)
-
----
+*(Current implementation polls the DS3231 Alarm 1 flag in firmware; no GPIO wiring to INT is required yet, but the design is ready for INT→FET / wake pin.)*
 
 ### Node “Belonging” States
 
 At a high level, nodes are in one of three effective states:
 
 - **Unpaired**
-    - No mothership MAC known.
-    - Node periodically sends DISCOVER_REQUEST and PAIRING_REQUEST broadcasts.
+
+  No mothership MAC known.
+
+  Node periodically sends DISCOVER_REQUEST and PAIRING_REQUEST broadcasts.
 
 - **Paired / Bound**
-    - Mothership MAC known and stored in NVS.
-    - Node is “owned” but not yet deployed.
-    - RTC may or may not be synced (`rtcSynced` flag).
+
+  Mothership MAC known and stored in NVS.
+
+  Node is “owned” but not yet deployed.
+
+  RTC may or may not be synced (rtcSynced flag).
 
 - **Deployed**
-    - Mothership MAC known.
-    - `deployedFlag == true`.
-    - RTC has been synced from a DEPLOY_NODE or TIME_SYNC message.
-    - Node arms the DS3231 Alarm 1 based on `g_intervalMin` and sends data on each alarm.
 
-On the node, the effective state is derived from:
-```c
+  Mothership MAC known.
+
+  deployedFlag == true.
+
+  RTC has been synced from a DEPLOY_NODE or TIME_SYNC message.
+
+  Node arms the DS3231 Alarm 1 based on g_intervalMin and sends data on each alarm.
+
+Internally:
+```c++
 bool hasMothershipMAC();  // derived from stored MAC in NVS
 bool rtcSynced;           // true once time is set via DEPLOY or TIME_SYNC
 bool deployedFlag;        // persisted "this node is deployed" flag
@@ -151,15 +187,10 @@ enum NodeState {
   STATE_PAIRED   = 1,   // has mothership MAC, but not deployed
   STATE_DEPLOYED = 2    // has mothership MAC + deployed flag set
 };
-```
-The raw NodeState enum is also stored in NVS for debugging, but runtime behaviour is ultimately driven by `hasMothershipMAC()`, `deployedFlag`, `rtcSynced`, and the DS3231 alarm.
-
-On the mothership, each node is tracked as:
-```c++
 struct NodeInfo {
   uint8_t   mac[6];
   String    nodeId;         // firmware ID (e.g. "TEMP_001")
-  String    nodeType;       // e.g. "AIR_TEMP"
+  String    nodeType;       // e.g. "AIR_SOIL"
   uint32_t  lastSeen;       // millis() of last packet
   bool      isActive;       // auto-false after 5 min silence
   NodeState state;          // UNPAIRED / PAIRED / DEPLOYED
@@ -173,166 +204,90 @@ struct NodeInfo {
   uint32_t  lastTimeSyncMs; // millis() when last TIME_SYNC was sent
 };
 ```
-The Node Manager page uses `lastTimeSyncMs` to show a small “time health” pill per node:
-- Fresh: < 6 h since last TIME_SYNC
-- OK: 6–24 h
-- Stale: > 24 h
-- Unknown: no TIME_SYNC yet
+The Node Manager page uses lastTimeSyncMs to show a small “time health” pill per node:
+
+- **Fresh:** < 6 h since last TIME_SYNC
+- **OK:** 6–24 h
+- **Stale:** > 24 h
+- **Unknown:** no TIME_SYNC yet
 
 ---
 
-### State Transitions
+## Current TEMP_001 Sensor Profile
 
-**Discovery → Unpaired → Paired**
-- Node boots with no mothership MAC → STATE_UNPAIRED.
-- Node periodically broadcasts DISCOVER_REQUEST.
-- Mothership receives it, calls `registerNode(...)`, and replies with DISCOVER_RESPONSE.
-- Node appears in Node Manager as Unpaired.
-- In web UI: click node, set ID/name, choose Start/deploy.
-- Mothership calls `pairNode(nodeId)`:
-    - Sends PAIR_NODE and PAIRING_RESPONSE.
-    - Sets state = PAIRED and persists.
-- Node stores mothershipMAC and clears deployedFlag + rtcSynced → STATE_PAIRED.
+The nodes/air-temperature-node firmware currently exposes:
 
-**Paired → Deployed**
-- Node is Paired (has mothershipMAC).
-- In UI: Configure & Start, set ID/name/interval, choose Start.
-- Mothership:
-    - Broadcasts SET_SCHEDULE (interval) to all paired/deployed.
-    - Sends DEPLOY_NODE with DS3231 time and mothership ID.
-- Node on DEPLOY_NODE:
-    - Sets DS3231, rtcSynced = true, deployedFlag = true, g_intervalMin, lastTimeSyncUnix
-    - Arms DS3231 Alarm 1, sends immediate reading (optionally) → STATE_DEPLOYED.
+- **DS18B20 backend (sensors_ds18b20.\*)**
 
-**Deployed → Paired (Stop)**
-- Node is Deployed.
-- In UI: Configure & Start, choose Stop/keep paired.
-- Mothership updates state = PAIRED.
-- Node may clear deployedFlag (policy), becoming STATE_PAIRED.
+  - One OneWire bus on DS18B20_PIN
+  - All DS18B20s on the bus are registered:
+    - Slots like DS18B20_TEMP_1, DS18B20_TEMP_2, …
+    - Each slot is read via DallasTemperature and sent as its own SENSOR_DATA packet
 
-**Unpair**
-- In UI: Configure & Start, choose Unpair/forget.
-- Mothership sends UNPAIR_NODE, removes node from ESP-NOW & NVS.
-- Node clears mothershipMAC, rtcSynced, deployedFlag, lastTimeSyncUnix → STATE_UNPAIRED.
+- **Soil moisture + temp backend (soil_moist_temp.\*)**
+
+  - One ADS1115 on the root I²C bus (same as RTC)
+  - Channels are used as:
+    - ch0 → SOIL1_VWC (Probe 1 moisture, calibrated to θv)
+    - ch1 → SOIL2_VWC (Probe 2 moisture)
+    - ch2 → SOIL1_TEMP (Probe 1 thermistor → °C)
+    - ch3 → SOIL2_TEMP (Probe 2 thermistor → °C)
+
+  - Moisture uses polynomial coefficients ported from the earlier MicroPython logger
+
+  - Thermistors use Steinhart–Hart fits based on your anchor measurements (cold/room/warm)
+
+On each DS3231 alarm:
+
+- Node checks it is STATE_DEPLOYED, rtcSynced == true, and has a mothership MAC.
+- It iterates g_sensors and sends one SENSOR_DATA packet per slot.
+- Mothership logs one CSV row per packet.
 
 ---
 
-### Time Sync Behaviour
+## Time Sync Behaviour
 
-#### Node-initiated TIME_SYNC
+**Node-initiated TIME_SYNC**
+
 - If `hasMothershipMAC()` && `!rtcSynced`:
-    - Send REQUEST_TIME every ~30 s until TIME_SYNC.
+  - Send REQUEST_TIME every ~30 s until TIME_SYNC arrives.
 - If `rtcSynced == true`:
-    - If >24 h since lastTimeSyncUnix, send another REQUEST_TIME (max once every 30 s).
+  - If >24 h since lastTimeSyncUnix, send another REQUEST_TIME
+    (rate-limited to max once per 30 s).
+- When TIME_SYNC is received:
+  - Node sets DS3231, rtcSynced = true, lastTimeSyncUnix = dt.unixtime().
+  - Persists everything to NVS.
+  - If STATE_DEPLOYED and interval is set, it re-arms the DS3231 alarm.
 
-When TIME_SYNC is received:
-- Node sets DS3231, rtcSynced = true, lastTimeSyncUnix.
-- Persists all to NVS.
-- If STATE_DEPLOYED and has interval, re-arms DS3231 alarm.
+**Fleet-wide TIME_SYNC**
 
-#### Fleet-wide TIME_SYNC
-
-On mothership:
-- `espnow_loop()` calls `broadcastTimeSyncIfDue(false)`:
+- On mothership:
+  - `espnow_loop()` calls `broadcastTimeSyncIfDue(false)`:
     - If >24 h since last fleet sync, broadcast TIME_SYNC to all PAIRED/DEPLOYED.
-    - Log event and CSV row.
-- `broadcastTimeSyncIfDue(true)` = force immediate fleet sync (e.g. GUI button).
+    - Log the event and a CSV row.
+  - `broadcastTimeSyncIfDue(true)` forces an immediate fleet sync (e.g. from UI).
 
 ---
 
 ## Power-Loss Behaviour
 
-### Normal Power Cut (RTC coin cell OK)
+**Normal Power Cut (RTC coin cell OK)**
+
 - NVS state retained, node DS3231 keeps time.
 - On reboot:
-    - Mothership loads paired nodes from NVS, restores state.
-    - Node loads state: often STATE_DEPLOYED, deployedFlag = true, rtcSynced = true, interval, mothershipMAC, lastTimeSyncUnix.
-    - If `rtc.lostPower() == false`, stays STATE_DEPLOYED, resumes alarm-driven sends.
+  - Mothership reloads nodes from NVS.
+  - Node reloads its state: often STATE_DEPLOYED with a valid RTC.
+  - Node re-arms Alarm 1 based on stored g_intervalMin.
+  - Alarm-driven sends resume without manual intervention.
 
-### RTC Lost Power (no coin cell / dead cell)
+**RTC Lost Power (no coin cell / dead cell)**
+
 - If DS3231 lost backup:
-    - `rtc.lostPower() == true` at boot.
-    - Node marks `rtcSynced = false`, clears deployedFlag, persists.
-    - Remembers mothershipMAC.
-    - Effective state: STATE_PAIRED.
-    - Starts REQUEST_TIME packets for new TIME_SYNC.
-
-Policy: RTC lost power → node drops to PAIRED, expects fresh DEPLOY.
-
----
-
-## Node Firmware & Hardware
-
-### Example Node Hardware
-
-- **MCU**: ESP32-C3 Mini
-- **RTC**: DS3231 (I²C)
-- **INT/SQW**: Not required currently; designed for alarm INT in future.
-- **Sensor**: Dummy temp for now (DS18B20, BME280, etc. possible)
-
-### Boot Lifecycle
-
-- NVS init: `nvs_flash_init()`, handle error cases.
-- Load config: `state`, `rtcSynced`, `deployedFlag`, `interval`, `mothershipMAC`, `lastTimeSyncUnix`
-- RTC init: `Wire.begin(...)` `rtc.begin()`
-    - If `rtc.lostPower()`:
-        - `rtcSynced = false`, `deployedFlag = false`, `lastTimeSyncUnix = 0`, persist.
-    - Normalise DS3231 Alarm 1 flag.
-- ESP-NOW init: station mode, `esp_now_init()`, callbacks, add peer(s).
-- Initial state log: Print MAC, bootCount, state, RTC synced.
-- **Main Loop:**
-    - If bound but unsynced → REQUEST_TIME.
-    - If bound & synced & >24h since last sync → REQUEST_TIME.
-    - Poll DS3231 Alarm 1 flag:
-        - If set:
-            - handle alarm: log, if deployed & synced & paired → sendSensorData.
-            - Re-arm alarm, clear A1F.
-
----
-
-## Mothership Firmware & Hardware
-
-### Example Hardware
-
-- **MCU**: ESP32-S3 dev module
-- **RTC**: DS3231 (I²C)
-- **SD**: microSD with `datalog.csv`
-- **Wi-Fi**: Soft AP (SSID `Logger001`, password `logger123`)
-
-### On Boot
-
-- `setupRTC()`: init DS3231, log time.
-- `setupSD()`: mount SD, check CSV exists.
-- Configure Wi-Fi: AP/STA mode.
-- `setupESPNOW`: init, register callbacks, add peers, load NVS paired nodes.
-- Start HTTP server (variety of routes), log boot/fleet summary.
-
-### ESP-NOW Packet Handling
-
-- `sensor_data_message_t`: Promote node to DEPLOYED, log to CSV.
-- `discovery_message_t`: `registerNode(...)`, DISCOVER_RESPONSE.
-- `pairing_request_t`: Determine state, `registerNode(...)`, PAIRING_RESPONSE.
-- `time_sync_request_t`: Log, `sendTimeSync` with DS3231 time.
-
----
-
-## Web UI Dashboard
-
-- **Access**
-    - Connect to `Logger001` (default: `logger123`)
-    - Open [http://192.168.4.1/](http://192.168.4.1/)
-- **Main Page**
-    - Shows live DS3231 time
-    - Set RTC time from browser
-    - Set global wake interval (broadcasts via ESP-NOW)
-    - Download logs
-    - Node discovery & fleet overview
-- **Node Manager** (`/nodes`)
-    - List all nodes: ID, firmware, friendly name, “time health” pill, state chip.
-- **Configure & Start** (`/node-config`)
-    - Set/see: firmware ID, state, node ID, name, interval
-    - Actions: Start/Deploy, Stop/keep paired, Unpair/forget
-    - Shows broadcast/command results
+  - `rtc.lostPower() == true` at boot.
+  - Node clears rtcSynced, deployedFlag, lastTimeSyncUnix.
+  - Keeps mothershipMAC.
+  - Effective state becomes STATE_PAIRED.
+  - Node begins REQUEST_TIME messages until re-synced and re-deployed.
 
 ---
 
@@ -340,39 +295,38 @@ Policy: RTC lost power → node drops to PAIRED, expects fresh DEPLOY.
 
 ### Mothership
 
-    Board: ESP32-S3 Dev Module
-    Project dir: mothership/
-
-    pio run -t upload
-    pio device monitor
-
+```sh
+# in mothership/ project dir
+pio run -t upload
+pio device monitor
+```
 Then:
 
-- Connect to Logger001
-- Open [http://192.168.4.1/](http://192.168.4.1/)
+- Connect to Logger001 (default password logger123)
+- Open http://192.168.4.1/ in a browser
 
 ### Node(s)
 
-    Board: ESP32-C3 Mini
-    Project dir: e.g. nodes/air-temperature-node/
-
-    pio run -t upload
-    pio device monitor
-
-On first boot you should see logs like:
+```sh
+# in nodes/air-temperature-node/ project dir
+pio run -t upload
+pio device monitor
 ```
+On first boot you should see logs like:
+```text
 STATE_UNPAIRED ...
 📡 Discovery request sent
 ⏰ Bound but RTC unsynced → requesting initial TIME_SYNC
 ⏰ Time sync request sent
 ```
-Once mothership is up and “Discover Nodes” is run, node will appear in /nodes.
+Once the mothership is running and you click “Discover Nodes” in the UI, the node will appear in /nodes.
 
 ---
 
 ## Current Status & Next Steps
 
-**Current**
+### Current
+
 - ✅ Robust node state model (Unpaired / Paired / Deployed)
 - ✅ End-to-end Pair / Deploy / Stop / Unpair flows via web UI
 - ✅ CSV logging to SD card with node ID + friendly name
@@ -382,11 +336,15 @@ Once mothership is up and “Discover Nodes” is run, node will appear in /node
 - ✅ Explicit REQUEST_TIME / TIME_SYNC handshake per node
 - ✅ Fleet-wide periodic TIME_SYNC
 - ✅ Per-node time-health indicators in the Node Manager
+- ✅ Modular sensor backend system:
+  - DS18B20 OneWire air temperature
+  - ADS1115-based soil moisture + soil temperature (2 probes)
 
-**Future**
+### Future
+
 - Wire DS3231 INT → FET / wake pin; enable true alarm-driven deep sleep
-- Real sensor integrations (DS18B20, BME280, soil moisture, PAR, etc.)
-- Per-node wake intervals instead of global broadcast
-- OTA firmware updates (at least for mothership)
-- Diagnostic charts in web UI (per-node sparkline)
+- Per-node wake intervals instead of a global broadcast
+- Additional sensor backends (BME280, PAR, ultrasonic wind, etc.)
+- OTA firmware updates (at least for the mothership)
+- Diagnostic charts in web UI (per-node sparklines)
 - Data ingestion helpers for R/Python pipelines
