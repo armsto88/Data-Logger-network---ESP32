@@ -8,6 +8,8 @@
 #include <nvs_flash.h>
 #include <nvs.h>
 #include "esp_system.h"
+#include "sensors.h"
+#include "soil_moist_temp.h"
 
 #include "protocol.h"     // pins, ESPNOW_CHANNEL, protocol structs
 
@@ -19,10 +21,23 @@
 #define NODE_ID   "TEMP_001"
 #define NODE_TYPE "temperature"
 
+// -------------------- I2C bus & mux --------------------
+// Single I2C bus (I2C0) for RTC + PCA9548A + ADS1115
+TwoWire WireRtc(0);
+
+// Mux helper using config from protocol.h (MUX_ADDR, MUX_CHANNELS)
+bool muxSelectChannel(uint8_t ch) {
+  if (ch >= MUX_CHANNELS) return false;
+  WireRtc.beginTransmission(MUX_ADDR);
+  WireRtc.write(1 << ch);
+  return (WireRtc.endTransmission() == 0);
+}
+
 // Hardware
 RTC_DS3231 rtc;
 
-// -------------------- DS3231 helpers --------------------
+// ---- DS3231 helpers ----
+
 static inline void formatTime(const DateTime& dt, char* out, size_t n) {
   snprintf(out, n, "%04d-%02d-%02d %02d:%02d:%02d",
            dt.year(), dt.month(), dt.day(),
@@ -48,59 +63,59 @@ static void initNVS()
 
 // Read DS3231 A1F (Alarm1 Flag). Returns 0 or 1, or 0xFF on I2C error.
 static uint8_t readDS3231_A1F() {
-  Wire.beginTransmission(0x68);
-  Wire.write(0x0F);                 // STATUS register
-  Wire.endTransmission(false);
-  Wire.requestFrom(0x68, 1);
-  if (Wire.available()) {
-    uint8_t s = Wire.read();
-    return (s & 0x01) ? 1 : 0;      // bit0 = A1F
+  WireRtc.beginTransmission(0x68);
+  WireRtc.write(0x0F);                 // STATUS register
+  WireRtc.endTransmission(false);
+  WireRtc.requestFrom((uint8_t)0x68, (uint8_t)1);
+  if (WireRtc.available()) {
+    uint8_t s = WireRtc.read();
+    return (s & 0x01) ? 1 : 0;         // bit0 = A1F
   }
   return 0xFF;
 }
 
 // Clear A1F (Alarm1 Flag) while preserving other status bits.
 static void clearDS3231_A1F() {
-  Wire.beginTransmission(0x68);
-  Wire.write(0x0F);      // STATUS
-  Wire.endTransmission(false);
-  Wire.requestFrom(0x68, 1);
-  uint8_t s = Wire.available() ? Wire.read() : 0;
+  WireRtc.beginTransmission(0x68);
+  WireRtc.write(0x0F);      // STATUS
+  WireRtc.endTransmission(false);
+  WireRtc.requestFrom((uint8_t)0x68, (uint8_t)1);
+  uint8_t s = WireRtc.available() ? WireRtc.read() : 0;
 
   // Clear A1F (bit0) AND A2F (bit1) to be safe
   s &= ~0x03;
 
-  Wire.beginTransmission(0x68);
-  Wire.write(0x0F);
-  Wire.write(s);
-  Wire.endTransmission();
+  WireRtc.beginTransmission(0x68);
+  WireRtc.write(0x0F);
+  WireRtc.write(s);
+  WireRtc.endTransmission();
 }
 
 // Enable INTCN + A1IE (Alarm1 interrupt)
 static void ds3231EnableAlarmInterrupt() {
-  Wire.beginTransmission(0x68);
-  Wire.write(0x0E);  // CTRL
-  Wire.endTransmission(false);
-  Wire.requestFrom(0x68, 1);
-  uint8_t ctrl = Wire.available() ? Wire.read() : 0;
+  WireRtc.beginTransmission(0x68);
+  WireRtc.write(0x0E);  // CTRL
+  WireRtc.endTransmission(false);
+  WireRtc.requestFrom((uint8_t)0x68, (uint8_t)1);
+  uint8_t ctrl = WireRtc.available() ? WireRtc.read() : 0;
 
   ctrl |= 0b00000101;  // INTCN (bit2) + A1IE (bit0)
 
-  Wire.beginTransmission(0x68);
-  Wire.write(0x0E);
-  Wire.write(ctrl);
-  Wire.endTransmission();
+  WireRtc.beginTransmission(0x68);
+  WireRtc.write(0x0E);
+  WireRtc.write(ctrl);
+  WireRtc.endTransmission();
 }
 
 // Low-level: write DS3231 Alarm1 registers
 static bool ds3231WriteA1(uint8_t secReg, uint8_t minReg, uint8_t hourReg, uint8_t dayReg) {
-  Wire.beginTransmission(0x68);
-  Wire.write(0x07);                // A1 seconds register
-  Wire.write(secReg);
-  Wire.write(minReg);
-  Wire.write(hourReg);
-  Wire.write(dayReg);
-  return Wire.endTransmission() == 0;
+  WireRtc.beginTransmission(0x68);
+  WireRtc.write(0x07);                // A1 seconds register
+  WireRtc.write(secReg);
+  WireRtc.write(minReg);
+  WireRtc.write(hourReg);
+  WireRtc.write(dayReg);
+  return WireRtc.endTransmission() == 0;
 }
 
 // Program “every minute” (seconds == 00, ignore others)
@@ -147,7 +162,6 @@ static bool ds3231ArmNextInNMinutes(uint8_t intervalMin, DateTime* nextOut = nul
   if (nextOut) *nextOut = next;
   return ds3231WriteA1(secBCD, minBCD, hourBCD, dayReg);
 }
-
 
 // -------------------- Node state --------------------
 enum NodeState {
@@ -594,32 +608,54 @@ static void sendSensorData() {
     return;
   }
 
-  // Dummy reading
-  float temperature = 20.0 + (random(0, 200) / 10.0f);
+  if (g_numSensors == 0) {
+    Serial.println("⚠️ No sensors configured (g_numSensors == 0)");
+    return;
+  }
 
-  sensor_data_message_t msg{};
-  strcpy(msg.nodeId,     NODE_ID);
-  strcpy(msg.sensorType, NODE_TYPE);
-  msg.value         = temperature;
-  msg.nodeTimestamp = rtc.now().unixtime();
+  Serial.printf("📦 sendSensorData(): g_numSensors = %u\n", (unsigned)g_numSensors);
 
-  esp_wifi_set_channel(ESPNOW_CHANNEL, WIFI_SECOND_CHAN_NONE);
-  esp_err_t res = esp_now_send(mothershipMAC, (uint8_t*)&msg, sizeof(msg));
+  // Iterate all sensors in the unified registry
+  for (size_t i = 0; i < g_numSensors; ++i) {
 
-  if (res == ESP_OK) {
-    Serial.print("📊 Sensor packet sent → temp = ");
-    Serial.print(temperature);
-    Serial.println(" °C");
+    float value;
+    if (!readSensor(i, value)) {
+      Serial.printf("⚠️ Sensor read failed for slot %u (label='%s', type='%s')\n",
+                    (unsigned)i,
+                    g_sensors[i].label      ? g_sensors[i].label      : "NULL",
+                    g_sensors[i].sensorType ? g_sensors[i].sensorType : "NULL");
+      continue;
+    }
 
-    Serial.printf("   → sent to mothership MAC %02X:%02X:%02X:%02X:%02X:%02X\n",
-                  mothershipMAC[0], mothershipMAC[1], mothershipMAC[2],
-                  mothershipMAC[3], mothershipMAC[4], mothershipMAC[5]);
-    Serial.println("   (Mothership should now log this row to CSV)");
-  } else {
-    Serial.print("❌ Failed to send data, esp_err = ");
-    Serial.println(esp_err_to_name(res));
+    sensor_data_message_t msg{};
+    strcpy(msg.nodeId, NODE_ID);
+    msg.nodeTimestamp = rtc.now().unixtime();
+
+    // Use the *label* as the identifier the mothership sees
+    const char* labelStr = g_sensors[i].label ? g_sensors[i].label : "UNKNOWN";
+    strncpy(msg.sensorType, labelStr, sizeof(msg.sensorType) - 1);
+    msg.sensorType[sizeof(msg.sensorType) - 1] = '\0';
+
+    msg.value = value;
+
+    esp_wifi_set_channel(ESPNOW_CHANNEL, WIFI_SECOND_CHAN_NONE);
+    esp_err_t res = esp_now_send(mothershipMAC, (uint8_t*)&msg, sizeof(msg));
+
+    if (res == ESP_OK) {
+      Serial.printf("📊 Sensor packet sent → %s (type=%s) = %.4f\n",
+                    labelStr,
+                    g_sensors[i].sensorType ? g_sensors[i].sensorType : "UNKNOWN",
+                    value);
+      Serial.printf("   → to mothership %02X:%02X:%02X:%02X:%02X:%02X\n",
+                    mothershipMAC[0], mothershipMAC[1], mothershipMAC[2],
+                    mothershipMAC[3], mothershipMAC[4], mothershipMAC[5]);
+    } else {
+      Serial.printf("❌ Failed to send %s: %s\n",
+                    labelStr, esp_err_to_name(res));
+    }
   }
 }
+
 
 
 // -------------------- Per-alarm handler --------------------
@@ -673,6 +709,51 @@ static void handleRtcAlarmEvent() {
   Serial.println("   → Simulated behaviour: FET OFF / LED OFF / node power CUT");
 }
 
+// -------------------- I2C / Mux / ADS1115 Self-test --------------------
+
+// Common ADS1115 default address
+#define ADS1115_ADDR 0x48
+
+static void testI2CBusesMuxAndADS() {
+  Serial.println("====== I2C / Mux / ADS1115 Self-Test (single bus) ======");
+
+  // 1) Probe DS3231 on bus
+  WireRtc.beginTransmission(0x68);
+  uint8_t errRtc = WireRtc.endTransmission();
+  Serial.printf("RTC probe @0x68 on WireRtc -> %s (err=%u)\n",
+                (errRtc == 0) ? "OK" : "FAIL", errRtc);
+
+  // 2) Root bus scan (should show RTC, MUX, ADS1115, etc.)
+  Serial.println("\nI2C scan on WireRtc:");
+  uint8_t count = 0;
+  for (uint8_t addr = 1; addr < 127; ++addr) {
+    WireRtc.beginTransmission(addr);
+    uint8_t err = WireRtc.endTransmission();
+    if (err == 0) {
+      Serial.printf("  Found device at 0x%02X\n", addr);
+      count++;
+    }
+  }
+  Serial.printf("  Done. Found %u device(s).\n", count);
+
+  // 3) Probe mux (optional, if installed)
+  WireRtc.beginTransmission(MUX_ADDR);
+  uint8_t errMux = WireRtc.endTransmission();
+  Serial.printf("MUX probe @0x%02X on WireRtc -> %s (err=%u)\n",
+                MUX_ADDR,
+                (errMux == 0) ? "OK" : "FAIL",
+                errMux);
+
+  // 4) Probe ADS1115 directly on root bus (NO muxSelectChannel)
+  WireRtc.beginTransmission(ADS1115_ADDR);
+  uint8_t errAds = WireRtc.endTransmission();
+  Serial.printf("ADS1115 probe @0x%02X on WireRtc -> %s (err=%u)\n",
+                ADS1115_ADDR,
+                (errAds == 0) ? "OK" : "FAIL",
+                errAds);
+
+  Serial.println("====== I2C / Mux / ADS1115 Self-Test done ======");
+}
 
 
 // ==================== Setup/Loop ====================
@@ -691,9 +772,12 @@ void setup() {
   debugState("after setup load");
   Serial.println("====================================");
 
-  // I2C + RTC
-  Wire.begin(RTC_SDA_PIN, RTC_SCL_PIN);  // pins from protocol.h
-  if (!rtc.begin()) {
+  // Single I2C bus for RTC + MUX + ADS1115
+  WireRtc.begin(RTC_SDA_PIN, RTC_SCL_PIN);
+  Serial.printf("✅ WireRtc started on SDA=%d SCL=%d\n", RTC_SDA_PIN, RTC_SCL_PIN);
+
+  // Make RTClib use this bus
+  if (!rtc.begin(&WireRtc)) {
     Serial.println("❌ RTC not found!");
   } else {
     Serial.println("✅ RTC initialized");
@@ -711,6 +795,33 @@ void setup() {
       Serial.println("RTC not synchronized yet");
     }
 
+    // After rtc.begin(...) block, once we know rtcSynced/deployedFlag/g_intervalMin
+    if (rtcSynced && deployedFlag && g_intervalMin > 0) {
+      bool ok = false;
+      DateTime next;
+
+      if (g_intervalMin <= 1) {
+        ok = ds3231EveryMinute();
+        DateTime now = rtc.now();
+        DateTime nextDisplay = (now.second() == 0)
+            ? now + TimeSpan(0,0,1,0)
+            : DateTime(now.year(),now.month(),now.day(),now.hour(),now.minute(),0)
+              + TimeSpan(0,0,1,0);
+        next = nextDisplay;
+      } else {
+        ok = ds3231ArmNextInNMinutes(g_intervalMin, &next);
+      }
+
+      ds3231EnableAlarmInterrupt();
+      clearDS3231_A1F();
+
+      char nextStr[24];
+      formatTime(next, nextStr, sizeof(nextStr));
+      Serial.printf("[BOOT] Re-armed RTC alarm based on stored interval=%u → next=%s (ok=%d)\n",
+                    g_intervalMin, nextStr, ok);
+    }
+
+
     // Normalise A1F at boot so we don't start on a stale alarm
     uint8_t a1fInit = readDS3231_A1F();
     if (a1fInit == 0xFF) {
@@ -724,8 +835,6 @@ void setup() {
       Serial.println("[RTC] A1F=0 at boot (idle)");
     }
   }
-
-  // No RTC_INT_PIN or ISR — INT only drives FET + LED in hardware.
 
   // WiFi / ESPNOW
   WiFi.mode(WIFI_STA);
@@ -773,7 +882,17 @@ void setup() {
     }
   }
 
+   // Initialise all sensors (DS18B20 + soil backend etc. via sensors.cpp)
+  if (!initSensors()) {
+    Serial.println("⚠️ Sensor init failed (continuing, but reads may fail)");
+  }
+
+
+  // I2C sanity check: RTC + mux + ADS1115 (optional to keep / update)
+  testI2CBusesMuxAndADS();
+
   persistNodeConfig();
+
   Serial.println("🔁 Setup persisted baseline node config");
   debugState("end of setup");
 }
@@ -781,9 +900,21 @@ void setup() {
 void loop() {
   static unsigned long lastAction      = 0;
   static unsigned long lastTimeSyncReq = 0;
-  unsigned long nowMs = millis();
+  static unsigned long lastBeat        = 0;   // heartbeat
+  static unsigned long lastA1Check     = 0;   // when we last checked A1F
+  static unsigned long loopCounter     = 0;   // just to see loop advancing
 
+  unsigned long nowMs = millis();
   NodeState st = currentNodeState();
+
+  loopCounter++;
+
+  // Very explicit heartbeat every 5 seconds
+  if (nowMs - lastBeat > 5000UL) {
+    lastBeat = nowMs;
+    Serial.printf("💓 loop heartbeat #%lu, millis=%lu, state=%d, rtcSynced=%d, deployed=%d\n",
+                  (unsigned long)loopCounter, nowMs, (int)st, rtcSynced, deployedFlag);
+  }
 
   // If we are bound but RTC isn't synced, occasionally ask for time.
   if (hasMothershipMAC() && !rtcSynced) {
@@ -812,21 +943,29 @@ void loop() {
     }
   }
 
-  // --- RTC alarm handling (simple A1F poll, like old version) ---
-  {
-    uint8_t a1 = readDS3231_A1F();
-    if (a1 == 0xFF) {
-      static unsigned long lastErr = 0;
-      if (nowMs - lastErr > 5000UL) {
-        Serial.println("⚠️ readDS3231_A1F() error (0xFF)");
-        lastErr = nowMs;
-      }
-    } else if (a1 == 1) {
+// --- RTC alarm handling: check A1F once per second ---
+if (nowMs - lastA1Check > 1000UL) {
+  lastA1Check = nowMs;
+
+  DateTime nowRtc = rtc.now();
+  char tbuf[24];
+  formatTime(nowRtc, tbuf, sizeof(tbuf));
+
+  uint8_t a1 = readDS3231_A1F();
+
+  if (a1 == 0xFF) {
+    Serial.printf("[RTC] %s A1F=ERR(0xFF)\n", tbuf);
+  } else {
+    Serial.printf("[RTC] %s A1F=%u\n", tbuf, a1);
+
+    if (a1 == 1) {
       Serial.println("⚡ A1F=1 → handleRtcAlarmEvent()");
       handleRtcAlarmEvent();
-      // handleRtcAlarmEvent() will clear A1F, so next poll should see 0
+      // handleRtcAlarmEvent() will clear A1F, so next check should see 0
     }
   }
+}
+
 
   // Simple state machine logs (for bench)
   if (st == STATE_UNPAIRED) {

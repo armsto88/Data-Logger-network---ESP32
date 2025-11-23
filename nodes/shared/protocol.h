@@ -102,3 +102,9 @@ typedef struct rnt_pairing_t {
 #define RTC_SDA_PIN 8
 #define RTC_SCL_PIN 9
 #define RTC_INT_PIN 4
+
+
+// NEW: mux configuration (PCA9548A-style)
+// Change these two if you move to a different mux / address later.
+#define MUX_ADDR      0x70
+#define MUX_CHANNELS  8       // set to 4 when you move to a 4-channel mux

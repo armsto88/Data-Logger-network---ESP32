@@ -892,9 +892,20 @@ void handleNodeConfigSave() {
       // 4) Log an UNPAIR event to CSV
       char timeBuffer[24];
       getRTCTimeString(timeBuffer, sizeof(timeBuffer));
-      String csvRow = String(timeBuffer) + ",MOTHERSHIP," +
-                      getMothershipsMAC() + ",UNPAIR," + nodeId;
+      String ts = String(timeBuffer);
+
+      // timestamp,node_id,node_name,mac,event_type,sensor_type,value,meta
+      String csvRow = ts + ","
+                    + "MOTHERSHIP"        + ","  // node_id
+                    + ""                  + ","  // node_name
+                    + getMothershipsMAC() + ","  // mac
+                    + "UNPAIR"            + ","  // event_type
+                    + ""                  + ","  // sensor_type
+                    + ""                  + ","  // value
+                    + nodeId;                  // meta = firmware nodeId
+
       logCSVRow(csvRow);
+
 
       Serial.printf("[CONFIG] Unpair action for %s → send=%s, local=%s\n",
                     nodeId.c_str(),
@@ -1169,8 +1180,20 @@ void loop() {
     char timeBuffer[24];
     getRTCTimeString(timeBuffer, sizeof(timeBuffer));
     // Note: CSV schema for mothership is still the old one – fine for now.
-    String csvRow = String(timeBuffer) + ",MOTHERSHIP," + getMothershipsMAC() + ",STATUS,ACTIVE";
+    String ts = String(timeBuffer);
+
+// timestamp,node_id,node_name,mac,event_type,sensor_type,value,meta
+    String csvRow = ts + ","
+                  + "MOTHERSHIP"        + ","  // node_id
+                  + ""                  + ","  // node_name
+                  + getMothershipsMAC() + ","  // mac
+                  + "STATUS"            + ","  // event_type
+                  + ""                  + ","  // sensor_type
+                  + ""                  + ","  // value
+                  + "ACTIVE";                // meta
+
     if (logCSVRow(csvRow)) Serial.println("✅ Mothership status logged");
+
     lastMothershipLog = millis();
   }
 }

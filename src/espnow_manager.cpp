@@ -192,20 +192,34 @@ static void OnDataRecv(const uint8_t * mac,
           (unsigned long)incoming.nodeTimestamp
         );
 
-        // CSV row: timestamp, node_id, node_name, mac, sensor_type, value
+    // CSV row: timestamp,node_id,node_name,mac,event_type,sensor_type,value,meta
         String row;
-        row.reserve(160);
-        row  = ts;              // timestamp (mothership RTC)
+        row.reserve(240);
+        row  = ts;               // timestamp (mothership RTC)
         row += ",";
-        row += csvId;           // node_id (numeric, falls back to fwId if empty)
+        row += csvId;            // node_id (numeric, falls back to fwId if empty)
         row += ",";
-        row += csvName;         // node_name (may be empty)
+        row += csvName;          // node_name (may be empty)
         row += ",";
-        row += macStr;          // raw MAC
+        row += macStr;           // raw MAC
         row += ",";
-        row += incoming.sensorType;
+        row += "SENSOR";         // event_type (more explicit than "DATA")
         row += ",";
-        row += String(incoming.value);
+        row += incoming.sensorType;         // sensor_type (e.g. "AIR_TEMP")
+        row += ",";
+        row += String(incoming.value, 3);   // value with 3 decimals
+        row += ",";
+
+        // --- meta: start using this for future stuff ---
+        // For now: firmware ID + node-side timestamp
+        String meta;
+        meta.reserve(80);
+        meta  = "FW_ID=";
+        meta += fwId; // e.g. "TEMP_001"
+        meta += ";NODE_TS=";
+        meta += String(incoming.nodeTimestamp);  // as sent by node (millis or unix)
+
+        row += meta;
 
         if (logCSVRow(row)) Serial.println("✅ Node data logged");
         else                Serial.println("❌ Failed to log node data");
@@ -619,10 +633,18 @@ bool broadcastTimeSyncIfDue(bool force) {
         Serial.printf("⏰ Fleet TIME_SYNC triggered (force=%d) at %s\n",
                       force ? 1 : 0, ts);
 
-        // Optional: log to CSV as a mothership event
-        String row = String(ts) + ",MOTHERSHIP," +
-                     getMothershipsMAC() + ",TIME_SYNC_FLEET,OK";
+        // timestamp,node_id,node_name,mac,event_type,sensor_type,value,meta
+        String row = String(ts) + ","
+                  + "MOTHERSHIP"        + ","  // node_id
+                  + ""                  + ","  // node_name
+                  + getMothershipsMAC() + ","  // mac
+                  + "TIME_SYNC_FLEET"   + ","  // event_type
+                  + ""                  + ","  // sensor_type
+                  + ""                  + ","  // value
+                  + "OK";                    // meta
+
         logCSVRow(row);
+
     }
     return any;
 }

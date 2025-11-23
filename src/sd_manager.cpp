@@ -4,7 +4,7 @@
 // Desired CSV header matching espnow_manager:
 // Timestamp,Node_ID,Node_Name,MAC_Address,Sensor_Type,Value
 static const char* CSV_HEADER =
-    "Timestamp,Node_ID,Node_Name,MAC_Address,Sensor_Type,Value";
+    "timestamp,node_id,node_name,mac,event_type,sensor_type,value,meta";
 
 // Forward decl for internal helper
 static bool ensureCSVHeader();
