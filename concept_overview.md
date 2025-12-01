@@ -60,6 +60,7 @@ It simply announces something like:
 The mothership hears these announcements and registers the node.  
 The node then appears in the **Node Manager** list in the web dashboard with state **Unpaired**.
 
+
 On subsequent boots:
 
 - If the node has already been paired, it loads the stored mothership MAC from NVS.
@@ -82,6 +83,7 @@ Choosing **Action: Start / deploy** on an **unpaired** node causes the mothershi
 4. The node stores the mothership MAC in its NVS.
 
 At this point the node is **bound/paired**, but not yet actively sending measurements until it’s deployed.
+
 
 ### 3. Deployment
 
@@ -121,6 +123,7 @@ On each alarm, the node sends one `SENSOR_DATA` packet per logical sensor slot, 
 
 In the dashboard, the node now shows as **Deployed**, with a “Fresh / OK / Stale / Unknown” time-health pill based on when it last received a `TIME_SYNC`.
 
+
 > After a power cut, a deployed node reloads this state from NVS.  
 > If its RTC still has valid time, it sees it is deployed + synced and simply **resumes sending data** without needing to be redeployed.
 
@@ -157,6 +160,7 @@ The node:
 
 On next boot, it will appear again as **Unpaired**, advertising itself to any listening mothership.
 
+
 ---
 
 ## Web Dashboard
@@ -181,12 +185,15 @@ From there you can:
 - See which nodes are currently deployed and actively sending data (air + soil).
 - Download the full **CSV log** of all data recorded to date.
 
+
+
 ### Screens / Views
 
 - **Main dashboard view**
   - Current RTC time.
   - Global wake interval controls.
   - System status and links.
+
 
 - **Node Manager**
   - List of nodes with:
@@ -195,6 +202,7 @@ From there you can:
     - State chip: Unpaired / Paired / Deployed.
     - Time-health pill: Fresh / OK / Stale / Unknown.
   - Tap-through to per-node configuration.
+
 
 - **Configure & Start (per node)**
   - Shows:
@@ -208,11 +216,20 @@ From there you can:
     - **Stop / keep paired**.
     - **Unpair / forget**.
 
+
+
 - **CSV / Logs**
   - Button to download the main CSV file from SD.
   - Optional system status messages (e.g. TIME_SYNC fleet events).
+ 
 
-(*Screenshots are referenced as `UI_Images/1.png` … `UI_Images/5.png` in the repo.*)
+
+
+ ![Node Discovery Screen](UI_Images/1.png)
+   ![Node Pairing Screen](UI_Images/2.png)
+   ![Deployment Screen](UI_Images/3.png)
+  ![Revert/Unpair UI](UI_Images/4.png)
+  ![Web Dashboard](UI_Images/5.png)
 
 ---
 
