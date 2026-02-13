@@ -13,7 +13,8 @@ from FreeCAD import Vector
 #       * internal fastening tubes aligned with pods (45/135/225/315)
 #       * heat-set inserts in those tubes (from top)
 #       * no holes through belly floor
-#       * wall ports + nut flats
+#       * wall ports + protrusions (GX12 cluster = single protrusion)
+#       * inside ALSO gets matching flat protrusion (inner boss)
 #       * PCB standoffs on belly floor
 # ============================================================
 
@@ -106,7 +107,7 @@ BELLY_WALL_H   = 75.0
 BELLY_WALL_THK = 6.0
 
 # Beef up internal belly fastening tubes:
-BELLY_TUBE_OD      = 12.0     # was 10.0 (stronger around insert)
+BELLY_TUBE_OD      = 12.0
 BELLY_FLOOR_HOLES_ENABLE = False   # no holes through belly floor
 
 # ---------------- Drip edge (external skirt under rim) ----------------
@@ -139,40 +140,44 @@ CONNECTORS_ENABLE = True
 
 GX12_HOLE_D     = 11.0
 GX12_NUT_D      = 15.0
-# ---- GX12 2x2 grid ----
 GX12_QTY = 4
 
-# Center angle for the row (pick where you want the row to sit)
-GX12_ROW_CENTER_ANGLE = 40.0   # tweak (deg)
-
-# Angular spacing between adjacent GX12s
-GX12_ROW_SPACING_DEG = 18.0    # tweak (deg) 16–22 usually sensible
-
-GX12_ROW_OFFSET_DEG = -5.0   # + = rotate clockwise (to the right when viewed from above)
-
-
-# Z position for the whole row (defaults to PORT_Z_CENTER if None)
-GX12_Z_CENTER = -30.0
-
+GX12_ROW_CENTER_ANGLE = 320.0
+GX12_ROW_SPACING_DEG  = 25.0
+GX12_ROW_OFFSET_DEG   = -15.0
+GX12_Z_CENTER         = -30.0
+GX12_PAIR_SEPARATION_DEG = 210.0
 
 PG7_HOLE_D    = 13.0
 PG7_NUT_D     = 17.9
-PG7_ANGLE_DEG = 240.0
+PG7_ANGLE_DEG = 225.0
 
 SHT_HOLE_D    = 11.5
 SHT_NUT_D     = 15.0
-SHT_ANGLE_DEG = 315.0
+SHT_ANGLE_DEG = 45.0
 
-PORT_Z_CENTER = None
-PORT_CUT_EXTRA = 2.0
+PORT_Z_CENTER        = None
+PORT_CUT_EXTRA       = 2.0
 PORT_AVOID_STANDOFF_DEG = 12.0
 
-# Nut-seat flats (CUTS)
-NUT_FLATS_ENABLE   = True
-NUT_FLAT_DEPTH_OUT = 1.0
-NUT_FLAT_DEPTH_IN  = 1.0
-NUT_FLAT_MARGIN    = 2.0
-NUT_FLAT_Z_MARGIN  = 2.0
+# ---------------- Protrusions / pads ----------------
+PORT_PADS_ENABLE = True
+PORT_PAD_EXTRA_W = 5.0
+PORT_PAD_EXTRA_H = 5.0
+PORT_PAD_THK     = 2.0
+PORT_PAD_INSET   = 0.8
+
+# Print-friendly taper (optional; only used in per-port pads)
+PORT_PAD_CHAMFER_Z   = 3.0
+PORT_PAD_CHAMFER_RUN = 3.5
+
+# --- NEW: inside ALSO gets matching protrusion so inner wall is flat there ---
+PORT_PAD_INNER_ENABLE = True
+PORT_PAD_INNER_THK    = 3.0
+
+# --- NEW: GX12 cluster is ONE protrusion (arc sector) ---
+GX12_CLUSTER_PAD_ENABLE     = True
+GX12_CLUSTER_PAD_ANG_MARGIN = 6.0  # degrees extra each side of cluster span
 
 # ---------------- PCB mounts (inside belly) ----------------
 PCB_ENABLE = True
@@ -196,9 +201,7 @@ PCB_INSERT_CHAMFER_H = 0.6
 PCB_OFFSET_X = 0.0
 PCB_OFFSET_Y = 0.0
 
-# Rotate PCB mounting pattern so posts align with belly fastening angles
-PCB_ROT_DEG = BELLY_FASTEN_OFFSET   # 35.0 to match your belly fasteners
-
+PCB_ROT_DEG = BELLY_FASTEN_OFFSET
 
 # ---------------- SHT "CIRCULAR ROOF" (NO GILLS) ----------------
 SHT_RS_ENABLE = False
@@ -210,15 +213,6 @@ SHT_CANOPY_STRUT_W = 4.0
 SHT_CANOPY_STRUT_Z = 6.0
 SHT_CANOPY_STRUT_Y_OFFSET = (SHT_NUT_D / 2.0) + 6.0
 SHT_Z = -BELLY_WALL_H / 2.0
-
-SHT_RS_NUT_CLEAR_ENABLE = True
-SHT_RS_NUT_CLEAR_MARGIN = 3.5
-SHT_RS_NUT_CLEAR_OUTSET = 18.0
-SHT_RS_NUT_CLEAR_Z      = 3.5
-
-SHT_RS_TUNNEL_ENABLE = True
-SHT_RS_TUNNEL_D      = SHT_NUT_D + 4.0
-SHT_RS_TUNNEL_EXTRA  = 35.0
 
 # ---------------- PAR / Spectral sensor housing ----------------
 PAR_ENABLE = True
@@ -240,16 +234,16 @@ PAR_CABLE_PORT_ANGLE = 90.0
 
 # ---------------- Aerodynamic edge rounding ----------------
 EDGE_ROUND_ENABLE = True
+HEAD_RIM_FILLET_R = 2.0
+ROOF_RIM_FILLET_R = 2.0
+RIM_RADIUS_TOL = 0.6
 
-# outer rim of the ultrasonic head (plate/body)
-HEAD_RIM_FILLET_R = 2.0     # try 1.5–3.0
-
-# outer rim of the roof disc
-ROOF_RIM_FILLET_R = 2.0     # try 1.5–3.0
-
-# how strict we are when detecting the rim radius
-RIM_RADIUS_TOL = 0.6        # mm
-
+# ---------------- Support root reinforcement (fillet-like gussets) ----------------
+SUPPORT_GUSSET_ENABLE = True
+STANDOFF_GUSSET_H       = 2.0
+STANDOFF_GUSSET_EXTRA_R = 2.0
+PCB_POST_GUSSET_H       = 2.0
+PCB_POST_GUSSET_EXTRA_R = 2.0
 
 # ---------- Document ----------
 DOC_NAME = "Ultrasonic_Head_Improved"
@@ -290,10 +284,21 @@ def angle_ok(a_deg):
             return False
     return True
 
-def cut_radial_port(solid, hole_d, angle_deg, z_center, wall_inner_r, wall_outer_r, extra=2.0):
+def cut_radial_port(solid, hole_d, angle_deg, z_center,
+                    wall_inner_r, wall_outer_r,
+                    extra=2.0,
+                    outer_extra=0.0,
+                    inner_extra=0.0):
+    """
+    Cuts a radial cylindrical hole.
+    outer_extra extends the cut beyond wall_outer_r (so it passes through outer protrusions).
+    inner_extra extends the cut inward beyond wall_inner_r (so it passes through inner bosses).
+    """
     zc = clamp(z_center, -BELLY_WALL_H + 6.0, -6.0)
-    length = (wall_outer_r - wall_inner_r) + 2.0 * extra
-    x0 = wall_inner_r - extra
+
+    x0 = (wall_inner_r - extra) - float(inner_extra)
+    x1 = (wall_outer_r + extra) + float(outer_extra)
+    length = max(0.1, x1 - x0)
 
     cutter = Part.makeCylinder(
         hole_d / 2.0,
@@ -304,69 +309,293 @@ def cut_radial_port(solid, hole_d, angle_deg, z_center, wall_inner_r, wall_outer
     cutter.rotate(Vector(0, 0, 0), Vector(0, 0, 1), angle_deg)
     return solid.cut(cutter)
 
-def cut_nut_flats(solid, angle_deg, zc, nut_d, wall_inner_r, wall_outer_r,
-                  depth_out=1.0, depth_in=1.0, margin=2.0, z_margin=2.0):
-    w = nut_d + 2.0 * margin
-    h = nut_d + 2.0 * z_margin
+def add_inner_port_pad(solid, angle_deg, zc, nut_d, wall_inner_r,
+                       inner_thk=3.0, inset=0.8,
+                       extra_w=8.0, extra_h=8.0,
+                       chamfer_z=3.0, chamfer_run=3.0,
+                       chamfer_y=None, chamfer_run_y=None):
+    """
+    Adds the SAME style of tapered flat pad, but on the INSIDE wall (protruding into cavity).
+    """
+    pad_w = float(nut_d) + 2.0 * float(extra_w)
+    pad_h = float(nut_d) + 2.0 * float(extra_h)
 
-    out_x0 = wall_outer_r - depth_out
-    out_len_x = depth_out + 30.0
-    outer_box = Part.makeBox(out_len_x, w, h, Vector(out_x0, -w/2.0, zc - h/2.0))
-    outer_box.rotate(Vector(0, 0, 0), Vector(0, 0, 1), angle_deg)
-    solid = solid.cut(outer_box)
+    if chamfer_y is None:
+        chamfer_y = chamfer_z
+    if chamfer_run_y is None:
+        chamfer_run_y = chamfer_run
 
-    in_len_x = (wall_inner_r + depth_in + 1.0)
-    inner_box = Part.makeBox(in_len_x, w, h, Vector(0.0, -w/2.0, zc - h/2.0))
-    inner_box.rotate(Vector(0, 0, 0), Vector(0, 0, 1), angle_deg)
-    solid = solid.cut(inner_box)
+    cz  = max(0.0, float(chamfer_z))
+    cr  = max(0.0, float(chamfer_run))
+    cy  = max(0.0, float(chamfer_y))
+    cyr = max(0.0, float(chamfer_run_y))
 
-    return solid
+    x0    = float(wall_inner_r) - float(inner_thk)
+    x_len = float(inner_thk) + float(inset)
 
-def cut_radial_box(solid, angle_deg, zc, x_start, x_len, y_w, z_h):
-    box = Part.makeBox(
-        x_len, y_w, z_h,
-        Vector(x_start, -y_w/2.0, zc - z_h/2.0)
-    )
-    box.rotate(Vector(0, 0, 0), Vector(0, 0, 1), angle_deg)
-    return solid.cut(box)
+    y0 = -pad_w / 2.0
+    z0 = float(zc) - pad_h / 2.0
+
+    pad = Part.makeBox(x_len, pad_w, pad_h, Vector(x0, y0, z0))
+
+    x_in = x0
+    y1 = y0 + pad_w
+    z1 = z0 + pad_h
+
+    # Z tapers (top/bottom)
+    if cz > 0.0 and cr > 0.0 and cz < pad_h:
+        tri_pts = [
+            Vector(x_in,       0, z0),
+            Vector(x_in,       0, z0 + cz),
+            Vector(x_in + cr,  0, z0),
+            Vector(x_in,       0, z0),
+        ]
+        tri = Part.makePolygon(tri_pts)
+        tri_face = Part.Face(tri)
+        bot = tri_face.extrude(Vector(0, pad_w, 0))
+        bot.translate(Vector(0, y0, 0))
+        pad = pad.cut(bot)
+
+        tri_pts2 = [
+            Vector(x_in,       0, z1),
+            Vector(x_in,       0, z1 - cz),
+            Vector(x_in + cr,  0, z1),
+            Vector(x_in,       0, z1),
+        ]
+        tri2 = Part.makePolygon(tri_pts2)
+        tri2_face = Part.Face(tri2)
+        top = tri2_face.extrude(Vector(0, pad_w, 0))
+        top.translate(Vector(0, y0, 0))
+        pad = pad.cut(top)
+
+    # Y tapers (left/right)
+    if cy > 0.0 and cyr > 0.0 and cy < pad_w:
+        triL = [
+            Vector(x_in,       y0, 0),
+            Vector(x_in,       y0 + cy, 0),
+            Vector(x_in + cyr, y0, 0),
+            Vector(x_in,       y0, 0),
+        ]
+        polyL = Part.makePolygon(triL)
+        faceL = Part.Face(polyL)
+        wedgeL = faceL.extrude(Vector(0, 0, pad_h))
+        wedgeL.translate(Vector(0, 0, z0))
+        pad = pad.cut(wedgeL)
+
+        triR = [
+            Vector(x_in,       y1, 0),
+            Vector(x_in,       y1 - cy, 0),
+            Vector(x_in + cyr, y1, 0),
+            Vector(x_in,       y1, 0),
+        ]
+        polyR = Part.makePolygon(triR)
+        faceR = Part.Face(polyR)
+        wedgeR = faceR.extrude(Vector(0, 0, pad_h))
+        wedgeR.translate(Vector(0, 0, z0))
+        pad = pad.cut(wedgeR)
+
+    pad.rotate(Vector(0, 0, 0), Vector(0, 0, 1), float(angle_deg))
+    return solid.fuse(pad).removeSplitter()
+
+# ------------------------------------------------------------
+# >>> REPLACEMENT: robust "top-only body rim fillet"
+# ------------------------------------------------------------
+def fillet_body_outer_top_rim(shape, target_r, fillet_r, top_z, tol_r=1.5, tol_z=1.2):
+    """
+    Fillet ONLY the outer rim of the base plate (top edge).
+
+    Robust selection:
+      - Edge must intersect a Z-band around top_z (not require ZMin==ZMax==top_z)
+      - All vertices must lie near target_r (outer radius)
+      - Extra sanity: midpoint radius check (helps avoid weird edges that happen to have 2 vertices at target_r)
+    """
+    if fillet_r <= 0:
+        return shape
+
+    tz = float(top_z)
+    tr = float(target_r)
+    tr_tol = float(tol_r)
+    tz_tol = float(tol_z)
+
+    edges = []
+
+    for e in shape.Edges:
+        bb = e.BoundBox
+
+        # Edge must overlap the top_z band at all (more tolerant than ZMin/ZMax == top_z)
+        if (bb.ZMax < (tz - tz_tol)) or (bb.ZMin > (tz + tz_tol)):
+            continue
+
+        # Vertex radius check (must all be near outer radius)
+        ok = True
+        for v in e.Vertexes:
+            x, y = v.Point.x, v.Point.y
+            r = (x*x + y*y) ** 0.5
+            if abs(r - tr) > tr_tol:
+                ok = False
+                break
+        if not ok:
+            continue
+
+        # Midpoint radius check (filters out some accidental edges)
+        try:
+            # parameter range often [0,1], but use Curve if available
+            p0 = e.FirstParameter
+            p1 = e.LastParameter
+            pm = 0.5 * (p0 + p1)
+            pt = e.valueAt(pm)
+            rm = (pt.x*pt.x + pt.y*pt.y) ** 0.5
+            if abs(rm - tr) > tr_tol:
+                continue
+        except Exception:
+            # If valueAt fails, fall back to vertex-only decision
+            pass
+
+        edges.append(e)
+
+    print("Top-rim candidate edges:", len(edges), " top_z:", tz, " target_r:", tr)
+
+    if not edges:
+        return shape
+
+    try:
+        return shape.makeFillet(float(fillet_r), edges)
+    except Exception as ex:
+        print("Fillet failed:", ex)
+        return shape
+
+
+
+def add_port_pad(solid, angle_deg, zc, nut_d, wall_outer_r,
+                 pad_thk=3.0, inset=0.8,
+                 extra_w=8.0, extra_h=8.0,
+                 chamfer_z=3.0, chamfer_run=3.0,
+                 chamfer_y=None, chamfer_run_y=None):
+    """
+    OUTSIDE flat pad with Z + Y tapers.
+    """
+    pad_w = float(nut_d) + 2.0 * float(extra_w)
+    pad_h = float(nut_d) + 2.0 * float(extra_h)
+
+    x0    = float(wall_outer_r) - float(inset)
+    x_len = float(inset) + float(pad_thk)
+
+    y0 = -pad_w / 2.0
+    z0 = float(zc) - pad_h / 2.0
+
+    pad = Part.makeBox(x_len, pad_w, pad_h, Vector(x0, y0, z0))
+
+    if chamfer_y is None:
+        chamfer_y = chamfer_z
+    if chamfer_run_y is None:
+        chamfer_run_y = chamfer_run
+
+    cz = max(0.0, float(chamfer_z))
+    cr = max(0.0, float(chamfer_run))
+    cy = max(0.0, float(chamfer_y))
+    cyr = max(0.0, float(chamfer_run_y))
+
+    x_out = x0 + x_len
+    y1 = y0 + pad_w
+    z1 = z0 + pad_h
+
+    # Z tapers
+    if cz > 0.0 and cr > 0.0 and cz < pad_h:
+        tri_pts = [
+            Vector(x_out,      0, z0),
+            Vector(x_out,      0, z0 + cz),
+            Vector(x_out - cr, 0, z0),
+            Vector(x_out,      0, z0),
+        ]
+        tri = Part.makePolygon(tri_pts)
+        tri_face = Part.Face(tri)
+        bot = tri_face.extrude(Vector(0, pad_w, 0))
+        bot.translate(Vector(0, y0, 0))
+        pad = pad.cut(bot)
+
+        tri_pts2 = [
+            Vector(x_out,      0, z1),
+            Vector(x_out,      0, z1 - cz),
+            Vector(x_out - cr, 0, z1),
+            Vector(x_out,      0, z1),
+        ]
+        tri2 = Part.makePolygon(tri_pts2)
+        tri2_face = Part.Face(tri2)
+        top = tri2_face.extrude(Vector(0, pad_w, 0))
+        top.translate(Vector(0, y0, 0))
+        pad = pad.cut(top)
+
+    # Y tapers
+    if cy > 0.0 and cyr > 0.0 and cy < pad_w:
+        triL = [
+            Vector(x_out,       y0, 0),
+            Vector(x_out,       y0 + cy, 0),
+            Vector(x_out - cyr, y0, 0),
+            Vector(x_out,       y0, 0),
+        ]
+        polyL = Part.makePolygon(triL)
+        faceL = Part.Face(polyL)
+        wedgeL = faceL.extrude(Vector(0, 0, pad_h))
+        wedgeL.translate(Vector(0, 0, z0))
+        pad = pad.cut(wedgeL)
+
+        triR = [
+            Vector(x_out,       y1, 0),
+            Vector(x_out,       y1 - cy, 0),
+            Vector(x_out - cyr, y1, 0),
+            Vector(x_out,       y1, 0),
+        ]
+        polyR = Part.makePolygon(triR)
+        faceR = Part.Face(polyR)
+        wedgeR = faceR.extrude(Vector(0, 0, pad_h))
+        wedgeR.translate(Vector(0, 0, z0))
+        pad = pad.cut(wedgeR)
+
+    pad.rotate(Vector(0, 0, 0), Vector(0, 0, 1), float(angle_deg))
+    return solid.fuse(pad).removeSplitter()
 
 def make_pcb_posts(z_floor, inner_r):
-    # PCB origin (centered), then holes defined in PCB coords
     x0 = -PCB_W / 2.0 + PCB_OFFSET_X
     y0 = -PCB_H / 2.0 + PCB_OFFSET_Y
 
-    # Rotation to align PCB posts with belly fasten pillars
     rot = math.radians(float(PCB_ROT_DEG))
     cr = math.cos(rot)
     sr = math.sin(rot)
 
     posts = []
     for (hx, hy) in PCB_HOLES:
-        # hole position in PCB coordinates (centered)
         px0 = x0 + hx
         py0 = y0 + hy
 
-        # rotate around origin (0,0)
         px = (px0 * cr) - (py0 * sr)
         py = (px0 * sr) + (py0 * cr)
 
-        # stay inside the belly cavity
         if math.hypot(px, py) > (inner_r - 3.0):
             continue
 
-        # post solid
-        post = Part.makeCylinder(PCB_POST_OD/2.0, PCB_STANDOFF_H, Vector(px, py, z_floor))
+        post = Part.makeCylinder(PCB_POST_OD / 2.0, PCB_STANDOFF_H, Vector(px, py, z_floor))
 
-        # heat-set insert bore at top of post
+        if SUPPORT_GUSSET_ENABLE and PCB_POST_GUSSET_H > 0 and PCB_POST_GUSSET_EXTRA_R > 0:
+            gus = Part.makeCone(
+                (PCB_POST_OD / 2.0) + PCB_POST_GUSSET_EXTRA_R,
+                (PCB_POST_OD / 2.0),
+                PCB_POST_GUSSET_H,
+                Vector(px, py, z_floor)
+            )
+            post = post.fuse(gus).removeSplitter()
+
         bore_z0 = z_floor + PCB_STANDOFF_H - PCB_INSERT_DEPTH
-        bore = Part.makeCylinder(PCB_INSERT_BORE_D/2.0, PCB_INSERT_DEPTH + 0.3, Vector(px, py, bore_z0 - 0.15))
+        bore = Part.makeCylinder(
+            PCB_INSERT_BORE_D / 2.0,
+            PCB_INSERT_DEPTH + 0.3,
+            Vector(px, py, bore_z0 - 0.15)
+        )
         post = post.cut(bore)
 
-        # lead-in chamfer
         if PCB_INSERT_CHAMFER_H > 0:
             cham = Part.makeCone(
-                (PCB_INSERT_BORE_D/2.0) + 0.35,
-                (PCB_INSERT_BORE_D/2.0),
+                (PCB_INSERT_BORE_D / 2.0) + 0.35,
+                (PCB_INSERT_BORE_D / 2.0),
                 PCB_INSERT_CHAMFER_H,
                 Vector(px, py, z_floor + PCB_STANDOFF_H - PCB_INSERT_CHAMFER_H)
             )
@@ -382,7 +611,6 @@ def make_pcb_posts(z_floor, inner_r):
         fused = fused.fuse(s)
     return fused
 
-
 def make_sht_canopy_roof(wall_outer_r, zc, angle_deg):
     OD = float(SHT_CANOPY_OD)
     thk = float(SHT_CANOPY_THK)
@@ -394,7 +622,6 @@ def make_sht_canopy_roof(wall_outer_r, zc, angle_deg):
     y_off = float(SHT_CANOPY_STRUT_Y_OFFSET)
 
     xc = wall_outer_r + outset + (OD / 2.0)
-
     disc = Part.makeCylinder(OD / 2.0, thk, Vector(xc, 0, zc + raise_z))
 
     x0 = wall_outer_r - 1.0
@@ -409,13 +636,8 @@ def make_sht_canopy_roof(wall_outer_r, zc, angle_deg):
     return roof
 
 def fillet_outer_rim_by_radius(shape, rim_radius, fillet_r, tol=0.5):
-    """
-    Fillet only circular edges whose circle radius ~= rim_radius.
-    This reliably catches the outer circumference edges on cylinders/discs.
-    """
     if fillet_r <= 0:
         return shape
-
     try:
         edges = []
         for e in shape.Edges:
@@ -423,14 +645,11 @@ def fillet_outer_rim_by_radius(shape, rim_radius, fillet_r, tol=0.5):
             if c and hasattr(c, "Radius"):
                 if abs(float(c.Radius) - float(rim_radius)) <= float(tol):
                     edges.append(e)
-
         if edges:
             return shape.makeFillet(float(fillet_r), edges)
     except Exception:
         pass
-
     return shape
-
 
 # ---------------- Base plate ----------------
 plate = Part.makeCylinder(HEAD_R, PLATE_THK, Vector(0, 0, 0))
@@ -560,8 +779,21 @@ for a in STANDOFF_ANGLES:
 
     pillar = Part.makeCylinder(STANDOFF_OD / 2.0, STANDOFF_TOTAL_H, Vector(x, y, 0.0))
 
+    if SUPPORT_GUSSET_ENABLE and STANDOFF_GUSSET_H > 0 and STANDOFF_GUSSET_EXTRA_R > 0:
+        gus = Part.makeCone(
+            (STANDOFF_OD / 2.0) + STANDOFF_GUSSET_EXTRA_R,
+            (STANDOFF_OD / 2.0),
+            STANDOFF_GUSSET_H,
+            Vector(x, y, PLATE_THK)
+        )
+        pillar = pillar.fuse(gus).removeSplitter()
+
     top_bore_z0 = roof_z - TOP_INSERT_DEPTH
-    top_insert_bore = Part.makeCylinder(TOP_INSERT_BORE_D / 2.0, TOP_INSERT_DEPTH + 0.2, Vector(x, y, top_bore_z0 - 0.1))
+    top_insert_bore = Part.makeCylinder(
+        TOP_INSERT_BORE_D / 2.0,
+        TOP_INSERT_DEPTH + 0.2,
+        Vector(x, y, top_bore_z0 - 0.1)
+    )
     pillar = pillar.cut(top_insert_bore)
 
     if TOP_INSERT_LEADIN_CHAMFER > 0:
@@ -573,29 +805,7 @@ for a in STANDOFF_ANGLES:
         )
         pillar = pillar.cut(cham)
 
-    if STANDOFF_BOTTOM_INSERT_ENABLE:
-        bot_insert_bore = Part.makeCylinder(BOTTOM_INSERT_BORE_D / 2.0, BOTTOM_INSERT_DEPTH + 0.2, Vector(x, y, -0.1))
-        pillar = pillar.cut(bot_insert_bore)
-
-        if BOTTOM_INSERT_LEADIN_CHAMFER > 0:
-            cham2 = Part.makeCone(
-                (BOTTOM_INSERT_BORE_D / 2.0) + 0.35,
-                (BOTTOM_INSERT_BORE_D / 2.0),
-                BOTTOM_INSERT_LEADIN_CHAMFER,
-                Vector(x, y, 0.0)
-            )
-            pillar = pillar.cut(cham2)
-
     body = body.fuse(pillar)
-
-# Optional old access holes (disabled)
-if BOTTOM_ACCESS_ENABLE and STANDOFF_BOTTOM_INSERT_ENABLE:
-    for a in STANDOFF_ANGLES:
-        rad = math.radians(a)
-        x = STANDOFF_RADIUS * math.cos(rad)
-        y = STANDOFF_RADIUS * math.sin(rad)
-        access = Part.makeCylinder((BOTTOM_ACCESS_D / 2.0), PLATE_THK + BOTTOM_ACCESS_EXTRA + 1.0, Vector(x, y, -0.5))
-        body = body.cut(access)
 
 # ---------------- Plate bolt-through holes to match belly fastening tubes ----------------
 for a in BELLY_FASTEN_ANGLES:
@@ -616,12 +826,20 @@ for a in BELLY_FASTEN_ANGLES:
 
 body = body.removeSplitter()
 
+# ---------------- BODY: top-only rim fillet (robust) ----------------
 if EDGE_ROUND_ENABLE:
-    body = fillet_outer_rim_by_radius(body, rim_radius=HEAD_R, fillet_r=HEAD_RIM_FILLET_R, tol=RIM_RADIUS_TOL)
+    body = fillet_body_outer_top_rim(
+        body,
+        target_r=HEAD_R,
+        fillet_r=HEAD_RIM_FILLET_R,
+        top_z=PLATE_THK,   # <-- this is the top face of the body plate
+        tol_r=1.5,
+        tol_z=0.9
+    )
+
 
 lower_obj = doc.addObject("Part::Feature", "LowerBody")
 lower_obj.Shape = body
-
 
 # ---------------- Roof ----------------
 roof_with_holes = Part.makeCylinder(ROOF_R, ROOF_THK, Vector(0, 0, roof_z))
@@ -640,7 +858,6 @@ for a in STANDOFF_ANGLES:
 
 roof_final = roof_with_holes
 
-# PAR housing + bosses on roof
 if PAR_ENABLE:
     cx, cy = PAR_CENTER.x, PAR_CENTER.y
     housing_id_r = max(0.1, (PAR_HOUSING_OD / 2.0) - PAR_HOUSING_WALL)
@@ -681,7 +898,6 @@ if EDGE_ROUND_ENABLE:
 roof_obj = doc.addObject("Part::Feature", "RoofPlate")
 roof_obj.Shape = roof_final
 
-
 # ---------------- Belly Pan (Cup) ----------------
 if BELLY_ENABLE:
     cup_total_h = BELLY_WALL_H + BELLY_BASE_THK
@@ -695,7 +911,7 @@ if BELLY_ENABLE:
     cavity = Part.makeCylinder(inner_r, BELLY_WALL_H + 0.2, Vector(0, 0, -BELLY_WALL_H - 0.1))
     pan = cup_outer.cut(cavity)
 
-    # ---- Internal fastening tubes aligned with pods, with heat-set inserts from top ----
+    # --- internal fastening tubes + inserts ---
     for a in BELLY_FASTEN_ANGLES:
         rad = math.radians(a)
         x = STANDOFF_RADIUS * math.cos(rad)
@@ -704,7 +920,6 @@ if BELLY_ENABLE:
         tube_outer = Part.makeCylinder(BELLY_TUBE_OD / 2.0, cup_total_h, Vector(x, y, cup_base_z))
         pan = pan.fuse(tube_outer)
 
-        # Insert pocket at TOP lip (z=0), bored downward
         insert_bore = Part.makeCylinder(
             BOTTOM_INSERT_BORE_D / 2.0,
             BOTTOM_INSERT_DEPTH + 0.2,
@@ -721,11 +936,7 @@ if BELLY_ENABLE:
             )
             pan = pan.cut(cham)
 
-    # ---- NO holes through belly floor (intentionally removed) ----
-    if BELLY_FLOOR_HOLES_ENABLE:
-        pass
-
-    # Seal groove (top face z=0)
+    # --- seal groove on lip (z=0) ---
     if BELLY_SEAL_ENABLE:
         wall_inner_r = inner_r
         wall_outer_r = HEAD_R
@@ -761,7 +972,7 @@ if BELLY_ENABLE:
             groove_ring = groove_outer.cut(groove_inner)
             pan = pan.cut(groove_ring)
 
-    # Drip edge
+    # --- drip edge skirt ---
     if DRIP_EDGE_ENABLE and (DRIP_EDGE_OUTSET > 0) and (DRIP_EDGE_DROP > 0):
         drop    = float(DRIP_EDGE_DROP)
         outset  = float(DRIP_EDGE_OUTSET)
@@ -784,66 +995,104 @@ if BELLY_ENABLE:
         drip_edge = outer_skirt.cut(inner_cut)
         pan = pan.fuse(drip_edge)
 
-    # Ports + nut flats
+    # --- ports + protrusions (OUTSIDE + INSIDE pads) ---
     if CONNECTORS_ENABLE:
         wall_inner_r = belly_inner_r
         wall_outer_r = HEAD_R
         zc_ports = PORT_Z_CENTER
 
-        # ---------------- GX12 (2x2 grid: two angles x two Z levels) ----------------
-               # GX12 (1x4 row at same Z)
         gx12_zc = zc_ports if (GX12_Z_CENTER is None) else float(GX12_Z_CENTER)
-        center = float(GX12_ROW_CENTER_ANGLE) + float(GX12_ROW_OFFSET_DEG)
-        step   = float(GX12_ROW_SPACING_DEG)
 
-        gx12_angles = [center + (i - 1.5) * step for i in range(4)]
+        pair_step = float(GX12_ROW_SPACING_DEG)
+        pair_half = pair_step / 2.0
 
-       
+        pairA_center = float(GX12_ROW_CENTER_ANGLE) + float(GX12_ROW_OFFSET_DEG)
+        pairB_center = pairA_center + 180.0
+
+        gx12_angles = [
+            pairA_center - pair_half, pairA_center + pair_half,
+            pairB_center - pair_half, pairB_center + pair_half
+        ]
 
         for ang in gx12_angles:
-            
-                pan = cut_radial_port(
-                    pan, GX12_HOLE_D, ang, gx12_zc,
-                    wall_inner_r, wall_outer_r,
-                    extra=PORT_CUT_EXTRA
+            if PORT_PADS_ENABLE:
+                pan = add_port_pad(
+                    pan, ang, gx12_zc, GX12_NUT_D, wall_outer_r,
+                    pad_thk=PORT_PAD_THK, inset=PORT_PAD_INSET,
+                    extra_w=PORT_PAD_EXTRA_W, extra_h=PORT_PAD_EXTRA_H,
+                    chamfer_z=PORT_PAD_CHAMFER_Z, chamfer_run=PORT_PAD_CHAMFER_RUN,
+                    chamfer_y=PORT_PAD_CHAMFER_Z, chamfer_run_y=PORT_PAD_CHAMFER_RUN
                 )
-                if NUT_FLATS_ENABLE:
-                    pan = cut_nut_flats(
-                        pan, ang, gx12_zc, GX12_NUT_D,
-                        wall_inner_r, wall_outer_r,
-                        depth_out=NUT_FLAT_DEPTH_OUT, depth_in=NUT_FLAT_DEPTH_IN,
-                        margin=NUT_FLAT_MARGIN, z_margin=NUT_FLAT_Z_MARGIN
-                    )
+                pan = add_inner_port_pad(
+                    pan, ang, gx12_zc, GX12_NUT_D, wall_inner_r,
+                    inner_thk=PORT_PAD_THK, inset=PORT_PAD_INSET,
+                    extra_w=PORT_PAD_EXTRA_W, extra_h=PORT_PAD_EXTRA_H,
+                    chamfer_z=PORT_PAD_CHAMFER_Z, chamfer_run=PORT_PAD_CHAMFER_RUN,
+                    chamfer_y=PORT_PAD_CHAMFER_Z, chamfer_run_y=PORT_PAD_CHAMFER_RUN
+                )
 
+            pan = cut_radial_port(
+                pan, GX12_HOLE_D, ang, gx12_zc,
+                wall_inner_r, wall_outer_r,
+                extra=PORT_CUT_EXTRA + (float(PORT_PAD_THK) if PORT_PADS_ENABLE else 0.0),
+                outer_extra=(float(PORT_PAD_THK) if PORT_PADS_ENABLE else 0.0),
+                inner_extra=(float(PORT_PAD_THK) if PORT_PADS_ENABLE else 0.0),
+            )
 
-        # ---------------- PG7 ----------------
         if angle_ok(PG7_ANGLE_DEG):
-            pan = cut_radial_port(pan, PG7_HOLE_D, PG7_ANGLE_DEG, zc_ports, wall_inner_r, wall_outer_r, extra=PORT_CUT_EXTRA)
-            if NUT_FLATS_ENABLE:
-                pan = cut_nut_flats(
-                    pan, PG7_ANGLE_DEG, zc_ports, PG7_NUT_D,
-                    wall_inner_r, wall_outer_r,
-                    depth_out=NUT_FLAT_DEPTH_OUT, depth_in=NUT_FLAT_DEPTH_IN,
-                    margin=NUT_FLAT_MARGIN, z_margin=NUT_FLAT_Z_MARGIN
+            if PORT_PADS_ENABLE:
+                pan = add_port_pad(
+                    pan, PG7_ANGLE_DEG, zc_ports, PG7_NUT_D, wall_outer_r,
+                    pad_thk=PORT_PAD_THK, inset=PORT_PAD_INSET,
+                    extra_w=PORT_PAD_EXTRA_W, extra_h=PORT_PAD_EXTRA_H,
+                    chamfer_z=PORT_PAD_CHAMFER_Z, chamfer_run=PORT_PAD_CHAMFER_RUN,
+                    chamfer_y=PORT_PAD_CHAMFER_Z, chamfer_run_y=PORT_PAD_CHAMFER_RUN
+                )
+                pan = add_inner_port_pad(
+                    pan, PG7_ANGLE_DEG, zc_ports, PG7_NUT_D, wall_inner_r,
+                    inner_thk=PORT_PAD_THK, inset=PORT_PAD_INSET,
+                    extra_w=PORT_PAD_EXTRA_W, extra_h=PORT_PAD_EXTRA_H,
+                    chamfer_z=PORT_PAD_CHAMFER_Z, chamfer_run=PORT_PAD_CHAMFER_RUN,
+                    chamfer_y=PORT_PAD_CHAMFER_Z, chamfer_run_y=PORT_PAD_CHAMFER_RUN
                 )
 
-        # ---------------- SHT ----------------
+            pan = cut_radial_port(
+                pan, PG7_HOLE_D, PG7_ANGLE_DEG, zc_ports,
+                wall_inner_r, wall_outer_r,
+                extra=PORT_CUT_EXTRA + (float(PORT_PAD_THK) if PORT_PADS_ENABLE else 0.0),
+                outer_extra=(float(PORT_PAD_THK) if PORT_PADS_ENABLE else 0.0),
+                inner_extra=(float(PORT_PAD_THK) if PORT_PADS_ENABLE else 0.0),
+            )
+
         if angle_ok(SHT_ANGLE_DEG):
-            pan = cut_radial_port(pan, SHT_HOLE_D, SHT_ANGLE_DEG, zc_ports, wall_inner_r, wall_outer_r, extra=PORT_CUT_EXTRA)
-            if NUT_FLATS_ENABLE:
-                pan = cut_nut_flats(
-                    pan, SHT_ANGLE_DEG, zc_ports, SHT_NUT_D,
-                    wall_inner_r, wall_outer_r,
-                    depth_out=NUT_FLAT_DEPTH_OUT, depth_in=NUT_FLAT_DEPTH_IN,
-                    margin=NUT_FLAT_MARGIN, z_margin=NUT_FLAT_Z_MARGIN
+            if PORT_PADS_ENABLE:
+                pan = add_port_pad(
+                    pan, SHT_ANGLE_DEG, zc_ports, SHT_NUT_D, wall_outer_r,
+                    pad_thk=PORT_PAD_THK, inset=PORT_PAD_INSET,
+                    extra_w=PORT_PAD_EXTRA_W, extra_h=PORT_PAD_EXTRA_H,
+                    chamfer_z=PORT_PAD_CHAMFER_Z, chamfer_run=PORT_PAD_CHAMFER_RUN,
+                    chamfer_y=PORT_PAD_CHAMFER_Z, chamfer_run_y=PORT_PAD_CHAMFER_RUN
+                )
+                pan = add_inner_port_pad(
+                    pan, SHT_ANGLE_DEG, zc_ports, SHT_NUT_D, wall_inner_r,
+                    inner_thk=PORT_PAD_THK, inset=PORT_PAD_INSET,
+                    extra_w=PORT_PAD_EXTRA_W, extra_h=PORT_PAD_EXTRA_H,
+                    chamfer_z=PORT_PAD_CHAMFER_Z, chamfer_run=PORT_PAD_CHAMFER_RUN,
+                    chamfer_y=PORT_PAD_CHAMFER_Z, chamfer_run_y=PORT_PAD_CHAMFER_RUN
                 )
 
-        # Optional SHT canopy (currently disabled)
+            pan = cut_radial_port(
+                pan, SHT_HOLE_D, SHT_ANGLE_DEG, zc_ports,
+                wall_inner_r, wall_outer_r,
+                extra=PORT_CUT_EXTRA + (float(PORT_PAD_THK) if PORT_PADS_ENABLE else 0.0),
+                outer_extra=(float(PORT_PAD_THK) if PORT_PADS_ENABLE else 0.0),
+                inner_extra=(float(PORT_PAD_THK) if PORT_PADS_ENABLE else 0.0),
+            )
+
         if SHT_RS_ENABLE and angle_ok(SHT_ANGLE_DEG):
             roof_shield = make_sht_canopy_roof(wall_outer_r=wall_outer_r, zc=SHT_Z, angle_deg=SHT_ANGLE_DEG)
             pan = pan.fuse(roof_shield)
 
-    # PCB posts on belly floor
     if PCB_ENABLE:
         z_floor = cup_base_z + BELLY_BASE_THK
         posts = make_pcb_posts(z_floor=z_floor, inner_r=inner_r)
@@ -854,10 +1103,9 @@ if BELLY_ENABLE:
     pan_obj = doc.addObject("Part::Feature", "BellyPan")
     pan_obj.Shape = pan
 
-
 doc.recompute()
 
-# ---------------- Exploded view placements (visual only) ----------------
+# ---------------- Exploded view offsets ----------------
 if EXPLODED_VIEW:
     try:
         lower_obj.Placement.Base = Vector(0, 0, EXPLODE_LOWER_DZ)
@@ -874,7 +1122,6 @@ if EXPLODED_VIEW:
             pass
     doc.recompute()
 
-# ---------------- Console report ----------------
 available_body_depth = shoulder_local_z - bottom_open_local_z
 
 print("\n============================================================")
@@ -892,6 +1139,8 @@ print("Belly tube OD:                 {:.2f} mm".format(BELLY_TUBE_OD))
 print("Plate bolt hole D:             {:.2f} mm".format(PLATE_BOLT_HOLE_D))
 print("Insert bore D:                 {:.2f} mm".format(BOTTOM_INSERT_BORE_D))
 print("Insert depth:                  {:.2f} mm".format(BOTTOM_INSERT_DEPTH))
+print("\n---- Ports / Protrusions ----")
+print("Inner protrusion:              {}".format("ON" if (PORT_PAD_INNER_ENABLE and PORT_PADS_ENABLE) else "OFF"))
 print("\n---- Key Geometry ----")
 print("Ports Z center:                {:.1f} mm".format(PORT_Z_CENTER))
 print("Available pod depth:           {:.2f} mm".format(available_body_depth))
