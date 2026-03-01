@@ -19,7 +19,7 @@ from FreeCAD import Vector
 # ============================================================
 
 # ---------------- Exploded view (visual only) ----------------
-EXPLODED_VIEW = False
+EXPLODED_VIEW = True
 EXPLODE_LOWER_DZ = 0.0
 EXPLODE_ROOF_DZ  = 35.0
 EXPLODE_PAN_DZ   = -105.0
@@ -28,6 +28,8 @@ EXPLODE_PAN_DZ   = -105.0
 HEAD_DIAM = 150.0
 ROOF_DIAM = 150.0
 PLATE_THK = 6.0
+PLATE_DROP = 10.0   # mm to extend plate downward (tune)
+PLATE_TOP_FILLET_R = 4.0   # try 3–6 mm
 
 POD_RADIUS   = 39.2
 POD_DIAM     = 24.0
@@ -77,24 +79,36 @@ TIP_FLAT_D      = 1.0
 STANDOFF_ANGLES_BASE  = [0, 90, 180, 270]
 STANDOFF_ANGLE_OFFSET = 0.0
 
-STANDOFF_OD         = 8.0
-STANDOFF_RIM_MARGIN = 4.0
+# Strength targets
+STANDOFF_OD = 12.0                 # was 8.0, now ~10–12 mm
+STANDOFF_MIN_INSERT_WALL = 1.8     # target 1.5–2.0mm wall around heat-set bore
+STANDOFF_BASE_FILLET_R = 1.6       # try 1.2–2.5 (too big can fail)
+
+# --- IMPORTANT: split roof vs belly bolt circles ---
+ROOF_STANDOFF_RIM_MARGIN = 7.0     # <-- what you want for roof standoffs
+BELLY_FASTEN_RIM_MARGIN  = 3.0     # <-- what you want for belly fasteners
 
 TOP_INSERT_BORE_D         = 4.6
 TOP_INSERT_DEPTH          = 5.0
 TOP_INSERT_LEADIN_CHAMFER = 0.6
 
-# Old belly-screw scheme (into standoff bottoms) — disable by default now
-STANDOFF_BOTTOM_INSERT_ENABLE = False
-BOTTOM_INSERT_BORE_D         = 4.6
-BOTTOM_INSERT_DEPTH          = 5.0
-BOTTOM_INSERT_LEADIN_CHAMFER = 0.6
+# --- Teardrop standoff geometry (present but you can ignore; you’re using ROUND now) ---
+STANDOFF_SHAPE = "teardrop"        # "cyl" or "teardrop"
 
-BOTTOM_ACCESS_ENABLE = False
-BOTTOM_ACCESS_D     = BOTTOM_INSERT_BORE_D
-BOTTOM_ACCESS_EXTRA = 0.4
+TEARDROP_WIDTH  = STANDOFF_OD
+TEARDROP_LENGTH = STANDOFF_OD * 1.15
+TEARDROP_NOSE_R = TEARDROP_WIDTH * 0.50
+TEARDROP_TAPER_EXP = 1.2
 
-# Roof holes (standoff -> roof plate)
+TEARDROP_ORIENT_MODE = "radial_out"
+TEARDROP_YAW_OFFSET_DEG = 0.0
+
+# Root reinforcement (optional; improves strength where pillar meets plate)
+STANDOFF_ROOT_FLARE_ENABLE = True
+STANDOFF_ROOT_FLARE_H = 6.0
+STANDOFF_ROOT_FLARE_EXTRA_R = 4.0
+
+# ---------------- Roof holes (standoff -> roof plate) ----------------
 ROOF_HOLE_D       = 3.4
 ADD_COUNTERBORE   = True
 COUNTERBORE_D     = 7.0
@@ -127,7 +141,7 @@ BELLY_SEAL_MIN_OUTER_MARGIN  = 2.0
 
 # ---------------- Belly fastening pillars (inside belly) ----------------
 BELLY_FASTEN_OFFSET = 35.0
-BELLY_FASTEN_ANGLES = [a + BELLY_FASTEN_OFFSET for a in [45,135,225,315]]
+BELLY_FASTEN_ANGLES = [a + BELLY_FASTEN_OFFSET for a in [43,133,223,313]]
 
 # ---------------- Plate-to-belly bolt holes ----------------
 PLATE_BOLT_HOLE_D       = 3.4   # M3 clearance
@@ -167,17 +181,14 @@ PORT_PAD_EXTRA_H = 5.0
 PORT_PAD_THK     = 2.0
 PORT_PAD_INSET   = 0.8
 
-# Print-friendly taper (optional; only used in per-port pads)
 PORT_PAD_CHAMFER_Z   = 3.0
 PORT_PAD_CHAMFER_RUN = 3.5
 
-# --- NEW: inside ALSO gets matching protrusion so inner wall is flat there ---
 PORT_PAD_INNER_ENABLE = True
 PORT_PAD_INNER_THK    = 3.0
 
-# --- NEW: GX12 cluster is ONE protrusion (arc sector) ---
 GX12_CLUSTER_PAD_ENABLE     = True
-GX12_CLUSTER_PAD_ANG_MARGIN = 6.0  # degrees extra each side of cluster span
+GX12_CLUSTER_PAD_ANG_MARGIN = 6.0
 
 # ---------------- PCB mounts (inside belly) ----------------
 PCB_ENABLE = True
@@ -234,16 +245,35 @@ PAR_CABLE_PORT_ANGLE = 90.0
 
 # ---------------- Aerodynamic edge rounding ----------------
 EDGE_ROUND_ENABLE = True
-HEAD_RIM_FILLET_R = 2.0
+HEAD_RIM_FILLET_R = 4.0
 ROOF_RIM_FILLET_R = 2.0
 RIM_RADIUS_TOL = 0.6
 
 # ---------------- Support root reinforcement (fillet-like gussets) ----------------
 SUPPORT_GUSSET_ENABLE = True
-STANDOFF_GUSSET_H       = 2.0
-STANDOFF_GUSSET_EXTRA_R = 2.0
+STANDOFF_GUSSET_H       = 3.0
+STANDOFF_GUSSET_EXTRA_R = 3.0
 PCB_POST_GUSSET_H       = 2.0
 PCB_POST_GUSSET_EXTRA_R = 2.0
+
+I2C_CONDUIT_ENABLE = True
+I2C_CONDUIT_STANDOFF_INDEX = 1   # 0,1,2,3  -> 90° if your angles are [0,90,180,270]
+
+I2C_CABLE_BORE_D = 4.0
+I2C_ENTRY_HOLE_D = 4.2
+I2C_ENTRY_Z_FROM_TOP = 8.0       # mm below roof_top_z (keeps it under roof)
+I2C_ENTRY_LEN_EXTRA = 8.0        # extra length so the side hole always reaches the bore
+
+I2C_EXIT_ENABLE = True
+I2C_EXIT_W = 7.0
+I2C_EXIT_H = 10.0
+I2C_EXIT_Z_FROM_PLATE = 14.0
+I2C_EXIT_RELIEF_ENABLE = True
+I2C_TOP_CAP_THK = 2.0    # mm of solid material above the conduit
+I2C_INSERT_CLEAR_THK = 1.0  # mm below the insert bore start
+I2C_ENTRY_FUNNEL_ENABLE = True
+I2C_ENTRY_FUNNEL_D = 7.5      # mouth diameter (try 6.5–9.0)
+I2C_ENTRY_FUNNEL_L = 3.0      # funnel length/depth (2–4)
 
 # ---------- Document ----------
 DOC_NAME = "Ultrasonic_Head_Improved"
@@ -261,7 +291,11 @@ roof_z     = (PLATE_THK + POD_HEIGHT) + ROOF_GAP_ABOVE_PODS
 roof_top_z = roof_z + ROOF_THK
 
 STANDOFF_TOTAL_H = roof_z - 0.0
-STANDOFF_RADIUS  = HEAD_R - (STANDOFF_OD / 2.0) - STANDOFF_RIM_MARGIN
+
+# Split radii (THIS is the key change)
+ROOF_STANDOFF_RADIUS = HEAD_R - (STANDOFF_OD / 2.0) - float(ROOF_STANDOFF_RIM_MARGIN)
+BELLY_FASTEN_RADIUS  = HEAD_R - (STANDOFF_OD / 2.0) - float(BELLY_FASTEN_RIM_MARGIN)
+
 STANDOFF_ANGLES  = [a + STANDOFF_ANGLE_OFFSET for a in STANDOFF_ANGLES_BASE]
 
 if PORT_Z_CENTER is None:
@@ -289,11 +323,6 @@ def cut_radial_port(solid, hole_d, angle_deg, z_center,
                     extra=2.0,
                     outer_extra=0.0,
                     inner_extra=0.0):
-    """
-    Cuts a radial cylindrical hole.
-    outer_extra extends the cut beyond wall_outer_r (so it passes through outer protrusions).
-    inner_extra extends the cut inward beyond wall_inner_r (so it passes through inner bosses).
-    """
     zc = clamp(z_center, -BELLY_WALL_H + 6.0, -6.0)
 
     x0 = (wall_inner_r - extra) - float(inner_extra)
@@ -314,9 +343,6 @@ def add_inner_port_pad(solid, angle_deg, zc, nut_d, wall_inner_r,
                        extra_w=8.0, extra_h=8.0,
                        chamfer_z=3.0, chamfer_run=3.0,
                        chamfer_y=None, chamfer_run_y=None):
-    """
-    Adds the SAME style of tapered flat pad, but on the INSIDE wall (protruding into cavity).
-    """
     pad_w = float(nut_d) + 2.0 * float(extra_w)
     pad_h = float(nut_d) + 2.0 * float(extra_h)
 
@@ -342,7 +368,6 @@ def add_inner_port_pad(solid, angle_deg, zc, nut_d, wall_inner_r,
     y1 = y0 + pad_w
     z1 = z0 + pad_h
 
-    # Z tapers (top/bottom)
     if cz > 0.0 and cr > 0.0 and cz < pad_h:
         tri_pts = [
             Vector(x_in,       0, z0),
@@ -368,7 +393,6 @@ def add_inner_port_pad(solid, angle_deg, zc, nut_d, wall_inner_r,
         top.translate(Vector(0, y0, 0))
         pad = pad.cut(top)
 
-    # Y tapers (left/right)
     if cy > 0.0 and cyr > 0.0 and cy < pad_w:
         triL = [
             Vector(x_in,       y0, 0),
@@ -397,18 +421,7 @@ def add_inner_port_pad(solid, angle_deg, zc, nut_d, wall_inner_r,
     pad.rotate(Vector(0, 0, 0), Vector(0, 0, 1), float(angle_deg))
     return solid.fuse(pad).removeSplitter()
 
-# ------------------------------------------------------------
-# >>> REPLACEMENT: robust "top-only body rim fillet"
-# ------------------------------------------------------------
 def fillet_body_outer_top_rim(shape, target_r, fillet_r, top_z, tol_r=1.5, tol_z=1.2):
-    """
-    Fillet ONLY the outer rim of the base plate (top edge).
-
-    Robust selection:
-      - Edge must intersect a Z-band around top_z (not require ZMin==ZMax==top_z)
-      - All vertices must lie near target_r (outer radius)
-      - Extra sanity: midpoint radius check (helps avoid weird edges that happen to have 2 vertices at target_r)
-    """
     if fillet_r <= 0:
         return shape
 
@@ -418,15 +431,11 @@ def fillet_body_outer_top_rim(shape, target_r, fillet_r, top_z, tol_r=1.5, tol_z
     tz_tol = float(tol_z)
 
     edges = []
-
     for e in shape.Edges:
         bb = e.BoundBox
-
-        # Edge must overlap the top_z band at all (more tolerant than ZMin/ZMax == top_z)
         if (bb.ZMax < (tz - tz_tol)) or (bb.ZMin > (tz + tz_tol)):
             continue
 
-        # Vertex radius check (must all be near outer radius)
         ok = True
         for v in e.Vertexes:
             x, y = v.Point.x, v.Point.y
@@ -437,9 +446,7 @@ def fillet_body_outer_top_rim(shape, target_r, fillet_r, top_z, tol_r=1.5, tol_z
         if not ok:
             continue
 
-        # Midpoint radius check (filters out some accidental edges)
         try:
-            # parameter range often [0,1], but use Curve if available
             p0 = e.FirstParameter
             p1 = e.LastParameter
             pm = 0.5 * (p0 + p1)
@@ -448,7 +455,6 @@ def fillet_body_outer_top_rim(shape, target_r, fillet_r, top_z, tol_r=1.5, tol_z
             if abs(rm - tr) > tr_tol:
                 continue
         except Exception:
-            # If valueAt fails, fall back to vertex-only decision
             pass
 
         edges.append(e)
@@ -464,16 +470,11 @@ def fillet_body_outer_top_rim(shape, target_r, fillet_r, top_z, tol_r=1.5, tol_z
         print("Fillet failed:", ex)
         return shape
 
-
-
 def add_port_pad(solid, angle_deg, zc, nut_d, wall_outer_r,
                  pad_thk=3.0, inset=0.8,
                  extra_w=8.0, extra_h=8.0,
                  chamfer_z=3.0, chamfer_run=3.0,
                  chamfer_y=None, chamfer_run_y=None):
-    """
-    OUTSIDE flat pad with Z + Y tapers.
-    """
     pad_w = float(nut_d) + 2.0 * float(extra_w)
     pad_h = float(nut_d) + 2.0 * float(extra_h)
 
@@ -499,7 +500,6 @@ def add_port_pad(solid, angle_deg, zc, nut_d, wall_outer_r,
     y1 = y0 + pad_w
     z1 = z0 + pad_h
 
-    # Z tapers
     if cz > 0.0 and cr > 0.0 and cz < pad_h:
         tri_pts = [
             Vector(x_out,      0, z0),
@@ -525,7 +525,6 @@ def add_port_pad(solid, angle_deg, zc, nut_d, wall_outer_r,
         top.translate(Vector(0, y0, 0))
         pad = pad.cut(top)
 
-    # Y tapers
     if cy > 0.0 and cyr > 0.0 and cy < pad_w:
         triL = [
             Vector(x_out,       y0, 0),
@@ -651,8 +650,51 @@ def fillet_outer_rim_by_radius(shape, rim_radius, fillet_r, tol=0.5):
         pass
     return shape
 
-# ---------------- Base plate ----------------
-plate = Part.makeCylinder(HEAD_R, PLATE_THK, Vector(0, 0, 0))
+# ---------------- Base plate (extended downward) ----------------
+plate = Part.makeCylinder(HEAD_R, PLATE_THK + PLATE_DROP, Vector(0, 0, -PLATE_DROP))
+
+# ---------------- Fillet the TOP outer edge of the plate (do this early!) ----------------
+def fillet_plate_top_rim(plate_shape, outer_r, top_z, fillet_r, tol_r=0.6, tol_z=0.6):
+    if fillet_r <= 0:
+        return plate_shape
+
+    edges = []
+    for e in plate_shape.Edges:
+        bb = e.BoundBox
+
+        # must be near the plate TOP plane
+        if abs(bb.ZMax - float(top_z)) > float(tol_z):
+            continue
+
+        # must be near the outer radius
+        ok = True
+        for v in e.Vertexes:
+            x, y = v.Point.x, v.Point.y
+            r = math.hypot(x, y)
+            if abs(r - float(outer_r)) > float(tol_r):
+                ok = False
+                break
+        if ok:
+            edges.append(e)
+
+    if not edges:
+        print("Plate-top rim fillet: no candidate edges found")
+        return plate_shape
+
+    try:
+        return plate_shape.makeFillet(float(fillet_r), edges)
+    except Exception as ex:
+        print("Plate-top rim fillet failed:", ex)
+        return plate_shape
+
+plate = fillet_plate_top_rim(
+    plate,
+    outer_r=HEAD_R,
+    top_z=PLATE_THK,
+    fillet_r=PLATE_TOP_FILLET_R,
+    tol_r=0.8,
+    tol_z=0.8
+)
 
 trim_box = Part.makeBox(
     HEAD_DIAM * 2.0,
@@ -771,28 +813,195 @@ for a in POD_ANGLES:
     body = body.cut(neck_bore_w)
     body = body.cut(main_bot_w)
 
-# ---------------- Roof standoffs (TOP inserts only now) ----------------
-for a in STANDOFF_ANGLES:
-    rad = math.radians(a)
-    x = STANDOFF_RADIUS * math.cos(rad)
-    y = STANDOFF_RADIUS * math.sin(rad)
+# ---------------- Roof standoffs (ROUND, thicker, top inserts) ----------------
 
+def _fillet_standoff_base_before_fuse(standoff_shape, x, y, base_r, z_target, fillet_r, tol_z=1.0, tol_r=1.5):
+    if fillet_r <= 0:
+        return standoff_shape
+
+    local = standoff_shape.copy()
+    local.translate(Vector(-x, -y, 0))
+
+    edges = []
+    zt = float(z_target)
+    rt = float(base_r)
+
+    for e in local.Edges:
+        bb = e.BoundBox
+        if abs(bb.ZMax - zt) > float(tol_z) and abs(bb.ZMin - zt) > float(tol_z):
+            continue
+
+        ok = True
+        for v in e.Vertexes:
+            r = math.hypot(v.Point.x, v.Point.y)
+            if abs(r - rt) > float(tol_r):
+                ok = False
+                break
+        if ok:
+            edges.append(e)
+
+    if edges:
+        try:
+            local = local.makeFillet(float(fillet_r), edges)
+        except Exception as ex:
+            print("Standoff base fillet failed:", ex)
+
+    local.translate(Vector(x, y, 0))
+    return local
+
+# ---------------- Roof standoffs (ROUND, thicker, top inserts + I2C conduit option) ----------------
+# This version guarantees:
+#  - vertical bore continues through the PLATE (cut applied to BODY after fuse)
+#  - side entry is below insert zone and includes a funnel/countersink for easy feeding
+#  - exit tunnel opens inward into the belly (cut applied to BODY after fuse)
+
+_insert_wall = (STANDOFF_OD - TOP_INSERT_BORE_D) / 2.0
+if _insert_wall < STANDOFF_MIN_INSERT_WALL:
+    print(
+        "WARNING: standoff insert wall thickness is {:.2f}mm (< {:.2f}mm target).".format(
+            _insert_wall, STANDOFF_MIN_INSERT_WALL
+        )
+    )
+
+for i, a in enumerate(STANDOFF_ANGLES):
+    rad = math.radians(a)
+    x = ROOF_STANDOFF_RADIUS * math.cos(rad)
+    y = ROOF_STANDOFF_RADIUS * math.sin(rad)
+
+    # Base pillar (ROUND)
     pillar = Part.makeCylinder(STANDOFF_OD / 2.0, STANDOFF_TOTAL_H, Vector(x, y, 0.0))
 
+    # Root flare reinforcement (strong junction at plate)
+    if STANDOFF_ROOT_FLARE_ENABLE and STANDOFF_ROOT_FLARE_H > 0 and STANDOFF_ROOT_FLARE_EXTRA_R > 0:
+        flare = Part.makeCone(
+            (STANDOFF_OD / 2.0) + float(STANDOFF_ROOT_FLARE_EXTRA_R),
+            (STANDOFF_OD / 2.0),
+            float(STANDOFF_ROOT_FLARE_H),
+            Vector(x, y, PLATE_THK),
+        )
+        pillar = pillar.fuse(flare).removeSplitter()
+
+    # Optional gusset reinforcement
     if SUPPORT_GUSSET_ENABLE and STANDOFF_GUSSET_H > 0 and STANDOFF_GUSSET_EXTRA_R > 0:
         gus = Part.makeCone(
-            (STANDOFF_OD / 2.0) + STANDOFF_GUSSET_EXTRA_R,
+            (STANDOFF_OD / 2.0) + float(STANDOFF_GUSSET_EXTRA_R),
             (STANDOFF_OD / 2.0),
-            STANDOFF_GUSSET_H,
-            Vector(x, y, PLATE_THK)
+            float(STANDOFF_GUSSET_H),
+            Vector(x, y, PLATE_THK),
         )
         pillar = pillar.fuse(gus).removeSplitter()
 
+    # Fillet the standoff base flare edge (before fusing into body)
+    if STANDOFF_BASE_FILLET_R > 0:
+        base_r = (STANDOFF_OD / 2.0)
+        if STANDOFF_ROOT_FLARE_ENABLE and STANDOFF_ROOT_FLARE_EXTRA_R > 0:
+            base_r = (STANDOFF_OD / 2.0) + float(STANDOFF_ROOT_FLARE_EXTRA_R)
+
+        pillar = _fillet_standoff_base_before_fuse(
+            standoff_shape=pillar,
+            x=x, y=y,
+            base_r=base_r,
+            z_target=PLATE_THK,
+            fillet_r=float(STANDOFF_BASE_FILLET_R),
+            tol_z=1.2,
+            tol_r=1.8
+        )
+
+    # ---------------- I2C conduit cutters (prepared here, applied after fuse to guarantee plate is cut) ----------------
+    make_i2c = (("I2C_CONDUIT_ENABLE" in globals()) and I2C_CONDUIT_ENABLE and (i == int(I2C_CONDUIT_STANDOFF_INDEX)))
+
+    conduit_cut_body = None
+    exit_cut_body    = None
+    entry_cut_pillar = None
+    entry_funnel_pillar = None
+
+    if make_i2c:
+        print("I2C conduit: cutting standoff index", i, "angle", a)
+
+        # Insert bore region occupies [roof_z - TOP_INSERT_DEPTH, roof_z]
+        top_bore_z0 = roof_z - TOP_INSERT_DEPTH
+
+        # Stop the conduit below:
+        #  - standoff top face
+        #  - AND below the insert bore region
+        safe_stop_z = min(roof_z - 2.0, top_bore_z0 - 1.0)
+
+        # Start the conduit below the plate, into the belly region
+        bore_z0 = -float(PLATE_DROP) - 2.0
+        bore_h  = safe_stop_z - bore_z0
+
+        if bore_h <= 2.0:
+            print("WARNING: I2C conduit bore height too small:", bore_h, "mm. Check roof_z/TOP_INSERT_DEPTH/PLATE_DROP.")
+        else:
+            # Wall thickness check vs insert bore
+            _min_wall = (STANDOFF_OD / 2.0) - (TOP_INSERT_BORE_D / 2.0) - (float(I2C_CABLE_BORE_D) / 2.0)
+            print("I2C conduit: min wall (insert+conduit) =", round(_min_wall, 2), "mm")
+            if _min_wall < 1.2:
+                print("WARNING: conduit + insert leaves thin wall. Increase STANDOFF_OD or reduce I2C_CABLE_BORE_D.")
+
+            # (A) Body conduit cut: ensures hole continues through PLATE (pillar alone can't cut below z=0)
+            conduit_cut_body = Part.makeCylinder(
+                float(I2C_CABLE_BORE_D) / 2.0,
+                bore_h,
+                Vector(x, y, bore_z0)
+            )
+
+            # (B) Side entry cut (pillar-only is fine) below insert zone
+            entry_z = safe_stop_z - 2.0
+
+            # radial outward -> inward
+            dx = math.cos(rad)
+            dy = math.sin(rad)
+
+            start_r = (STANDOFF_OD / 2.0) + 0.8
+            sx = x + dx * start_r
+            sy = y + dy * start_r
+
+            entry_len = (STANDOFF_OD / 2.0) + 3.0
+            entry_cut_pillar = Part.makeCylinder(
+                float(I2C_ENTRY_HOLE_D) / 2.0,
+                entry_len,
+                Vector(sx, sy, entry_z),
+                Vector(-dx, -dy, 0)
+            )
+
+            # Funnel/countersink for easy feeding (optional)
+            if ("I2C_ENTRY_FUNNEL_ENABLE" in globals()) and I2C_ENTRY_FUNNEL_ENABLE:
+                # Requires: I2C_ENTRY_FUNNEL_D, I2C_ENTRY_FUNNEL_L
+                entry_funnel_pillar = Part.makeCone(
+                    float(I2C_ENTRY_FUNNEL_D) / 2.0,         # mouth radius
+                    float(I2C_ENTRY_HOLE_D) / 2.0,           # matches entry hole
+                    float(I2C_ENTRY_FUNNEL_L),               # length along drill axis
+                    Vector(sx, sy, entry_z),                 # starts at outer surface
+                    Vector(-dx, -dy, 0)                      # points inward
+                )
+
+            # (C) Exit tunnel into belly interior (inward toward housing center)
+            exit_z = PLATE_THK - float(I2C_EXIT_Z_FROM_PLATE)
+
+            ix = -math.cos(rad)
+            iy = -math.sin(rad)
+
+            exit_len = (STANDOFF_OD / 2.0) + 10.0  # generous so it breaks out inward reliably
+            exit_cut_body = Part.makeCylinder(
+                float(I2C_CABLE_BORE_D) / 2.0,
+                exit_len,
+                Vector(x, y, exit_z),
+                Vector(ix, iy, 0)
+            )
+
+    # Apply pillar-only entry cuts now
+    if entry_cut_pillar is not None:
+        pillar = pillar.cut(entry_cut_pillar)
+    if entry_funnel_pillar is not None:
+        pillar = pillar.cut(entry_funnel_pillar)
+
+    # ---------------- TOP heat-set insert bore (roof screw) ----------------
     top_bore_z0 = roof_z - TOP_INSERT_DEPTH
     top_insert_bore = Part.makeCylinder(
         TOP_INSERT_BORE_D / 2.0,
         TOP_INSERT_DEPTH + 0.2,
-        Vector(x, y, top_bore_z0 - 0.1)
+        Vector(x, y, top_bore_z0 - 0.1),
     )
     pillar = pillar.cut(top_insert_bore)
 
@@ -800,18 +1009,27 @@ for a in STANDOFF_ANGLES:
         cham = Part.makeCone(
             (TOP_INSERT_BORE_D / 2.0) + 0.35,
             (TOP_INSERT_BORE_D / 2.0),
-            TOP_INSERT_LEADIN_CHAMFER,
-            Vector(x, y, roof_z - TOP_INSERT_LEADIN_CHAMFER)
+            float(TOP_INSERT_LEADIN_CHAMFER),
+            Vector(x, y, roof_z - TOP_INSERT_LEADIN_CHAMFER),
         )
         pillar = pillar.cut(cham)
 
-    body = body.fuse(pillar)
+    # Fuse pillar into body FIRST
+    body = body.fuse(pillar).removeSplitter()
 
+    # Now apply body-level conduit cuts so the hole continues through the plate + opens into belly
+    if conduit_cut_body is not None:
+        body = body.cut(conduit_cut_body)
+
+    if exit_cut_body is not None:
+        body = body.cut(exit_cut_body)
+
+    body = body.removeSplitter()
 # ---------------- Plate bolt-through holes to match belly fastening tubes ----------------
 for a in BELLY_FASTEN_ANGLES:
     rad = math.radians(a)
-    x = STANDOFF_RADIUS * math.cos(rad)
-    y = STANDOFF_RADIUS * math.sin(rad)
+    x = BELLY_FASTEN_RADIUS * math.cos(rad)
+    y = BELLY_FASTEN_RADIUS * math.sin(rad)
 
     thru = Part.makeCylinder(PLATE_BOLT_HOLE_D / 2.0, PLATE_THK + 2.0, Vector(x, y, -1.0))
     body = body.cut(thru)
@@ -832,11 +1050,10 @@ if EDGE_ROUND_ENABLE:
         body,
         target_r=HEAD_R,
         fillet_r=HEAD_RIM_FILLET_R,
-        top_z=PLATE_THK,   # <-- this is the top face of the body plate
-        tol_r=1.5,
-        tol_z=0.9
+        top_z=PLATE_THK,
+        tol_r=2.5,
+        tol_z=1.2
     )
-
 
 lower_obj = doc.addObject("Part::Feature", "LowerBody")
 lower_obj.Shape = body
@@ -846,8 +1063,8 @@ roof_with_holes = Part.makeCylinder(ROOF_R, ROOF_THK, Vector(0, 0, roof_z))
 
 for a in STANDOFF_ANGLES:
     rad = math.radians(a)
-    x = STANDOFF_RADIUS * math.cos(rad)
-    y = STANDOFF_RADIUS * math.sin(rad)
+    x = ROOF_STANDOFF_RADIUS * math.cos(rad)
+    y = ROOF_STANDOFF_RADIUS * math.sin(rad)
 
     hole = Part.makeCylinder(ROOF_HOLE_D / 2.0, ROOF_THK + 1.0, Vector(x, y, roof_z - 0.5))
     roof_with_holes = roof_with_holes.cut(hole)
@@ -914,25 +1131,25 @@ if BELLY_ENABLE:
     # --- internal fastening tubes + inserts ---
     for a in BELLY_FASTEN_ANGLES:
         rad = math.radians(a)
-        x = STANDOFF_RADIUS * math.cos(rad)
-        y = STANDOFF_RADIUS * math.sin(rad)
+        x = BELLY_FASTEN_RADIUS * math.cos(rad)
+        y = BELLY_FASTEN_RADIUS * math.sin(rad)
 
         tube_outer = Part.makeCylinder(BELLY_TUBE_OD / 2.0, cup_total_h, Vector(x, y, cup_base_z))
         pan = pan.fuse(tube_outer)
 
         insert_bore = Part.makeCylinder(
-            BOTTOM_INSERT_BORE_D / 2.0,
-            BOTTOM_INSERT_DEPTH + 0.2,
-            Vector(x, y, -BOTTOM_INSERT_DEPTH - 0.1)
+            TOP_INSERT_BORE_D / 2.0,
+            TOP_INSERT_DEPTH + 0.2,
+            Vector(x, y, -TOP_INSERT_DEPTH - 0.1)
         )
         pan = pan.cut(insert_bore)
 
-        if BOTTOM_INSERT_LEADIN_CHAMFER > 0:
+        if TOP_INSERT_LEADIN_CHAMFER > 0:
             cham = Part.makeCone(
-                (BOTTOM_INSERT_BORE_D / 2.0) + 0.35,
-                (BOTTOM_INSERT_BORE_D / 2.0),
-                BOTTOM_INSERT_LEADIN_CHAMFER,
-                Vector(x, y, -BOTTOM_INSERT_LEADIN_CHAMFER)
+                (TOP_INSERT_BORE_D / 2.0) + 0.35,
+                (TOP_INSERT_BORE_D / 2.0),
+                TOP_INSERT_LEADIN_CHAMFER,
+                Vector(x, y, -TOP_INSERT_LEADIN_CHAMFER)
             )
             pan = pan.cut(cham)
 
@@ -940,7 +1157,7 @@ if BELLY_ENABLE:
     if BELLY_SEAL_ENABLE:
         wall_inner_r = inner_r
         wall_outer_r = HEAD_R
-        tube_outer_r = STANDOFF_RADIUS + (BELLY_TUBE_OD / 2.0)
+        tube_outer_r = BELLY_FASTEN_RADIUS + (BELLY_TUBE_OD / 2.0)
 
         if BELLY_SEAL_CENTER_IN_WALL:
             groove_center_r = (wall_inner_r + wall_outer_r) / 2.0
@@ -1137,11 +1354,11 @@ print("Sil pocket extra radius:       {:.2f} mm".format(SIL_SEAL_EXTRA_R))
 print("\n---- Plate-to-belly fastening ----")
 print("Belly tube OD:                 {:.2f} mm".format(BELLY_TUBE_OD))
 print("Plate bolt hole D:             {:.2f} mm".format(PLATE_BOLT_HOLE_D))
-print("Insert bore D:                 {:.2f} mm".format(BOTTOM_INSERT_BORE_D))
-print("Insert depth:                  {:.2f} mm".format(BOTTOM_INSERT_DEPTH))
-print("\n---- Ports / Protrusions ----")
-print("Inner protrusion:              {}".format("ON" if (PORT_PAD_INNER_ENABLE and PORT_PADS_ENABLE) else "OFF"))
+print("Insert bore D:                 {:.2f} mm".format(TOP_INSERT_BORE_D))
+print("Insert depth:                  {:.2f} mm".format(TOP_INSERT_DEPTH))
 print("\n---- Key Geometry ----")
+print("ROOF_STANDOFF_RADIUS:          {:.2f} mm".format(ROOF_STANDOFF_RADIUS))
+print("BELLY_FASTEN_RADIUS:           {:.2f} mm".format(BELLY_FASTEN_RADIUS))
 print("Ports Z center:                {:.1f} mm".format(PORT_Z_CENTER))
 print("Available pod depth:           {:.2f} mm".format(available_body_depth))
 print("\n---- 3D Printing Tips ----")
