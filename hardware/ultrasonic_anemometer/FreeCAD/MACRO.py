@@ -19,7 +19,7 @@ from FreeCAD import Vector
 # ============================================================
 
 # ---------------- Exploded view (visual only) ----------------
-EXPLODED_VIEW = True
+EXPLODED_VIEW = True    
 EXPLODE_LOWER_DZ = 0.0
 EXPLODE_ROOF_DZ  = 35.0
 EXPLODE_PAN_DZ   = -105.0
@@ -230,18 +230,48 @@ PAR_ENABLE = True
 PAR_CENTER = Vector(0, 0, 0)
 
 PAR_HOUSING_WALL = 3.0
-PAR_HOUSING_OD   = 45.0
+PAR_HOUSING_OD   = 50.0
 PAR_HOUSING_H    = 20.0
 PAR_APERTURE_D   = 30.0
 
-PAR_BOSS_OFFSET_XY = [(0.0, 8.69), (0.0, -8.69)]
+PAR_BOSS_OFFSET_XY = [(0.0, 9.3), (0.0, -9.3)]
 PAR_BOSS_HEIGHT    = 10.0
-PAR_BOSS_DIAM      = 5.0
-PAR_SCREW_DIAMETER = 2.2
+PAR_BOSS_DIAM      = 7.0
+PAR_SCREW_DIAMETER = 3.1
+PAR_BOSS_ROOT_FLARE_ENABLE  = True
+PAR_BOSS_ROOT_FLARE_H       = 2.5
+PAR_BOSS_ROOT_FLARE_EXTRA_R = 1.8
+PAR_BOSS_BASE_FILLET_R = 1.2
+PAR_BOSS_CROSS_GUSSET_ENABLE = True
+PAR_BOSS_CROSS_GUSSET_THK    = 2.5
+PAR_BOSS_CROSS_GUSSET_H      = 6.0
+
+# PAR diffuser (top-mounted disc)
+PAR_DIFFUSER_ENABLE         = True
+PAR_DIFFUSER_D              = 38.6
+PAR_DIFFUSER_THK            = 1.6
+PAR_DIFFUSER_POCKET_ENABLE  = True
+PAR_DIFFUSER_RECESS_DEPTH   = 1.6   # pocket depth for seated diffuser
+PAR_DIFFUSER_OD_CLEAR_D     = 0.6   # diametral assembly clearance (fit-safe for 38.6mm disc)
+PAR_DIFFUSER_LEDGE_ENABLE   = True
+PAR_DIFFUSER_LEDGE_H        = 1.6   # seat depth (match diffuser thickness)
+PAR_DIFFUSER_LEDGE_OVERLAP  = 5.0   # radial glue/support land under diffuser edge
+PAR_DIFFUSER_POCKET_FLOOR_ENABLE = True
+PAR_DIFFUSER_POCKET_FLOOR_THK    = 0.8
+PAR_DIFFUSER_ANTI_OVERHANG_ENABLE    = True
+PAR_DIFFUSER_ANTI_OVERHANG_H         = 5.0   # minimum vertical drop for underside support slope
+PAR_DIFFUSER_ANTI_OVERHANG_ANGLE_DEG = 30.0  # gentle support slope angle toward wall
+PAR_DIFFUSER_ANTI_OVERHANG_WALL_CLEAR = 0.3  # keep a small inner wall thickness margin
+PAR_DIFFUSER_ANTI_OVERHANG_WALL_HIT_DROP = 0.0  # 0 = auto-depth to wall (stronger print support)
+PAR_DIFFUSER_RETAINER_ENABLE = False
+PAR_DIFFUSER_RETAINER_WALL  = 1.0
+PAR_DIFFUSER_RETAINER_H     = 1.6   # retaining lip height (match diffuser thickness)
+PAR_DIFFUSER_RETAINER_RADIAL_MARGIN = 0.2
 
 PAR_CABLE_PORT_D     = 7.0
 PAR_CABLE_PORT_Z_OFF = 5.0
 PAR_CABLE_PORT_ANGLE = 90.0
+PAR_CABLE_PORT_CUT_EXTRA = 6.0   # extra inward cut to ensure full breakthrough after all fuses
 
 # ---------------- Aerodynamic edge rounding ----------------
 EDGE_ROUND_ENABLE = True
@@ -259,8 +289,8 @@ PCB_POST_GUSSET_EXTRA_R = 2.0
 I2C_CONDUIT_ENABLE = True
 I2C_CONDUIT_STANDOFF_INDEX = 1   # 0,1,2,3  -> 90° if your angles are [0,90,180,270]
 
-I2C_CABLE_BORE_D = 4.0
-I2C_ENTRY_HOLE_D = 4.2
+I2C_CABLE_BORE_D = 4.5      # for ~3.55mm cable with print tolerance
+I2C_ENTRY_HOLE_D = 4.8      # slight lead-in clearance vs bore
 I2C_ENTRY_Z_FROM_TOP = 8.0       # mm below roof_top_z (keeps it under roof)
 I2C_ENTRY_LEN_EXTRA = 8.0        # extra length so the side hole always reaches the bore
 
@@ -274,7 +304,7 @@ I2C_INSERT_CLEAR_THK = 1.0  # mm below the insert bore start
 I2C_ENTRY_FUNNEL_ENABLE = True
 I2C_ENTRY_FUNNEL_D = 7.5      # mouth diameter (try 6.5–9.0)
 I2C_ENTRY_FUNNEL_L = 3.0      # funnel length/depth (2–4)
-I2C_EXIT_LEN_EXTRA = 1.5   # mm past standoff wall (1–3mm is plenty)
+I2C_EXIT_LEN_EXTRA = 1.5      # mm past inner standoff wall (keep small to avoid plate over-cut)
 
 # ---------- Document ----------
 DOC_NAME = "Ultrasonic_Head_Improved"
@@ -829,7 +859,8 @@ def _fillet_standoff_base_before_fuse(standoff_shape, x, y, base_r, z_target, fi
 
     for e in local.Edges:
         bb = e.BoundBox
-        if abs(bb.ZMax - zt) > float(tol_z) and abs(bb.ZMin - zt) > float(tol_z):
+        # Keep ONLY edges lying on the base plane (avoids selecting vertical seam edges)
+        if abs(bb.ZMin - zt) > float(tol_z) or abs(bb.ZMax - zt) > float(tol_z):
             continue
 
         ok = True
@@ -978,16 +1009,28 @@ for i, a in enumerate(STANDOFF_ANGLES):
                 )
 
             # (C) Exit tunnel into belly interior (inward toward housing center)
-            exit_z = PLATE_THK - float(I2C_EXIT_Z_FROM_PLATE)
+            # Keep this cut in/near the standoff zone (not deep in plate-drop solid),
+            # then only break through inner wall by a small controlled extra.
+            exit_z_raw = PLATE_THK - float(I2C_EXIT_Z_FROM_PLATE)
+            exit_z = clamp(exit_z_raw, 0.6, safe_stop_z - 1.0)
+            if abs(exit_z - exit_z_raw) > 1e-6:
+                print("I2C exit_z clamped from", round(exit_z_raw, 2), "to", round(exit_z, 2), "to stay in standoff region")
 
             ix = -math.cos(rad)
             iy = -math.sin(rad)
 
-            exit_len = (STANDOFF_OD / 2.0) + 10.0  # generous so it breaks out inward reliably
+            # Start at conduit wall (inward side) so we don't over-cut through the conduit centerline.
+            conduit_r = float(I2C_CABLE_BORE_D) / 2.0
+            wall_run = (STANDOFF_OD / 2.0) - conduit_r
+            exit_len = max(0.4, wall_run + float(I2C_EXIT_LEN_EXTRA))
+
+            sx_exit = x + ix * conduit_r
+            sy_exit = y + iy * conduit_r
+
             exit_cut_body = Part.makeCylinder(
                 float(I2C_CABLE_BORE_D) / 2.0,
                 exit_len,
-                Vector(x, y, exit_z),
+                Vector(sx_exit, sy_exit, exit_z),
                 Vector(ix, iy, 0)
             )
 
@@ -1089,7 +1132,7 @@ if PAR_ENABLE:
     wall_thk = float(PAR_HOUSING_WALL)
 
     start_x = cx + outer_r + 0.8
-    drill_len = wall_thk + 2.0
+    drill_len = wall_thk + float(PAR_CABLE_PORT_CUT_EXTRA)
 
     cable_cutter = Part.makeCylinder(
         float(PAR_CABLE_PORT_D) / 2.0,
@@ -1100,13 +1143,193 @@ if PAR_ENABLE:
     cable_cutter.rotate(Vector(cx, cy, 0), Vector(0, 0, 1), float(PAR_CABLE_PORT_ANGLE))
     ring = ring.cut(cable_cutter)
 
+    # Diffuser top support (flush mating) + optional retainer collar
+    if PAR_DIFFUSER_ENABLE:
+        z_top = roof_top_z + float(PAR_HOUSING_H)
+
+        diffuser_r = float(PAR_DIFFUSER_D) / 2.0
+        diffuser_fit_r = diffuser_r + (float(PAR_DIFFUSER_OD_CLEAR_D) / 2.0)
+        seat_inner_r = max(0.1, diffuser_fit_r - float(PAR_DIFFUSER_LEDGE_OVERLAP))
+        pocket_underside_z = z_top - float(PAR_DIFFUSER_RECESS_DEPTH)
+
+        # (1) Flush support ledge under diffuser edge (top face remains flush)
+        if PAR_DIFFUSER_LEDGE_ENABLE and PAR_DIFFUSER_LEDGE_H > 0 and PAR_DIFFUSER_LEDGE_OVERLAP > 0:
+            ledge_outer_r = float(PAR_HOUSING_OD) / 2.0
+            ledge_inner_r = seat_inner_r
+
+            if ledge_outer_r > (ledge_inner_r + 0.15):
+                ledge_outer = Part.makeCylinder(ledge_outer_r, float(PAR_DIFFUSER_LEDGE_H), Vector(cx, cy, z_top - float(PAR_DIFFUSER_LEDGE_H)))
+                ledge_inner = Part.makeCylinder(ledge_inner_r, float(PAR_DIFFUSER_LEDGE_H) + 0.2, Vector(cx, cy, z_top - float(PAR_DIFFUSER_LEDGE_H) - 0.1))
+                ledge = ledge_outer.cut(ledge_inner)
+                ring = ring.fuse(ledge).removeSplitter()
+            else:
+                print("WARNING: PAR diffuser support ledge too narrow. Check diffuser size/clearance/overlap.")
+
+        # (1b) Explicit recessed seat for diffuser OD fit
+        if PAR_DIFFUSER_POCKET_ENABLE and PAR_DIFFUSER_RECESS_DEPTH > 0:
+            seat_depth = float(PAR_DIFFUSER_RECESS_DEPTH)
+            pocket_underside_z = z_top - seat_depth
+            seat_cut = Part.makeCylinder(
+                diffuser_fit_r,
+                seat_depth + 0.2,
+                Vector(cx, cy, z_top - seat_depth - 0.1)
+            )
+            ring = ring.cut(seat_cut).removeSplitter()
+
+            # Restore explicit pocket support shelf at pocket floor (for real seating contact)
+            if PAR_DIFFUSER_POCKET_FLOOR_ENABLE and PAR_DIFFUSER_POCKET_FLOOR_THK > 0 and PAR_DIFFUSER_LEDGE_OVERLAP > 0:
+                floor_top_z = z_top - seat_depth
+                floor_thk = min(float(PAR_DIFFUSER_POCKET_FLOOR_THK), max(0.2, seat_depth - 0.2))
+                floor_outer_r = diffuser_fit_r
+                floor_inner_r = max(0.1, seat_inner_r)
+                pocket_underside_z = floor_top_z - floor_thk
+
+                if floor_outer_r > (floor_inner_r + 0.15):
+                    floor_outer = Part.makeCylinder(
+                        floor_outer_r,
+                        floor_thk,
+                        Vector(cx, cy, floor_top_z - floor_thk)
+                    )
+                    floor_inner = Part.makeCylinder(
+                        floor_inner_r,
+                        floor_thk + 0.2,
+                        Vector(cx, cy, floor_top_z - floor_thk - 0.1)
+                    )
+                    floor_ring = floor_outer.cut(floor_inner)
+                    ring = ring.fuse(floor_ring).removeSplitter()
+
+        # (1c) Anti-overhang underside support slope back to inner wall (print-friendly)
+        if (
+            PAR_DIFFUSER_ANTI_OVERHANG_ENABLE
+            and PAR_DIFFUSER_RECESS_DEPTH > 0
+            and PAR_DIFFUSER_LEDGE_ENABLE
+            and PAR_DIFFUSER_LEDGE_OVERLAP > 0
+            and PAR_DIFFUSER_ANTI_OVERHANG_H > 0
+        ):
+            seat_depth = float(PAR_DIFFUSER_RECESS_DEPTH)
+            support_h = float(PAR_DIFFUSER_ANTI_OVERHANG_H)
+            support_top_z = pocket_underside_z
+            draft = math.tan(math.radians(float(PAR_DIFFUSER_ANTI_OVERHANG_ANGLE_DEG)))
+            inner_top_r = seat_inner_r
+            inner_bottom_target_r = max(inner_top_r + 0.1, housing_id_r - float(PAR_DIFFUSER_ANTI_OVERHANG_WALL_CLEAR))
+            radial_span = inner_bottom_target_r - inner_top_r
+            max_h = max(0.6, float(PAR_HOUSING_H) - seat_depth - 0.6)
+
+            wall_hit_drop = float(PAR_DIFFUSER_ANTI_OVERHANG_WALL_HIT_DROP)
+            if wall_hit_drop > 0:
+                support_h = min(max_h, wall_hit_drop)
+                inner_bottom_r = inner_bottom_target_r
+            else:
+                if draft > 1e-6:
+                    required_h = radial_span / draft
+                else:
+                    required_h = support_h
+
+                support_h = min(max_h, max(support_h, required_h))
+                inner_bottom_r = inner_top_r + (support_h * draft)
+                inner_bottom_r = min(inner_bottom_r, inner_bottom_target_r)
+
+            support_base_z = support_top_z - support_h
+
+            if inner_bottom_r > (inner_top_r + 0.1) and support_h > 0.2:
+                support_outer = Part.makeCylinder(
+                    housing_id_r,
+                    support_h,
+                    Vector(cx, cy, support_base_z)
+                )
+                support_inner = Part.makeCone(
+                    inner_bottom_r,
+                    inner_top_r,
+                    support_h + 0.2,
+                    Vector(cx, cy, support_base_z - 0.1)
+                )
+                support_slope = support_outer.cut(support_inner)
+                ring = ring.fuse(support_slope).removeSplitter()
+
+        # (2) Optional raised retainer collar (disabled by default to keep mating surface flush)
+        if PAR_DIFFUSER_RETAINER_ENABLE and PAR_DIFFUSER_RETAINER_H > 0 and PAR_DIFFUSER_RETAINER_WALL > 0:
+            collar_id_r = max(diffuser_fit_r, housing_id_r + 0.05)
+            collar_od_r_raw = collar_id_r + float(PAR_DIFFUSER_RETAINER_WALL)
+            collar_od_r_max = (float(PAR_HOUSING_OD) / 2.0) - float(PAR_DIFFUSER_RETAINER_RADIAL_MARGIN)
+            collar_od_r = min(collar_od_r_raw, collar_od_r_max)
+
+            if collar_od_r > (collar_id_r + 0.2):
+                collar_outer = Part.makeCylinder(collar_od_r, float(PAR_DIFFUSER_RETAINER_H), Vector(cx, cy, z_top))
+                collar_inner = Part.makeCylinder(collar_id_r, float(PAR_DIFFUSER_RETAINER_H) + 0.2, Vector(cx, cy, z_top - 0.1))
+                collar = collar_outer.cut(collar_inner)
+                ring = ring.fuse(collar).removeSplitter()
+            else:
+                print("WARNING: PAR diffuser retainer collar could not be created. Check PAR_HOUSING_OD / PAR_HOUSING_WALL / diffuser size.")
+
+        # Re-cut cable port after all added support/seat features so passage is guaranteed open
+        ring = ring.cut(cable_cutter).removeSplitter()
+
     roof_final = roof_final.fuse(ring)
 
+    par_support = None
+    boss_points = []
+
     for (dx, dy) in PAR_BOSS_OFFSET_XY:
-        boss = Part.makeCylinder(PAR_BOSS_DIAM / 2.0, PAR_BOSS_HEIGHT, Vector(cx + dx, cy + dy, roof_top_z))
-        hole = Part.makeCylinder(PAR_SCREW_DIAMETER / 2.0, PAR_BOSS_HEIGHT + 0.5, Vector(cx + dx, cy + dy, roof_top_z - 0.25))
-        boss = boss.cut(hole)
-        roof_final = roof_final.fuse(boss)
+        bx = cx + dx
+        by = cy + dy
+        boss_points.append((bx, by))
+
+        boss = Part.makeCylinder(PAR_BOSS_DIAM / 2.0, PAR_BOSS_HEIGHT, Vector(bx, by, roof_top_z))
+
+        if PAR_BOSS_ROOT_FLARE_ENABLE and PAR_BOSS_ROOT_FLARE_H > 0 and PAR_BOSS_ROOT_FLARE_EXTRA_R > 0:
+            root_flare = Part.makeCone(
+                (PAR_BOSS_DIAM / 2.0) + float(PAR_BOSS_ROOT_FLARE_EXTRA_R),
+                (PAR_BOSS_DIAM / 2.0),
+                float(PAR_BOSS_ROOT_FLARE_H),
+                Vector(bx, by, roof_top_z)
+            )
+            boss = boss.fuse(root_flare).removeSplitter()
+
+        if PAR_BOSS_BASE_FILLET_R > 0:
+            base_r = (PAR_BOSS_DIAM / 2.0)
+            if PAR_BOSS_ROOT_FLARE_ENABLE and PAR_BOSS_ROOT_FLARE_EXTRA_R > 0:
+                base_r = (PAR_BOSS_DIAM / 2.0) + float(PAR_BOSS_ROOT_FLARE_EXTRA_R)
+
+            boss = _fillet_standoff_base_before_fuse(
+                standoff_shape=boss,
+                x=bx,
+                y=by,
+                base_r=base_r,
+                z_target=roof_top_z,
+                fillet_r=float(PAR_BOSS_BASE_FILLET_R),
+                tol_z=1.0,
+                tol_r=1.5,
+            )
+
+        if par_support is None:
+            par_support = boss
+        else:
+            par_support = par_support.fuse(boss)
+
+    if PAR_BOSS_CROSS_GUSSET_ENABLE and len(boss_points) >= 2:
+        ys = [p[1] for p in boss_points]
+        y_min = min(ys)
+        y_max = max(ys)
+        web_len = y_max - y_min
+        if web_len > 0.2:
+            web_h = min(float(PAR_BOSS_CROSS_GUSSET_H), float(PAR_BOSS_HEIGHT))
+            web = Part.makeBox(
+                float(PAR_BOSS_CROSS_GUSSET_THK),
+                web_len,
+                web_h,
+                Vector(cx - (float(PAR_BOSS_CROSS_GUSSET_THK) / 2.0), y_min, roof_top_z)
+            )
+            par_support = par_support.fuse(web)
+
+    for (bx, by) in boss_points:
+        hole = Part.makeCylinder(
+            PAR_SCREW_DIAMETER / 2.0,
+            PAR_BOSS_HEIGHT + 0.5,
+            Vector(bx, by, roof_top_z - 0.25)
+        )
+        par_support = par_support.cut(hole)
+
+    roof_final = roof_final.fuse(par_support)
 
 roof_final = roof_final.removeSplitter()
 
@@ -1362,6 +1585,16 @@ print("ROOF_STANDOFF_RADIUS:          {:.2f} mm".format(ROOF_STANDOFF_RADIUS))
 print("BELLY_FASTEN_RADIUS:           {:.2f} mm".format(BELLY_FASTEN_RADIUS))
 print("Ports Z center:                {:.1f} mm".format(PORT_Z_CENTER))
 print("Available pod depth:           {:.2f} mm".format(available_body_depth))
+
+if PAR_ENABLE:
+    par_diffuser_pocket_d = float(PAR_DIFFUSER_D) + float(PAR_DIFFUSER_OD_CLEAR_D)
+    par_cable_cut_len = float(PAR_HOUSING_WALL) + float(PAR_CABLE_PORT_CUT_EXTRA)
+    print("\n---- PAR / Diffuser Check ----")
+    print("Diffuser target D:             {:.2f} mm".format(PAR_DIFFUSER_D))
+    print("Pocket cut D (effective):      {:.2f} mm".format(par_diffuser_pocket_d))
+    print("Pocket recess depth:           {:.2f} mm".format(PAR_DIFFUSER_RECESS_DEPTH))
+    print("PAR cable port cut length:     {:.2f} mm".format(par_cable_cut_len))
+
 print("\n---- 3D Printing Tips ----")
 print("• Print belly pan UPSIDE DOWN (base on bed)")
 print("• Material: PETG or ASA for outdoor use")
