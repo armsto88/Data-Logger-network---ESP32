@@ -274,6 +274,7 @@ I2C_INSERT_CLEAR_THK = 1.0  # mm below the insert bore start
 I2C_ENTRY_FUNNEL_ENABLE = True
 I2C_ENTRY_FUNNEL_D = 7.5      # mouth diameter (try 6.5–9.0)
 I2C_ENTRY_FUNNEL_L = 3.0      # funnel length/depth (2–4)
+I2C_EXIT_LEN_EXTRA = 1.5   # mm past standoff wall (1–3mm is plenty)
 
 # ---------- Document ----------
 DOC_NAME = "Ultrasonic_Head_Improved"
