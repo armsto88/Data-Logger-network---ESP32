@@ -19,7 +19,7 @@ from FreeCAD import Vector
 # ============================================================
 
 # ---------------- Exploded view (visual only) ----------------
-EXPLODED_VIEW = True    
+EXPLODED_VIEW = True   
 EXPLODE_LOWER_DZ = 0.0
 EXPLODE_ROOF_DZ  = 35.0
 EXPLODE_PAN_DZ   = -105.0
@@ -34,7 +34,7 @@ PLATE_TOP_FILLET_R = 4.0   # try 3–6 mm
 POD_RADIUS   = 39.2
 POD_DIAM     = 24.0
 POD_HEIGHT   = 12.0
-POD_TILT_DEG = 30.0
+POD_TILT_DEG = 32.3
 POD_THROUGH  = 5.0
 
 # ---- Transducer geometry ----
@@ -117,7 +117,7 @@ COUNTERBORE_DEPTH = 2.5
 # ---------------- Belly cup ----------------
 BELLY_ENABLE   = True
 BELLY_BASE_THK = 3.0
-BELLY_WALL_H   = 75.0
+BELLY_WALL_H   = 65.0
 BELLY_WALL_THK = 6.0
 
 # Beef up internal belly fastening tubes:
@@ -125,7 +125,7 @@ BELLY_TUBE_OD      = 12.0
 BELLY_FLOOR_HOLES_ENABLE = False   # no holes through belly floor
 
 # ---------------- Drip edge (external skirt under rim) ----------------
-DRIP_EDGE_ENABLE   = True
+DRIP_EDGE_ENABLE   = False
 DRIP_EDGE_DROP     = 3.0
 DRIP_EDGE_OUTSET   = 1.5
 DRIP_EDGE_OVERLAP  = 0.25
@@ -212,7 +212,7 @@ PCB_INSERT_CHAMFER_H = 0.6
 PCB_OFFSET_X = 0.0
 PCB_OFFSET_Y = 0.0
 
-PCB_ROT_DEG = BELLY_FASTEN_OFFSET
+PCB_ROT_DEG = BELLY_FASTEN_OFFSET + 45.0
 
 # ---------------- SHT "CIRCULAR ROOF" (NO GILLS) ----------------
 SHT_RS_ENABLE = False
@@ -1565,6 +1565,26 @@ if EXPLODED_VIEW:
 
 available_body_depth = shoulder_local_z - bottom_open_local_z
 
+# ---- Flat-roof TOF reflection sanity check (diagnostic only; no geometry changes) ----
+tof_emit_z = PLATE_THK
+tof_reflector_z = roof_z
+tof_dz = tof_reflector_z - tof_emit_z
+tof_tilt_rad = math.radians(float(POD_TILT_DEG))
+
+tof_required_tilt_deg = None
+tof_inward_run_one_leg = None
+tof_bounce_x = None
+tof_return_x = None
+tof_opp_miss = None
+
+if tof_dz > 0 and abs(math.tan(tof_tilt_rad)) > 1e-9:
+    # 1D along a pod-opposite-pod diameter line (+R source side, -R opposite side)
+    tof_inward_run_one_leg = float(tof_dz) * math.tan(tof_tilt_rad)
+    tof_bounce_x = float(POD_RADIUS) - tof_inward_run_one_leg
+    tof_return_x = float(POD_RADIUS) - (2.0 * tof_inward_run_one_leg)
+    tof_opp_miss = tof_return_x - (-float(POD_RADIUS))
+    tof_required_tilt_deg = math.degrees(math.atan2(float(POD_RADIUS), float(tof_dz)))
+
 print("\n============================================================")
 print("   ULTRASONIC ANEMOMETER HEAD - BUILD COMPLETE")
 print("============================================================")
@@ -1594,6 +1614,18 @@ if PAR_ENABLE:
     print("Pocket cut D (effective):      {:.2f} mm".format(par_diffuser_pocket_d))
     print("Pocket recess depth:           {:.2f} mm".format(PAR_DIFFUSER_RECESS_DEPTH))
     print("PAR cable port cut length:     {:.2f} mm".format(par_cable_cut_len))
+
+print("\n---- TOF Flat-Roof Check ----")
+if tof_required_tilt_deg is None:
+    print("TOF check:                     unavailable (invalid dz/tilt)")
+else:
+    print("Reflector dz (emit->roof):     {:.2f} mm".format(tof_dz))
+    print("Current pod tilt:              {:.2f} deg".format(POD_TILT_DEG))
+    print("Tilt for center bounce:        {:.2f} deg".format(tof_required_tilt_deg))
+    print("Inward run to roof (1-leg):    {:.2f} mm".format(tof_inward_run_one_leg))
+    print("Bounce X at roof (0=center):   {:.2f} mm".format(tof_bounce_x))
+    print("Return X at emit z:            {:.2f} mm".format(tof_return_x))
+    print("Opposite-pod center miss:      {:.2f} mm".format(tof_opp_miss))
 
 print("\n---- 3D Printing Tips ----")
 print("• Print belly pan UPSIDE DOWN (base on bed)")
