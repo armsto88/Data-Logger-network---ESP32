@@ -1,4 +1,5 @@
 import math
+import random
 import FreeCAD as App
 import Part
 from FreeCAD import Vector
@@ -19,14 +20,14 @@ from FreeCAD import Vector
 # ============================================================
 
 # ---------------- Exploded view (visual only) ----------------
-EXPLODED_VIEW = True   
+EXPLODED_VIEW = True 
 EXPLODE_LOWER_DZ = 0.0
 EXPLODE_ROOF_DZ  = 35.0
 EXPLODE_PAN_DZ   = -105.0
 
 # ---------------- PARAMETERS ----------------
-HEAD_DIAM = 150.0
-ROOF_DIAM = 150.0
+HEAD_DIAM = 138.0
+ROOF_DIAM = 138.0
 PLATE_THK = 6.0
 PLATE_DROP = 10.0   # mm to extend plate downward (tune)
 PLATE_TOP_FILLET_R = 4.0   # try 3–6 mm
@@ -36,6 +37,24 @@ POD_DIAM     = 24.0
 POD_HEIGHT   = 12.0
 POD_TILT_DEG = 32.3
 POD_THROUGH  = 5.0
+
+# ---- TOF diagnostic assumptions (print-only; no geometry changes) ----
+TOF_AIR_TEMP_C = 20.0
+TOF_SAMPLE_WINDS_MPS = [1.0, 5.0, 10.0]
+TOF_BEAM_TRACE_ENABLE = True
+TOF_BEAM_TRACE_HALF_ANGLES = [25.0, 30.0]
+TOF_BEAM_TRACE_RAYS = 4000
+TOF_BEAM_TRACE_RECEIVER_RADII_MM = [8.0, 16.0, 25.0]
+TOF_BEAM_WEIGHT_EXPONENTS = [6, 10]
+TOF_BEAM_TRACE_YAW_DEG = 0.0
+TOF_BEAM_TRACE_SEED = 42
+TOF_BLOCK_CHECK_ENABLE = True
+TOF_BORE_EFFECTIVE_LEN_MM = 8.0
+TOF_REFLECTOR_TEST_MODES = ["flat", "dish", "cone"]
+TOF_REFLECTOR_DISH_DEPTH_MM = 1.5
+TOF_REFLECTOR_DISH_DIAM_MM = 40.0
+TOF_REFLECTOR_CONE_DEPTH_MM = 1.5
+TOF_REFLECTOR_CONE_DIAM_MM = 40.0
 
 # ---- Transducer geometry ----
 TRANSDUCER_CAN_D  = 16.0
@@ -68,7 +87,7 @@ SIL_POCKET_EXT_BELOW  = 1.5
 ROOF_GAP_ABOVE_PODS = 50.0
 ROOF_THK = 10.0
 
-# ---------------- Reflector parameters ----------------
+# ---------------- Reflector parameters (legacy/reserved; flat roof currently acts as reflector) ----------------
 REFLECTOR_DEPTH = 8.0
 REFLECTOR_R_TOP = 50.0
 REFLECTOR_R_TIP = 6.0
@@ -92,7 +111,7 @@ TOP_INSERT_BORE_D         = 4.6
 TOP_INSERT_DEPTH          = 5.0
 TOP_INSERT_LEADIN_CHAMFER = 0.6
 
-# --- Teardrop standoff geometry (present but you can ignore; you’re using ROUND now) ---
+# --- Teardrop standoff geometry (legacy/reserved; pillar builder is currently cylindrical) ---
 STANDOFF_SHAPE = "teardrop"        # "cyl" or "teardrop"
 
 TEARDROP_WIDTH  = STANDOFF_OD
@@ -105,8 +124,8 @@ TEARDROP_YAW_OFFSET_DEG = 0.0
 
 # Root reinforcement (optional; improves strength where pillar meets plate)
 STANDOFF_ROOT_FLARE_ENABLE = True
-STANDOFF_ROOT_FLARE_H = 6.0
-STANDOFF_ROOT_FLARE_EXTRA_R = 4.0
+STANDOFF_ROOT_FLARE_H = 4.0
+STANDOFF_ROOT_FLARE_EXTRA_R = 2.0
 
 # ---------------- Roof holes (standoff -> roof plate) ----------------
 ROOF_HOLE_D       = 3.4
@@ -117,7 +136,7 @@ COUNTERBORE_DEPTH = 2.5
 # ---------------- Belly cup ----------------
 BELLY_ENABLE   = True
 BELLY_BASE_THK = 3.0
-BELLY_WALL_H   = 65.0
+BELLY_WALL_H   = 62.0
 BELLY_WALL_THK = 6.0
 
 # Beef up internal belly fastening tubes:
@@ -154,13 +173,13 @@ CONNECTORS_ENABLE = True
 
 GX12_HOLE_D     = 11.0
 GX12_NUT_D      = 15.0
-GX12_QTY = 4
+GX12_QTY = 4                    # legacy/reserved (current placement derives from row angles below)
 
 GX12_ROW_CENTER_ANGLE = 320.0
 GX12_ROW_SPACING_DEG  = 25.0
 GX12_ROW_OFFSET_DEG   = -15.0
-GX12_Z_CENTER         = -30.0
-GX12_PAIR_SEPARATION_DEG = 210.0
+GX12_Z_CENTER         = -25.0
+GX12_PAIR_SEPARATION_DEG = 210.0  # legacy/reserved (not currently used in gx12_angles build)
 
 PG7_HOLE_D    = 13.0
 PG7_NUT_D     = 17.9
@@ -170,7 +189,7 @@ SHT_HOLE_D    = 11.5
 SHT_NUT_D     = 15.0
 SHT_ANGLE_DEG = 45.0
 
-PORT_Z_CENTER        = None
+PORT_Z_CENTER        = -27.0
 PORT_CUT_EXTRA       = 2.0
 PORT_AVOID_STANDOFF_DEG = 12.0
 
@@ -192,11 +211,11 @@ GX12_CLUSTER_PAD_ANG_MARGIN = 6.0
 
 # ---------------- PCB mounts (inside belly) ----------------
 PCB_ENABLE = True
-PCB_W      = 100.0
-PCB_H      = 100.0
+PCB_W      = 84.2
+PCB_H      = 84.2
 PCB_HOLE_D = 3.2
 
-PCB_EDGE_MARGIN = 12.0
+PCB_EDGE_MARGIN = 4.1   # (84.2 - 76.0)/2 to match 76mm hole-center spacing
 PCB_HOLES = [
     (PCB_EDGE_MARGIN, PCB_EDGE_MARGIN),
     (PCB_W - PCB_EDGE_MARGIN, PCB_EDGE_MARGIN),
@@ -213,6 +232,12 @@ PCB_OFFSET_X = 0.0
 PCB_OFFSET_Y = 0.0
 
 PCB_ROT_DEG = BELLY_FASTEN_OFFSET + 45.0
+
+# ---------------- Battery envelope check (diagnostic only) ----------------
+BATTERY_CHECK_ENABLE = True
+BATTERY_L_MM = 100.0
+BATTERY_W_MM = 60.0
+BATTERY_H_MM = 12.0
 
 # ---------------- SHT "CIRCULAR ROOF" (NO GILLS) ----------------
 SHT_RS_ENABLE = False
@@ -282,7 +307,7 @@ RIM_RADIUS_TOL = 0.6
 # ---------------- Support root reinforcement (fillet-like gussets) ----------------
 SUPPORT_GUSSET_ENABLE = True
 STANDOFF_GUSSET_H       = 3.0
-STANDOFF_GUSSET_EXTRA_R = 3.0
+STANDOFF_GUSSET_EXTRA_R = 1.5
 PCB_POST_GUSSET_H       = 2.0
 PCB_POST_GUSSET_EXTRA_R = 2.0
 
@@ -291,16 +316,16 @@ I2C_CONDUIT_STANDOFF_INDEX = 1   # 0,1,2,3  -> 90° if your angles are [0,90,180
 
 I2C_CABLE_BORE_D = 4.5      # for ~3.55mm cable with print tolerance
 I2C_ENTRY_HOLE_D = 4.8      # slight lead-in clearance vs bore
-I2C_ENTRY_Z_FROM_TOP = 8.0       # mm below roof_top_z (keeps it under roof)
-I2C_ENTRY_LEN_EXTRA = 8.0        # extra length so the side hole always reaches the bore
+I2C_ENTRY_Z_FROM_TOP = 8.0       # legacy/reserved (current entry_z is derived from safe_stop_z)
+I2C_ENTRY_LEN_EXTRA = 8.0        # legacy/reserved (entry_len currently computed from standoff OD)
 
-I2C_EXIT_ENABLE = True
-I2C_EXIT_W = 7.0
-I2C_EXIT_H = 10.0
+I2C_EXIT_ENABLE = True           # legacy/reserved (exit branch currently follows conduit enable/index)
+I2C_EXIT_W = 7.0                 # legacy/reserved
+I2C_EXIT_H = 10.0                # legacy/reserved
 I2C_EXIT_Z_FROM_PLATE = 14.0
-I2C_EXIT_RELIEF_ENABLE = True
-I2C_TOP_CAP_THK = 2.0    # mm of solid material above the conduit
-I2C_INSERT_CLEAR_THK = 1.0  # mm below the insert bore start
+I2C_EXIT_RELIEF_ENABLE = True   # legacy/reserved
+I2C_TOP_CAP_THK = 2.0    # legacy/reserved
+I2C_INSERT_CLEAR_THK = 1.0  # legacy/reserved
 I2C_ENTRY_FUNNEL_ENABLE = True
 I2C_ENTRY_FUNNEL_D = 7.5      # mouth diameter (try 6.5–9.0)
 I2C_ENTRY_FUNNEL_L = 3.0      # funnel length/depth (2–4)
@@ -1441,6 +1466,8 @@ if BELLY_ENABLE:
         wall_inner_r = belly_inner_r
         wall_outer_r = HEAD_R
         zc_ports = PORT_Z_CENTER
+        outer_pads_on = bool(PORT_PADS_ENABLE)
+        inner_pads_on = bool(PORT_PADS_ENABLE and PORT_PAD_INNER_ENABLE)
 
         gx12_zc = zc_ports if (GX12_Z_CENTER is None) else float(GX12_Z_CENTER)
 
@@ -1456,7 +1483,7 @@ if BELLY_ENABLE:
         ]
 
         for ang in gx12_angles:
-            if PORT_PADS_ENABLE:
+            if outer_pads_on:
                 pan = add_port_pad(
                     pan, ang, gx12_zc, GX12_NUT_D, wall_outer_r,
                     pad_thk=PORT_PAD_THK, inset=PORT_PAD_INSET,
@@ -1464,6 +1491,7 @@ if BELLY_ENABLE:
                     chamfer_z=PORT_PAD_CHAMFER_Z, chamfer_run=PORT_PAD_CHAMFER_RUN,
                     chamfer_y=PORT_PAD_CHAMFER_Z, chamfer_run_y=PORT_PAD_CHAMFER_RUN
                 )
+            if inner_pads_on:
                 pan = add_inner_port_pad(
                     pan, ang, gx12_zc, GX12_NUT_D, wall_inner_r,
                     inner_thk=PORT_PAD_THK, inset=PORT_PAD_INSET,
@@ -1475,13 +1503,13 @@ if BELLY_ENABLE:
             pan = cut_radial_port(
                 pan, GX12_HOLE_D, ang, gx12_zc,
                 wall_inner_r, wall_outer_r,
-                extra=PORT_CUT_EXTRA + (float(PORT_PAD_THK) if PORT_PADS_ENABLE else 0.0),
-                outer_extra=(float(PORT_PAD_THK) if PORT_PADS_ENABLE else 0.0),
-                inner_extra=(float(PORT_PAD_THK) if PORT_PADS_ENABLE else 0.0),
+                extra=PORT_CUT_EXTRA + (float(PORT_PAD_THK) if outer_pads_on else 0.0),
+                outer_extra=(float(PORT_PAD_THK) if outer_pads_on else 0.0),
+                inner_extra=(float(PORT_PAD_THK) if inner_pads_on else 0.0),
             )
 
         if angle_ok(PG7_ANGLE_DEG):
-            if PORT_PADS_ENABLE:
+            if outer_pads_on:
                 pan = add_port_pad(
                     pan, PG7_ANGLE_DEG, zc_ports, PG7_NUT_D, wall_outer_r,
                     pad_thk=PORT_PAD_THK, inset=PORT_PAD_INSET,
@@ -1489,6 +1517,7 @@ if BELLY_ENABLE:
                     chamfer_z=PORT_PAD_CHAMFER_Z, chamfer_run=PORT_PAD_CHAMFER_RUN,
                     chamfer_y=PORT_PAD_CHAMFER_Z, chamfer_run_y=PORT_PAD_CHAMFER_RUN
                 )
+            if inner_pads_on:
                 pan = add_inner_port_pad(
                     pan, PG7_ANGLE_DEG, zc_ports, PG7_NUT_D, wall_inner_r,
                     inner_thk=PORT_PAD_THK, inset=PORT_PAD_INSET,
@@ -1500,13 +1529,13 @@ if BELLY_ENABLE:
             pan = cut_radial_port(
                 pan, PG7_HOLE_D, PG7_ANGLE_DEG, zc_ports,
                 wall_inner_r, wall_outer_r,
-                extra=PORT_CUT_EXTRA + (float(PORT_PAD_THK) if PORT_PADS_ENABLE else 0.0),
-                outer_extra=(float(PORT_PAD_THK) if PORT_PADS_ENABLE else 0.0),
-                inner_extra=(float(PORT_PAD_THK) if PORT_PADS_ENABLE else 0.0),
+                extra=PORT_CUT_EXTRA + (float(PORT_PAD_THK) if outer_pads_on else 0.0),
+                outer_extra=(float(PORT_PAD_THK) if outer_pads_on else 0.0),
+                inner_extra=(float(PORT_PAD_THK) if inner_pads_on else 0.0),
             )
 
         if angle_ok(SHT_ANGLE_DEG):
-            if PORT_PADS_ENABLE:
+            if outer_pads_on:
                 pan = add_port_pad(
                     pan, SHT_ANGLE_DEG, zc_ports, SHT_NUT_D, wall_outer_r,
                     pad_thk=PORT_PAD_THK, inset=PORT_PAD_INSET,
@@ -1514,6 +1543,7 @@ if BELLY_ENABLE:
                     chamfer_z=PORT_PAD_CHAMFER_Z, chamfer_run=PORT_PAD_CHAMFER_RUN,
                     chamfer_y=PORT_PAD_CHAMFER_Z, chamfer_run_y=PORT_PAD_CHAMFER_RUN
                 )
+            if inner_pads_on:
                 pan = add_inner_port_pad(
                     pan, SHT_ANGLE_DEG, zc_ports, SHT_NUT_D, wall_inner_r,
                     inner_thk=PORT_PAD_THK, inset=PORT_PAD_INSET,
@@ -1525,9 +1555,9 @@ if BELLY_ENABLE:
             pan = cut_radial_port(
                 pan, SHT_HOLE_D, SHT_ANGLE_DEG, zc_ports,
                 wall_inner_r, wall_outer_r,
-                extra=PORT_CUT_EXTRA + (float(PORT_PAD_THK) if PORT_PADS_ENABLE else 0.0),
-                outer_extra=(float(PORT_PAD_THK) if PORT_PADS_ENABLE else 0.0),
-                inner_extra=(float(PORT_PAD_THK) if PORT_PADS_ENABLE else 0.0),
+                extra=PORT_CUT_EXTRA + (float(PORT_PAD_THK) if outer_pads_on else 0.0),
+                outer_extra=(float(PORT_PAD_THK) if outer_pads_on else 0.0),
+                inner_extra=(float(PORT_PAD_THK) if inner_pads_on else 0.0),
             )
 
         if SHT_RS_ENABLE and angle_ok(SHT_ANGLE_DEG):
@@ -1576,6 +1606,377 @@ tof_inward_run_one_leg = None
 tof_bounce_x = None
 tof_return_x = None
 tof_opp_miss = None
+tof_leg_len_mm = None
+tof_path_len_mm = None
+tof_c_ms = None
+tof_t0_us = None
+tof_beam_proj = None
+tof_wind_scale = None
+tof_sample_rows = []
+tof_beam_trace_rows = []
+tof_beam_axis_ratio = None
+tof_beam_expected_ratio = None
+
+def _tof_unit(v):
+    length = (v.x * v.x + v.y * v.y + v.z * v.z) ** 0.5
+    if length < 1e-12:
+        return Vector(0.0, 0.0, 1.0)
+    return Vector(v.x / length, v.y / length, v.z / length)
+
+def _tof_dot(a, b):
+    return a.x * b.x + a.y * b.y + a.z * b.z
+
+def _tof_reflect(v, n):
+    k = 2.0 * _tof_dot(v, n)
+    return Vector(v.x - k * n.x, v.y - k * n.y, v.z - k * n.z)
+
+def _tof_ray_plane_intersect_z(p0, direction, z_plane):
+    if abs(direction.z) < 1e-9:
+        return None
+    t = (z_plane - p0.z) / direction.z
+    if t <= 0.0:
+        return None
+    return Vector(p0.x + t * direction.x, p0.y + t * direction.y, p0.z + t * direction.z)
+
+def _tof_reflector_shape_z_grad(x, y, mode):
+    mode_n = str(mode).lower()
+    if mode_n == "dish":
+        rr = math.hypot(x, y)
+        reflector_r = max(0.1, float(TOF_REFLECTOR_DISH_DIAM_MM) / 2.0)
+        depth = max(0.0, float(TOF_REFLECTOR_DISH_DEPTH_MM))
+        if (rr <= reflector_r) and (depth > 1e-9):
+            base = float(roof_z) - depth
+            z_local = base + depth * ((rr * rr) / (reflector_r * reflector_r))
+            dzdx = (2.0 * depth * x) / (reflector_r * reflector_r)
+            dzdy = (2.0 * depth * y) / (reflector_r * reflector_r)
+            return z_local, dzdx, dzdy
+        return float(roof_z), 0.0, 0.0
+
+    if mode_n == "cone":
+        rr = math.hypot(x, y)
+        reflector_r = max(0.1, float(TOF_REFLECTOR_CONE_DIAM_MM) / 2.0)
+        depth = max(0.0, float(TOF_REFLECTOR_CONE_DEPTH_MM))
+        if (rr <= reflector_r) and (depth > 1e-9):
+            base = float(roof_z) - depth
+            z_local = base + depth * (rr / reflector_r)
+            if rr > 1e-9:
+                slope = depth / reflector_r
+                dzdx = slope * (x / rr)
+                dzdy = slope * (y / rr)
+            else:
+                dzdx, dzdy = 0.0, 0.0
+            return z_local, dzdx, dzdy
+        return float(roof_z), 0.0, 0.0
+
+    return float(roof_z), 0.0, 0.0
+
+def _tof_reflector_normal_at(x, y, mode):
+    _, dzdx, dzdy = _tof_reflector_shape_z_grad(x, y, mode)
+    return _tof_unit(Vector(-dzdx, -dzdy, 1.0))
+
+def _tof_ray_reflector_intersect(p0, direction, mode):
+    if abs(direction.z) < 1e-9:
+        return None
+
+    t = (float(roof_z) - p0.z) / direction.z
+    if t <= 0.0:
+        return None
+
+    for _ in range(14):
+        x = p0.x + t * direction.x
+        y = p0.y + t * direction.y
+        z = p0.z + t * direction.z
+
+        fz, dzdx, dzdy = _tof_reflector_shape_z_grad(x, y, mode)
+        g = z - fz
+        if abs(g) < 1e-5:
+            n = _tof_reflector_normal_at(x, y, mode)
+            return Vector(x, y, z), n
+
+        dgdt = direction.z - (dzdx * direction.x + dzdy * direction.y)
+        if abs(dgdt) < 1e-10:
+            return None
+
+        t = t - (g / dgdt)
+        if t <= 0.0:
+            return None
+
+    return None
+
+def _tof_sample_dir_in_cone(axis_dir, half_angle_deg, rng):
+    axis = _tof_unit(axis_dir)
+    half_angle = math.radians(float(half_angle_deg))
+
+    u = rng.random()
+    cos_theta = (1.0 - u) + (u * math.cos(half_angle))
+    sin_theta = max(0.0, 1.0 - (cos_theta * cos_theta)) ** 0.5
+    phi = 2.0 * math.pi * rng.random()
+
+    helper = Vector(1.0, 0.0, 0.0) if abs(axis.x) < 0.9 else Vector(0.0, 1.0, 0.0)
+    e1 = _tof_unit(axis.cross(helper))
+    e2 = _tof_unit(axis.cross(e1))
+
+    direction = Vector(
+        axis.x * cos_theta + (e1.x * math.cos(phi) + e2.x * math.sin(phi)) * sin_theta,
+        axis.y * cos_theta + (e1.y * math.cos(phi) + e2.y * math.sin(phi)) * sin_theta,
+        axis.z * cos_theta + (e1.z * math.cos(phi) + e2.z * math.sin(phi)) * sin_theta,
+    )
+    return _tof_unit(direction)
+
+def _tof_segment_hits_standoff(p0, p1, sx, sy, sr, z_min, z_max):
+    dx = p1.x - p0.x
+    dy = p1.y - p0.y
+    dz = p1.z - p0.z
+
+    ax = p0.x - sx
+    ay = p0.y - sy
+
+    a = dx * dx + dy * dy
+    if a < 1e-12:
+        return False
+
+    b = 2.0 * (ax * dx + ay * dy)
+    c = ax * ax + ay * ay - (sr * sr)
+    disc = b * b - 4.0 * a * c
+    if disc < 0.0:
+        return False
+
+    root = math.sqrt(max(0.0, disc))
+    t1 = (-b - root) / (2.0 * a)
+    t2 = (-b + root) / (2.0 * a)
+
+    for tt in (t1, t2):
+        if 0.0 <= tt <= 1.0:
+            zz = p0.z + tt * dz
+            if (z_min - 1e-6) <= zz <= (z_max + 1e-6):
+                return True
+    return False
+
+def _tof_receiver_hits(recv_pt, receiver, radii):
+    dx = recv_pt.x - receiver.x
+    dy = recv_pt.y - receiver.y
+    rr = math.hypot(dx, dy)
+    return rr, [rr <= float(rm) for rm in radii]
+
+def _tof_run_beam_trace(half_angle_deg, n_rays, receiver_radii_mm, yaw_deg, seed, weight_exponents, reflector_mode):
+    emit_z = float(PLATE_THK)
+    if float(roof_z) <= emit_z:
+        return None
+
+    emitter = Vector(+float(POD_RADIUS), 0.0, emit_z)
+    receiver = Vector(-float(POD_RADIUS), 0.0, emit_z)
+
+    tilt = math.radians(float(POD_TILT_DEG))
+    yaw = math.radians(float(yaw_deg))
+    axis = Vector(-math.sin(tilt), 0.0, math.cos(tilt))
+
+    if abs(yaw_deg) > 1e-9:
+        cy = math.cos(yaw)
+        sy = math.sin(yaw)
+        axis = Vector(axis.x * cy - axis.y * sy, axis.x * sy + axis.y * cy, axis.z)
+
+    axis = _tof_unit(axis)
+
+    rng = random.Random(
+        int(seed)
+        + int(round(half_angle_deg * 100.0))
+        + int(round(float(yaw_deg) * 1000.0))
+        + (0 if str(reflector_mode).lower() == "flat" else (100000 if str(reflector_mode).lower() == "dish" else 200000))
+    )
+
+    radii = [float(rm) for rm in receiver_radii_mm]
+    if not radii:
+        radii = [8.0]
+    weights = [int(n) for n in weight_exponents]
+    if not weights:
+        weights = [6, 10]
+
+    valid = 0
+    miss_radii = []
+    hit_counts = [0 for _ in radii]
+    weighted_total = {n: 0.0 for n in weights}
+    weighted_hits = {n: [0.0 for _ in radii] for n in weights}
+
+    roof_hit_radii = []
+    roof_hit_x = []
+    roof_hit_y = []
+
+    blocked_standoff = 0
+    blocked_bore = 0
+    roof_in_par_aperture = 0
+    roof_in_par_wall = 0
+    pod_rim_clip = 0
+
+    bore_len = max(0.1, float(TOF_BORE_EFFECTIVE_LEN_MM))
+    bore_r = float(BORE_MAIN_D) / 2.0
+    bore_max_angle = math.atan2(bore_r, bore_len)
+
+    standoff_r = (float(STANDOFF_OD) / 2.0) + max(0.0, float(STANDOFF_ROOT_FLARE_EXTRA_R), float(STANDOFF_GUSSET_EXTRA_R))
+    standoff_centers = []
+    for aa in STANDOFF_ANGLES:
+        rr = math.radians(float(aa))
+        standoff_centers.append((float(ROOF_STANDOFF_RADIUS) * math.cos(rr), float(ROOF_STANDOFF_RADIUS) * math.sin(rr)))
+
+    for _ in range(int(n_rays)):
+        ray0 = _tof_sample_dir_in_cone(axis, half_angle_deg, rng)
+
+        cos_to_axis = max(-1.0, min(1.0, _tof_dot(ray0, axis)))
+        off_axis = math.acos(cos_to_axis)
+        if TOF_BLOCK_CHECK_ENABLE and (off_axis > bore_max_angle):
+            blocked_bore += 1
+            continue
+
+        hit_reflector = _tof_ray_reflector_intersect(emitter, ray0, reflector_mode)
+        if hit_reflector is None:
+            continue
+        roof_pt, roof_n = hit_reflector
+
+        if TOF_BLOCK_CHECK_ENABLE:
+            out_end = Vector(
+                roof_pt.x - (0.05 * ray0.x),
+                roof_pt.y - (0.05 * ray0.y),
+                roof_pt.z - (0.05 * ray0.z),
+            )
+            for sx, sy in standoff_centers:
+                if _tof_segment_hits_standoff(emitter, out_end, sx, sy, standoff_r, 0.0, float(roof_z)):
+                    blocked_standoff += 1
+                    roof_pt = None
+                    break
+            if roof_pt is None:
+                continue
+
+        ray1 = _tof_reflect(ray0, roof_n)
+
+        recv_pt = _tof_ray_plane_intersect_z(roof_pt, ray1, emit_z)
+        if recv_pt is None:
+            continue
+
+        if TOF_BLOCK_CHECK_ENABLE:
+            in_start = Vector(
+                roof_pt.x + (0.05 * ray1.x),
+                roof_pt.y + (0.05 * ray1.y),
+                roof_pt.z + (0.05 * ray1.z),
+            )
+            blocked = False
+            for sx, sy in standoff_centers:
+                if _tof_segment_hits_standoff(in_start, recv_pt, sx, sy, standoff_r, 0.0, float(roof_z)):
+                    blocked_standoff += 1
+                    blocked = True
+                    break
+            if blocked:
+                continue
+
+        rr, hit_flags = _tof_receiver_hits(recv_pt, receiver, radii)
+        miss_radii.append(rr)
+        if rr > (float(POD_DIAM) / 2.0):
+            pod_rim_clip += 1
+        roof_hit_r = math.hypot(roof_pt.x, roof_pt.y)
+        roof_hit_radii.append(roof_hit_r)
+        roof_hit_x.append(roof_pt.x)
+        roof_hit_y.append(roof_pt.y)
+
+        if PAR_ENABLE:
+            par_outer_r = float(PAR_HOUSING_OD) / 2.0
+            par_inner_r = max(0.0, par_outer_r - float(PAR_HOUSING_WALL))
+            if roof_hit_r <= par_inner_r:
+                roof_in_par_aperture += 1
+            elif roof_hit_r <= par_outer_r:
+                roof_in_par_wall += 1
+
+        valid += 1
+
+        for i, ok in enumerate(hit_flags):
+            if ok:
+                hit_counts[i] += 1
+
+        for n in weights:
+            w = cos_to_axis ** max(0, int(n))
+            weighted_total[n] += w
+            for i, ok in enumerate(hit_flags):
+                if ok:
+                    weighted_hits[n][i] += w
+
+    if valid <= 0:
+        return {
+            "mode": str(reflector_mode).lower(),
+            "half_angle": float(half_angle_deg),
+            "n_rays": int(n_rays),
+            "valid": 0,
+            "receiver_radii": radii,
+            "hit_pct": [0.0 for _ in radii],
+            "weighted_hit_pct": {n: [0.0 for _ in radii] for n in weights},
+            "p50": None,
+            "p90": None,
+            "p99": None,
+            "path_mean_mm": None,
+            "path_delta_center_mm": None,
+            "blocked_bore": int(blocked_bore),
+            "blocked_standoff": int(blocked_standoff),
+            "roof_in_par_aperture_pct": 0.0,
+            "roof_in_par_wall_pct": 0.0,
+            "pod_rim_clip_pct": 0.0,
+            "roof_r_p90": None,
+            "roof_r_p99": None,
+        }
+
+    miss_radii.sort()
+    i50 = int(0.50 * (valid - 1))
+    i90 = int(0.90 * (valid - 1))
+    i99 = int(0.99 * (valid - 1))
+
+    roof_hit_radii.sort()
+    ir90 = int(0.90 * (valid - 1))
+    ir99 = int(0.99 * (valid - 1))
+
+    path_samples = []
+    for i in range(min(valid, 256)):
+        rx = roof_hit_x[i]
+        ry = roof_hit_y[i]
+        rz, _, _ = _tof_reflector_shape_z_grad(rx, ry, reflector_mode)
+        leg1 = math.sqrt((rx - emitter.x) ** 2 + (ry - emitter.y) ** 2 + (rz - emitter.z) ** 2)
+        leg2 = math.sqrt((rx - receiver.x) ** 2 + (ry - receiver.y) ** 2 + (rz - receiver.z) ** 2)
+        path_samples.append(leg1 + leg2)
+
+    path_mean_mm = (sum(path_samples) / float(len(path_samples))) if path_samples else None
+
+    center_pt = _tof_ray_reflector_intersect(emitter, axis, reflector_mode)
+    path_delta_center_mm = None
+    if center_pt is not None and tof_path_len_mm is not None:
+        cpt, _ = center_pt
+        c_leg1 = math.sqrt((cpt.x - emitter.x) ** 2 + (cpt.y - emitter.y) ** 2 + (cpt.z - emitter.z) ** 2)
+        c_leg2 = math.sqrt((cpt.x - receiver.x) ** 2 + (cpt.y - receiver.y) ** 2 + (cpt.z - receiver.z) ** 2)
+        path_delta_center_mm = (c_leg1 + c_leg2) - float(tof_path_len_mm)
+
+    hit_pct = [100.0 * float(hc) / float(valid) for hc in hit_counts]
+    weighted_hit_pct = {}
+    for n in weights:
+        denom = weighted_total[n]
+        if denom <= 1e-12:
+            weighted_hit_pct[n] = [0.0 for _ in radii]
+        else:
+            weighted_hit_pct[n] = [100.0 * float(vv) / float(denom) for vv in weighted_hits[n]]
+
+    return {
+        "mode": str(reflector_mode).lower(),
+        "half_angle": float(half_angle_deg),
+        "n_rays": int(n_rays),
+        "valid": int(valid),
+        "receiver_radii": radii,
+        "hit_pct": hit_pct,
+        "weighted_hit_pct": weighted_hit_pct,
+        "p50": float(miss_radii[i50]),
+        "p90": float(miss_radii[i90]),
+        "p99": float(miss_radii[i99]),
+        "path_mean_mm": path_mean_mm,
+        "path_delta_center_mm": path_delta_center_mm,
+        "blocked_bore": int(blocked_bore),
+        "blocked_standoff": int(blocked_standoff),
+        "roof_in_par_aperture_pct": 100.0 * float(roof_in_par_aperture) / float(valid),
+        "roof_in_par_wall_pct": 100.0 * float(roof_in_par_wall) / float(valid),
+        "pod_rim_clip_pct": 100.0 * float(pod_rim_clip) / float(valid),
+        "roof_r_p90": float(roof_hit_radii[ir90]),
+        "roof_r_p99": float(roof_hit_radii[ir99]),
+    }
 
 if tof_dz > 0 and abs(math.tan(tof_tilt_rad)) > 1e-9:
     # 1D along a pod-opposite-pod diameter line (+R source side, -R opposite side)
@@ -1584,6 +1985,41 @@ if tof_dz > 0 and abs(math.tan(tof_tilt_rad)) > 1e-9:
     tof_return_x = float(POD_RADIUS) - (2.0 * tof_inward_run_one_leg)
     tof_opp_miss = tof_return_x - (-float(POD_RADIUS))
     tof_required_tilt_deg = math.degrees(math.atan2(float(POD_RADIUS), float(tof_dz)))
+
+    tof_leg_len_mm = math.hypot(float(tof_dz), tof_inward_run_one_leg)
+    tof_path_len_mm = 2.0 * tof_leg_len_mm
+    tof_c_ms = 331.3 + (0.606 * float(TOF_AIR_TEMP_C))
+    tof_t0_us = ((tof_path_len_mm / 1000.0) / tof_c_ms) * 1e6
+    tof_beam_proj = abs(math.sin(tof_tilt_rad))
+
+    if tof_beam_proj > 1e-6:
+        tof_wind_scale = (tof_path_len_mm / 1000.0) / (2.0 * tof_beam_proj)
+
+        for wind_mps in TOF_SAMPLE_WINDS_MPS:
+            u_path = float(wind_mps) * tof_beam_proj
+            t_ab = ((tof_path_len_mm / 1000.0) / (tof_c_ms + u_path)) * 1e6
+            t_ba = ((tof_path_len_mm / 1000.0) / (tof_c_ms - u_path)) * 1e6
+            tof_sample_rows.append((float(wind_mps), t_ab, t_ba, abs(t_ba - t_ab)))
+
+if TOF_BEAM_TRACE_ENABLE:
+    for mode in TOF_REFLECTOR_TEST_MODES:
+        for half_angle in TOF_BEAM_TRACE_HALF_ANGLES:
+            row = _tof_run_beam_trace(
+                half_angle_deg=float(half_angle),
+                n_rays=int(TOF_BEAM_TRACE_RAYS),
+                receiver_radii_mm=TOF_BEAM_TRACE_RECEIVER_RADII_MM,
+                yaw_deg=float(TOF_BEAM_TRACE_YAW_DEG),
+                seed=int(TOF_BEAM_TRACE_SEED),
+                weight_exponents=TOF_BEAM_WEIGHT_EXPONENTS,
+                reflector_mode=mode,
+            )
+            if row is not None:
+                tof_beam_trace_rows.append(row)
+
+    if abs(math.cos(math.radians(float(POD_TILT_DEG)))) > 1e-9:
+        tof_beam_axis_ratio = -math.tan(math.radians(float(POD_TILT_DEG)))
+    if tof_dz > 1e-9:
+        tof_beam_expected_ratio = -float(POD_RADIUS) / float(tof_dz)
 
 print("\n============================================================")
 print("   ULTRASONIC ANEMOMETER HEAD - BUILD COMPLETE")
@@ -1615,6 +2051,87 @@ if PAR_ENABLE:
     print("Pocket recess depth:           {:.2f} mm".format(PAR_DIFFUSER_RECESS_DEPTH))
     print("PAR cable port cut length:     {:.2f} mm".format(par_cable_cut_len))
 
+if BATTERY_CHECK_ENABLE:
+    belly_inner_r_chk = (HEAD_DIAM / 2.0) - BELLY_WALL_THK
+    battery_half_diag = 0.5 * math.hypot(float(BATTERY_L_MM), float(BATTERY_W_MM))
+    battery_radial_margin = belly_inner_r_chk - battery_half_diag
+    battery_height_margin = float(PCB_STANDOFF_H) - float(BATTERY_H_MM)
+
+    # PCB-to-wall radial clearances (using current PCB placement/rotation)
+    x0_chk = -PCB_W / 2.0 + PCB_OFFSET_X
+    y0_chk = -PCB_H / 2.0 + PCB_OFFSET_Y
+    rot_chk = math.radians(float(PCB_ROT_DEG))
+    cr_chk = math.cos(rot_chk)
+    sr_chk = math.sin(rot_chk)
+
+    pcb_corner_pts = [
+        (x0_chk, y0_chk),
+        (x0_chk + PCB_W, y0_chk),
+        (x0_chk + PCB_W, y0_chk + PCB_H),
+        (x0_chk, y0_chk + PCB_H),
+    ]
+
+    max_corner_r = 0.0
+    for (px0, py0) in pcb_corner_pts:
+        px = (px0 * cr_chk) - (py0 * sr_chk)
+        py = (px0 * sr_chk) + (py0 * cr_chk)
+        max_corner_r = max(max_corner_r, math.hypot(px, py))
+
+    max_post_center_r = 0.0
+    for (hx, hy) in PCB_HOLES:
+        px0 = x0_chk + hx
+        py0 = y0_chk + hy
+        px = (px0 * cr_chk) - (py0 * sr_chk)
+        py = (px0 * sr_chk) + (py0 * cr_chk)
+        max_post_center_r = max(max_post_center_r, math.hypot(px, py))
+
+    pcb_corner_margin = belly_inner_r_chk - max_corner_r
+    pcb_post_outer_margin = belly_inner_r_chk - (max_post_center_r + (PCB_POST_OD / 2.0))
+
+    print("\n---- Battery Envelope Check ----")
+    print("Battery LxWxH:                 {:.1f} x {:.1f} x {:.1f} mm".format(BATTERY_L_MM, BATTERY_W_MM, BATTERY_H_MM))
+    print("Belly inner radius (approx):   {:.2f} mm".format(belly_inner_r_chk))
+    print("Battery half-diagonal:         {:.2f} mm".format(battery_half_diag))
+    print("Radial fit margin (approx):    {:.2f} mm".format(battery_radial_margin))
+    print("Under-PCB height margin:       {:.2f} mm".format(battery_height_margin))
+    print("PCB corner radial margin:      {:.2f} mm".format(pcb_corner_margin))
+    print("PCB post outer radial margin:  {:.2f} mm".format(pcb_post_outer_margin))
+
+if CONNECTORS_ENABLE:
+    z_floor_chk = -float(BELLY_WALL_H)
+    pcb_top_z_chk = z_floor_chk + float(PCB_STANDOFF_H)
+    batt_top_z_chk = z_floor_chk + float(BATTERY_H_MM)
+
+    gx12_zc_chk = float(PORT_Z_CENTER if (GX12_Z_CENTER is None) else GX12_Z_CENTER)
+    gx12_bot_z = gx12_zc_chk - (float(GX12_HOLE_D) / 2.0)
+
+    print("\n---- Connector / Gland Clearance ----")
+    print("PCB top Z (post top):          {:.2f} mm".format(pcb_top_z_chk))
+    print("Battery top Z (approx):        {:.2f} mm".format(batt_top_z_chk))
+
+    print("GX12 hole center Z:            {:.2f} mm".format(gx12_zc_chk))
+    print("GX12 hole bottom Z:            {:.2f} mm".format(gx12_bot_z))
+    print("GX12 bottom above PCB top:     {:.2f} mm".format(gx12_bot_z - pcb_top_z_chk))
+    print("GX12 bottom above battery top: {:.2f} mm".format(gx12_bot_z - batt_top_z_chk))
+
+    pg7_on = angle_ok(PG7_ANGLE_DEG)
+    if pg7_on:
+        pg7_bot_z = float(PORT_Z_CENTER) - (float(PG7_HOLE_D) / 2.0)
+        print("PG7 enabled:                   yes")
+        print("PG7 hole bottom Z:             {:.2f} mm".format(pg7_bot_z))
+        print("PG7 bottom above PCB top:      {:.2f} mm".format(pg7_bot_z - pcb_top_z_chk))
+    else:
+        print("PG7 enabled:                   no (angle blocked by standoff keepout)")
+
+    sht_on = angle_ok(SHT_ANGLE_DEG)
+    if sht_on:
+        sht_bot_z = float(PORT_Z_CENTER) - (float(SHT_HOLE_D) / 2.0)
+        print("SHT enabled:                   yes")
+        print("SHT hole bottom Z:             {:.2f} mm".format(sht_bot_z))
+        print("SHT bottom above PCB top:      {:.2f} mm".format(sht_bot_z - pcb_top_z_chk))
+    else:
+        print("SHT enabled:                   no (angle blocked by standoff keepout)")
+
 print("\n---- TOF Flat-Roof Check ----")
 if tof_required_tilt_deg is None:
     print("TOF check:                     unavailable (invalid dz/tilt)")
@@ -1626,6 +2143,123 @@ else:
     print("Bounce X at roof (0=center):   {:.2f} mm".format(tof_bounce_x))
     print("Return X at emit z:            {:.2f} mm".format(tof_return_x))
     print("Opposite-pod center miss:      {:.2f} mm".format(tof_opp_miss))
+    print("Path length (pod->roof->pod):  {:.2f} mm".format(tof_path_len_mm))
+    print("Assumed air temp:              {:.1f} C".format(TOF_AIR_TEMP_C))
+    print("Speed of sound (assumed):      {:.2f} m/s".format(tof_c_ms))
+    print("No-wind TOF (A->B):            {:.2f} us".format(tof_t0_us))
+
+    if tof_wind_scale is None:
+        print("Wind solve factor:             unavailable (beam projection too small)")
+    else:
+        print("Beam projection (|sin tilt|):  {:.4f}".format(tof_beam_proj))
+        print("Wind solve factor K:           {:.6f} m".format(tof_wind_scale))
+        print("Wind solve formula:            U_axis = K * (1/t_AB - 1/t_BA)")
+        print("(t_AB, t_BA in seconds; positive U along A->B axis)")
+
+        if tof_sample_rows:
+            print("Sample timing deltas (at assumed temp):")
+            for wind_mps, t_ab, t_ba, dt_us in tof_sample_rows:
+                print("  U={:>4.1f} m/s -> t_AB={:>8.2f} us, t_BA={:>8.2f} us, |dt|={:>6.2f} us".format(
+                    wind_mps, t_ab, t_ba, dt_us
+                ))
+
+if TOF_BEAM_TRACE_ENABLE:
+    print("\n---- TOF Beam Trace (reflector + spread diagnostics) ----")
+    print("Beam yaw offset:               {:.2f} deg".format(float(TOF_BEAM_TRACE_YAW_DEG)))
+    if (tof_beam_axis_ratio is not None) and (tof_beam_expected_ratio is not None):
+        print("Axis slope vx/vz (from tilt):  {:.5f}".format(tof_beam_axis_ratio))
+        print("Axis slope vx/vz (expected):   {:.5f}".format(tof_beam_expected_ratio))
+
+    if not tof_beam_trace_rows:
+        print("Beam trace:                    unavailable (check reflector/emit planes)")
+    else:
+        for row in tof_beam_trace_rows:
+            mode_name = str(row.get("mode", "flat")).lower()
+            print(
+                "Mode {:>4s} | Half-angle {:>5.1f} deg | Rays {:>5d} | Valid {:>5d}".format(
+                    mode_name,
+                    row["half_angle"],
+                    row["n_rays"],
+                    row["valid"],
+                )
+            )
+
+            radii = row.get("receiver_radii", [])
+            hit_pct = row.get("hit_pct", [])
+            weighted = row.get("weighted_hit_pct", {})
+            if radii and hit_pct:
+                radius_parts = []
+                for rr, hp in zip(radii, hit_pct):
+                    radius_parts.append("R={:.0f}mm:{:.2f}%".format(float(rr), float(hp)))
+                print("  Geometric hit fraction:       {}".format(" | ".join(radius_parts)))
+
+            for wn in TOF_BEAM_WEIGHT_EXPONENTS:
+                wvals = weighted.get(int(wn), None)
+                if wvals is None:
+                    continue
+                w_parts = []
+                for rr, hv in zip(radii, wvals):
+                    w_parts.append("R={:.0f}mm:{:.2f}%".format(float(rr), float(hv)))
+                print("  Weighted hit (cos^{}):        {}".format(int(wn), " | ".join(w_parts)))
+
+            if row["p50"] is None:
+                print("  Miss radius p50/p90/p99:     unavailable")
+            else:
+                print("  Miss radius p50/p90/p99:     {:.2f} / {:.2f} / {:.2f} mm".format(row["p50"], row["p90"], row["p99"]))
+
+            if row.get("roof_r_p90") is not None:
+                print("  Roof footprint radius p90/p99:{:.2f} / {:.2f} mm".format(row["roof_r_p90"], row["roof_r_p99"]))
+                print(
+                    "  Roof hits in PAR aperture/wall:{:.2f}% / {:.2f}%".format(
+                        float(row.get("roof_in_par_aperture_pct", 0.0)),
+                        float(row.get("roof_in_par_wall_pct", 0.0)),
+                    )
+                )
+
+            if row.get("path_delta_center_mm") is not None:
+                print("  Center-ray path delta vs flat:{:+.3f} mm".format(row["path_delta_center_mm"]))
+
+            if TOF_BLOCK_CHECK_ENABLE:
+                print(
+                    "  Blocked rays (bore/standoff): {:d} / {:d} | Pod-rim clip: {:.2f}%".format(
+                        int(row.get("blocked_bore", 0)),
+                        int(row.get("blocked_standoff", 0)),
+                        float(row.get("pod_rim_clip_pct", 0.0)),
+                    )
+                )
+
+        best_flat = None
+        best_alt = None
+        for row in tof_beam_trace_rows:
+            mode_name = str(row.get("mode", "flat")).lower()
+            weighted = row.get("weighted_hit_pct", {})
+            w_main = weighted.get(int(TOF_BEAM_WEIGHT_EXPONENTS[-1]), None)
+            if not w_main:
+                continue
+            score = max(w_main)
+            if mode_name == "flat":
+                if (best_flat is None) or (score > best_flat[0]):
+                    best_flat = (score, row)
+            else:
+                if (best_alt is None) or (score > best_alt[0]):
+                    best_alt = (score, row)
+
+        print("\nBeam-trace recommendation:")
+        if (best_flat is None) or (best_alt is None):
+            print("  Insufficient data for flat-vs-focus recommendation.")
+        else:
+            flat_score = best_flat[0]
+            alt_score = best_alt[0]
+            gain = alt_score - flat_score
+            if gain < 3.0:
+                print("  Flat reflector acceptable (best weighted hit gain < 3%).")
+            else:
+                print(
+                    "  Consider weak focusing reflector (best gain +{:.2f}% in mode '{}').".format(
+                        gain,
+                        best_alt[1].get("mode", "?")
+                    )
+                )
 
 print("\n---- 3D Printing Tips ----")
 print("• Print belly pan UPSIDE DOWN (base on bed)")
