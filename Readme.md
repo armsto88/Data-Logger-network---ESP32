@@ -35,6 +35,17 @@ The system is built around:
 
 ---
 
+## Ultrasonic Design Docs
+
+The ultrasonic anemometer documentation is maintained in the following aligned documents:
+
+- [NODE-PCB-OVERVIEW.md](NODE-PCB-OVERVIEW.md) — Hardware Design Document
+- [NODE-FIRMWARE_NOTES.md](NODE-FIRMWARE_NOTES.md) — Firmware Architecture Document
+- [hardware/ultrasonic_anemometer/docs/MECHANICAL_DESIGN.md](hardware/ultrasonic_anemometer/docs/MECHANICAL_DESIGN.md) — Mechanical Design Document
+- [hardware/ultrasonic_anemometer/docs/TOF_WORKOUT_GUIDE.md](hardware/ultrasonic_anemometer/docs/TOF_WORKOUT_GUIDE.md) — TOF geometry/constants and validation workflow
+
+---
+
 ## Features
 
 - **ESP-NOW “mesh-ish” communication**
