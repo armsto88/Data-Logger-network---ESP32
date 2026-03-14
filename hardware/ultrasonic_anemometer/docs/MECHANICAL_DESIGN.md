@@ -62,6 +62,17 @@ Assumption / To Be Verified:
 
 - Final gasket and venting strategy for long-duration field humidity control.
 
+## Quick Dimensions (Current CAD)
+
+Primary envelope dimensions from current `FreeCAD/MACRO.py` parameters:
+
+- Head outer diameter: `144.0 mm`
+- Roof outer diameter: `144.0 mm`
+- Body height (belly bottom to roof top, excluding PAR housing): `~143.0 mm`
+- Max overall height including PAR housing: `~163.0 mm`
+
+These values supersede the earlier 138 mm diameter envelope.
+
 ## Ultrasonic Measurement Geometry
 
 Current validated geometry snapshot:

@@ -26,8 +26,8 @@ EXPLODE_ROOF_DZ  = 35.0
 EXPLODE_PAN_DZ   = -105.0
 
 # ---------------- PARAMETERS ----------------
-HEAD_DIAM = 138.0
-ROOF_DIAM = 138.0
+HEAD_DIAM = 144.0
+ROOF_DIAM = 144.0
 PLATE_THK = 6.0
 PLATE_DROP = 10.0   # mm to extend plate downward (tune)
 PLATE_TOP_FILLET_R = 4.0   # try 3–6 mm
@@ -232,6 +232,11 @@ PCB_OFFSET_X = 0.0
 PCB_OFFSET_Y = 0.0
 
 PCB_ROT_DEG = BELLY_FASTEN_OFFSET + 45.0
+
+# Effective PCB envelope check (set to include overhang items such as antenna)
+PCB_EFFECTIVE_CHECK_ENABLE = True
+PCB_EFFECTIVE_W = 88.9
+PCB_EFFECTIVE_H = 84.2
 
 # ---------------- Battery envelope check (diagnostic only) ----------------
 BATTERY_CHECK_ENABLE = True
@@ -2096,6 +2101,24 @@ if BATTERY_CHECK_ENABLE:
     print("Under-PCB height margin:       {:.2f} mm".format(battery_height_margin))
     print("PCB corner radial margin:      {:.2f} mm".format(pcb_corner_margin))
     print("PCB post outer radial margin:  {:.2f} mm".format(pcb_post_outer_margin))
+
+if PCB_EFFECTIVE_CHECK_ENABLE:
+    belly_inner_r_eff = (HEAD_DIAM / 2.0) - BELLY_WALL_THK
+    pcb_eff_half_diag = 0.5 * math.hypot(float(PCB_EFFECTIVE_W), float(PCB_EFFECTIVE_H))
+    pcb_eff_radial_margin = belly_inner_r_eff - pcb_eff_half_diag
+
+    print("\n---- Effective PCB Envelope Check ----")
+    print("Effective PCB WxH:             {:.1f} x {:.1f} mm".format(PCB_EFFECTIVE_W, PCB_EFFECTIVE_H))
+    print("Belly inner radius (approx):   {:.2f} mm".format(belly_inner_r_eff))
+    print("Envelope half-diagonal:        {:.2f} mm".format(pcb_eff_half_diag))
+    print("Radial fit margin (approx):    {:.2f} mm".format(pcb_eff_radial_margin))
+
+    if pcb_eff_radial_margin < 0:
+        print("Fit result:                    FAIL (envelope exceeds inner radius)")
+    elif pcb_eff_radial_margin < 2.0:
+        print("Fit result:                    TIGHT (low assembly margin)")
+    else:
+        print("Fit result:                    PASS")
 
 if CONNECTORS_ENABLE:
     z_floor_chk = -float(BELLY_WALL_H)
