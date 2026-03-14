@@ -225,11 +225,11 @@ From there you can:
 
 
 
- ![Node Discovery Screen](UI_Images/1.png)
-   ![Node Pairing Screen](UI_Images/2.png)
-   ![Deployment Screen](UI_Images/3.png)
-  ![Revert/Unpair UI](UI_Images/4.png)
-  ![Web Dashboard](UI_Images/5.png)
+ ![Node Discovery Screen](assets/ui/1.png)
+   ![Node Pairing Screen](assets/ui/2.png)
+   ![Deployment Screen](assets/ui/3.png)
+  ![Revert/Unpair UI](assets/ui/4.png)
+  ![Web Dashboard](assets/ui/5.png)
 
 ---
 

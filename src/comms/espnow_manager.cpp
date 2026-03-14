@@ -1,11 +1,11 @@
 #include "espnow_manager.h"
-#include "sd_manager.h"
-#include "rtc_manager.h"
+#include "../storage/sd_manager.h"
+#include "../time/rtc_manager.h"
 #include <esp_now.h>
 #include <WiFi.h>
 #include <esp_wifi.h>
 #include <esp_err.h>
-#include "config.h"
+#include "../system/config.h"
 #include <vector>
 #include <Preferences.h>
 #include "protocol.h"

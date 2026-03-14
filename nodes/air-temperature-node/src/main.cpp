@@ -9,7 +9,7 @@
 #include <nvs.h>
 #include "esp_system.h"
 #include "sensors.h"
-#include "soil_moist_temp.h"
+#include "sensors/soil_moist_temp.h"
 
 #include "protocol.h"     // pins, ESPNOW_CHANNEL, protocol structs
 

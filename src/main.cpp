@@ -13,9 +13,9 @@
   #include <SPIFFS.h>
 #endif
 
-#include "rtc_manager.h"
-#include "sd_manager.h"
-#include "espnow_manager.h"
+#include "time/rtc_manager.h"
+#include "storage/sd_manager.h"
+#include "comms/espnow_manager.h"
 #include "protocol.h"
 #include <Preferences.h>
 

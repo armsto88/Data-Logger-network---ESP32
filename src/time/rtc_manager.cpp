@@ -1,7 +1,7 @@
 #include "rtc_manager.h"
 #include <Wire.h>
 #include <RTClib.h>
-#include "config.h"
+#include "../system/config.h"
 
 RTC_DS3231 rtc;  // Using only RTClib like your working sketch
 

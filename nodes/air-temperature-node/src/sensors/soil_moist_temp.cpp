@@ -4,7 +4,7 @@
 #include <math.h>
 
 #include "soil_moist_temp.h"
-#include "ads1115_helper.h"
+#include "../drivers/ads1115_helper.h"
 #include "sensors_soil_ads_calib.h"   // your SOIL1_A0, SOIL2_A1, theta_v_from_mv
 
 // Use the same I2C bus as RTC / rest of sensors

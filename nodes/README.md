@@ -1,56 +1,41 @@
 # Sensor Node Projects
 
-This folder contains example sensor node projects that communicate with the mothership via ESP-NOW. The primary example included is the air-temperature node (ESP32-C3).
+This folder holds node firmware projects that pair with the mothership over ESP-NOW.
 
 ## Layout
 
-```
+```text
 nodes/
-├── shared/                   # (optional) shared protocol headers
-├── air-temperature-node/     # Example ESP32-C3 node
-└── (other nodes...)          # Future node types
+|- shared/                    # shared headers (protocol, sensor slots)
+|- air-temperature-node/      # active ESP32-C3 node firmware
+|- soil-moisture-node/        # placeholder for dedicated soil node firmware
 ```
 
-## air-temperature-node (ESP32-C3)
+## Active Build: air-temperature-node
 
-This example node (`nodes/air-temperature-node`) is a simple air-temperature sender. It:
+- Project: `nodes/air-temperature-node`
+- PlatformIO env: `esp32c3`
+- Board: `esp32-c3-devkitm-1`
 
-- Broadcasts discovery requests when UNPAIRED.
-- Accepts pairing commands and pairing responses from the mothership.
-- Responds to `DEPLOY_NODE` to set RTC, schedule, and enter DEPLOYED state.
-- Handles a best-effort `UNPAIR_NODE` command to clear its stored mothership MAC and return to UNPAIRED.
-
-### Quick build & upload (PlatformIO)
-
-From the repository root (PowerShell):
+Build from repo root:
 
 ```powershell
-& "$env:USERPROFILE\.platformio\penv\Scripts\platformio.exe" run -d .\nodes\air-temperature-node -e esp32c3 -t upload --upload-port COM7
+& "$env:USERPROFILE\.platformio\penv\Scripts\platformio.exe" run -d .\nodes\air-temperature-node -e esp32c3
 ```
 
-Adjust the COM port as needed.
+Upload + monitor:
 
-### Node configuration
+```powershell
+& "$env:USERPROFILE\.platformio\penv\Scripts\platformio.exe" run -d .\nodes\air-temperature-node -e esp32c3 -t upload
+& "$env:USERPROFILE\.platformio\penv\Scripts\platformio.exe" device monitor -d .\nodes\air-temperature-node -e esp32c3
+```
 
-- Node ID: `TEMP_001` (edit `src/main.cpp` to change)
-- Default wake interval: 5 minutes
-- The node stores a preloaded `mothershipMAC` in RTC memory for testing—discovery/pairing will overwrite it when the node finds the mothership.
+Port defaults are currently pinned in `nodes/air-temperature-node/platformio.ini`:
 
-### How pairing & unpairing works
+- `upload_port = COM3`
+- `monitor_port = COM3`
 
-- Discovery: node broadcasts a `DISCOVER_REQUEST`; the mothership responds with a discovery response.
-- Pairing: node sends/receives pairing messages. The mothership sends both a textual `PAIR_NODE` command and an RNT compact reply; the node stores the mothership MAC and marks itself PAIRED.
-- Deploy: mothership sends `DEPLOY_NODE` with time and schedule; node sets RTC, records schedule, and becomes DEPLOYED.
-- Unpair: mothership will send a best-effort `UNPAIR_NODE` command and also remove the peer locally. The node's code listens for `UNPAIR_NODE`, clears its stored mothership MAC, sets state to UNPAIRED, and re-enters discovery.
+## Source Layout Reference
 
-### Known issues
-
-- Undeploy (moving a node from DEPLOYED back to PAIRED/UNPAIRED) is not implemented yet. If you need an 'undeploy' action, we can add it so the mothership sends a specific `UNDEPLOY_NODE` command and the node transitions back and optionally clears scheduled behavior.
-- ESP-NOW channel/interface sensitivity: pairing uses channel 1 and peers are bound to the STA interface to avoid ESP_ERR_ESPNOW_IF errors. If you see send failures, ensure devices are on channel 1 during pairing and check serial logs for `esp_err` text.
-
-### Troubleshooting
-
-- Check serial logs on both node and mothership. The mothership prints `📨 send_cb to <MAC> status=OK/FAIL` for delivery status. Use those lines to determine whether commands reached the node.
-- If the node doesn't persist pairing, ensure the mothership saved paired nodes to NVS (mothership serial shows "✅ Saved X paired nodes to NVS").
-
-If you'd like, I can add a small test harness or scripts to simulate many nodes for load testing.
+- `nodes/air-temperature-node/src/README.md` describes node source modules.
+- `nodes/soil-moisture-node/src/README.md` defines the target module pattern for the upcoming soil node firmware.

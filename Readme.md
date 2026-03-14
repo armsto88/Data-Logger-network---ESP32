@@ -4,6 +4,18 @@ A small **ESP-NOW**–based sensor network for environmental data logging, desig
 
 ---
 
+## Repository Navigation
+
+- [docs/README.md](docs/README.md) - documentation index
+- [nodes/README.md](nodes/README.md) - node project overview
+- [src/README.md](src/README.md) - mothership source layout and build target
+- [nodes/air-temperature-node/src/README.md](nodes/air-temperature-node/src/README.md) - node source layout and build target
+- [scripts/README.md](scripts/README.md) - helper script conventions
+- [tests/README.md](tests/README.md) - test asset layout and scope
+- [CONTRIBUTING.md](CONTRIBUTING.md) - repo organization and contribution rules
+
+---
+
 ## System Overview
 
 The system is built around:
@@ -39,8 +51,8 @@ The system is built around:
 
 The ultrasonic anemometer documentation is maintained in the following aligned documents:
 
-- [NODE-PCB-OVERVIEW.md](NODE-PCB-OVERVIEW.md) — Hardware Design Document
-- [NODE-FIRMWARE_NOTES.md](NODE-FIRMWARE_NOTES.md) — Firmware Architecture Document
+- [docs/NODE-PCB-OVERVIEW.md](docs/NODE-PCB-OVERVIEW.md) — Hardware Design Document
+- [docs/NODE-FIRMWARE_NOTES.md](docs/NODE-FIRMWARE_NOTES.md) — Firmware Architecture Document
 - [hardware/ultrasonic_anemometer/docs/MECHANICAL_DESIGN.md](hardware/ultrasonic_anemometer/docs/MECHANICAL_DESIGN.md) — Mechanical Design Document
 - [hardware/ultrasonic_anemometer/docs/TOF_WORKOUT_GUIDE.md](hardware/ultrasonic_anemometer/docs/TOF_WORKOUT_GUIDE.md) — TOF geometry/constants and validation workflow
 
@@ -306,10 +318,11 @@ On each DS3231 alarm:
 
 ### Mothership
 
-```sh
-# in mothership/ project dir
-pio run -t upload
-pio device monitor
+```powershell
+# from repo root
+& "$env:USERPROFILE\.platformio\penv\Scripts\platformio.exe" run -e esp32s3
+& "$env:USERPROFILE\.platformio\penv\Scripts\platformio.exe" run -e esp32s3 -t upload
+& "$env:USERPROFILE\.platformio\penv\Scripts\platformio.exe" device monitor -e esp32s3
 ```
 Then:
 
@@ -318,11 +331,15 @@ Then:
 
 ### Node(s)
 
-```sh
-# in nodes/air-temperature-node/ project dir
-pio run -t upload
-pio device monitor
+```powershell
+# from repo root (air-temperature-node)
+& "$env:USERPROFILE\.platformio\penv\Scripts\platformio.exe" run -d .\nodes\air-temperature-node -e esp32c3
+& "$env:USERPROFILE\.platformio\penv\Scripts\platformio.exe" run -d .\nodes\air-temperature-node -e esp32c3 -t upload
+& "$env:USERPROFILE\.platformio\penv\Scripts\platformio.exe" device monitor -d .\nodes\air-temperature-node -e esp32c3
 ```
+
+Current node `platformio.ini` pins `upload_port` and `monitor_port` to `COM3`; adjust that file if your port differs.
+
 On first boot you should see logs like:
 ```text
 STATE_UNPAIRED ...
