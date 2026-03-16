@@ -10,13 +10,13 @@ This folder is for utility scripts used during development, bring-up, and valida
 
 ## Script conventions
 
-- Prefer PowerShell (`.ps1`) for local Windows workflows.
+- Prefer PlatformIO-first scripts and Python wrappers (`.py`) for portability.
 - Keep scripts idempotent where possible.
 - Do not hardcode COM ports; accept them as parameters.
 - Add a short usage header at the top of each script.
 
 ## First candidates to add
 
-- `scripts/test/smoke_espnow.ps1`
-- `scripts/test/check_rtc_sync.ps1`
-- `scripts/flash/upload_node.ps1`
+- `scripts/test/smoke_espnow.py`
+- `scripts/test/check_rtc_sync.py`
+- `scripts/flash/upload_node.py`

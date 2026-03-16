@@ -21,3 +21,16 @@ This folder is reserved for repeatable validation assets when new hardware arriv
 - Keep tests deterministic and fast where possible.
 - Store expected outputs close to each test.
 - If a test depends on real hardware, state assumptions clearly.
+
+## Current Smoke Suite
+
+- `tests/test_smoke_esp32_wroom/test_main.cpp`
+
+These tests target early bring-up for a new ESP32-WROOM node.
+
+Quick examples from repo root:
+
+```powershell
+& "$env:USERPROFILE\.platformio\penv\Scripts\platformio.exe" test -e esp32wroom-smoke
+& "$env:USERPROFILE\.platformio\penv\Scripts\platformio.exe" test -e esp32wroom-smoke --without-uploading
+```
