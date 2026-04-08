@@ -181,6 +181,78 @@ Result summary:
 - Sequential validation completed by moving the same sensor across mux channels.
 - User-confirmed outcome: valid data obtained on all mux channels during per-channel move test.
 
+### Run log: 2026-04-08 (ADC connector VIN selector + ADS1015 sanity)
+
+- Firmware flashed: `esp32wroom-ads1015-analog`
+- Test condition: physical VIN selector switch on ADC connectors toggled between 5 V and 22 V input rails
+- Observation: both 5 V and 22 V rails present at connector VIN when selected
+- ADS1015 readings: stable low-level floating values on unconnected analog inputs (expected behavior for floating channels)
+
+Interpretation:
+
+- Connector VIN selector hardware is functioning for both source rails.
+- ADS1015 acquisition path is alive and reading channels correctly; next step should use known driven voltages to validate scaling/linearity.
+
+### Run log: 2026-04-08 (Ultrasonic route-finder A/B + isolation)
+
+- Firmware flashed: `esp32wroom-ultrasonic-first-test`
+- Test mode: command-driven rounds (`OPEN`/`BLOCKED`) with per-combo scoring
+- Pin map under test: `TOF_EDGE=34`, `RX_EN=4`, `MUX_A=16`, `MUX_B=17`, `DRV_N/E/S/W=26/27/14/13`, `TX_PWM=25`
+- Geometry tested: approximately 10 cm and 20 cm spacing (N <-> S transducers)
+- Isolation test: one cable removed from South transducer receive side
+
+Observed behavior summary:
+
+- All `REL/DRV` combinations repeatedly reported `DET=24/24` in both `OPEN` and `BLOCKED` conditions.
+- `listen_only` also repeatedly reported events, including early edges.
+- Median TOF values shifted only modestly and inconsistently between `OPEN` and `BLOCKED` conditions.
+- With one South transducer cable removed, detections still remained saturated (`24/24`) with similar TOF/jitter bands.
+
+Interpretation:
+
+- Current capture is feedthrough/noise dominated; not yet a clean first-acoustic-arrival measurement.
+- Direction/polarity discrimination cannot be trusted yet because all combinations look similarly valid.
+- The RX front-end state likely contributes: D8/D9 protection diodes are currently removed due to earlier footprint/pinout fault.
+- Running without the intended clamp/protection network can increase comparator overdrive sensitivity and TX->RX coupling susceptibility.
+
+Short ultrasonic testing summary:
+
+- Ultrasonic TX/RX chain is active and repeatable, but measurements are not yet acoustically discriminative.
+- Data indicates strong non-acoustic triggering path (electrical feedthrough and/or comparator threshold sensitivity).
+- Next work should prioritize RX front-end protection/threshold cleanup before further TOF accuracy validation.
+
+### Next session focus: noise-source isolation plan
+
+Stop functional TOF validation for now and run targeted noise isolation only.
+
+Priority sequence:
+
+1. Baseline comparator noise with TX disabled
+
+- Keep RX path enabled and count comparator edges in a fixed listen window.
+- Record edge count and first-edge timing over multiple repeats.
+
+2. TX-only coupling check with receive transducer disconnected
+
+- Enable TX burst path while keeping receive acoustic path physically disconnected.
+- If detections remain high, classify as electrical feedthrough dominated.
+
+3. OPEN vs BLOCKED re-check after threshold hardening
+
+- Increase blanking and minimum valid TOF thresholds.
+- Re-run one OPEN and one BLOCKED round at fixed geometry.
+- Require a clear detection-rate or median/jitter separation before resuming functional TOF testing.
+
+4. Protection network review (D8/D9 context)
+
+- Current board runs with D8/D9 removed due to verified footprint pinout fault.
+- Treat absence of clamps as a likely contributor to overdrive/noise susceptibility.
+- Prioritize corrected clamp implementation (or temporary bodge-equivalent behavior) before final ultrasonic validation.
+
+5. Escalation criterion
+
+- If noise still dominates after firmware threshold/gating changes, move to scope-based probing of RX mux output, amplifier stages, and comparator input/output to locate dominant coupling node.
+
 ## Bring-up lessons captured from this fault
 
 - A rail that looks acceptable in resistance mode can still fail badly under live power if the fault is through active silicon or a miswired protection network.

@@ -25,6 +25,16 @@
 #define MUX_FIXED_CHANNEL -1
 #endif
 
+#ifndef TX_PWM_PIN
+#define TX_PWM_PIN 25
+#endif
+
+#ifndef TX_PWM_ACTIVE_HIGH
+#define TX_PWM_ACTIVE_HIGH 1
+#endif
+
+static const uint8_t kTxOnLevel = TX_PWM_ACTIVE_HIGH ? HIGH : LOW;
+
 static bool mux_write_mask(uint8_t mask) {
   Wire.beginTransmission(MUX_ADDR);
   Wire.write(mask);
@@ -44,12 +54,17 @@ void setup() {
   Serial.begin(115200);
   delay(800);
 
+  // Hold the 22V stage enabled while probing mux channel power.
+  pinMode(TX_PWM_PIN, OUTPUT);
+  digitalWrite(TX_PWM_PIN, kTxOnLevel);
+
   Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
   Wire.setClock(100000);
 
   Serial.println();
   Serial.println("ESP32-WROOM I2C mux power probe");
   Serial.printf("I2C SDA=%d SCL=%d MUX=0x%02X\n", I2C_SDA_PIN, I2C_SCL_PIN, MUX_ADDR);
+  Serial.printf("22V EN pin=%d state=%s\n", TX_PWM_PIN, TX_PWM_ACTIVE_HIGH ? "ON(HIGH)" : "ON(LOW)");
   Serial.printf("Channel dwell=%d ms, all-off dwell=%d ms\n", MUX_CHANNEL_DWELL_MS, MUX_ALL_OFF_DWELL_MS);
   if (MUX_FIXED_CHANNEL >= 0 && MUX_FIXED_CHANNEL <= 7) {
     Serial.printf("Fixed-channel mode: CH%d\n", MUX_FIXED_CHANNEL);
@@ -57,6 +72,7 @@ void setup() {
     Serial.println("Sweep mode: CH0..CH7");
   }
 }
+
 
 void loop() {
   if (MUX_FIXED_CHANNEL >= 0 && MUX_FIXED_CHANNEL <= 7) {
