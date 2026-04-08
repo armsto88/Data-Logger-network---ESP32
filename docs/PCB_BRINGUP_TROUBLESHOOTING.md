@@ -127,6 +127,60 @@ Interpretation note:
 - With 5 V connected to RAW_BAT, I2C devices are detected reliably.
 - Combined with the prior no-5V run, this indicates the 5 V rail state changes peripheral visibility while flash stability remains good.
 
+### Observation: TX gate path debug (2026-04-08)
+
+- TX gate firmware confirmed active on `IO25` (`TX_PWM`) with long ON/OFF windows.
+- `TX_PWM` test pad shows expected 3.3 V logic activity.
+- Signal is also observed near `TC4427EOA` input region.
+- No corresponding activity observed at the 22 V switching regulator `EN` test point.
+
+Confirmed root cause update:
+
+- A diode in the TX gate to EN control path is installed in reverse orientation.
+- This blocks expected control propagation to the 22 V regulator `EN` node.
+
+Immediate corrective action:
+
+- Rework diode orientation to match intended schematic polarity.
+- Re-run TX gate firmware (`esp32wroom-txpwm-gate`) and verify:
+	- `EN` node toggles in sync with TX gate state.
+	- 22 V rail follows ON/OFF gate windows.
+
+Rework status update:
+
+- Diode removed and pads bridged as a temporary bypass fix.
+- Measured `EN` on 22 V regulator now reaches 3.3 V.
+- Measured boost output now reaches approximately 18 V on the 22 V rail node.
+
+Interpretation:
+
+- The TX control path to regulator `EN` is now functional.
+- Boost stage is switching and producing high voltage, though currently below nominal 22 V target.
+
+### Run log: 2026-04-08 (PWR_HOLD gate validation)
+
+- Firmware flashed: `esp32wroom-pwrhold-gate`
+- Test pin: `IO23` (`PWR_HOLD`)
+- Pattern used: ON/OFF gate toggling with long dwell windows
+- Result: PASS
+	- `PWR_HOLD` state transitions observed in serial output
+	- Rail probing confirmed hold-gate behavior is responsive to firmware control
+
+### Run log: 2026-04-08 (I2C mux + SHTC3 validation)
+
+- Firmware flashed: `esp32wroom-i2c-mux-shtc3`
+- I2C wiring: SDA=18, SCL=19
+- Mux address: `0x71`
+- Sensor address: `0x70` (SHTC3)
+- Driver path: SparkFun SHTC3 library integrated for measurement calls
+
+Result summary:
+
+- Baseline checks confirmed 3.3 V present at I2C connectors.
+- Single-channel baseline produced valid SHTC3 readings on active channel (temperature + RH).
+- Sequential validation completed by moving the same sensor across mux channels.
+- User-confirmed outcome: valid data obtained on all mux channels during per-channel move test.
+
 ## Bring-up lessons captured from this fault
 
 - A rail that looks acceptable in resistance mode can still fail badly under live power if the fault is through active silicon or a miswired protection network.
