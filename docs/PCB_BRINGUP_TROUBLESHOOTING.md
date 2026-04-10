@@ -221,6 +221,26 @@ Short ultrasonic testing summary:
 - Data indicates strong non-acoustic triggering path (electrical feedthrough and/or comparator threshold sensitivity).
 - Next work should prioritize RX front-end protection/threshold cleanup before further TOF accuracy validation.
 
+### Run log: 2026-04-09 (DS3231 RTC + alarm-driven gate validation)
+
+- Firmware flashed: `esp32wroom-ds3231-alarm-10s`
+- RTC device: DS3231 at `0x68`
+- Test mode: set RTC time from firmware build time, arm Alarm1 every 10 s, clear/re-arm in loop
+- Hardware topology note: DS3231 alarm line is not connected to ESP32 GPIO; it drives the gate path directly (active-low at DS3231 output, then inverted in hardware for gate trigger)
+- Hold-window test: alarm active hold before clear set to `8000 ms` for voltage probing
+
+Observed behavior summary:
+
+- RTC time set and readback confirmed in serial output.
+- Alarm events fired repeatedly at expected schedule points.
+- Alarm flag clear and re-arm behavior confirmed each cycle.
+- Extended hold window observed in runtime logs (`holding active for 8000 ms before clear`), enabling gate-path voltage probing.
+
+Result:
+
+- PASS: RTC functionality confirmed.
+- PASS: alarm-driven power gate trigger path behavior confirmed.
+
 ### Next session focus: noise-source isolation plan
 
 Stop functional TOF validation for now and run targeted noise isolation only.
