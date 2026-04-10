@@ -7,11 +7,10 @@ A small **ESP-NOW**–based sensor network for environmental data logging, desig
 ## Repository Navigation
 
 - [docs/README.md](docs/README.md) - documentation index
-- [nodes/README.md](nodes/README.md) - node project overview
-- [src/README.md](src/README.md) - mothership source layout and build target
-- [nodes/air-temperature-node/src/README.md](nodes/air-temperature-node/src/README.md) - node source layout and build target
-- [scripts/README.md](scripts/README.md) - helper script conventions
-- [tests/README.md](tests/README.md) - test asset layout and scope
+- [firmware/README.md](firmware/README.md) - firmware structure overview
+- [firmware/nodes/README.md](firmware/nodes/README.md) - node project overview
+- [firmware/mothership/src/README.md](firmware/mothership/src/README.md) - mothership source layout and build target
+- [firmware/nodes/sensor-node/src/README.md](firmware/nodes/sensor-node/src/README.md) - node source layout and build target
 - [CONTRIBUTING.md](CONTRIBUTING.md) - repo organization and contribution rules
 
 ---
@@ -154,7 +153,7 @@ The ultrasonic anemometer documentation is maintained in the following aligned d
 |       Sensor Node(s)      |  ESP-NOW      |          Mothership          |
 |       (ESP32-C3 Mini)     | <-----------> |       (ESP32-S3, AP)         |
 +---------------------------+               +------------------------------+
-  - Firmware ID (e.g. TEMP_001)              - Wi-Fi AP "Logger001"
+  - Firmware ID (e.g. NODE_001)              - Wi-Fi AP "Logger001"
   - DS3231 RTC + Alarm 1                      - DS3231 RTC
   - (Future) RTC INT → FET/wake               - SD card (datalog.csv)
   - NVS   (MAC, deployedFlag, etc.)          - ESP-NOW manager
@@ -212,7 +211,7 @@ enum NodeState {
 };
 struct NodeInfo {
   uint8_t   mac[6];
-  String    nodeId;         // firmware ID (e.g. "TEMP_001")
+  String    nodeId;         // firmware ID (e.g. "NODE_001")
   String    nodeType;       // e.g. "AIR_SOIL"
   uint32_t  lastSeen;       // millis() of last packet
   bool      isActive;       // auto-false after 5 min silence
@@ -236,9 +235,9 @@ The Node Manager page uses lastTimeSyncMs to show a small “time health” pill
 
 ---
 
-## Current TEMP_001 Sensor Profile
+## Current Sensor Node Profile
 
-The nodes/air-temperature-node firmware currently exposes:
+The firmware/nodes/sensor-node firmware currently exposes:
 
 - **DS18B20 backend (sensors_ds18b20.\*)**
 
@@ -332,10 +331,10 @@ Then:
 ### Node(s)
 
 ```powershell
-# from repo root (air-temperature-node)
-& "$env:USERPROFILE\.platformio\penv\Scripts\platformio.exe" run -d .\nodes\air-temperature-node -e esp32c3
-& "$env:USERPROFILE\.platformio\penv\Scripts\platformio.exe" run -d .\nodes\air-temperature-node -e esp32c3 -t upload
-& "$env:USERPROFILE\.platformio\penv\Scripts\platformio.exe" device monitor -d .\nodes\air-temperature-node -e esp32c3
+# from repo root (sensor-node)
+& "$env:USERPROFILE\.platformio\penv\Scripts\platformio.exe" run -d .\firmware\nodes\sensor-node -e esp32c3
+& "$env:USERPROFILE\.platformio\penv\Scripts\platformio.exe" run -d .\firmware\nodes\sensor-node -e esp32c3 -t upload
+& "$env:USERPROFILE\.platformio\penv\Scripts\platformio.exe" device monitor -d .\firmware\nodes\sensor-node -e esp32c3
 ```
 
 Current node `platformio.ini` pins `upload_port` and `monitor_port` to `COM3`; adjust that file if your port differs.

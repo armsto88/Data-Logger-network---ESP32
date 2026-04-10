@@ -241,6 +241,35 @@ Result:
 - PASS: RTC functionality confirmed.
 - PASS: alarm-driven power gate trigger path behavior confirmed.
 
+### Run log: 2026-04-10 (Charging path validation: solar + USB)
+
+- Solar charging path: PASS
+	- Charging confirmed when solar input is in the 5 V to 6 V range.
+- USB charging path: PASS
+	- USB charging confirmed in both switch positions tested.
+- Dual-source condition: PASS
+	- Charging behavior remained functional when solar and USB sources were applied simultaneously.
+
+Interpretation:
+
+- Both charging circuits are operational on this board.
+- Solar input requires practical minimum headroom near 5 V before charge behavior is observed.
+- No immediate contention/fault behavior observed under simultaneous USB + solar charging during this test.
+
+### Run log: 2026-04-10 (Battery sense validation on IO35)
+
+- Firmware flashed: `esp32wroom-battery-io35`
+- ADC pin under test: `IO35`
+- Divider network: top `220k`, bottom `100k`
+- Calibrated divider scale used in firmware: `3.6200`
+- Reference measurement: DMM battery voltage `3.88 V`
+- Serial measurement after calibration: `3.8828 V` to `3.8857 V`
+
+Result:
+
+- PASS: battery voltage measurement path on `IO35` validated and calibrated.
+- Firmware battery estimate now matches DMM within a few millivolts in this operating condition.
+
 ### Next session focus: noise-source isolation plan
 
 Stop functional TOF validation for now and run targeted noise isolation only.

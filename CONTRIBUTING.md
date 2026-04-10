@@ -2,13 +2,11 @@
 
 ## Repository layout
 
-- `src/` - mothership firmware source
-- `nodes/` - sensor node firmware projects
+- `firmware/mothership/src/` - mothership firmware source
+- `firmware/nodes/` - sensor node firmware projects and bring-up scripts
 - `include/` - shared headers for mothership firmware
 - `hardware/` - PCB, CAD, and simulation assets
 - `docs/` - high-level design, roadmap, and debug notes
-- `scripts/` - automation and helper scripts
-- `tests/` - repeatable validation assets
 - `data/` - collected or example datasets
 
 ## Organization rules
@@ -27,5 +25,4 @@
 ## Before opening a PR
 
 - Build the target firmware (`mothership` or node) at least once.
-- Run any relevant smoke checks from `tests/` or `scripts/test/`.
 - Update documentation if folder structure or workflows changed.
