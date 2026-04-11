@@ -90,6 +90,9 @@
 #ifndef SWEEP_SHOTS
 #define SWEEP_SHOTS 10
 #endif
+#ifndef DEBUG_FIRST3_EDGES
+#define DEBUG_FIRST3_EDGES 1
+#endif
 
 #if PIN_TX_PWM == PIN_DRV_N || PIN_TX_PWM == PIN_DRV_E || PIN_TX_PWM == PIN_DRV_S || PIN_TX_PWM == PIN_DRV_W
 #error "PIN_TX_PWM conflicts with one of DRV_* pins. Set PIN_TX_PWM to the dedicated TX enable GPIO."
@@ -100,6 +103,8 @@ namespace {
 volatile uint32_t g_edgeCount = 0;
 volatile uint32_t g_firstEdgeUs = 0;
 volatile uint32_t g_lastEdgeUs = 0;
+volatile uint32_t g_secondEdgeUs = 0;
+volatile uint32_t g_thirdEdgeUs = 0;
 volatile bool g_captureArmed = false;
 
 uint32_t g_blankingUs = BLANKING_US;
@@ -121,6 +126,10 @@ void IRAM_ATTR onTofEdge() {
   g_edgeCount = newCount;
   if (newCount == 1) {
     g_firstEdgeUs = nowUs;
+  } else if (newCount == 2) {
+    g_secondEdgeUs = nowUs;
+  } else if (newCount == 3) {
+    g_thirdEdgeUs = nowUs;
   }
   g_lastEdgeUs = nowUs;
 }
@@ -128,7 +137,16 @@ void IRAM_ATTR onTofEdge() {
 void resetEdgeCapture() {
   g_edgeCount = 0;
   g_firstEdgeUs = 0;
+  g_secondEdgeUs = 0;
+  g_thirdEdgeUs = 0;
   g_lastEdgeUs = 0;
+}
+
+int32_t edgeRelUs(uint32_t edgeTs, uint32_t t0) {
+  if (edgeTs == 0) {
+    return -1;
+  }
+  return static_cast<int32_t>(edgeTs - t0);
 }
 
 void setRxDirection(char dir) {
@@ -209,7 +227,9 @@ void sendBurst40kHz(int cycles) {
   }
 }
 
-void printResult(char txDir, char rxDir, bool relState, bool drvState, bool detected, int32_t tofUs) {
+void printResult(char txDir, char rxDir, bool relState, bool drvState,
+                 bool detected, int32_t tofUs, int32_t edgeAfterArmUs,
+                 int32_t edge0Us, int32_t edge1Us, int32_t edge2Us) {
   Serial.print("MODE=tx_rx_single TX=");
   Serial.print(txDir);
   Serial.print(" RX=");
@@ -222,13 +242,24 @@ void printResult(char txDir, char rxDir, bool relState, bool drvState, bool dete
   Serial.print(detected ? 1 : 0);
   Serial.print(" TOF_US=");
   Serial.print(tofUs);
+  Serial.print(" EDGE_AFTER_ARM_US=");
+  Serial.print(edgeAfterArmUs);
+#if DEBUG_FIRST3_EDGES
+  Serial.print(" E0_US=");
+  Serial.print(edge0Us);
+  Serial.print(" E1_US=");
+  Serial.print(edge1Us);
+  Serial.print(" E2_US=");
+  Serial.print(edge2Us);
+#endif
   Serial.print(" BLANK_US=");
   Serial.print(g_blankingUs);
   Serial.print(" TIMEOUT_US=");
   Serial.println(TOF_TIMEOUT_US);
 }
 
-bool runSingleTest(char txDir, char rxDir, bool relState, bool drvState, int32_t* outTofUs = nullptr) {
+bool runSingleTest(char txDir, char rxDir, bool relState, bool drvState,
+                   int32_t* outTofUs = nullptr, int32_t* outEdgeAfterArmUs = nullptr) {
   setRxDirection(rxDir);
   disableRxPath();
   setTxCombo(txDir, relState, drvState);
@@ -256,6 +287,7 @@ bool runSingleTest(char txDir, char rxDir, bool relState, bool drvState, int32_t
 
   bool detected = false;
   int32_t tofUs = -1;
+  int32_t edgeAfterArmUs = -1;
   uint32_t handledCount = 0;
 
   while ((micros() - listenStartUs) < TOF_TIMEOUT_US) {
@@ -264,6 +296,7 @@ bool runSingleTest(char txDir, char rxDir, bool relState, bool drvState, int32_t
       const uint32_t edgeUs = g_lastEdgeUs;
       handledCount = countNow;
       tofUs = static_cast<int32_t>(edgeUs - txDoneUs);
+      edgeAfterArmUs = static_cast<int32_t>(edgeUs - listenStartUs);
 
       if (tofUs >= static_cast<int32_t>(g_minValidTofUs)) {
         detected = true;
@@ -275,11 +308,17 @@ bool runSingleTest(char txDir, char rxDir, bool relState, bool drvState, int32_t
   g_captureArmed = false;
 
 #if VERBOSE_SHOTS
-  printResult(txDir, rxDir, relState, drvState, detected, tofUs);
+  printResult(txDir, rxDir, relState, drvState, detected, tofUs, edgeAfterArmUs,
+              edgeRelUs(g_firstEdgeUs, listenStartUs),
+              edgeRelUs(g_secondEdgeUs, listenStartUs),
+              edgeRelUs(g_thirdEdgeUs, listenStartUs));
 #endif
 
   if (outTofUs != nullptr) {
     *outTofUs = tofUs;
+  }
+  if (outEdgeAfterArmUs != nullptr) {
+    *outEdgeAfterArmUs = edgeAfterArmUs;
   }
 
   clearTxSelects();
@@ -328,32 +367,38 @@ void sortInt32(int32_t* data, int count) {
 void scoreCombo(char txDir, char rxDir, bool relState, bool drvState) {
   for (int i = 0; i < WARMUP_SHOTS; ++i) {
     int32_t dummyTof = -1;
-    runSingleTest(txDir, rxDir, relState, drvState, &dummyTof);
+    runSingleTest(txDir, rxDir, relState, drvState, &dummyTof, nullptr);
     delay(INTER_SHOT_MS);
   }
 
   int detectedCount = 0;
   int32_t tofs[SCORE_SHOTS];
+  int32_t edgeAfterArmVals[SCORE_SHOTS];
 
   for (int i = 0; i < SCORE_SHOTS; ++i) {
     int32_t tofUs = -1;
-    const bool detected = runSingleTest(txDir, rxDir, relState, drvState, &tofUs);
+    int32_t edgeAfterArmUs = -1;
+    const bool detected = runSingleTest(txDir, rxDir, relState, drvState, &tofUs, &edgeAfterArmUs);
     if (detected && detectedCount < SCORE_SHOTS) {
       tofs[detectedCount++] = tofUs;
+      edgeAfterArmVals[detectedCount - 1] = edgeAfterArmUs;
     }
     delay(INTER_SHOT_MS);
   }
 
   int32_t medianTof = -1;
+  int32_t medianEdgeAfterArmUs = -1;
   int32_t minTof = -1;
   int32_t maxTof = -1;
   int32_t jitter = -1;
 
   if (detectedCount > 0) {
     sortInt32(tofs, detectedCount);
+    sortInt32(edgeAfterArmVals, detectedCount);
     minTof = tofs[0];
     maxTof = tofs[detectedCount - 1];
     medianTof = tofs[detectedCount / 2];
+    medianEdgeAfterArmUs = edgeAfterArmVals[detectedCount / 2];
     jitter = maxTof - minTof;
   }
 
@@ -375,6 +420,8 @@ void scoreCombo(char txDir, char rxDir, bool relState, bool drvState) {
   Serial.print(detPct, 1);
   Serial.print(" MED_TOF_US=");
   Serial.print(medianTof);
+  Serial.print(" MED_EDGE_AFTER_ARM_US=");
+  Serial.print(medianEdgeAfterArmUs);
   Serial.print(" JITTER_US=");
   Serial.print(jitter);
   Serial.print(" MIN_US=");
@@ -427,7 +474,16 @@ void runNoiseBaseline(uint32_t windowUs, int repeats) {
     Serial.print(" EDGE_COUNT=");
     Serial.print(edgeCount);
     Serial.print(" FIRST_EDGE_US=");
-    Serial.println(firstEdgeUs);
+    Serial.print(firstEdgeUs);
+  #if DEBUG_FIRST3_EDGES
+    Serial.print(" E0_US=");
+    Serial.print(edgeRelUs(g_firstEdgeUs, t0));
+    Serial.print(" E1_US=");
+    Serial.print(edgeRelUs(g_secondEdgeUs, t0));
+    Serial.print(" E2_US=");
+    Serial.print(edgeRelUs(g_thirdEdgeUs, t0));
+  #endif
+    Serial.println();
     delay(40);
   }
 
@@ -450,6 +506,66 @@ void runNoiseBaseline(uint32_t windowUs, int repeats) {
   Serial.print(" FIRST_EDGE_MED_US=");
   Serial.println(medianFirstUs);
   Serial.println("---- NOISE BASELINE DONE ----");
+}
+
+void runRxDisabledBaseline(uint32_t windowUs, int repeats) {
+  if (repeats > NOISE_REPEATS) {
+    repeats = NOISE_REPEATS;
+  }
+
+  Serial.print("==== RX-DISABLED BASELINE START WINDOW_US=");
+  Serial.print(windowUs);
+  Serial.print(" REPEATS=");
+  Serial.print(repeats);
+  Serial.println(" ====");
+
+  int32_t counts[NOISE_REPEATS];
+  int32_t totalCount = 0;
+
+  for (int i = 0; i < repeats; ++i) {
+    clearTxSelects();
+    disableRxPath();
+    g_captureArmed = false;
+    resetEdgeCapture();
+    g_captureArmed = true;
+
+    const uint32_t t0 = micros();
+    while ((micros() - t0) < windowUs) {
+    }
+
+    g_captureArmed = false;
+    const uint32_t edgeCount = g_edgeCount;
+    counts[i] = static_cast<int32_t>(edgeCount);
+    totalCount += counts[i];
+
+    Serial.print("RXOFF_SAMPLE IDX=");
+    Serial.print(i + 1);
+    Serial.print(" EDGE_COUNT=");
+    Serial.print(edgeCount);
+#if DEBUG_FIRST3_EDGES
+    Serial.print(" E0_US=");
+    Serial.print(edgeRelUs(g_firstEdgeUs, t0));
+    Serial.print(" E1_US=");
+    Serial.print(edgeRelUs(g_secondEdgeUs, t0));
+    Serial.print(" E2_US=");
+    Serial.print(edgeRelUs(g_thirdEdgeUs, t0));
+#endif
+    Serial.println();
+
+    delay(40);
+  }
+
+  sortInt32(counts, repeats);
+  const int32_t medianCount = counts[repeats / 2];
+  const float meanCount = static_cast<float>(totalCount) / static_cast<float>(repeats);
+
+  Serial.print("RXOFF_SUMMARY REPEATS=");
+  Serial.print(repeats);
+  Serial.print(" MEAN_EDGE_COUNT=");
+  Serial.print(meanCount, 2);
+  Serial.print(" MEDIAN_EDGE_COUNT=");
+  Serial.println(medianCount);
+  Serial.println("---- RX-DISABLED BASELINE DONE ----");
 }
 
 void scoreCouplingCombo(char txDir, char rxDir, bool relState, bool drvState) {
@@ -595,7 +711,7 @@ void runCouplingRound(const char* label) {
 int32_t collectMedianTof(char txDir, char rxDir, bool relState, bool drvState, int* outDetections) {
   for (int i = 0; i < WARMUP_SHOTS; ++i) {
     int32_t dummyTof = -1;
-    runSingleTest(txDir, rxDir, relState, drvState, &dummyTof);
+    runSingleTest(txDir, rxDir, relState, drvState, &dummyTof, nullptr);
     delay(INTER_SHOT_MS);
   }
 
@@ -604,7 +720,7 @@ int32_t collectMedianTof(char txDir, char rxDir, bool relState, bool drvState, i
 
   for (int i = 0; i < SCORE_SHOTS; ++i) {
     int32_t tofUs = -1;
-    const bool detected = runSingleTest(txDir, rxDir, relState, drvState, &tofUs);
+    const bool detected = runSingleTest(txDir, rxDir, relState, drvState, &tofUs, nullptr);
     if (detected && detectedCount < SCORE_SHOTS) {
       tofs[detectedCount++] = tofUs;
     }
@@ -851,7 +967,7 @@ void runSweepRound() {
 
         for (int i = 0; i < SWEEP_SHOTS; ++i) {
           int32_t tofUs = -1;
-          const bool detected = runSingleTest('N', 'S', true, true, &tofUs);
+          const bool detected = runSingleTest('N', 'S', true, true, &tofUs, nullptr);
           if (detected && detectedCount < SWEEP_SHOTS) {
             tofs[detectedCount++] = tofUs;
           }
@@ -894,7 +1010,7 @@ char toUpperAscii(char c) {
 }
 
 void printCommandHelp() {
-  Serial.println("Commands: O=open-path, B=blocked-path, C=coupling, N=noise baseline, P=paired axis, A=aggressor matrix, S=blanking/guard sweep, R=manual, H=help");
+  Serial.println("Commands: O=open-path, B=blocked-path, C=coupling, N=noise baseline, D=RX-disabled baseline, P=paired axis, A=aggressor matrix, S=blanking/guard sweep, R=manual, H=help");
 }
 
 void runRouteFinderRound(const char* label) {
@@ -956,7 +1072,7 @@ void setup() {
   Serial.printf("POST_ENABLE_GUARD_US=%d AGG_WINDOW_US=%d AGG_REPEATS=%d SWEEP_SHOTS=%d\n",
                 POST_ENABLE_GUARD_US, AGG_WINDOW_US, AGG_REPEATS, SWEEP_SHOTS);
   printCommandHelp();
-  Serial.println("Type N for RX-noise baseline, C for TX-coupling round (with RX transducer unplugged).");
+  Serial.println("Type N for RX-noise baseline, D for RX-disabled baseline, C for TX-coupling (RX transducer unplugged).");
   Serial.println("Use A to rank digital aggressors and S to sweep blanking/guard/min-tof.");
   Serial.println("Then run O/B/P for acoustic discrimination checks.");
 }
@@ -978,6 +1094,8 @@ void loop() {
     runCouplingRound("COUPLING");
   } else if (cmd == 'N') {
     runNoiseBaseline(NOISE_WINDOW_US, NOISE_REPEATS);
+  } else if (cmd == 'D') {
+    runRxDisabledBaseline(NOISE_WINDOW_US, NOISE_REPEATS);
   } else if (cmd == 'P') {
     runPairedAxisRound("PAIR_NS", 'N', 'S');
   } else if (cmd == 'A') {

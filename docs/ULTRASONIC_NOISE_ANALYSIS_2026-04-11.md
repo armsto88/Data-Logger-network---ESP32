@@ -110,6 +110,11 @@ Evidence converges on an electrical-dominant trigger path:
 3. Measured TOF tracks blanking window changes strongly.
 4. Direction/blocking tests fail to show robust physical-path dependence.
 
+Route-selection caveat:
+
+- Do not lock in the final TX truth table from current route-finder detections.
+- Under feedthrough-dominant behavior, "detects" does not prove acoustically correct routing.
+
 ## Probable Root Causes (ranked)
 
 1. TX burst feedthrough into RX/comparator path (dominant)
@@ -146,6 +151,12 @@ Objective:
 - Increase post-enable guard range for diagnostics and temporary suppression
 - Continue robust multi-shot statistics (median/trimmed logic), avoid single-shot trust
 
+Review-driven diagnostic additions now integrated:
+
+- `edge_after_arm_us` is reported so timing can be analyzed relative to capture-arm instant.
+- A dedicated RX-disabled baseline mode is available to separate analog-path effects from general digital contamination.
+- First three edge times can be logged during diagnostics for early-edge pattern inspection.
+
 ### Priority 4: Re-validation gate before acoustic claims
 
 Require all of the following before declaring acoustic TOF valid:
@@ -170,15 +181,82 @@ Require all of the following before declaring acoustic TOF valid:
 - Sweep trend: median timing increases strongly with blanking interval
 - Paired/open/blocked: no robust physical-path discrimination yet
 
+## Session Update (Later 2026-04-11 Run)
+
+Additional diagnostics from the updated script further support electrical-dominant triggering.
+
+### New baseline comparison (N vs D)
+
+- N summary: mean edge count about 4.92
+- D summary (RX disabled): mean edge count about 5.50
+
+Interpretation:
+
+- Holding RX disabled does not reduce edge activity.
+- This indicates a large non-acoustic contribution outside the intended enabled RX analog path.
+
+### Coupling remains saturated
+
+- C still reports 24/24 detections in all tested REL/DRV combinations.
+- Median values remain clustered and non-discriminative.
+
+Interpretation:
+
+- Saturation under disconnected-RX coupling checks remains consistent with electrical feedthrough.
+
+### Aggressor matrix strengthened
+
+- BASE_RX_ONLY mean edge count: 4.00
+- TX_PWM_ONLY mean edge count: 12.70
+- TX_PWM_WITH_ROUTE mean edge count: 12.70
+
+Interpretation:
+
+- TX burst activity remains the dominant aggressor by a large margin.
+- Route enable state does not materially reduce coupling in this run.
+
+### Sweep still tracks blanking strongly
+
+At MIN_TOF_US=220 and GUARD_US=0:
+
+- BLANK_US=320 -> MED_TOF_US=709
+- BLANK_US=500 -> MED_TOF_US=868
+- BLANK_US=800 -> MED_TOF_US=1086
+- BLANK_US=1100 -> MED_TOF_US=1517
+
+Interpretation:
+
+- Measured median continues to move upward with blanking window, consistent with gating/feedthrough timing dominance.
+
+### Edge-after-arm behavior
+
+From OPEN/BLOCKED scoring:
+
+- MED_EDGE_AFTER_ARM_US remains in a relatively tight band (roughly high 300 us range)
+
+Interpretation:
+
+- First accepted edges are strongly tied to post-arm timing behavior, not cleanly to physical path changes.
+
+### Paired and blockage discrimination remain weak
+
+- P deltas remain near zero and sign-variable.
+- OPEN vs BLOCKED medians/jitter still overlap strongly with 24/24 detections.
+
+Interpretation:
+
+- Acoustic discrimination remains unproven.
+
 ## Notes for Next Session
 
 Run order:
 
 1. `N`
-2. `C` (with RX transducer physically disconnected)
-3. `A`
-4. `S`
-5. `P`
-6. `O` and `B`
+2. `D` (RX-disabled baseline)
+3. `C` (with RX transducer physically disconnected)
+4. `A`
+5. `S`
+6. `P`
+7. `O` and `B`
 
 Record outputs exactly and compare to this report to detect whether noise source shifts after hardware changes.
