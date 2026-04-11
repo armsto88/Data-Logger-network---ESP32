@@ -78,6 +78,18 @@
 #ifndef COUPLING_SHOTS
 #define COUPLING_SHOTS 24
 #endif
+#ifndef POST_ENABLE_GUARD_US
+#define POST_ENABLE_GUARD_US 0
+#endif
+#ifndef AGG_WINDOW_US
+#define AGG_WINDOW_US 2500
+#endif
+#ifndef AGG_REPEATS
+#define AGG_REPEATS 10
+#endif
+#ifndef SWEEP_SHOTS
+#define SWEEP_SHOTS 10
+#endif
 
 #if PIN_TX_PWM == PIN_DRV_N || PIN_TX_PWM == PIN_DRV_E || PIN_TX_PWM == PIN_DRV_S || PIN_TX_PWM == PIN_DRV_W
 #error "PIN_TX_PWM conflicts with one of DRV_* pins. Set PIN_TX_PWM to the dedicated TX enable GPIO."
@@ -89,6 +101,10 @@ volatile uint32_t g_edgeCount = 0;
 volatile uint32_t g_firstEdgeUs = 0;
 volatile uint32_t g_lastEdgeUs = 0;
 volatile bool g_captureArmed = false;
+
+uint32_t g_blankingUs = BLANKING_US;
+uint32_t g_postEnableGuardUs = POST_ENABLE_GUARD_US;
+uint32_t g_minValidTofUs = MIN_VALID_TOF_US;
 
 constexpr uint8_t kTxOnLevel = TX_PWM_ACTIVE_HIGH ? HIGH : LOW;
 constexpr uint8_t kTxOffLevel = TX_PWM_ACTIVE_HIGH ? LOW : HIGH;
@@ -207,7 +223,7 @@ void printResult(char txDir, char rxDir, bool relState, bool drvState, bool dete
   Serial.print(" TOF_US=");
   Serial.print(tofUs);
   Serial.print(" BLANK_US=");
-  Serial.print(BLANKING_US);
+  Serial.print(g_blankingUs);
   Serial.print(" TIMEOUT_US=");
   Serial.println(TOF_TIMEOUT_US);
 }
@@ -225,13 +241,16 @@ bool runSingleTest(char txDir, char rxDir, bool relState, bool drvState, int32_t
   sendBurst40kHz(BURST_CYCLES);
   const uint32_t txDoneUs = micros();
 
-  delayMicroseconds(BLANKING_US);
+  delayMicroseconds(g_blankingUs);
 
   // Start listening only after blanking to suppress early TX feedthrough/ring-down.
   enableRxPath();
   delayMicroseconds(20);
 
   resetEdgeCapture();
+  if (g_postEnableGuardUs > 0) {
+    delayMicroseconds(g_postEnableGuardUs);
+  }
   g_captureArmed = true;
   const uint32_t listenStartUs = micros();
 
@@ -246,7 +265,7 @@ bool runSingleTest(char txDir, char rxDir, bool relState, bool drvState, int32_t
       handledCount = countNow;
       tofUs = static_cast<int32_t>(edgeUs - txDoneUs);
 
-      if (tofUs >= MIN_VALID_TOF_US) {
+      if (tofUs >= static_cast<int32_t>(g_minValidTofUs)) {
         detected = true;
         break;
       }
@@ -453,11 +472,14 @@ void scoreCouplingCombo(char txDir, char rxDir, bool relState, bool drvState) {
     sendBurst40kHz(BURST_CYCLES);
     const uint32_t txDoneUs = micros();
 
-    delayMicroseconds(BLANKING_US);
+    delayMicroseconds(g_blankingUs);
     enableRxPath();
     delayMicroseconds(20);
 
     resetEdgeCapture();
+    if (g_postEnableGuardUs > 0) {
+      delayMicroseconds(g_postEnableGuardUs);
+    }
     g_captureArmed = true;
     const uint32_t listenStartUs = micros();
     uint32_t handledCount = 0;
@@ -470,7 +492,7 @@ void scoreCouplingCombo(char txDir, char rxDir, bool relState, bool drvState) {
         const uint32_t edgeUs = g_lastEdgeUs;
         handledCount = countNow;
         tofUs = static_cast<int32_t>(edgeUs - txDoneUs);
-        if (tofUs >= MIN_VALID_TOF_US) {
+        if (tofUs >= static_cast<int32_t>(g_minValidTofUs)) {
           detected = true;
           break;
         }
@@ -677,6 +699,193 @@ void runPairedAxisRound(const char* label, char a, char b) {
   Serial.println(" ----");
 }
 
+void runAggressorScenario(const char* label, int scenarioId) {
+  Serial.print("==== AGGRESSOR START LABEL=");
+  Serial.print(label);
+  Serial.print(" WINDOW_US=");
+  Serial.print(AGG_WINDOW_US);
+  Serial.print(" REPEATS=");
+  Serial.print(AGG_REPEATS);
+  Serial.println(" ====");
+
+  int32_t counts[AGG_REPEATS];
+  int32_t firstEdges[AGG_REPEATS];
+  int firstValidCount = 0;
+  int32_t totalCount = 0;
+
+  for (int i = 0; i < AGG_REPEATS; ++i) {
+    clearTxSelects();
+    setRxDirection('S');
+    disableRxPath();
+    digitalWrite(PIN_TX_PWM, kTxOffLevel);
+    g_captureArmed = false;
+    resetEdgeCapture();
+
+    const uint32_t t0 = micros();
+    enableRxPath();
+    g_captureArmed = true;
+
+    bool fired = false;
+    while ((micros() - t0) < AGG_WINDOW_US) {
+      const uint32_t dt = micros() - t0;
+      if (!fired && dt >= 120) {
+        fired = true;
+        switch (scenarioId) {
+          case 1:
+            digitalWrite(PIN_RX_EN, kRxOffLevel);
+            delayMicroseconds(20);
+            digitalWrite(PIN_RX_EN, kRxOnLevel);
+            break;
+          case 2:
+            setRxDirection('N');
+            delayMicroseconds(20);
+            setRxDirection('S');
+            break;
+          case 3:
+            setTxCombo('N', true, true);
+            delayMicroseconds(20);
+            clearTxSelects();
+            break;
+          case 4:
+            sendBurst40kHz(BURST_CYCLES);
+            break;
+          case 5:
+            setTxCombo('N', true, true);
+            sendBurst40kHz(BURST_CYCLES);
+            break;
+          default:
+            break;
+        }
+      }
+    }
+
+    g_captureArmed = false;
+    const uint32_t edgeCount = g_edgeCount;
+    const int32_t firstEdgeUs = (edgeCount > 0) ? static_cast<int32_t>(g_firstEdgeUs - t0) : -1;
+
+    counts[i] = static_cast<int32_t>(edgeCount);
+    totalCount += counts[i];
+    firstEdges[i] = firstEdgeUs;
+    if (firstEdgeUs >= 0) {
+      firstValidCount++;
+    }
+
+    clearTxSelects();
+    disableRxPath();
+
+    Serial.print("AGG_SAMPLE LABEL=");
+    Serial.print(label);
+    Serial.print(" IDX=");
+    Serial.print(i + 1);
+    Serial.print(" EDGE_COUNT=");
+    Serial.print(edgeCount);
+    Serial.print(" FIRST_EDGE_US=");
+    Serial.println(firstEdgeUs);
+    delay(30);
+  }
+
+  sortInt32(counts, AGG_REPEATS);
+  const float meanCount = static_cast<float>(totalCount) / static_cast<float>(AGG_REPEATS);
+  const int32_t medianCount = counts[AGG_REPEATS / 2];
+
+  int32_t compactFirst[AGG_REPEATS];
+  int compactIdx = 0;
+  for (int i = 0; i < AGG_REPEATS; ++i) {
+    if (firstEdges[i] >= 0) {
+      compactFirst[compactIdx++] = firstEdges[i];
+    }
+  }
+
+  int32_t medianFirstUs = -1;
+  if (compactIdx > 0) {
+    sortInt32(compactFirst, compactIdx);
+    medianFirstUs = compactFirst[compactIdx / 2];
+  }
+
+  Serial.print("AGG_SUMMARY LABEL=");
+  Serial.print(label);
+  Serial.print(" MEAN_EDGE_COUNT=");
+  Serial.print(meanCount, 2);
+  Serial.print(" MEDIAN_EDGE_COUNT=");
+  Serial.print(medianCount);
+  Serial.print(" FIRST_EDGE_MED_US=");
+  Serial.print(medianFirstUs);
+  Serial.print(" FIRST_EDGE_VALID=");
+  Serial.print(firstValidCount);
+  Serial.print("/");
+  Serial.println(AGG_REPEATS);
+}
+
+void runAggressorRound() {
+  Serial.println("==== AGGRESSOR MATRIX START ====");
+  runAggressorScenario("BASE_RX_ONLY", 0);
+  runAggressorScenario("RX_EN_TOGGLE", 1);
+  runAggressorScenario("MUX_SWITCH", 2);
+  runAggressorScenario("DRVREL_SWITCH", 3);
+  runAggressorScenario("TX_PWM_ONLY", 4);
+  runAggressorScenario("TX_PWM_WITH_ROUTE", 5);
+  Serial.println("---- AGGRESSOR MATRIX DONE ----");
+}
+
+void runSweepRound() {
+  const uint32_t blankingList[] = {320, 500, 800, 1100};
+  const uint32_t guardList[] = {0, 80, 160, 240};
+  const uint32_t minTofList[] = {220, 350, 500};
+
+  const uint32_t oldBlanking = g_blankingUs;
+  const uint32_t oldGuard = g_postEnableGuardUs;
+  const uint32_t oldMinTof = g_minValidTofUs;
+
+  Serial.println("==== SWEEP START (TX=N RX=S REL=1 DRV=1) ====");
+  Serial.println("Columns: BLANK_US GUARD_US MIN_TOF_US DET/SWEEP_SHOTS MED_TOF_US");
+
+  for (size_t mi = 0; mi < (sizeof(minTofList) / sizeof(minTofList[0])); ++mi) {
+    for (size_t bi = 0; bi < (sizeof(blankingList) / sizeof(blankingList[0])); ++bi) {
+      for (size_t gi = 0; gi < (sizeof(guardList) / sizeof(guardList[0])); ++gi) {
+        g_minValidTofUs = minTofList[mi];
+        g_blankingUs = blankingList[bi];
+        g_postEnableGuardUs = guardList[gi];
+
+        int detectedCount = 0;
+        int32_t tofs[SWEEP_SHOTS];
+
+        for (int i = 0; i < SWEEP_SHOTS; ++i) {
+          int32_t tofUs = -1;
+          const bool detected = runSingleTest('N', 'S', true, true, &tofUs);
+          if (detected && detectedCount < SWEEP_SHOTS) {
+            tofs[detectedCount++] = tofUs;
+          }
+          delay(INTER_SHOT_MS);
+        }
+
+        int32_t medianTof = -1;
+        if (detectedCount > 0) {
+          sortInt32(tofs, detectedCount);
+          medianTof = tofs[detectedCount / 2];
+        }
+
+        Serial.print("SWEEP BLANK_US=");
+        Serial.print(g_blankingUs);
+        Serial.print(" GUARD_US=");
+        Serial.print(g_postEnableGuardUs);
+        Serial.print(" MIN_TOF_US=");
+        Serial.print(g_minValidTofUs);
+        Serial.print(" DET=");
+        Serial.print(detectedCount);
+        Serial.print("/");
+        Serial.print(SWEEP_SHOTS);
+        Serial.print(" MED_TOF_US=");
+        Serial.println(medianTof);
+      }
+    }
+  }
+
+  g_blankingUs = oldBlanking;
+  g_postEnableGuardUs = oldGuard;
+  g_minValidTofUs = oldMinTof;
+  Serial.println("---- SWEEP DONE ----");
+}
+
 char toUpperAscii(char c) {
   if (c >= 'a' && c <= 'z') {
     return static_cast<char>(c - ('a' - 'A'));
@@ -685,7 +894,7 @@ char toUpperAscii(char c) {
 }
 
 void printCommandHelp() {
-  Serial.println("Commands: O=open-path, B=blocked-path, C=coupling, N=noise baseline, P=paired axis, R=manual, H=help");
+  Serial.println("Commands: O=open-path, B=blocked-path, C=coupling, N=noise baseline, P=paired axis, A=aggressor matrix, S=blanking/guard sweep, R=manual, H=help");
 }
 
 void runRouteFinderRound(const char* label) {
@@ -744,9 +953,12 @@ void setup() {
   Serial.printf("BURST_CYCLES=%d BLANKING_US=%d TIMEOUT_US=%d\n", BURST_CYCLES, BLANKING_US, TOF_TIMEOUT_US);
   Serial.printf("MIN_VALID_TOF_US=%d WARMUP_SHOTS=%d SCORE_SHOTS=%d\n", MIN_VALID_TOF_US, WARMUP_SHOTS, SCORE_SHOTS);
   Serial.printf("NOISE_WINDOW_US=%d NOISE_REPEATS=%d COUPLING_SHOTS=%d\n", NOISE_WINDOW_US, NOISE_REPEATS, COUPLING_SHOTS);
+  Serial.printf("POST_ENABLE_GUARD_US=%d AGG_WINDOW_US=%d AGG_REPEATS=%d SWEEP_SHOTS=%d\n",
+                POST_ENABLE_GUARD_US, AGG_WINDOW_US, AGG_REPEATS, SWEEP_SHOTS);
   printCommandHelp();
   Serial.println("Type N for RX-noise baseline, C for TX-coupling round (with RX transducer unplugged).");
-  Serial.println("Then run O/B for OPEN/BLOCKED and P for paired N<->S timing delta.");
+  Serial.println("Use A to rank digital aggressors and S to sweep blanking/guard/min-tof.");
+  Serial.println("Then run O/B/P for acoustic discrimination checks.");
 }
 
 void loop() {
@@ -768,6 +980,10 @@ void loop() {
     runNoiseBaseline(NOISE_WINDOW_US, NOISE_REPEATS);
   } else if (cmd == 'P') {
     runPairedAxisRound("PAIR_NS", 'N', 'S');
+  } else if (cmd == 'A') {
+    runAggressorRound();
+  } else if (cmd == 'S') {
+    runSweepRound();
   } else if (cmd == 'R') {
     runRouteFinderRound("MANUAL");
   } else if (cmd == 'H') {
