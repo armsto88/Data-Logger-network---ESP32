@@ -88,6 +88,7 @@ namespace {
 volatile uint32_t g_edgeCount = 0;
 volatile uint32_t g_firstEdgeUs = 0;
 volatile uint32_t g_lastEdgeUs = 0;
+volatile bool g_captureArmed = false;
 
 constexpr uint8_t kTxOnLevel = TX_PWM_ACTIVE_HIGH ? HIGH : LOW;
 constexpr uint8_t kTxOffLevel = TX_PWM_ACTIVE_HIGH ? LOW : HIGH;
@@ -95,6 +96,10 @@ constexpr uint8_t kRxOnLevel = RX_EN_ACTIVE_HIGH ? HIGH : LOW;
 constexpr uint8_t kRxOffLevel = RX_EN_ACTIVE_HIGH ? LOW : HIGH;
 
 void IRAM_ATTR onTofEdge() {
+  if (!g_captureArmed) {
+    return;
+  }
+
   const uint32_t nowUs = micros();
   const uint32_t newCount = g_edgeCount + 1;
   g_edgeCount = newCount;
@@ -212,6 +217,7 @@ bool runSingleTest(char txDir, char rxDir, bool relState, bool drvState, int32_t
   disableRxPath();
   setTxCombo(txDir, relState, drvState);
 
+  g_captureArmed = false;
   delay(2);
 
   resetEdgeCapture();
@@ -226,6 +232,7 @@ bool runSingleTest(char txDir, char rxDir, bool relState, bool drvState, int32_t
   delayMicroseconds(20);
 
   resetEdgeCapture();
+  g_captureArmed = true;
   const uint32_t listenStartUs = micros();
 
   bool detected = false;
@@ -246,6 +253,8 @@ bool runSingleTest(char txDir, char rxDir, bool relState, bool drvState, int32_t
     }
   }
 
+  g_captureArmed = false;
+
 #if VERBOSE_SHOTS
   printResult(txDir, rxDir, relState, drvState, detected, tofUs);
 #endif
@@ -262,11 +271,15 @@ bool runSingleTest(char txDir, char rxDir, bool relState, bool drvState, int32_t
 void runListenOnly(uint32_t windowUs) {
   clearTxSelects();
   enableRxPath();
+  g_captureArmed = false;
   resetEdgeCapture();
+  g_captureArmed = true;
 
   const uint32_t t0 = micros();
   while ((micros() - t0) < windowUs) {
   }
+
+  g_captureArmed = false;
 
   const uint32_t edgeCount = g_edgeCount;
   const int32_t firstEdgeUs = (edgeCount > 0) ? static_cast<int32_t>(g_firstEdgeUs - t0) : -1;
@@ -370,11 +383,15 @@ void runNoiseBaseline(uint32_t windowUs, int repeats) {
   for (int i = 0; i < repeats; ++i) {
     clearTxSelects();
     enableRxPath();
+    g_captureArmed = false;
     resetEdgeCapture();
+    g_captureArmed = true;
 
     const uint32_t t0 = micros();
     while ((micros() - t0) < windowUs) {
     }
+
+    g_captureArmed = false;
 
     const uint32_t edgeCount = g_edgeCount;
     const int32_t firstEdgeUs = (edgeCount > 0) ? static_cast<int32_t>(g_firstEdgeUs - t0) : -1;
@@ -429,6 +446,7 @@ void scoreCouplingCombo(char txDir, char rxDir, bool relState, bool drvState) {
     setRxDirection(rxDir);
     disableRxPath();
     setTxCombo(txDir, relState, drvState);
+    g_captureArmed = false;
     delay(2);
 
     resetEdgeCapture();
@@ -440,6 +458,7 @@ void scoreCouplingCombo(char txDir, char rxDir, bool relState, bool drvState) {
     delayMicroseconds(20);
 
     resetEdgeCapture();
+    g_captureArmed = true;
     const uint32_t listenStartUs = micros();
     uint32_t handledCount = 0;
     bool detected = false;
@@ -457,6 +476,8 @@ void scoreCouplingCombo(char txDir, char rxDir, bool relState, bool drvState) {
         }
       }
     }
+
+    g_captureArmed = false;
 
     const uint32_t edgeCount = g_edgeCount;
     const int32_t firstEdgeUs = (edgeCount > 0) ? static_cast<int32_t>(g_firstEdgeUs - listenStartUs) : -1;
@@ -549,6 +570,113 @@ void runCouplingRound(const char* label) {
   Serial.println(" ----");
 }
 
+int32_t collectMedianTof(char txDir, char rxDir, bool relState, bool drvState, int* outDetections) {
+  for (int i = 0; i < WARMUP_SHOTS; ++i) {
+    int32_t dummyTof = -1;
+    runSingleTest(txDir, rxDir, relState, drvState, &dummyTof);
+    delay(INTER_SHOT_MS);
+  }
+
+  int32_t tofs[SCORE_SHOTS];
+  int detectedCount = 0;
+
+  for (int i = 0; i < SCORE_SHOTS; ++i) {
+    int32_t tofUs = -1;
+    const bool detected = runSingleTest(txDir, rxDir, relState, drvState, &tofUs);
+    if (detected && detectedCount < SCORE_SHOTS) {
+      tofs[detectedCount++] = tofUs;
+    }
+    delay(INTER_SHOT_MS);
+  }
+
+  if (outDetections != nullptr) {
+    *outDetections = detectedCount;
+  }
+
+  if (detectedCount <= 0) {
+    return -1;
+  }
+
+  sortInt32(tofs, detectedCount);
+  return tofs[detectedCount / 2];
+}
+
+void runPairedAxisRound(const char* label, char a, char b) {
+  Serial.print("==== PAIRED AXIS ROUND START LABEL=");
+  Serial.print(label);
+  Serial.print(" AXIS=");
+  Serial.print(a);
+  Serial.print("<->");
+  Serial.print(b);
+  Serial.println(" ====");
+
+  const bool relOpts[2] = {false, true};
+  const bool drvOpts[2] = {false, true};
+
+  for (int relIdx = 0; relIdx < 2; ++relIdx) {
+    for (int drvIdx = 0; drvIdx < 2; ++drvIdx) {
+      const bool relState = relOpts[relIdx];
+      const bool drvState = drvOpts[drvIdx];
+
+      int detAB = 0;
+      int detBA = 0;
+      const int32_t medAB = collectMedianTof(a, b, relState, drvState, &detAB);
+      const int32_t medBA = collectMedianTof(b, a, relState, drvState, &detBA);
+
+      Serial.print("PAIR AXIS=");
+      Serial.print(a);
+      Serial.print("<->");
+      Serial.print(b);
+      Serial.print(" REL=");
+      Serial.print(relState ? 1 : 0);
+      Serial.print(" DRV=");
+      Serial.print(drvState ? 1 : 0);
+      Serial.print(" DET_");
+      Serial.print(a);
+      Serial.print(b);
+      Serial.print("=");
+      Serial.print(detAB);
+      Serial.print("/");
+      Serial.print(SCORE_SHOTS);
+      Serial.print(" MED_");
+      Serial.print(a);
+      Serial.print(b);
+      Serial.print("_US=");
+      Serial.print(medAB);
+      Serial.print(" DET_");
+      Serial.print(b);
+      Serial.print(a);
+      Serial.print("=");
+      Serial.print(detBA);
+      Serial.print("/");
+      Serial.print(SCORE_SHOTS);
+      Serial.print(" MED_");
+      Serial.print(b);
+      Serial.print(a);
+      Serial.print("_US=");
+      Serial.print(medBA);
+
+      int32_t deltaUs = -999999;
+      if (medAB > 0 && medBA > 0) {
+        deltaUs = medAB - medBA;
+      }
+
+      Serial.print(" DELTA_US=");
+      if (deltaUs == -999999) {
+        Serial.print("NA");
+      } else {
+        Serial.print(deltaUs);
+      }
+      Serial.println();
+      delay(150);
+    }
+  }
+
+  Serial.print("---- PAIRED AXIS ROUND DONE LABEL=");
+  Serial.print(label);
+  Serial.println(" ----");
+}
+
 char toUpperAscii(char c) {
   if (c >= 'a' && c <= 'z') {
     return static_cast<char>(c - ('a' - 'A'));
@@ -557,7 +685,7 @@ char toUpperAscii(char c) {
 }
 
 void printCommandHelp() {
-  Serial.println("Commands: O=open-path round, B=blocked-path round, C=coupling round, N=noise baseline, R=generic round, H=help");
+  Serial.println("Commands: O=open-path, B=blocked-path, C=coupling, N=noise baseline, P=paired axis, R=manual, H=help");
 }
 
 void runRouteFinderRound(const char* label) {
@@ -618,7 +746,7 @@ void setup() {
   Serial.printf("NOISE_WINDOW_US=%d NOISE_REPEATS=%d COUPLING_SHOTS=%d\n", NOISE_WINDOW_US, NOISE_REPEATS, COUPLING_SHOTS);
   printCommandHelp();
   Serial.println("Type N for RX-noise baseline, C for TX-coupling round (with RX transducer unplugged).");
-  Serial.println("Then run O/B for acoustic OPEN vs BLOCKED checks.");
+  Serial.println("Then run O/B for OPEN/BLOCKED and P for paired N<->S timing delta.");
 }
 
 void loop() {
@@ -638,6 +766,8 @@ void loop() {
     runCouplingRound("COUPLING");
   } else if (cmd == 'N') {
     runNoiseBaseline(NOISE_WINDOW_US, NOISE_REPEATS);
+  } else if (cmd == 'P') {
+    runPairedAxisRound("PAIR_NS", 'N', 'S');
   } else if (cmd == 'R') {
     runRouteFinderRound("MANUAL");
   } else if (cmd == 'H') {
