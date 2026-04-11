@@ -2,11 +2,21 @@
 
 **Power-path and 3.3 V rail fault isolation leading to successful first flash**
 
+## Executive summary
+
+- Root cause identified and confirmed: D8/D9 clamp diode footprint pin mapping error (pins 1 and 2 swapped), causing unintended 3V3-to-GND conduction.
+- Interim hardware recovery on current board: D8/D9 removed; 3.3 V rail recovered; board flashing and core bring-up restored.
+- Key subsystem validations completed: power gating, RTC alarm gating, charging paths, battery sensing, I2C mux/sensor path, and preliminary ultrasonic diagnostics.
+- ESP-NOW field results:
+	- 1 m LOS: strong reliability (about 98.5% ACK)
+	- 30 m LOS: near-perfect reliability (about 99.7% ACK)
+	- 100 m weak LOS / obstructed: usable but degraded (about 84% to 87% ACK)
+
 **Board status:** Powered and flashed successfully  
 **Primary root cause:** D8/D9 clamp diode footprint wired with pins 1 and 2 swapped  
 **Interim fix:** Removed D8 and D9; 3V3 rail recovered
 
-This note documents the first bring-up troubleshooting sequence for the custom PCB, from the initial power-path symptom through to identification of the failed protection network and successful firmware flashing. The wording is structured so it can be reused in a methods appendix, lab notebook, or internal design record.
+This note documents the first bring-up troubleshooting sequence for the custom PCB, from the initial power-path symptom through identification of the failed protection network and successful firmware flashing. The content is structured so it can be reused in a methods appendix, lab notebook, or internal design record.
 
 ## Initial symptoms and field observations
 
@@ -36,7 +46,7 @@ This note documents the first bring-up troubleshooting sequence for the custom P
 
 The primary bring-up failure was caused by D8 and D9, implemented as BAV99 dual diodes, having pins 1 and 2 swapped in the PCB realization relative to the intended clamp-to-rails arrangement. As assembled, each device created a DC conduction path from `3V3_SYS` to `GND` through two forward-biased diode junctions. This loaded the switched 3.3 V rail heavily enough to drag `VSYS` down when the LDO was enabled.
 
-**What confirmed it:** Both D8 and D9 heated strongly under 3V3 rail injection. Removing them restored correct 3.3 V behaviour. The board could then be flashed successfully.
+**What confirmed it:** Both D8 and D9 heated strongly under 3V3 rail injection. Removing them restored correct 3.3 V behavior. The board could then be flashed successfully.
 
 ## Corrective action and recommended PCB revision items
 
@@ -50,7 +60,7 @@ The primary bring-up failure was caused by D8 and D9, implemented as BAV99 dual 
 
 **Power state:** 3.3 V rail recovered after D8/D9 removal.  
 **Firmware status:** ESP32 board was flashed successfully.  
-**Open item:** Protection diodes should be re-implemented correctly in the next board revision or with a bodge fix if needed.
+**Open item:** Protection diodes should be re-implemented correctly in the next board revision or with an interim bodge fix if needed.
 
 ## Active test note (current board)
 
@@ -410,3 +420,97 @@ This procedure verifies that the ultrasonic TX boost rail behaves correctly and 
 - Add a temporary bring-up firmware that periodically toggles `TX_PWM` with a visible interval (for example 1 s ON / 2 s OFF) and no ultrasonic burst.
 - Then verify the 22 V rail follows the gate command cleanly.
 - After verification, revert to normal measurement firmware.
+
+## Run log: 2026-04-11 (ESP-NOW range and reliability characterization)
+
+- Firmware targets:
+	- TX: `esp32wroom-espnow-range-tx`
+	- RX: `esp32wrover-espnow-range-rx`
+- Test window: 60 s timed runs
+- TX packet interval: 100 ms
+- Payload: 64 bytes
+- Trigger model: `G` on TX starts local timed run and sends remote start control to RX
+- Monitor stabilization note:
+	- Most reliable monitor command on COM3 was `device monitor -p COM3 -b 115200 --dtr 0 --rts 0`
+
+### Firmware/statistics fix applied during test session
+
+- Issue found:
+	- `send_ok_pct` could exceed 100% because startup control packets were counted in send callbacks while excluded from the `sent` data counter.
+- Fix applied:
+	- Control-start callback events are tracked separately and excluded from data send success/fail counters.
+- Verification:
+	- Post-fix TX runs show `send_ok_pct` pinned to 100.0 with `send_fail=0` under clean links.
+
+### Measured results summary
+
+1) 1 m baseline (LOS)
+
+- TX final summary:
+	- `sent=595`
+	- `send_ok=595` (`send_ok_pct=100.0`)
+	- `ack_rx=586` (`ack_pct=98.5`)
+	- `rtt_ms_avg=5.7`, `rtt_ms_max=22`
+
+2) 30 m LOS
+
+- TX final summary:
+	- `sent=595`
+	- `send_ok=595` (`send_ok_pct=100.0`)
+	- `ack_rx=593` (`ack_pct=99.7`)
+	- `rtt_ms_avg=6.7`, `rtt_ms_max=31`
+
+3) 100 m (reduced LOS quality), run A
+
+- TX final summary:
+	- `sent=595`
+	- `send_ok=595` (`send_ok_pct=100.0`)
+	- `ack_rx=509` (`ack_pct=85.5`)
+	- `rtt_ms_avg=6.1`, `rtt_ms_max=27`
+
+4) 100 m (reduced LOS quality), run B
+
+- TX final summary:
+	- `sent=595`
+	- `send_ok=595` (`send_ok_pct=100.0`)
+	- `ack_rx=519` (`ack_pct=87.2`)
+	- `rtt_ms_avg=6.2`, `rtt_ms_max=25`
+
+5) 100 m with wall obstruction
+
+- TX final summary:
+	- `sent=595`
+	- `send_ok=595` (`send_ok_pct=100.0`)
+	- `ack_rx=504` (`ack_pct=84.7`)
+	- `rtt_ms_avg=6.4`, `rtt_ms_max=27`
+
+### Interpretation
+
+- ESP-NOW link and firmware are validated as functional and stable.
+- Short-to-mid LOS range (1 m to 30 m) shows near-perfect reliability.
+- At 100 m in weaker or obstructed paths, reliability drops into the mid-80% range.
+- TX path health remained strong in all runs (`send_fail=0`), indicating losses are RF propagation/channel effects rather than TX firmware transport faults.
+
+### Practical deployment guidance from this dataset
+
+- Strong-link operating band (current hardware/layout): LOS up to at least 30 m.
+- Usable but degraded band in difficult paths: around 100 m with weak LOS and/or wall obstruction.
+- For delivery-critical telemetry at harder range:
+	- add higher-level retries/queueing,
+	- log ACK-rate trends,
+	- and verify with longer soak tests under representative interference conditions.
+
+## Ultrasonic hardware tweaks TODO (next revision)
+
+- [ ] Re-implement RX input clamp stage with corrected diode mapping and series resistor placement.
+- [ ] Add hardware blanking of comparator digital output (`TOF_EDGE`) during TX burst and blanking window.
+- [ ] Add optional analog mute/clamp footprint on RX path for TX-period overload suppression.
+- [ ] Redesign `VREF` network with lower divider impedance and local decoupling (`100 nF + 1 uF`, optional `4.7 uF`).
+- [ ] Evaluate buffered `VREF` distribution for analog section stability.
+- [ ] Increase comparator hysteresis to intentional tens-of-mV range; add tuning resistor footprints.
+- [ ] Partition layout into quiet RX analog zone and noisy TX/boost zone.
+- [ ] Feed analog receive section from filtered `3V3_A` rail (bead/resistor + local decoupling).
+- [ ] Force RX-disabled state to a true quiet condition (no floating analog nodes, no spurious comparator edges).
+- [ ] Add test points for: `TX_PWM`, `TX_PULSE`, `PWM_5V`, `22V_SYS`, `3V3_A`, `VREF`, `RX_HOT`, `RX_IN`, `RX_AMP`, `TOF_EDGE`.
+- [ ] Add optional tuning footprints: comparator RC filter, hysteresis options, TX snubber, TX damping resistor, analog mute transistor.
+- [ ] Re-run bring-up acceptance checks after rework: baseline noise (`N`), RX-disabled baseline (`D`), coupling (`C`), aggressor (`A`), sweep (`S`), paired direction (`P`), open/blocked (`O`/`B`).

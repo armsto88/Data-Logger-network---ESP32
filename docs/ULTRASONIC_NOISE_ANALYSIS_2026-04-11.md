@@ -260,3 +260,44 @@ Run order:
 7. `O` and `B`
 
 Record outputs exactly and compare to this report to detect whether noise source shifts after hardware changes.
+
+## V2 Redesign Mapping (From ultrasonic_circuit_v2_design_advice)
+
+The V2 advice aligns closely with measured behavior in this report.
+
+### Evidence -> V2 design implication
+
+- Persistent baseline edges (`N`) and non-quiet RX-disabled behavior (`D`):
+  - enforce a truly quiet RX-off state in hardware
+  - avoid floating front-end states when disabled
+
+- TX aggressor dominance (`A`: `TX_PWM_*` much higher than baseline):
+  - prioritize TX-to-RX isolation in schematic and layout
+  - isolate analog rail/ground from TX switching loops
+
+- TOF tracking blanking (`S`):
+  - add real hardware blanking (digital TOF_EDGE blanking minimum)
+  - optionally add analog mute during TX/blanking
+
+- Weak OPEN/BLOCKED and paired discrimination (`O/B/P`):
+  - do not finalize route truth table from current detections
+  - harden RX/comparator chain before route validation
+
+### V2 hardware priorities (ordered)
+
+1. Correct and simplify RX clamp/protection implementation.
+2. Add hardware blanking path for comparator output (and optional analog mute).
+3. Stiffen or buffer VREF and treat as a protected analog net.
+4. Increase comparator hysteresis to a deliberate, tunable value.
+5. Partition TX and RX power/ground/layout regions.
+6. Add test points and tuning footprints for bring-up trim.
+
+## Immediate V1 Interim Actions (Before V2 Hardware)
+
+While on current V1 hardware, use these actions only for diagnosis quality improvement:
+
+1. Keep strict capture arming and RX gating (already in script).
+2. Use `N` + `D` + `A` at start of each session to classify noise source balance.
+3. Use `S` as a diagnostic indicator only; do not interpret shifted medians as acoustic TOF.
+4. Keep route-truth and wind-extraction work paused until coupling is no longer saturated.
+5. Move next debugging focus to scope correlation on TX edges vs `TOF_EDGE`, `RX_AMP`, and `VREF`.
