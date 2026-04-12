@@ -6,9 +6,12 @@
 // Sensor -> Mothership data
 typedef struct sensor_data_message {
     char nodeId[16];            // e.g., "TEMP_001"
-    char sensorType[16];        // e.g., "TEMPERATURE"
+    char sensorType[16];        // e.g., "SOIL_TEMP", "AIR_TEMP"
+    char sensorLabel[24];       // e.g., "SOIL1_TEMP", "AUX1_INPUT"
+    uint16_t sensorId;          // stable channel id for downstream processing
     float value;                // reading
     unsigned long nodeTimestamp;// node-side timestamp (unix or millis)
+    uint16_t qualityFlags;      // reserved for sensor/time/queue quality bits
 } sensor_data_message_t;
 
 // Discovery (node -> broadcast) and response (mothership -> broadcast)
@@ -78,6 +81,14 @@ typedef struct schedule_command_message {
     char mothership_id[16];
 } schedule_command_message_t;
 
+// Sync schedule (server -> node): tells nodes when to open WiFi and flush backlog
+typedef struct sync_schedule_command_message {
+    char command[20];           // "SET_SYNC_SCHED"
+    unsigned long syncIntervalMinutes;
+    unsigned long phaseUnix;    // alignment anchor (unix seconds)
+    char mothership_id[16];
+} sync_schedule_command_message_t;
+
 // Optional: RNT-compatible pairing struct
 typedef struct rnt_pairing_t {
     uint8_t msgType;            // 0 = PAIRING, 1 = DATA
@@ -90,21 +101,52 @@ typedef struct rnt_pairing_t {
 #define DEFAULT_WAKE_INTERVAL_MINUTES 5
 #define DEFAULT_SLEEP_TIME_SECONDS (DEFAULT_WAKE_INTERVAL_MINUTES * 60)
 
-#define NODE_TYPE_AIR_TEMP      "AIR_TEMP"
-#define NODE_TYPE_SOIL_MOISTURE "SOIL_MOIST"
-#define NODE_TYPE_HUMIDITY      "HUMIDITY"
-#define NODE_TYPE_LIGHT         "LIGHT"
-#define NODE_TYPE_PH            "PH"
+#define NODE_TYPE_MULTI_ENV     "MULTI_ENV"
+#define NODE_PROFILE_V1         "STD_NODE_V1"
+
+#define SENSOR_TYPE_AIR_TEMP    "AIR_TEMP"
+#define SENSOR_TYPE_HUMIDITY    "HUMIDITY"
+#define SENSOR_TYPE_PAR         "PAR"
+#define SENSOR_TYPE_WIND        "WIND"
+#define SENSOR_TYPE_SOIL_VWC    "SOIL_VWC"
+#define SENSOR_TYPE_SOIL_TEMP   "SOIL_TEMP"
+#define SENSOR_TYPE_AUX         "AUX"
+
+// Stable sensor channel IDs for standard node profile.
+#define SENSOR_ID_UNKNOWN       0
+#define SENSOR_ID_AIR_TEMP      1001
+#define SENSOR_ID_AIR_RH        1002
+#define SENSOR_ID_PAR           1101
+#define SENSOR_ID_WIND_SPEED    1201
+#define SENSOR_ID_SOIL1_VWC     2001
+#define SENSOR_ID_SOIL2_VWC     2002
+#define SENSOR_ID_SOIL1_TEMP    2003
+#define SENSOR_ID_SOIL2_TEMP    2004
+#define SENSOR_ID_AUX1          3001
+#define SENSOR_ID_AUX2          3002
 
 #define ESPNOW_CHANNEL 1
 
 // I2C pins (ESP32-C3 Mini) — used by node builds
+#ifndef RTC_SDA_PIN
 #define RTC_SDA_PIN 8
+#endif
+
+#ifndef RTC_SCL_PIN
 #define RTC_SCL_PIN 9
+#endif
+
+#ifndef RTC_INT_PIN
 #define RTC_INT_PIN 4
+#endif
 
 
 // NEW: mux configuration (PCA9548A-style)
 // Change these two if you move to a different mux / address later.
+#ifndef MUX_ADDR
 #define MUX_ADDR      0x70
+#endif
+
+#ifndef MUX_CHANNELS
 #define MUX_CHANNELS  8       // set to 4 when you move to a 4-channel mux
+#endif

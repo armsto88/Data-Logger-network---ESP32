@@ -70,6 +70,12 @@ bool sendDiscoveryBroadcast();
 bool broadcastWakeInterval(int intervalMinutes);
 
 /**
+ * Broadcast the fleet sync schedule so deployed nodes know when to enable WiFi
+ * and upload queued samples.
+ */
+bool broadcastSyncSchedule(int syncIntervalMinutes, unsigned long phaseUnix);
+
+/**
  * Set node to PAIRED and notify it.
  */
 bool pairNode(const String& nodeId);

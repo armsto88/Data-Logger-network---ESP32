@@ -31,6 +31,11 @@ void getRTCTimeString(char* buffer, size_t bufferSize) {
             now.year(), now.month(), now.day(), now.hour(), now.minute(), now.second());
 }
 
+unsigned long getRTCTimeUnix() {
+    DateTime now = rtc.now();
+    return now.unixtime();
+}
+
 bool setRTCTime(int year, int month, int day, int hour, int minute, int second) {
     Serial.printf("Setting RTC time to: %04d-%02d-%02d %02d:%02d:%02d\n", 
                   year, month, day, hour, minute, second);

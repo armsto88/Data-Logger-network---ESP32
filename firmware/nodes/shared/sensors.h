@@ -6,12 +6,14 @@
 // label      = human-readable name for CSV, e.g. "DS18B20_TEMP_1"
 // sensorType = generic type/category, e.g. "DS18B20", "SOIL_MOISTURE", "AIR_TEMP"
 struct SensorSlot {
+    uint16_t sensorId;
     const char* label;
     const char* sensorType;
 };
 
-// Max number of sensors handled by this node firmware
-constexpr size_t MAX_SENSORS = 8;
+// Max number of sensors handled by this node firmware.
+// Baseline standard profile uses 8 slots, with headroom for AUX expansion.
+constexpr size_t MAX_SENSORS = 16;
 
 // Global registry (defined in sensors.cpp)
 extern SensorSlot g_sensors[MAX_SENSORS];

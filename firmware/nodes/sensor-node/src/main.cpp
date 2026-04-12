@@ -10,6 +10,7 @@
 #include "esp_system.h"
 #include "sensors.h"
 #include "sensors/soil_moist_temp.h"
+#include "storage/local_queue.h"
 
 #include "protocol.h"     // pins, ESPNOW_CHANNEL, protocol structs
 
@@ -18,8 +19,8 @@
 #endif
 
 // -------------------- Node config --------------------
-#define NODE_ID   "TEMP_001"
-#define NODE_TYPE "temperature"
+#define NODE_ID   "ENV_001"
+#define NODE_TYPE "MULTI_ENV_V1"
 
 // -------------------- I2C bus & mux --------------------
 // Single I2C bus (I2C0) for RTC + PCA9548A + ADS1115
@@ -180,6 +181,11 @@ RTC_DATA_ATTR uint8_t   g_intervalMin    = 1;
 RTC_DATA_ATTR bool      deployedFlag     = false;
 // New: unix time of last successful TIME_SYNC (also mirrored into NVS)
 RTC_DATA_ATTR uint32_t  lastTimeSyncUnix = 0;
+RTC_DATA_ATTR uint16_t  g_syncIntervalMin = 15;
+RTC_DATA_ATTR uint32_t  g_syncPhaseUnix = 0;
+RTC_DATA_ATTR uint32_t  g_lastSyncSlot = 0xFFFFFFFFUL;
+
+static bool g_espNowReady = false;
 
 // --- Derived state helpers ---
 static bool hasMothershipMAC() {
@@ -227,6 +233,9 @@ static void persistNodeConfig() {
   p.putBool ("deployed",   deployedFlag);
   p.putUChar("interval",   g_intervalMin);
   p.putULong("lastSync",   lastTimeSyncUnix);
+  p.putUShort("syncMin",    g_syncIntervalMin);
+  p.putULong("syncPhase",   g_syncPhaseUnix);
+  p.putULong("syncSlot",    g_lastSyncSlot);
 
   // store mothership MAC as 12-char hex string
   char macHex[13];
@@ -247,9 +256,13 @@ static void persistNodeConfig() {
     bool     dep= p2.getBool("deployed", false);
     bool     rs = p2.getBool("rtc_synced", false);
     uint32_t ls = p2.getULong("lastSync", 0);
+    uint16_t sm = p2.getUShort("syncMin", 15);
+    uint32_t sp = p2.getULong("syncPhase", 0);
+    uint32_t ss = p2.getULong("syncSlot", 0xFFFFFFFFUL);
     p2.end();
-    Serial.printf("🔍 NVS verify: state=%u deployed=%d rtc_synced=%d msmac='%s' lastSyncUnix=%lu\n",
-                  st, dep, rs, ms.c_str(), (unsigned long)ls);
+    Serial.printf("🔍 NVS verify: state=%u deployed=%d rtc_synced=%d msmac='%s' lastSyncUnix=%lu syncMin=%u syncPhase=%lu syncSlot=%lu\n",
+            st, dep, rs, ms.c_str(), (unsigned long)ls, (unsigned)sm,
+            (unsigned long)sp, (unsigned long)ss);
   } else {
     Serial.println("⚠️ NVS verify: begin() failed");
   }
@@ -265,6 +278,9 @@ static void loadNodeConfig() {
     deployedFlag     = false;
     g_intervalMin    = 1;
     lastTimeSyncUnix = 0;
+    g_syncIntervalMin = 15;
+    g_syncPhaseUnix = 0;
+    g_lastSyncSlot = 0xFFFFFFFFUL;
     memset(mothershipMAC, 0, sizeof(mothershipMAC));
     return;
   }
@@ -274,6 +290,9 @@ static void loadNodeConfig() {
   deployedFlag       = p.getBool ("deployed",   false);
   g_intervalMin      = p.getUChar("interval",   1);
   lastTimeSyncUnix   = p.getULong("lastSync",   0);
+  g_syncIntervalMin  = p.getUShort("syncMin",   15);
+  g_syncPhaseUnix    = p.getULong("syncPhase",  0);
+  g_lastSyncSlot     = p.getULong("syncSlot",   0xFFFFFFFFUL);
 
   String macHex = p.getString("msmac", "");
   p.end();
@@ -290,8 +309,10 @@ static void loadNodeConfig() {
     memset(mothershipMAC, 0, sizeof(mothershipMAC));
   }
 
-  Serial.printf("💾 Node config loaded from NVS: state=%u, rtcSynced=%d, deployed=%d, interval=%u, msmac='%s'\n",
-                (unsigned)nodeState, rtcSynced, deployedFlag, g_intervalMin, macHex.c_str());
+  Serial.printf("💾 Node config loaded from NVS: state=%u, rtcSynced=%d, deployed=%d, interval=%u, syncMin=%u, syncPhase=%lu, syncSlot=%lu, msmac='%s'\n",
+                (unsigned)nodeState, rtcSynced, deployedFlag, g_intervalMin,
+                (unsigned)g_syncIntervalMin, (unsigned long)g_syncPhaseUnix,
+                (unsigned long)g_lastSyncSlot, macHex.c_str());
 
   if (lastTimeSyncUnix > 0) {
     DateTime ls(lastTimeSyncUnix);
@@ -309,7 +330,158 @@ static void onDataReceived(const uint8_t *mac, const uint8_t *incomingData, int 
 static void sendTimeSyncRequest();
 static void sendDiscoveryRequest();
 static void sendPairingRequest();
-static void sendSensorData();
+static bool bringupEspNow();
+static void shutdownEspNow();
+static bool shouldSyncAt(uint32_t unixNow);
+static void captureSensorsToQueue();
+static void flushQueuedToMothership();
+
+static bool bringupEspNow() {
+  if (g_espNowReady) return true;
+
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect();
+  delay(80);
+
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("❌ ESP-NOW init failed");
+    return false;
+  }
+
+  esp_now_register_send_cb(onDataSent);
+  esp_now_register_recv_cb(onDataReceived);
+
+  // Broadcast peer for fleet-level commands.
+  {
+    esp_now_peer_info_t pi{};
+    static const uint8_t bcast[6] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
+    memcpy(pi.peer_addr, bcast, 6);
+    pi.channel = ESPNOW_CHANNEL;
+    pi.ifidx   = WIFI_IF_STA;
+    pi.encrypt = false;
+    esp_now_add_peer(&pi);
+  }
+
+  if (hasMothershipMAC()) {
+    esp_now_peer_info_t pi{};
+    memcpy(pi.peer_addr, mothershipMAC, 6);
+    pi.channel = ESPNOW_CHANNEL;
+    pi.ifidx   = WIFI_IF_STA;
+    pi.encrypt = false;
+    esp_now_del_peer(mothershipMAC);
+    esp_now_add_peer(&pi);
+  }
+
+  esp_wifi_set_channel(ESPNOW_CHANNEL, WIFI_SECOND_CHAN_NONE);
+  g_espNowReady = true;
+  Serial.println("✅ ESP-NOW online");
+  return true;
+}
+
+static void shutdownEspNow() {
+  if (!g_espNowReady) return;
+  esp_now_deinit();
+  WiFi.mode(WIFI_OFF);
+  g_espNowReady = false;
+  Serial.println("📴 WiFi/ESP-NOW off");
+}
+
+static bool shouldSyncAt(uint32_t unixNow) {
+  if (!rtcSynced || g_syncIntervalMin == 0) return false;
+
+  const uint32_t period = (uint32_t)g_syncIntervalMin * 60UL;
+  uint32_t phase = g_syncPhaseUnix;
+  if (phase == 0 || phase > unixNow) phase = 0;
+
+  uint32_t slot = (unixNow - phase) / period;
+  if (slot == g_lastSyncSlot) return false;
+
+  g_lastSyncSlot = slot;
+  persistNodeConfig();
+  return true;
+}
+
+static void captureSensorsToQueue() {
+  if (g_numSensors == 0) {
+    Serial.println("⚠️ No sensors configured (g_numSensors == 0)");
+    return;
+  }
+
+  uint32_t nowUnix = rtc.now().unixtime();
+  for (size_t i = 0; i < g_numSensors; ++i) {
+    float value = 0.0f;
+    if (!readSensor(i, value)) {
+      Serial.printf("⚠️ Sensor read failed for slot %u\n", (unsigned)i);
+      continue;
+    }
+
+    const char* labelStr = g_sensors[i].label ? g_sensors[i].label : "UNKNOWN";
+    const char* typeStr  = g_sensors[i].sensorType ? g_sensors[i].sensorType : "UNKNOWN";
+    uint16_t sensorId = g_sensors[i].sensorId;
+    if (local_queue::enqueue(nowUnix, sensorId, typeStr, labelStr, value, 0)) {
+      Serial.printf("🧾 queued seq=%lu %s=%.4f (pending=%u)\n",
+                    (unsigned long)(local_queue::nextSeq() - 1),
+                    labelStr,
+                    value,
+                    (unsigned)local_queue::count());
+    } else {
+      Serial.printf("❌ queue append failed for %s\n", labelStr);
+    }
+  }
+}
+
+static void flushQueuedToMothership() {
+  if (!hasMothershipMAC()) {
+    Serial.println("⚠️ flush skipped: no mothership MAC");
+    return;
+  }
+
+  if (!bringupEspNow()) {
+    Serial.println("❌ flush skipped: ESP-NOW bringup failed");
+    return;
+  }
+
+  size_t sent = 0;
+  while (local_queue::count() > 0) {
+    local_queue::QueuedSample rec{};
+    if (!local_queue::peek(rec)) break;
+
+    sensor_data_message_t msg{};
+    strcpy(msg.nodeId, NODE_ID);
+    strncpy(msg.sensorType, rec.sensorType, sizeof(msg.sensorType) - 1);
+    msg.sensorType[sizeof(msg.sensorType) - 1] = '\0';
+    strncpy(msg.sensorLabel, rec.sensorLabel, sizeof(msg.sensorLabel) - 1);
+    msg.sensorLabel[sizeof(msg.sensorLabel) - 1] = '\0';
+    msg.sensorId = rec.sensorId;
+    msg.value = rec.value;
+    msg.nodeTimestamp = rec.sampleUnix;
+    msg.qualityFlags = rec.qualityFlags;
+
+    esp_wifi_set_channel(ESPNOW_CHANNEL, WIFI_SECOND_CHAN_NONE);
+    esp_err_t res = esp_now_send(mothershipMAC, (uint8_t*)&msg, sizeof(msg));
+    if (res != ESP_OK) {
+      Serial.printf("❌ queue flush send failed at seq=%lu: %s\n",
+                    (unsigned long)rec.sampleSeq,
+                    esp_err_to_name(res));
+      break;
+    }
+
+    if (!local_queue::pop()) {
+      Serial.println("❌ queue pop failed after send");
+      break;
+    }
+    sent++;
+    delay(5);
+  }
+
+  Serial.printf("📤 queue flush done: sent=%u pending=%u\n",
+                (unsigned)sent,
+                (unsigned)local_queue::count());
+
+  if (currentNodeState() == STATE_DEPLOYED) {
+    shutdownEspNow();
+  }
+}
 
 static void onDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
   Serial.print("Send Status: ");
@@ -405,6 +577,8 @@ static void onDataReceived(const uint8_t *mac, const uint8_t *incomingData, int 
       rtcSynced        = true;
       deployedFlag     = true;
       lastTimeSyncUnix = rtc.now().unixtime();   // treat deploy time as fresh sync
+      if (g_syncPhaseUnix == 0) g_syncPhaseUnix = lastTimeSyncUnix;
+      g_lastSyncSlot = 0xFFFFFFFFUL;
       memcpy(mothershipMAC, mac, 6);
       persistNodeConfig();
 
@@ -436,9 +610,9 @@ static void onDataReceived(const uint8_t *mac, const uint8_t *incomingData, int 
       Serial.printf("[DEPLOY] First alarm armed for %s (ok=%d, interval=%u min)\n",
                     nextStr, ok, g_intervalMin);
 
-      // Optional: initial reading right after deploy
-      Serial.println("📤 Initial post-deploy reading…");
-      sendSensorData();
+      // Deployed mode is queue-first with WiFi duty-cycled.
+      Serial.println("🧾 DEPLOYED queue-first mode enabled");
+      shutdownEspNow();
     }
     return;
   }
@@ -455,7 +629,9 @@ static void onDataReceived(const uint8_t *mac, const uint8_t *incomingData, int 
       rtcSynced        = false;
       deployedFlag     = false;
       lastTimeSyncUnix = 0;
+      g_lastSyncSlot   = 0xFFFFFFFFUL;
       persistNodeConfig();
+      local_queue::clear();
       Serial.println("💾 Node config persisted after UNPAIR");
 
       debugState("after UNPAIR");
@@ -504,7 +680,27 @@ static void onDataReceived(const uint8_t *mac, const uint8_t *incomingData, int 
     return;
   }
 
-  // 7) Time sync response from mothership
+  // 7) Sync schedule command (fleet-wide broadcast from mothership)
+  if (len == sizeof(sync_schedule_command_message_t)) {
+    sync_schedule_command_message_t sc{};
+    memcpy(&sc, incomingData, sizeof(sc));
+
+    if (strcmp(sc.command, "SET_SYNC_SCHED") == 0) {
+      uint16_t oldMin = g_syncIntervalMin;
+      g_syncIntervalMin = (uint16_t)sc.syncIntervalMinutes;
+      g_syncPhaseUnix = (uint32_t)sc.phaseUnix;
+      g_lastSyncSlot = 0xFFFFFFFFUL;
+
+      Serial.printf("[SET_SYNC_SCHED] sync interval: %u -> %u minutes, phaseUnix=%lu\n",
+                    (unsigned)oldMin,
+                    (unsigned)g_syncIntervalMin,
+                    (unsigned long)g_syncPhaseUnix);
+      persistNodeConfig();
+    }
+    return;
+  }
+
+  // 8) Time sync response from mothership
   if (len == sizeof(time_sync_response_t)) {
     time_sync_response_t resp;
     memcpy(&resp, incomingData, sizeof(resp));
@@ -551,6 +747,8 @@ static void onDataReceived(const uint8_t *mac, const uint8_t *incomingData, int 
 static void sendTimeSyncRequest() {
   static const uint8_t broadcastAddress[6] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
 
+  if (!bringupEspNow()) return;
+
   time_sync_request_t req{};
   strcpy(req.nodeId, NODE_ID);
   strcpy(req.command, "REQUEST_TIME");
@@ -570,6 +768,8 @@ static void sendTimeSyncRequest() {
 static void sendDiscoveryRequest() {
   static const uint8_t broadcastAddress[6] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
 
+  if (!bringupEspNow()) return;
+
   discovery_message_t m{};
   strcpy(m.nodeId,   NODE_ID);
   strcpy(m.nodeType, NODE_TYPE);
@@ -584,6 +784,8 @@ static void sendDiscoveryRequest() {
 static void sendPairingRequest() {
   static const uint8_t broadcastAddress[6] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
 
+  if (!bringupEspNow()) return;
+
   pairing_request_t m{};
   strcpy(m.command, "PAIRING_REQUEST");
   strcpy(m.nodeId,  NODE_ID);
@@ -594,65 +796,18 @@ static void sendPairingRequest() {
 }
 
 static void sendSensorData() {
-  NodeState s = currentNodeState();
+  captureSensorsToQueue();
 
-  // Timestamp for logs
-  char nowStr[24];
-  formatTime(rtc.now(), nowStr, sizeof(nowStr));
+  DateTime now = rtc.now();
+  uint32_t nowUnix = now.unixtime();
 
-  Serial.printf("📤 sendSensorData() @ %s | state=%d rtcSynced=%d hasMS=%d\n",
-                nowStr, (int)s, rtcSynced, hasMothershipMAC());
-
-  if (s != STATE_DEPLOYED || !rtcSynced || !hasMothershipMAC()) {
-    Serial.println("⚠️ Not DEPLOYED / RTC unsynced / no mothership — skipping data send");
-    return;
-  }
-
-  if (g_numSensors == 0) {
-    Serial.println("⚠️ No sensors configured (g_numSensors == 0)");
-    return;
-  }
-
-  Serial.printf("📦 sendSensorData(): g_numSensors = %u\n", (unsigned)g_numSensors);
-
-  // Iterate all sensors in the unified registry
-  for (size_t i = 0; i < g_numSensors; ++i) {
-
-    float value;
-    if (!readSensor(i, value)) {
-      Serial.printf("⚠️ Sensor read failed for slot %u (label='%s', type='%s')\n",
-                    (unsigned)i,
-                    g_sensors[i].label      ? g_sensors[i].label      : "NULL",
-                    g_sensors[i].sensorType ? g_sensors[i].sensorType : "NULL");
-      continue;
-    }
-
-    sensor_data_message_t msg{};
-    strcpy(msg.nodeId, NODE_ID);
-    msg.nodeTimestamp = rtc.now().unixtime();
-
-    // Use the *label* as the identifier the mothership sees
-    const char* labelStr = g_sensors[i].label ? g_sensors[i].label : "UNKNOWN";
-    strncpy(msg.sensorType, labelStr, sizeof(msg.sensorType) - 1);
-    msg.sensorType[sizeof(msg.sensorType) - 1] = '\0';
-
-    msg.value = value;
-
-    esp_wifi_set_channel(ESPNOW_CHANNEL, WIFI_SECOND_CHAN_NONE);
-    esp_err_t res = esp_now_send(mothershipMAC, (uint8_t*)&msg, sizeof(msg));
-
-    if (res == ESP_OK) {
-      Serial.printf("📊 Sensor packet sent → %s (type=%s) = %.4f\n",
-                    labelStr,
-                    g_sensors[i].sensorType ? g_sensors[i].sensorType : "UNKNOWN",
-                    value);
-      Serial.printf("   → to mothership %02X:%02X:%02X:%02X:%02X:%02X\n",
-                    mothershipMAC[0], mothershipMAC[1], mothershipMAC[2],
-                    mothershipMAC[3], mothershipMAC[4], mothershipMAC[5]);
-    } else {
-      Serial.printf("❌ Failed to send %s: %s\n",
-                    labelStr, esp_err_to_name(res));
-    }
+  if (shouldSyncAt(nowUnix)) {
+    Serial.printf("📶 Sync slot due (every %u min). Enabling WiFi and flushing queue...\n",
+                  (unsigned)g_syncIntervalMin);
+    flushQueuedToMothership();
+  } else {
+    Serial.printf("🧾 Sampled locally only; pending queue=%u\n",
+                  (unsigned)local_queue::count());
   }
 }
 
@@ -665,15 +820,14 @@ static void handleRtcAlarmEvent() {
   formatTime(fired, firedStr, sizeof(firedStr));
   uint8_t a1fBefore = readDS3231_A1F();
 
-  Serial.println("⚡ DS3231 alarm detected → "
-                 "simulating FET ON / LED ON / node power APPLIED");
+  Serial.println("⚡ DS3231 alarm detected → sample to local queue");
   Serial.printf("⏰ RTC alarm context @ %s  | A1F(before)=%u\n",
                 firedStr, a1fBefore);
 
-  // 1) Use this alarm as the trigger to send data (while "power is ON")
+  // 1) Sample to queue every alarm, flush only on sync schedule slots.
   NodeState s = currentNodeState();
   if (s == STATE_DEPLOYED && rtcSynced && hasMothershipMAC()) {
-    Serial.println("📤 Alarm → sending sensor data (node is 'powered' in simulation)");
+    Serial.println("🧾 Alarm → capture sensors to local queue (sync on schedule)");
     sendSensorData();
   } else {
     Serial.println("⚠️ Alarm but node not ready (not DEPLOYED / RTC unsynced / no mothership)");
@@ -706,7 +860,7 @@ static void handleRtcAlarmEvent() {
 
   uint8_t a1fAfter = readDS3231_A1F();
   Serial.printf("🔚 DS3231 A1F cleared → A1F(after)=%u\n", a1fAfter);
-  Serial.println("   → Simulated behaviour: FET OFF / LED OFF / node power CUT");
+  Serial.println("   → Alarm cycle complete");
 }
 
 // -------------------- I2C / Mux / ADS1115 Self-test --------------------
@@ -836,53 +990,15 @@ void setup() {
     }
   }
 
-  // WiFi / ESPNOW
-  WiFi.mode(WIFI_STA);
-  WiFi.disconnect();
-  delay(1000);
-
-  if (esp_now_init() != ESP_OK) {
-    Serial.println("❌ ESP-NOW init failed");
-    return;
-  }
-  Serial.println("✅ ESP-NOW initialized");
-
-  esp_now_register_send_cb(onDataSent);
-  esp_now_register_recv_cb(onDataReceived);
-
-  // Broadcast peer for discovery
-  {
-    esp_now_peer_info_t pi{};
-    static const uint8_t broadcastAddress[6] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
-    memcpy(pi.peer_addr, broadcastAddress, 6);
-    pi.channel = ESPNOW_CHANNEL;
-    pi.ifidx   = WIFI_IF_STA;
-    pi.encrypt = false;
-    esp_now_add_peer(&pi);
+  if (!local_queue::begin()) {
+    Serial.println("⚠️ Local queue init failed; logging/sync will be degraded");
   }
 
-  // Preloaded mothership peer (only if we already know MAC from NVS)
-  if (hasMothershipMAC()) {
-    esp_now_peer_info_t pi{};
-    memcpy(pi.peer_addr, mothershipMAC, 6);
-    pi.channel = ESPNOW_CHANNEL;
-    pi.ifidx   = WIFI_IF_STA;
-    pi.encrypt = false;
-
-    esp_now_del_peer(mothershipMAC);
-    if (esp_now_add_peer(&pi) == ESP_OK) {
-      Serial.print("✅ Preloaded mothership peer: ");
-      for (int i = 0; i < 6; ++i) {
-        if (i) Serial.print(":");
-        Serial.printf("%02X", mothershipMAC[i]);
-      }
-      Serial.println();
-    } else {
-      Serial.println("❌ Failed to add mothership peer");
-    }
+  if (!bringupEspNow()) {
+    Serial.println("⚠️ ESP-NOW bringup failed in setup");
   }
 
-   // Initialise all sensors (DS18B20 + soil backend etc. via sensors.cpp)
+  // Initialise all sensors (SHT41, PAR, soil, wind stub, AUX stub via sensors.cpp)
   if (!initSensors()) {
     Serial.println("⚠️ Sensor init failed (continuing, but reads may fail)");
   }
@@ -892,6 +1008,11 @@ void setup() {
   testI2CBusesMuxAndADS();
 
   persistNodeConfig();
+
+  // In deployed mode, keep WiFi/ESP-NOW disabled except sync windows.
+  if (currentNodeState() == STATE_DEPLOYED) {
+    shutdownEspNow();
+  }
 
   Serial.println("🔁 Setup persisted baseline node config");
   debugState("end of setup");
@@ -921,6 +1042,7 @@ void loop() {
     if (nowMs - lastTimeSyncReq > 30000UL) {
       Serial.println("⏰ Bound but RTC unsynced → requesting initial TIME_SYNC");
       sendTimeSyncRequest();
+      if (currentNodeState() == STATE_DEPLOYED) shutdownEspNow();
       lastTimeSyncReq = nowMs;
     }
   }
@@ -938,6 +1060,7 @@ void loop() {
         Serial.printf("⏰ >24h since last TIME_SYNC (Δ=%lu s) → requesting periodic TIME_SYNC\n",
                       (unsigned long)delta);
         sendTimeSyncRequest();
+        if (currentNodeState() == STATE_DEPLOYED) shutdownEspNow();
         lastTimeSyncReq = nowMs;
       }
     }

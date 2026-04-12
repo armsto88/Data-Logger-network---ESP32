@@ -15,7 +15,7 @@ namespace {
   // One global ADS instance on the root I2C bus
   static ADS1115 ads(WireRtc);
 
-  // ---- Thermistor divider + Steinhart–Hart (from MicroPython main.py) ----
+  // ---- Legacy thermistor divider + Steinhart–Hart (from older probe setup) ----
   constexpr float V_DIV_SUPPLY = 4.910f;
   constexpr float R_FIXED_A2   = 9880.0f;   // A2 → soil1 NTC
   constexpr float R_FIXED_A3   = 9970.0f;   // A3 → soil2 NTC
@@ -77,11 +77,23 @@ namespace {
       return;
     }
 
-    // Moisture → θv (using your soil_calibration.h helpers)
+    #if SOIL_CWT_THA_MODE
+    // CWT TH-A (0-5V): A0/A1 moisture, A2/A3 temperature.
+    // Convert ADS input volts -> sensor output volts using configured gain.
+    float v0 = (mv0 / 1000.0f) * SOIL_ADC_INPUT_TO_SENSOR_VOLT_GAIN;
+    float v1 = (mv1 / 1000.0f) * SOIL_ADC_INPUT_TO_SENSOR_VOLT_GAIN;
+    float v2 = (mv2 / 1000.0f) * SOIL_ADC_INPUT_TO_SENSOR_VOLT_GAIN;
+    float v3 = (mv3 / 1000.0f) * SOIL_ADC_INPUT_TO_SENSOR_VOLT_GAIN;
+
+    lastThetaV1 = cwt_tha_moisture_from_sensor_volts(v0);
+    lastThetaV2 = cwt_tha_moisture_from_sensor_volts(v1);
+    lastTemp1C  = cwt_tha_temp_c_from_sensor_volts(v2);
+    lastTemp2C  = cwt_tha_temp_c_from_sensor_volts(v3);
+    #else
+    // Legacy moisture polynomial + thermistor model.
     lastThetaV1 = theta_v_from_mv(mv0, SOIL1_A0, SOIL1_B0, SOIL1_C0);
     lastThetaV2 = theta_v_from_mv(mv1, SOIL2_A1, SOIL2_B1, SOIL2_C1);
 
-    // Thermistors → °C
     float r2 = r_from_vnode(mv2 / 1000.0f, V_DIV_SUPPLY, R_FIXED_A2);
     float t2 = sh_temp_c(r2, A2_A, A2_B, A2_C);
     lastTemp1C = A2_TRIM_GAIN * t2 + A2_TRIM_OFF;
@@ -89,6 +101,7 @@ namespace {
     float r3 = r_from_vnode(mv3 / 1000.0f, V_DIV_SUPPLY, R_FIXED_A3);
     float t3 = sh_temp_c(r3, A3_A, A3_B, A3_C);
     lastTemp2C = A3_TRIM_GAIN * t3 + A3_TRIM_OFF;
+    #endif
 
     // Debug
     Serial.printf("[SOIL] ch0 raw=%d mv=%.1f → θv1=%.4f\n", raw0, mv0, lastThetaV1);

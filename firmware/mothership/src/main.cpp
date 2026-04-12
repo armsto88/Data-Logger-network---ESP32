@@ -29,6 +29,8 @@ const char* password = "logger123";
 
 Preferences gPrefs;
 int gWakeIntervalMin = 5;          // default shown in UI & used at boot
+int gSyncIntervalMin = 15;         // fleet sync schedule (broadcast)
+unsigned long gLastSyncSchedBroadcastMs = 0;
 const int kAllowedIntervals[] = {1, 5, 10, 20, 30, 60};
 const size_t kAllowedCount = sizeof(kAllowedIntervals) / sizeof(kAllowedIntervals[0]);
 
@@ -60,6 +62,28 @@ static void loadWakeIntervalFromNVS() {
 static void saveWakeIntervalToNVS(int mins) {
   if (gPrefs.begin("ui", false)) {
     gPrefs.putInt("wake_min", mins);
+    gPrefs.end();
+  }
+}
+
+static void loadSyncIntervalFromNVS() {
+  if (gPrefs.begin("ui", true)) {
+    int v = gPrefs.getInt("sync_min", gSyncIntervalMin);
+    gPrefs.end();
+    bool ok = false;
+    for (size_t i = 0; i < kAllowedCount; i++) {
+      if (v == kAllowedIntervals[i]) {
+        ok = true;
+        break;
+      }
+    }
+    gSyncIntervalMin = ok ? v : 15;
+  }
+}
+
+static void saveSyncIntervalToNVS(int mins) {
+  if (gPrefs.begin("ui", false)) {
+    gPrefs.putInt("sync_min", mins);
     gPrefs.end();
   }
 }
@@ -435,6 +459,7 @@ static inline String footCommon(){ return String(F("</div></body></html>")); }
 void handleNodeConfigForm();
 void handleNodeConfigSave();
 void handleNodesPage();
+void handleSetSyncInterval();
 
 // ---------- Routes / Handlers ----------
 
@@ -536,6 +561,26 @@ void handleRoot() {
             "<div class='help'>Current default: <strong>");
   html += String(gWakeIntervalMin);
   html += F(" min</strong></div>"
+            "</form>"
+            "<form action='/set-sync-interval' method='POST' style='margin-top:12px'>"
+            "<label class='label'><strong>Sync interval (minutes)</strong></label>"
+            "<select class='input' name='interval'>");
+
+  for (size_t i = 0; i < kAllowedCount; ++i) {
+    int v = kAllowedIntervals[i];
+    html += F("<option value='");
+    html += String(v);
+    html += F("'");
+    if (v == gSyncIntervalMin) html += F(" selected");
+    html += F(">");
+    html += String(v);
+    html += F("</option>");
+  }
+
+  html += F("</select>"
+            "<button type='submit' class='btn btn--warn' style='margin-top:8px'>"
+            "Broadcast sync schedule</button>"
+            "<div class='help'>Nodes open WiFi at this cadence to flush queued data.</div>"
             "</form>"
             "</div>"); // end col
 
@@ -693,6 +738,40 @@ void handleSetWakeInterval() {
   html += String(interval);
   html += F(" min to nodes.</p><p style='color:#666'>");
   html += sent ? F("At least one node accepted the packet.") : F("No eligible nodes (PAIRED/DEPLOYED) were found.");
+  html += F("</p><a href='/' style='display:inline-block;padding:10px 16px;"
+            "background:#2196F3;color:#fff;text-decoration:none;border-radius:6px'>Back</a></body>");
+  server.send(200, "text/html", html);
+}
+
+void handleSetSyncInterval() {
+  int interval = server.hasArg("interval") ? server.arg("interval").toInt() : 0;
+  bool ok = false;
+  for (size_t i = 0; i < kAllowedCount; ++i) {
+    if (interval == kAllowedIntervals[i]) {
+      ok = true;
+      break;
+    }
+  }
+  if (!ok) interval = 15;
+
+  unsigned long phaseUnix = getRTCTimeUnix();
+  bool sent = broadcastSyncSchedule(interval, phaseUnix);
+
+  gSyncIntervalMin = interval;
+  gLastSyncSchedBroadcastMs = millis();
+  saveSyncIntervalToNVS(interval);
+
+  Serial.printf("[UI] Sync schedule set to %d min phase=%lu -> broadcast %s\n",
+                interval,
+                phaseUnix,
+                sent ? "SENT" : "FAILED");
+
+  String html = F("<!doctype html><meta name='viewport' content='width=device-width,initial-scale=1'>"
+                  "<body style='font-family:sans-serif;padding:20px;text-align:center'>"
+                  "<h3>📶 Sync Schedule</h3><p>Broadcasted sync schedule: ");
+  html += String(interval);
+  html += F(" min.</p><p style='color:#666'>");
+  html += sent ? F("Broadcast sent to fleet.") : F("Broadcast failed.");
   html += F("</p><a href='/' style='display:inline-block;padding:10px 16px;"
             "background:#2196F3;color:#fff;text-decoration:none;border-radius:6px'>Back</a></body>");
   server.send(200, "text/html", html);
@@ -1104,8 +1183,21 @@ void setup() {
 
   Serial.println("Starting WiFi AP (AP+STA mode)...");
   WiFi.mode(WIFI_AP_STA);
-  WiFi.softAP(ssid.c_str(), password, 1); // Force channel 1
+  WiFi.setSleep(false);
+
+  // AP and ESP-NOW must share one RF channel on ESP32 to avoid coexistence issues.
+  bool apOk = WiFi.softAP(ssid.c_str(), password, ESPNOW_CHANNEL, false, 4);
+
+  if (!apOk) {
+    Serial.println("❌ SoftAP failed to start");
+  } else {
+    Serial.println("✅ SoftAP started");
+  }
+
+  Serial.print("SoftAP SSID: "); Serial.println(WiFi.softAPSSID());
   Serial.print("SoftAP IP: "); Serial.println(WiFi.softAPIP());
+  Serial.print("SoftAP MAC: "); Serial.println(WiFi.softAPmacAddress());
+  Serial.print("SoftAP channel: "); Serial.println(WiFi.channel());
   Serial.print("Device ID: "); Serial.println(DEVICE_ID);
   Serial.print("WiFi Network: "); Serial.println(ssid);
   Serial.print("Firmware: "); Serial.print(FW_VERSION); Serial.print(" "); Serial.println(FW_BUILD);
@@ -1119,7 +1211,15 @@ void setup() {
   Serial.print("Current RTC Time: "); Serial.println(timeStr);
 
   loadWakeIntervalFromNVS();
+  loadSyncIntervalFromNVS();
   Serial.printf("Current wake interval (from NVS): %d min\n", gWakeIntervalMin);
+  Serial.printf("Current sync interval (from NVS): %d min\n", gSyncIntervalMin);
+
+  // Prime the fleet sync schedule so deployed nodes can stay WiFi-off until sync windows.
+  unsigned long phaseUnix = getRTCTimeUnix();
+  if (broadcastSyncSchedule(gSyncIntervalMin, phaseUnix)) {
+    gLastSyncSchedBroadcastMs = millis();
+  }
 
   // 🔎 One-shot boot summary so you can see the fleet state in one block
   logBootSummary();
@@ -1149,6 +1249,7 @@ void setup() {
   server.on("/download-csv", HTTP_GET, handleDownloadCSV);
   server.on("/discover-nodes", HTTP_POST, handleDiscoverNodes);
   server.on("/set-wake-interval", HTTP_POST, handleSetWakeInterval);
+  server.on("/set-sync-interval", HTTP_POST, handleSetSyncInterval);
 
   // Node manager + config routes
   server.on("/nodes", HTTP_GET, handleNodesPage);
@@ -1163,6 +1264,15 @@ void setup() {
 void loop() {
   server.handleClient();
   espnow_loop(); // Handle ESP-NOW node management
+
+  // Re-broadcast sync schedule as a keepalive so nodes that recently woke can align.
+  static const unsigned long kSyncSchedRebroadcastMs = 5UL * 60UL * 1000UL;
+  if (millis() - gLastSyncSchedBroadcastMs > kSyncSchedRebroadcastMs) {
+    unsigned long phaseUnix = getRTCTimeUnix();
+    if (broadcastSyncSchedule(gSyncIntervalMin, phaseUnix)) {
+      gLastSyncSchedBroadcastMs = millis();
+    }
+  }
 
   // Print current RTC time every 10s
   static unsigned long lastTimeCheck = 0;

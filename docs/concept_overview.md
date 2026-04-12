@@ -23,9 +23,11 @@ The system is a small, self-contained **wireless sensor network** for environmen
 
 - Multiple **sensor nodes** are deployed around the site.
   - They measure environmental variables such as:
-    - Air temperature (DS18B20)
-    - Soil volumetric water content (θv) via custom soil probes (ADS1115 channels A0/A1)
-    - Soil temperature via thermistors mounted on those same probes (ADS1115 channels A2/A3)
+    - Air temperature + relative humidity (SHT41)
+    - PAR (AS734x)
+    - Ultrasonic wind input (when available)
+    - Two VH-5 soil probes with volumetric water content and probe temperature (ADS1115 A0-A3)
+    - Two AUX I2C expansion ports for future sensors
   - Additional sensor backends can be added later (e.g. PAR, humidity, wind).
   - They use a low-power wireless protocol (**ESP-NOW**) to send data back to the mothership.
   - They wake on a configurable interval driven by the **DS3231 alarm** and send one packet per configured sensor slot each time (so a single node can produce multiple CSV rows per wake).
@@ -55,7 +57,7 @@ When a sensor node is powered up for the first time, it doesn’t know which mot
 
 It simply announces something like:
 
-> “I’m here, my ID is `TEMP_001`, I’m an air + soil node.”
+> “I’m here, my ID is `ENV_001`, I’m a standard multi-sensor environment node.”
 
 The mothership hears these announcements and registers the node.  
 The node then appears in the **Node Manager** list in the web dashboard with state **Unpaired**.
@@ -107,19 +109,27 @@ The node will:
   - Wake interval  
   - “RTC is synced” flag + last time-sync timestamp
 - Begin using the DS3231 alarm to wake and, on each interval, read:
-  - All DS18B20 air temperature sensors on its OneWire bus.
-  - ADS1115 channels A0–A3:
-    - A0/A1 → soil moisture (θv) for two probes.
-    - A2/A3 → soil temperatures for those two probes via thermistors.
+  - SHT41 air temperature + relative humidity.
+  - AS734x PAR.
+  - Ultrasonic wind input (when available).
+  - ADS1115 channels A0-A3:
+    - A0/A1 -> soil moisture (θv) for two VH-5 probes.
+    - A2/A3 -> soil temperatures for those two VH-5 probes.
+  - AUX I2C Port 1 (optional future sensor backend).
+  - AUX I2C Port 2 (optional future sensor backend).
 
 On each alarm, the node sends one `SENSOR_DATA` packet per logical sensor slot, for example:
 
-- `DS18B20_TEMP_1`
-- `DS18B20_TEMP_2`
+- `AIR_TEMP`
+- `AIR_RH`
+- `PAR`
+- `WIND`
 - `SOIL1_VWC`
 - `SOIL2_VWC`
 - `SOIL1_TEMP`
 - `SOIL2_TEMP`
+- `AUX1_*` (optional)
+- `AUX2_*` (optional)
 
 In the dashboard, the node now shows as **Deployed**, with a “Fresh / OK / Stale / Unknown” time-health pill based on when it last received a `TIME_SYNC`.
 
@@ -330,13 +340,15 @@ These backends populate a global sensor registry (`g_sensors[]`), which `sendSen
   - `TIME_SYNC` (mothership → node).
   - The UI surfaces a simple time-health indicator per node.
 
-- **Sensor integrations (current)**
-  - DS18B20 air temperature.
-  - ADS1115-based soil moisture + soil temperature (two integrated probes).
-  - All four soil channels + DS18B20 readings are visible in the CSV and in the serial log on each alarm.
+- **Sensor integrations (current standard profile target)**
+  - SHT41 air temperature + humidity.
+  - AS734x PAR.
+  - Ultrasonic wind input (when available).
+  - ADS1115-based soil moisture + soil temperature (two VH-5 probes; four ADC channels total).
+  - Two AUX I2C ports reserved for future sensor backends.
 
 - Data is reliably logged to the SD card in a simple, analysis-friendly CSV format that’s ready for downstream processing in R/Python.
 
 ---
 
-*This document tracks the current behaviour of the node + UI layer as of the latest firmware changes (DS18B20 + soil moisture + soil thermistors). Future sensor types (PAR, humidity, wind, etc.) will follow the same “backend → registry → CSV” pattern.*
+*This document tracks the intended standard node profile: SHT41 + AS734x PAR + ultrasonic wind input + dual VH-5 soil probes on ADS1115, with two AUX I2C expansion ports. Additional sensors follow the same backend -> registry -> CSV pattern.*

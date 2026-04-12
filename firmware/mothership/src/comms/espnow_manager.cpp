@@ -30,6 +30,9 @@ String getNodeName(const String& nodeId);
 // Fleet-wide TIME_SYNC bookkeeping
 static uint32_t g_lastFleetTimeSyncMs = 0;
 static const uint32_t FLEET_SYNC_INTERVAL_MS = 24UL * 60UL * 60UL * 1000UL; // 24h
+static const uint32_t FLEET_SYNC_NO_ELIGIBLE_RETRY_MS = 60UL * 1000UL;       // 1 min
+static uint32_t g_lastNoEligibleLogMs = 0;
+static const uint32_t NO_ELIGIBLE_LOG_INTERVAL_MS = 30UL * 1000UL;           // 30 s
 
 
 // ----------------- small helpers -----------------
@@ -181,15 +184,18 @@ static void OnDataRecv(const uint8_t * mac,
           "📊 Data @ %s\n"
           "   from FW=%s, MAC=%s\n"
           "   CSV node_id=%s, name='%s'\n"
-          "   sensor=%s, value=%.3f, node_ts=%lu\n",
+          "   sensor_id=%u, sensor_type=%s, sensor_label=%s, value=%.3f, node_ts=%lu, qf=0x%04X\n",
           ts,
           incoming.nodeId,
           macStr.c_str(),
           csvId.c_str(),
           csvName.c_str(),
+          (unsigned)incoming.sensorId,
           incoming.sensorType,
+                    incoming.sensorLabel,
           incoming.value,
-          (unsigned long)incoming.nodeTimestamp
+                    (unsigned long)incoming.nodeTimestamp,
+                    (unsigned)incoming.qualityFlags
         );
 
     // CSV row: timestamp,node_id,node_name,mac,event_type,sensor_type,value,meta
@@ -205,7 +211,7 @@ static void OnDataRecv(const uint8_t * mac,
         row += ",";
         row += "SENSOR";         // event_type (more explicit than "DATA")
         row += ",";
-        row += incoming.sensorType;         // sensor_type (e.g. "AIR_TEMP")
+        row += incoming.sensorLabel[0] ? incoming.sensorLabel : incoming.sensorType;
         row += ",";
         row += String(incoming.value, 3);   // value with 3 decimals
         row += ",";
@@ -216,6 +222,14 @@ static void OnDataRecv(const uint8_t * mac,
         meta.reserve(80);
         meta  = "FW_ID=";
         meta += fwId; // e.g. "TEMP_001"
+        meta += ";SENSOR_ID=";
+        meta += String((unsigned)incoming.sensorId);
+        meta += ";SENSOR_TYPE=";
+        meta += incoming.sensorType;
+        meta += ";QF=0x";
+        char qfHex[5];
+        snprintf(qfHex, sizeof(qfHex), "%04X", (unsigned)incoming.qualityFlags);
+        meta += qfHex;
         meta += ";NODE_TS=";
         meta += String(incoming.nodeTimestamp);  // as sent by node (millis or unix)
 
@@ -540,6 +554,27 @@ bool broadcastWakeInterval(int intervalMinutes) {
     return anySent;
 }
 
+bool broadcastSyncSchedule(int syncIntervalMinutes, unsigned long phaseUnix) {
+    sync_schedule_command_message_t cmd{};
+    strcpy(cmd.command, "SET_SYNC_SCHED");
+    strncpy(cmd.mothership_id, DEVICE_ID,
+            sizeof(cmd.mothership_id) - 1);
+    cmd.syncIntervalMinutes = (unsigned long)syncIntervalMinutes;
+    cmd.phaseUnix = phaseUnix;
+
+    uint8_t bcast[6] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
+
+    ensurePeerOnChannel(bcast, ESPNOW_CHANNEL);
+    esp_wifi_set_channel(ESPNOW_CHANNEL, WIFI_SECOND_CHAN_NONE);
+
+    esp_err_t res = esp_now_send(bcast, (uint8_t*)&cmd, sizeof(cmd));
+    Serial.printf("📤 SET_SYNC_SCHED %d min phase=%lu -> BROADCAST : %s\n",
+                  syncIntervalMinutes,
+                  phaseUnix,
+                  (res == ESP_OK) ? "OK" : esp_err_to_name(res));
+    return (res == ESP_OK);
+}
+
 bool sendTimeSync(const uint8_t* mac, const char* nodeId) {
     time_sync_response_t resp{};
     strcpy(resp.command, "TIME_SYNC");
@@ -605,7 +640,12 @@ bool broadcastTimeSyncAll() {
     }
 
     if (targeted == 0) {
-        Serial.println("⚠️ Fleet TIME_SYNC: no eligible PAIRED/DEPLOYED nodes");
+        uint32_t nowLogMs = millis();
+        if (g_lastNoEligibleLogMs == 0 ||
+            (uint32_t)(nowLogMs - g_lastNoEligibleLogMs) >= NO_ELIGIBLE_LOG_INTERVAL_MS) {
+            Serial.println("⚠️ Fleet TIME_SYNC: no eligible PAIRED/DEPLOYED nodes");
+            g_lastNoEligibleLogMs = nowLogMs;
+        }
     } else {
         Serial.printf("⏰ Fleet TIME_SYNC broadcast: targeted=%u, success=%u\n",
                       targeted, okCount);
@@ -617,16 +657,28 @@ bool broadcastTimeSyncIfDue(bool force) {
     uint32_t nowMs = millis();
 
     if (!force) {
+        bool hasEligible = false;
+        for (const auto &node : registeredNodes) {
+            if (!node.isActive) continue;
+            if (node.state == PAIRED || node.state == DEPLOYED) {
+                hasEligible = true;
+                break;
+            }
+        }
+
+        uint32_t intervalMs = hasEligible
+            ? FLEET_SYNC_INTERVAL_MS
+            : FLEET_SYNC_NO_ELIGIBLE_RETRY_MS;
+
         if (g_lastFleetTimeSyncMs != 0 &&
-            (uint32_t)(nowMs - g_lastFleetTimeSyncMs) < FLEET_SYNC_INTERVAL_MS) {
+            (uint32_t)(nowMs - g_lastFleetTimeSyncMs) < intervalMs) {
             return false;  // not due yet
         }
     }
 
     bool any = broadcastTimeSyncAll();
+    g_lastFleetTimeSyncMs = nowMs;
     if (any) {
-        g_lastFleetTimeSyncMs = nowMs;
-
         char ts[24];
         getRTCTimeString(ts, sizeof(ts));
 
