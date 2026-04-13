@@ -1,6 +1,7 @@
 #pragma once
 
 #include <Arduino.h>
+#include "protocol.h"
 
 using BleStatusJsonProvider = String (*)();
 using BleNowUnixProvider = unsigned long (*)();
@@ -23,3 +24,4 @@ void bleSetup(
 );
 void bleLoop();
 bool bleIsConnected();
+void blePublishTelemetryEvent(const sensor_data_message_t& sample, const uint8_t mac[6]);

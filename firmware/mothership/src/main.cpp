@@ -430,6 +430,50 @@ static String buildListNodesDataJson() {
   return json;
 }
 
+static String buildExportCsvResultJson(String& errorCode, String& errorMessage) {
+  File file = SD.open("/datalog.csv", FILE_READ);
+  if (!file) {
+    errorCode = "CSV_NOT_FOUND";
+    errorMessage = "CSV file not found";
+    return "";
+  }
+
+  const size_t totalSize = file.size();
+  const size_t maxPayloadBytes = 8192;
+  String csv;
+  csv.reserve(maxPayloadBytes + 8);
+
+  while (file.available() && csv.length() < maxPayloadBytes) {
+    int c = file.read();
+    if (c < 0) break;
+    csv += (char)c;
+  }
+  const bool truncated = file.available();
+  file.close();
+
+  String out;
+  out.reserve(300 + csv.length());
+  out += "{";
+  out += "\"fileName\":\"datalog.csv\",";
+  out += "\"totalBytes\":";
+  out += String((unsigned long)totalSize);
+  out += ",";
+  out += "\"returnedBytes\":";
+  out += String((unsigned long)csv.length());
+  out += ",";
+  out += "\"truncated\":";
+  out += truncated ? "true" : "false";
+  out += ",";
+  out += "\"csvData\":\"";
+  out += jsonEscapeLocal(csv);
+  out += "\"}";
+  return out;
+}
+
+static void onBleSensorTelemetry(const sensor_data_message_t& sample, const uint8_t mac[6]) {
+  blePublishTelemetryEvent(sample, mac);
+}
+
 static bool handleBleCommand(
   const String& command,
   const String& payloadJson,
@@ -543,8 +587,167 @@ static bool handleBleCommand(
     return true;
   }
 
+  if (cmd == "node_config_apply") {
+    const String nodeId = extractJsonStringFieldLocal(payloadJson, "nodeId");
+    if (nodeId.length() == 0) {
+      errorCode = "INVALID_PAYLOAD";
+      errorMessage = "node_config_apply requires payload.nodeId";
+      return false;
+    }
+
+    long wakeIv = 0;
+    const bool hasWake = extractJsonIntFieldLocal(payloadJson, "wakeIntervalMinutes", wakeIv);
+    long syncIv = 0;
+    const bool hasSync = extractJsonIntFieldLocal(payloadJson, "syncIntervalMinutes", syncIv);
+    long phase = 0;
+    const bool hasPhase = extractJsonIntFieldLocal(payloadJson, "phaseUnix", phase);
+
+    NodeInfo* target = nullptr;
+    for (auto& n : registeredNodes) {
+      if (n.nodeId == nodeId) {
+        target = &n;
+        break;
+      }
+    }
+
+    bool pairOk = true;
+    if (target && target->state == UNPAIRED) {
+      pairOk = pairNode(nodeId);
+      if (pairOk) {
+        target->state = PAIRED;
+        savePairedNodes();
+      }
+    }
+
+    std::vector<String> ids;
+    ids.push_back(nodeId);
+    const bool deployOk = deploySelectedNodes(ids);
+
+    bool wakeSent = false;
+    if (hasWake) {
+      const int iv = (int)wakeIv;
+      if (isAllowedInterval(iv)) {
+        wakeSent = broadcastWakeInterval(iv);
+        gWakeIntervalMin = iv;
+        saveWakeIntervalToNVS(iv);
+      }
+    }
+
+    bool syncSent = false;
+    if (hasSync) {
+      const int iv = (int)syncIv;
+      if (isAllowedInterval(iv)) {
+        const unsigned long phaseUnix = (hasPhase && phase > 0) ? (unsigned long)phase : getRTCTimeUnix();
+        syncSent = broadcastSyncSchedule(iv, phaseUnix);
+        gSyncIntervalMin = iv;
+        gLastSyncSchedBroadcastMs = millis();
+        saveSyncIntervalToNVS(iv);
+      }
+    }
+
+    if (!deployOk) {
+      errorCode = "NODE_CONFIG_APPLY_FAILED";
+      errorMessage = "Failed to deploy node";
+      return false;
+    }
+
+    responseType = "ack";
+    responseDataJson = String("{\"command\":\"node_config_apply\",\"nodeId\":\"")
+      + jsonEscapeLocal(nodeId)
+      + "\",\"paired\":"
+      + (pairOk ? "true" : "false")
+      + ",\"deployed\":"
+      + (deployOk ? "true" : "false")
+      + ",\"wakeBroadcast\":"
+      + (wakeSent ? "true" : "false")
+      + ",\"syncBroadcast\":"
+      + (syncSent ? "true" : "false")
+      + "}";
+    responseMessage = "Node config applied";
+    return true;
+  }
+
+  if (cmd == "node_revert") {
+    const String nodeId = extractJsonStringFieldLocal(payloadJson, "nodeId");
+    if (nodeId.length() == 0) {
+      errorCode = "INVALID_PAYLOAD";
+      errorMessage = "node_revert requires payload.nodeId";
+      return false;
+    }
+
+    NodeInfo* target = nullptr;
+    for (auto& n : registeredNodes) {
+      if (n.nodeId == nodeId) {
+        target = &n;
+        break;
+      }
+    }
+
+    if (!target) {
+      errorCode = "NODE_NOT_FOUND";
+      errorMessage = "Node not found";
+      return false;
+    }
+
+    target->state = PAIRED;
+    savePairedNodes();
+    const bool sent = pairNode(nodeId);
+
+    responseType = "ack";
+    responseDataJson = String("{\"command\":\"node_revert\",\"nodeId\":\"")
+      + jsonEscapeLocal(nodeId)
+      + "\",\"sent\":"
+      + (sent ? "true" : "false")
+      + "}";
+    responseMessage = sent ? "Node reverted to paired" : "Node reverted locally; command send failed";
+    return true;
+  }
+
+  if (cmd == "node_unpair") {
+    const String nodeId = extractJsonStringFieldLocal(payloadJson, "nodeId");
+    if (nodeId.length() == 0) {
+      errorCode = "INVALID_PAYLOAD";
+      errorMessage = "node_unpair requires payload.nodeId";
+      return false;
+    }
+
+    const bool sent = sendUnpairToNode(nodeId);
+    const bool local = unpairNode(nodeId);
+    if (!local) {
+      errorCode = "NODE_UNPAIR_FAILED";
+      errorMessage = "Failed to remove node from local registry";
+      return false;
+    }
+
+    responseType = "ack";
+    responseDataJson = String("{\"command\":\"node_unpair\",\"nodeId\":\"")
+      + jsonEscapeLocal(nodeId)
+      + "\",\"remoteSent\":"
+      + (sent ? "true" : "false")
+      + ",\"localRemoved\":"
+      + (local ? "true" : "false")
+      + "}";
+    responseMessage = sent ? "Node unpaired" : "Node unpaired locally; remote command send failed";
+    return true;
+  }
+
+  if (cmd == "export_csv" || cmd == "export_csv_request") {
+    String eCode;
+    String eMsg;
+    String result = buildExportCsvResultJson(eCode, eMsg);
+    if (result.length() == 0) {
+      errorCode = eCode;
+      errorMessage = eMsg;
+      return false;
+    }
+    responseType = "export_csv_result";
+    responseDataJson = result;
+    responseMessage = "CSV export ready";
+    return true;
+  }
+
   errorCode = "UNKNOWN_COMMAND";
-  errorMessage = "Command not implemented in Phase B";
+  errorMessage = "Command not implemented in Phase C";
   return false;
 }
 
@@ -1493,6 +1696,7 @@ void setup() {
   delay(1000);
   Serial.println("Starting ESP-NOW setup...");
   setupESPNOW();
+  setSensorDataEventCallback(onBleSensorTelemetry);
 
   Serial.println("Starting BLE GATT setup...");
   bleSetup(DEVICE_ID, FW_VERSION, buildBleStatusDataJson, getRTCTimeUnix, handleBleCommand);

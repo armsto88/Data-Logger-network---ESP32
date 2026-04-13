@@ -2,7 +2,7 @@
 
 Date: 2026-04-13  
 From: Firmware Team (VSCode)  
-Status: Phase B implemented; integration testing can start for command envelope + core routing
+Status: Phase C implemented; ready for full app workflow integration testing
 
 ## Executive Status
 
@@ -22,14 +22,13 @@ Current state:
 - [x] Are all three characteristics exposed?
   - Yes.
 - [ ] Is chunked message framing implemented?
-  - No.
+  - Yes. 8-byte header framing and reassembly are implemented.
 - [x] Does firmware echo correlationId in responses?
   - Yes for implemented Phase B command paths (success and error responses).
 
 ### Protocol Alignment
 - [x] Does node_config_apply_request include phaseUnix field?
-  - Partial alignment exists: phaseUnix is already used for fleet sync scheduling over ESP-NOW.
-  - App-side BLE node_config_apply_request handler is not implemented yet.
+  - Yes. BLE `node_config_apply` handler supports `phaseUnix` and sync scheduling alignment.
 - [x] Are sensor identity fields preserved in telemetry events?
   - Yes, telemetry includes sensorId, sensorType, sensorLabel.
 - [x] Is timestamp validation implemented (>5 min stale rejection)?
@@ -61,10 +60,8 @@ Telemetry schema already supports app-required sensor identity fields:
 ## 3) Integration Gaps vs App Contract
 
 Required but missing in firmware:
-- Chunking/reassembly layer for payloads larger than BLE ATT payload.
-- status notify stream for node_telemetry_event over BLE.
 - iOS-safe stable identifier strategy in advertisements.
-- Full command parity for remaining app commands (`node_config_apply`, `node_revert`, `node_unpair`, `export_csv_request`).
+- BLE pairing/bonding strategy and reconnect hardening for iOS/Android edge cases.
 
 ## 4) Proposed Firmware Delivery Plan
 
@@ -84,10 +81,10 @@ Required but missing in firmware:
 - Add command router mapping to existing internal handlers. (Done for: `set_time`, `discover_nodes`, `set_wake_interval`, `set_sync_interval`, `list_nodes`)
 
 ### Phase C (2-4 days): full command parity + export
-- Complete all 10 app commands.
-- Add chunked framing for request/response payloads.
-- Add export_csv_request -> export_csv_result with chunked transfer.
-- Add status notify stream for node telemetry events.
+- Complete all 10 app commands. (Done)
+- Add chunked framing for request/response payloads. (Done)
+- Add export_csv_request -> export_csv_result with chunked transfer. (Done)
+- Add status notify stream for node telemetry events. (Done)
 
 ### Phase D (1-2 days): platform hardening
 - Validate iOS reconnection behavior; add stable device identifier strategy.
@@ -123,4 +120,9 @@ Confirmed by app team on 2026-04-13:
 
 ## 7) Immediate Next Action
 
-Firmware team will start Phase C by adding chunking, status event streaming, and remaining command parity (`node_config_apply`, `node_revert`, `node_unpair`, `export_csv_request`) for full app workflow testing.
+Firmware team will start Phase D hardening: platform-specific BLE reliability testing (iOS/Android), bonded reconnect strategy, and MTU/throughput validation in integration runs with the app team.
+
+## 8) Test Execution Reference
+
+For app-team execution steps and pass criteria, use:
+- `docs/PHASE_C_APP_INTEGRATION_CHECKLIST.md`

@@ -39,6 +39,8 @@ struct NodeInfo {
     uint32_t  lastTimeSyncMs;
 };
 
+typedef void (*SensorDataEventCallback)(const sensor_data_message_t& sample, const uint8_t mac[6]);
+
 
 // -----------------------------------------------------------------------------
 // Lifecycle
@@ -110,3 +112,5 @@ void      printRegisteredNodes();
 // -----------------------------------------------------------------------------
 void savePairedNodes();
 void loadPairedNodes();
+
+void setSensorDataEventCallback(SensorDataEventCallback cb);

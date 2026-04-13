@@ -33,6 +33,7 @@ static const uint32_t FLEET_SYNC_INTERVAL_MS = 24UL * 60UL * 60UL * 1000UL; // 2
 static const uint32_t FLEET_SYNC_NO_ELIGIBLE_RETRY_MS = 60UL * 1000UL;       // 1 min
 static uint32_t g_lastNoEligibleLogMs = 0;
 static const uint32_t NO_ELIGIBLE_LOG_INTERVAL_MS = 30UL * 1000UL;           // 30 s
+static SensorDataEventCallback g_sensorDataEventCb = nullptr;
 
 
 // ----------------- small helpers -----------------
@@ -135,6 +136,10 @@ void registerNode(const uint8_t* mac,
     }
 }
 
+void setSensorDataEventCallback(SensorDataEventCallback cb) {
+    g_sensorDataEventCb = cb;
+}
+
 NodeState getNodeState(const char* nodeId) {
     for (const auto& node : registeredNodes)
         if (node.nodeId == String(nodeId)) return node.state;
@@ -150,6 +155,10 @@ static void OnDataRecv(const uint8_t * mac,
     if (len == sizeof(sensor_data_message_t)) {
         sensor_data_message_t incoming{};
         memcpy(&incoming, incomingBytes, sizeof(incoming));
+
+        if (g_sensorDataEventCb) {
+            g_sensorDataEventCb(incoming, mac);
+        }
 
         registerNode(mac, incoming.nodeId, incoming.sensorType, DEPLOYED);
 

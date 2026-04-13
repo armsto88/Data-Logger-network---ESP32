@@ -4,6 +4,7 @@
 #include <BLEDevice.h>
 #include <BLEServer.h>
 #include <BLEUtils.h>
+#include <vector>
 
 namespace {
 
@@ -26,6 +27,35 @@ volatile bool g_hasPendingRequest = false;
 String g_pendingRequest;
 
 String g_deviceName;
+uint32_t g_nextTxMessageId = 1;
+
+static const size_t kChunkHeaderBytes = 8;
+static const size_t kChunkPayloadBytes = 160;
+
+bool g_rxChunkActive = false;
+uint32_t g_rxMessageId = 0;
+uint8_t g_rxChunkCount = 0;
+std::vector<String> g_rxChunks;
+
+uint32_t readU32BE(const uint8_t* p) {
+  return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | (uint32_t)p[3];
+}
+
+void writeU32BE(uint8_t* p, uint32_t v) {
+  p[0] = (uint8_t)((v >> 24) & 0xFF);
+  p[1] = (uint8_t)((v >> 16) & 0xFF);
+  p[2] = (uint8_t)((v >> 8) & 0xFF);
+  p[3] = (uint8_t)(v & 0xFF);
+}
+
+uint16_t readU16BE(const uint8_t* p) {
+  return (uint16_t)(((uint16_t)p[0] << 8) | (uint16_t)p[1]);
+}
+
+void writeU16BE(uint8_t* p, uint16_t v) {
+  p[0] = (uint8_t)((v >> 8) & 0xFF);
+  p[1] = (uint8_t)(v & 0xFF);
+}
 
 unsigned long nowUnix() {
   return g_nowUnixProvider ? g_nowUnixProvider() : (unsigned long)(millis() / 1000UL);
@@ -170,6 +200,12 @@ String buildErrorResponse(const String& correlationId, const String& code, const
   return s;
 }
 
+String macToString(const uint8_t mac[6]) {
+  char b[18];
+  snprintf(b, sizeof(b), "%02X:%02X:%02X:%02X:%02X:%02X", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+  return String(b);
+}
+
 String buildStatusResponse(const String& correlationId) {
   const String dataJson = g_statusProvider ? g_statusProvider() : String("{}");
 
@@ -213,8 +249,66 @@ String buildOkResponse(const String& correlationId, const String& type, const St
 
 void sendResponseNotify(const String& payload) {
   if (!g_responseChar) return;
-  g_responseChar->setValue((uint8_t*)payload.c_str(), payload.length());
-  g_responseChar->notify();
+
+  if (payload.length() <= 20) {
+    g_responseChar->setValue((uint8_t*)payload.c_str(), payload.length());
+    g_responseChar->notify();
+    return;
+  }
+
+  const uint32_t messageId = g_nextTxMessageId++;
+  const size_t total = payload.length();
+  const uint8_t chunkCount = (uint8_t)((total + kChunkPayloadBytes - 1) / kChunkPayloadBytes);
+
+  for (uint8_t i = 0; i < chunkCount; ++i) {
+    const size_t start = (size_t)i * kChunkPayloadBytes;
+    const size_t len = min(kChunkPayloadBytes, total - start);
+
+    std::vector<uint8_t> frame;
+    frame.resize(kChunkHeaderBytes + len);
+
+    writeU32BE(frame.data(), messageId);
+    frame[4] = i;
+    frame[5] = chunkCount;
+    writeU16BE(frame.data() + 6, (uint16_t)len);
+    memcpy(frame.data() + kChunkHeaderBytes, payload.c_str() + start, len);
+
+    g_responseChar->setValue(frame.data(), frame.size());
+    g_responseChar->notify();
+    delay(5);
+  }
+}
+
+void sendStatusNotify(const String& payload) {
+  if (!g_statusChar) return;
+
+  if (payload.length() <= 20) {
+    g_statusChar->setValue((uint8_t*)payload.c_str(), payload.length());
+    g_statusChar->notify();
+    return;
+  }
+
+  const uint32_t messageId = g_nextTxMessageId++;
+  const size_t total = payload.length();
+  const uint8_t chunkCount = (uint8_t)((total + kChunkPayloadBytes - 1) / kChunkPayloadBytes);
+
+  for (uint8_t i = 0; i < chunkCount; ++i) {
+    const size_t start = (size_t)i * kChunkPayloadBytes;
+    const size_t len = min(kChunkPayloadBytes, total - start);
+
+    std::vector<uint8_t> frame;
+    frame.resize(kChunkHeaderBytes + len);
+
+    writeU32BE(frame.data(), messageId);
+    frame[4] = i;
+    frame[5] = chunkCount;
+    writeU16BE(frame.data() + 6, (uint16_t)len);
+    memcpy(frame.data() + kChunkHeaderBytes, payload.c_str() + start, len);
+
+    g_statusChar->setValue(frame.data(), frame.size());
+    g_statusChar->notify();
+    delay(5);
+  }
 }
 
 class ServerCallbacks : public BLEServerCallbacks {
@@ -237,10 +331,56 @@ class RequestCallbacks : public BLECharacteristicCallbacks {
   void onWrite(BLECharacteristic* c) override {
     if (!c) return;
 
-    String value = c->getValue().c_str();
-    if (value.length() == 0) return;
+    std::string raw = c->getValue();
+    if (raw.empty()) return;
 
-    g_pendingRequest = value;
+    const uint8_t* p = (const uint8_t*)raw.data();
+    const size_t n = raw.size();
+
+    if (n >= kChunkHeaderBytes) {
+      const uint32_t msgId = readU32BE(p);
+      const uint8_t chunkIndex = p[4];
+      const uint8_t chunkCount = p[5];
+      const uint16_t payloadLen = readU16BE(p + 6);
+
+      const size_t bytesAfterHeader = n - kChunkHeaderBytes;
+      const bool looksChunked = (chunkCount > 0) && (chunkIndex < chunkCount) && (payloadLen == bytesAfterHeader);
+
+      if (looksChunked) {
+        if (!g_rxChunkActive || msgId != g_rxMessageId || chunkCount != g_rxChunkCount) {
+          g_rxChunkActive = true;
+          g_rxMessageId = msgId;
+          g_rxChunkCount = chunkCount;
+          g_rxChunks.clear();
+          g_rxChunks.resize(chunkCount);
+        }
+
+        g_rxChunks[chunkIndex] = String((const char*)(p + kChunkHeaderBytes)).substring(0, payloadLen);
+
+        bool complete = true;
+        for (uint8_t i = 0; i < g_rxChunkCount; ++i) {
+          if (g_rxChunks[i].length() == 0) {
+            complete = false;
+            break;
+          }
+        }
+
+        if (!complete) return;
+
+        String assembled;
+        for (uint8_t i = 0; i < g_rxChunkCount; ++i) {
+          assembled += g_rxChunks[i];
+        }
+        g_pendingRequest = assembled;
+        g_hasPendingRequest = true;
+
+        g_rxChunkActive = false;
+        g_rxChunks.clear();
+        return;
+      }
+    }
+
+    g_pendingRequest = String(raw.c_str());
     g_hasPendingRequest = true;
   }
 };
@@ -381,4 +521,40 @@ void bleLoop() {
 
 bool bleIsConnected() {
   return g_bleConnected;
+}
+
+void blePublishTelemetryEvent(const sensor_data_message_t& sample, const uint8_t mac[6]) {
+  if (!g_bleConnected || !g_statusChar) return;
+
+  String payload;
+  payload.reserve(360);
+  payload += "{\"type\":\"node_telemetry_event\",\"timestampUnix\":";
+  payload += String(nowUnix());
+  payload += ",\"data\":{";
+  payload += "\"nodeId\":\"";
+  payload += jsonEscape(String(sample.nodeId));
+  payload += "\",";
+  payload += "\"mac\":\"";
+  payload += macToString(mac);
+  payload += "\",";
+  payload += "\"sensorId\":";
+  payload += String((unsigned)sample.sensorId);
+  payload += ",";
+  payload += "\"sensorType\":\"";
+  payload += jsonEscape(String(sample.sensorType));
+  payload += "\",";
+  payload += "\"sensorLabel\":\"";
+  payload += jsonEscape(String(sample.sensorLabel));
+  payload += "\",";
+  payload += "\"value\":";
+  payload += String(sample.value, 3);
+  payload += ",";
+  payload += "\"nodeTimestamp\":";
+  payload += String((unsigned long)sample.nodeTimestamp);
+  payload += ",";
+  payload += "\"qualityFlags\":";
+  payload += String((unsigned)sample.qualityFlags);
+  payload += "}}";
+
+  sendStatusNotify(payload);
 }
