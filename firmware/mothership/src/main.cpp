@@ -16,8 +16,10 @@
 #include "time/rtc_manager.h"
 #include "storage/sd_manager.h"
 #include "comms/espnow_manager.h"
+#include "ble/ble_manager.h"
 #include "protocol.h"
 #include <Preferences.h>
+#include <RTClib.h>
 
 // ---------- Device identification and WiFi ----------
 const char* DEVICE_ID = "001";  // Simplified ID
@@ -258,6 +260,292 @@ static void logBootSummary() {
   }
 
   Serial.println("==================================================");
+}
+
+static String buildBleStatusDataJson() {
+  auto allNodes = getRegisteredNodes();
+
+  size_t deployedCount = 0;
+  for (const auto& n : allNodes) {
+    if (n.state == DEPLOYED) deployedCount++;
+  }
+
+  const size_t pairedCount = getPairedNodes().size();
+  const size_t unpairedCount = getUnpairedNodes().size();
+
+  String json;
+  json.reserve(420);
+  json += "{";
+  json += "\"deviceId\":\"";
+  json += DEVICE_ID;
+  json += "\",";
+  json += "\"firmwareVersion\":\"";
+  json += FW_VERSION;
+  json += "\",";
+  json += "\"firmwareBuild\":\"";
+  json += FW_BUILD;
+  json += "\",";
+  json += "\"rtcUnix\":";
+  json += String(getRTCTimeUnix());
+  json += ",";
+  json += "\"apEnabled\":";
+  const wifi_mode_t mode = WiFi.getMode();
+  const bool apEnabled = (mode == WIFI_MODE_AP || mode == WIFI_MODE_APSTA);
+  json += apEnabled ? "true" : "false";
+  json += ",";
+  json += "\"espnowChannel\":";
+  json += String(ESPNOW_CHANNEL);
+  json += ",";
+  json += "\"wakeIntervalMinutes\":";
+  json += String(gWakeIntervalMin);
+  json += ",";
+  json += "\"syncIntervalMinutes\":";
+  json += String(gSyncIntervalMin);
+  json += ",";
+  json += "\"fleet\":{";
+  json += "\"total\":";
+  json += String((unsigned)allNodes.size());
+  json += ",";
+  json += "\"unpaired\":";
+  json += String((unsigned)unpairedCount);
+  json += ",";
+  json += "\"paired\":";
+  json += String((unsigned)pairedCount);
+  json += ",";
+  json += "\"deployed\":";
+  json += String((unsigned)deployedCount);
+  json += "}";
+  json += "}";
+  return json;
+}
+
+static String jsonEscapeLocal(const String& in) {
+  String out;
+  out.reserve(in.length() + 8);
+  for (size_t i = 0; i < in.length(); ++i) {
+    const char c = in[i];
+    if (c == '\\' || c == '"') {
+      out += '\\';
+      out += c;
+    } else if (c == '\n') {
+      out += "\\n";
+    } else if (c == '\r') {
+      out += "\\r";
+    } else if (c == '\t') {
+      out += "\\t";
+    } else {
+      out += c;
+    }
+  }
+  return out;
+}
+
+static String extractJsonStringFieldLocal(const String& json, const char* key) {
+  if (!key || !*key) return "";
+
+  String needle = String("\"") + key + "\"";
+  int keyPos = json.indexOf(needle);
+  if (keyPos < 0) return "";
+
+  int colonPos = json.indexOf(':', keyPos + needle.length());
+  if (colonPos < 0) return "";
+
+  int startQuote = json.indexOf('"', colonPos + 1);
+  if (startQuote < 0) return "";
+
+  String value;
+  bool escape = false;
+  for (int i = startQuote + 1; i < (int)json.length(); ++i) {
+    const char c = json[i];
+    if (escape) {
+      value += c;
+      escape = false;
+      continue;
+    }
+    if (c == '\\') {
+      escape = true;
+      continue;
+    }
+    if (c == '"') return value;
+    value += c;
+  }
+  return "";
+}
+
+static bool extractJsonIntFieldLocal(const String& json, const char* key, long& outValue) {
+  String needle = String("\"") + key + "\"";
+  int keyPos = json.indexOf(needle);
+  if (keyPos < 0) return false;
+
+  int colonPos = json.indexOf(':', keyPos + needle.length());
+  if (colonPos < 0) return false;
+
+  int i = colonPos + 1;
+  while (i < (int)json.length() && (json[i] == ' ' || json[i] == '\t' || json[i] == '\r' || json[i] == '\n')) i++;
+  if (i >= (int)json.length()) return false;
+
+  int start = i;
+  if (json[i] == '-') i++;
+  while (i < (int)json.length() && json[i] >= '0' && json[i] <= '9') i++;
+  if (i == start || (i == start + 1 && json[start] == '-')) return false;
+
+  outValue = json.substring(start, i).toInt();
+  return true;
+}
+
+static bool isAllowedInterval(int interval) {
+  for (size_t i = 0; i < kAllowedCount; ++i) {
+    if (interval == kAllowedIntervals[i]) return true;
+  }
+  return false;
+}
+
+static String buildListNodesDataJson() {
+  auto nodes = getRegisteredNodes();
+
+  String json;
+  json.reserve(300 + (nodes.size() * 120));
+  json += "{\"nodes\":[";
+  for (size_t i = 0; i < nodes.size(); ++i) {
+    const auto& n = nodes[i];
+    if (i > 0) json += ",";
+    json += "{";
+    json += "\"nodeId\":\"";
+    json += jsonEscapeLocal(n.nodeId);
+    json += "\",";
+    json += "\"nodeType\":\"";
+    json += jsonEscapeLocal(n.nodeType);
+    json += "\",";
+    json += "\"state\":\"";
+    json += nodeStateToString(n.state);
+    json += "\",";
+    json += "\"lastSeenMs\":";
+    json += String((unsigned long)n.lastSeen);
+    json += ",";
+    json += "\"isActive\":";
+    json += n.isActive ? "true" : "false";
+    json += "}";
+  }
+  json += "]}";
+  return json;
+}
+
+static bool handleBleCommand(
+  const String& command,
+  const String& payloadJson,
+  String& responseType,
+  String& responseDataJson,
+  String& responseMessage,
+  String& errorCode,
+  String& errorMessage
+) {
+  String cmd = command;
+  if (cmd.endsWith("_request")) {
+    cmd = cmd.substring(0, cmd.length() - 8);
+  }
+
+  if (cmd == "discover_nodes") {
+    bool sent = sendDiscoveryBroadcast();
+    if (!sent) {
+      errorCode = "DISCOVERY_FAILED";
+      errorMessage = "Failed to send discovery broadcast";
+      return false;
+    }
+    responseType = "discover_nodes_result";
+    responseDataJson = "{\"broadcastSent\":true}";
+    responseMessage = "Discovery broadcast sent";
+    return true;
+  }
+
+  if (cmd == "list_nodes") {
+    responseType = "list_nodes_result";
+    responseDataJson = buildListNodesDataJson();
+    return true;
+  }
+
+  if (cmd == "set_time") {
+    long ts = 0;
+    if (!extractJsonIntFieldLocal(payloadJson, "timestampUnix", ts) || ts <= 0) {
+      errorCode = "INVALID_PAYLOAD";
+      errorMessage = "set_time requires payload.timestampUnix (seconds)";
+      return false;
+    }
+    DateTime dt((uint32_t)ts);
+    bool ok = setRTCTime(dt.year(), dt.month(), dt.day(), dt.hour(), dt.minute(), dt.second());
+    if (!ok) {
+      errorCode = "SET_TIME_FAILED";
+      errorMessage = "Failed to set RTC time";
+      return false;
+    }
+    responseType = "ack";
+    responseDataJson = String("{\"command\":\"set_time\",\"rtcUnix\":") + String(getRTCTimeUnix()) + "}";
+    responseMessage = "RTC updated";
+    return true;
+  }
+
+  if (cmd == "set_wake_interval") {
+    long iv = 0;
+    if (!extractJsonIntFieldLocal(payloadJson, "intervalMinutes", iv)) {
+      extractJsonIntFieldLocal(payloadJson, "interval", iv);
+    }
+    int interval = (int)iv;
+    if (!isAllowedInterval(interval)) {
+      errorCode = "INVALID_INTERVAL";
+      errorMessage = "Interval must be one of: 1, 5, 10, 20, 30, 60";
+      return false;
+    }
+
+    bool sent = broadcastWakeInterval(interval);
+    gWakeIntervalMin = interval;
+    saveWakeIntervalToNVS(interval);
+
+    responseType = "ack";
+    responseDataJson = String("{\"command\":\"set_wake_interval\",\"intervalMinutes\":")
+      + String(interval)
+      + ",\"broadcastSent\":"
+      + (sent ? "true" : "false")
+      + "}";
+    responseMessage = sent ? "Wake schedule broadcast sent" : "No eligible paired/deployed nodes";
+    return true;
+  }
+
+  if (cmd == "set_sync_interval") {
+    long iv = 0;
+    if (!extractJsonIntFieldLocal(payloadJson, "intervalMinutes", iv)) {
+      extractJsonIntFieldLocal(payloadJson, "syncIntervalMinutes", iv);
+    }
+    int interval = (int)iv;
+    if (!isAllowedInterval(interval)) {
+      errorCode = "INVALID_INTERVAL";
+      errorMessage = "Interval must be one of: 1, 5, 10, 20, 30, 60";
+      return false;
+    }
+
+    long phase = 0;
+    if (!extractJsonIntFieldLocal(payloadJson, "phaseUnix", phase) || phase <= 0) {
+      phase = (long)getRTCTimeUnix();
+    }
+
+    bool sent = broadcastSyncSchedule(interval, (unsigned long)phase);
+    gSyncIntervalMin = interval;
+    gLastSyncSchedBroadcastMs = millis();
+    saveSyncIntervalToNVS(interval);
+
+    responseType = "ack";
+    responseDataJson = String("{\"command\":\"set_sync_interval\",\"intervalMinutes\":")
+      + String(interval)
+      + ",\"phaseUnix\":"
+      + String((unsigned long)phase)
+      + ",\"broadcastSent\":"
+      + (sent ? "true" : "false")
+      + "}";
+    responseMessage = sent ? "Sync schedule broadcast sent" : "No eligible paired/deployed nodes";
+    return true;
+  }
+
+  errorCode = "UNKNOWN_COMMAND";
+  errorMessage = "Command not implemented in Phase B";
+  return false;
 }
 
 
@@ -1206,6 +1494,9 @@ void setup() {
   Serial.println("Starting ESP-NOW setup...");
   setupESPNOW();
 
+  Serial.println("Starting BLE GATT setup...");
+  bleSetup(DEVICE_ID, FW_VERSION, buildBleStatusDataJson, getRTCTimeUnix, handleBleCommand);
+
   char timeStr[32];
   getRTCTimeString(timeStr, sizeof(timeStr));
   Serial.print("Current RTC Time: "); Serial.println(timeStr);
@@ -1264,6 +1555,7 @@ void setup() {
 void loop() {
   server.handleClient();
   espnow_loop(); // Handle ESP-NOW node management
+  bleLoop();
 
   // Re-broadcast sync schedule as a keepalive so nodes that recently woke can align.
   static const unsigned long kSyncSchedRebroadcastMs = 5UL * 60UL * 1000UL;
