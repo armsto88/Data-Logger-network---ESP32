@@ -37,6 +37,82 @@ bool muxSelectChannel(uint8_t ch) {
 // Hardware
 RTC_DS3231 rtc;
 
+#ifndef ENABLE_POWER_HOLD_CONTROL
+#define ENABLE_POWER_HOLD_CONTROL 1
+#endif
+
+#ifndef PWR_HOLD_PIN
+#define PWR_HOLD_PIN -1
+#endif
+
+#ifndef PWR_HOLD_ACTIVE_HIGH
+#define PWR_HOLD_ACTIVE_HIGH 1
+#endif
+
+// Post-wake command window: keep ESP-NOW alive for N ms after HELLO to receive
+// CONFIG_SNAPSHOT or other commands before the power cut. Set 0 to disable.
+#ifndef POST_WAKE_WINDOW_MS
+#define POST_WAKE_WINDOW_MS 1500
+#endif
+
+#if ENABLE_POWER_HOLD_CONTROL && (PWR_HOLD_PIN >= 0)
+static const uint8_t kPwrHoldOnLevel  = PWR_HOLD_ACTIVE_HIGH ? HIGH : LOW;
+static const uint8_t kPwrHoldOffLevel = PWR_HOLD_ACTIVE_HIGH ? LOW  : HIGH;
+static bool gPowerCutRequested = false;
+static uint32_t gPowerCutAtMs = 0;
+#endif
+
+static void initPowerHoldControl() {
+#if ENABLE_POWER_HOLD_CONTROL && (PWR_HOLD_PIN >= 0)
+  pinMode(PWR_HOLD_PIN, OUTPUT);
+  digitalWrite(PWR_HOLD_PIN, kPwrHoldOffLevel);
+  Serial.printf("[PWR_HOLD] enabled on pin=%d active=%s\n",
+                PWR_HOLD_PIN,
+                PWR_HOLD_ACTIVE_HIGH ? "HIGH" : "LOW");
+#else
+  Serial.println("[PWR_HOLD] disabled (set PWR_HOLD_PIN>=0 and ENABLE_POWER_HOLD_CONTROL=1 to use RTC power gating)");
+#endif
+}
+
+static void assertPowerHold(const char* reason) {
+#if ENABLE_POWER_HOLD_CONTROL && (PWR_HOLD_PIN >= 0)
+  digitalWrite(PWR_HOLD_PIN, kPwrHoldOnLevel);
+  Serial.printf("[PWR_HOLD] asserted (%s)\n", reason ? reason : "n/a");
+#else
+  (void)reason;
+#endif
+}
+
+static void schedulePowerCut(const char* reason, uint32_t delayMs = 20) {
+#if ENABLE_POWER_HOLD_CONTROL && (PWR_HOLD_PIN >= 0)
+  gPowerCutRequested = true;
+  gPowerCutAtMs = millis() + delayMs;
+  Serial.printf("[PWR_HOLD] release scheduled in %lu ms (%s)\n",
+                (unsigned long)delayMs,
+                reason ? reason : "n/a");
+#else
+  (void)reason;
+  (void)delayMs;
+#endif
+}
+
+static void processPowerCut() {
+#if ENABLE_POWER_HOLD_CONTROL && (PWR_HOLD_PIN >= 0)
+  if (!gPowerCutRequested) return;
+
+  const int32_t waitMs = (int32_t)(gPowerCutAtMs - millis());
+  if (waitMs > 0) return;
+
+  Serial.println("[PWR_HOLD] releasing hold now (expect power-off)");
+  digitalWrite(PWR_HOLD_PIN, kPwrHoldOffLevel);
+  delay(20);
+
+  while (true) {
+    delay(1000);
+  }
+#endif
+}
+
 // ---- DS3231 helpers ----
 
 static inline void formatTime(const DateTime& dt, char* out, size_t n) {
@@ -330,6 +406,9 @@ static void onDataReceived(const uint8_t *mac, const uint8_t *incomingData, int 
 static void sendTimeSyncRequest();
 static void sendDiscoveryRequest();
 static void sendPairingRequest();
+static void sendNodeHello();
+static uint8_t getNodeConfigVersion();
+static void setNodeConfigVersion(uint8_t v);
 static bool bringupEspNow();
 static void shutdownEspNow();
 static bool shouldSyncAt(uint32_t unixNow);
@@ -741,6 +820,56 @@ static void onDataReceived(const uint8_t *mac, const uint8_t *incomingData, int 
     }
     return;
   }
+
+  // 9) CONFIG_SNAPSHOT from mothership (pull handshake response)
+  if (len == sizeof(config_snapshot_message_t)) {
+    config_snapshot_message_t snap{};
+    memcpy(&snap, incomingData, sizeof(snap));
+
+    if (strcmp(snap.command, "CONFIG_SNAPSHOT") == 0) {
+      uint8_t currentVer = getNodeConfigVersion();
+      Serial.printf("📦 CONFIG_SNAPSHOT received: v%u (current v%u) wakeMin=%u syncMin=%u\n",
+                    snap.configVersion, currentVer,
+                    snap.wakeIntervalMin, snap.syncIntervalMin);
+
+      config_apply_ack_message_t ack{};
+      strcpy(ack.command, "CONFIG_ACK");
+      strncpy(ack.nodeId, NODE_ID, sizeof(ack.nodeId) - 1);
+      ack.appliedVersion = snap.configVersion;
+      ack.ok = 0;
+
+      if (snap.configVersion > currentVer) {
+        // Apply: wake interval
+        if (snap.wakeIntervalMin > 0 && snap.wakeIntervalMin != g_intervalMin) {
+          g_intervalMin = snap.wakeIntervalMin;
+          // Re-arm already happens at end of alarm cycle; just update state
+          Serial.printf("   ↪ wake interval updated: %u min\n", g_intervalMin);
+        }
+        // Apply: sync schedule
+        if (snap.syncIntervalMin > 0) {
+          g_syncIntervalMin = snap.syncIntervalMin;
+          g_syncPhaseUnix   = snap.syncPhaseUnix;
+          g_lastSyncSlot    = 0xFFFFFFFFUL;
+          Serial.printf("   ↪ sync schedule updated: %u min, phase=%lu\n",
+                        g_syncIntervalMin, (unsigned long)g_syncPhaseUnix);
+        }
+        setNodeConfigVersion(snap.configVersion);
+        persistNodeConfig();
+        ack.ok = 1;
+        Serial.printf("   ↪ Config v%u applied OK\n", snap.configVersion);
+      } else {
+        Serial.printf("   ↪ Config v%u not newer than current v%u; ignored\n",
+                      snap.configVersion, currentVer);
+        ack.ok = 1; // still ACK so mothership knows we're current
+      }
+
+      // Send ACK back to mothership
+      esp_wifi_set_channel(ESPNOW_CHANNEL, WIFI_SECOND_CHAN_NONE);
+      esp_now_send(mac, (uint8_t*)&ack, sizeof(ack));
+      Serial.printf("   ↪ CONFIG_ACK sent (v%u ok=%d)\n", ack.appliedVersion, ack.ok);
+    }
+    return;
+  }
 }
 
 // ==================== Actions ======================
@@ -795,6 +924,44 @@ static void sendPairingRequest() {
   Serial.println(res == ESP_OK ? "📋 Pairing status request sent" : "❌ Pairing request failed");
 }
 
+// Pull-handshake: current config version persisted in NVS
+static uint8_t getNodeConfigVersion() {
+  Preferences p;
+  if (!p.begin("node_cfg", true)) return 0;
+  uint8_t v = p.getUChar("cfgVer", 0);
+  p.end();
+  return v;
+}
+
+static void setNodeConfigVersion(uint8_t v) {
+  Preferences p;
+  if (!p.begin("node_cfg", false)) return;
+  p.putUChar("cfgVer", v);
+  p.end();
+}
+
+// Send NODE_HELLO to mothership at top of each wake cycle (before data flush)
+static void sendNodeHello() {
+  if (!hasMothershipMAC()) return;
+  if (!bringupEspNow()) return;
+
+  node_hello_message_t hello{};
+  strcpy(hello.command, "NODE_HELLO");
+  strncpy(hello.nodeId,   NODE_ID,   sizeof(hello.nodeId)   - 1);
+  strncpy(hello.nodeType, NODE_TYPE, sizeof(hello.nodeType) - 1);
+  hello.configVersion   = getNodeConfigVersion();
+  hello.wakeIntervalMin = g_intervalMin;
+  hello.queueDepth      = (uint8_t)min((int)local_queue::count(), 255);
+  hello.rtcUnix         = rtc.now().unixtime();
+
+  // bringupEspNow() already registers the mothership peer; send directly
+  esp_wifi_set_channel(ESPNOW_CHANNEL, WIFI_SECOND_CHAN_NONE);
+  esp_err_t res = esp_now_send(mothershipMAC, (uint8_t*)&hello, sizeof(hello));
+  Serial.printf("👋 NODE_HELLO sent: cfgV=%u wakeMin=%u qDepth=%u : %s\n",
+                hello.configVersion, hello.wakeIntervalMin, hello.queueDepth,
+                res == ESP_OK ? "OK" : esp_err_to_name(res));
+}
+
 static void sendSensorData() {
   captureSensorsToQueue();
 
@@ -827,6 +994,14 @@ static void handleRtcAlarmEvent() {
   // 1) Sample to queue every alarm, flush only on sync schedule slots.
   NodeState s = currentNodeState();
   if (s == STATE_DEPLOYED && rtcSynced && hasMothershipMAC()) {
+    // Pull-handshake: announce wake, pick up any pending config update
+    sendNodeHello();
+#if POST_WAKE_WINDOW_MS > 0
+    // Post-wake command window: stay awake for incoming CONFIG_SNAPSHOT
+    Serial.printf("⏳ Post-wake window: %d ms\n", POST_WAKE_WINDOW_MS);
+    delay(POST_WAKE_WINDOW_MS);
+#endif
+
     Serial.println("🧾 Alarm → capture sensors to local queue (sync on schedule)");
     sendSensorData();
   } else {
@@ -861,6 +1036,14 @@ static void handleRtcAlarmEvent() {
   uint8_t a1fAfter = readDS3231_A1F();
   Serial.printf("🔚 DS3231 A1F cleared → A1F(after)=%u\n", a1fAfter);
   Serial.println("   → Alarm cycle complete");
+
+  if (currentNodeState() == STATE_DEPLOYED) {
+    // Ensure WiFi/ESP-NOW is off before releasing power hold.
+    // HELLO may have left it up if this was not a sync slot.
+    shutdownEspNow();
+    // Power can be dropped once sampling/sync work is done and next wake is armed.
+    schedulePowerCut("alarm cycle complete + next wake armed");
+  }
 }
 
 // -------------------- I2C / Mux / ADS1115 Self-test --------------------
@@ -914,6 +1097,9 @@ static void testI2CBusesMuxAndADS() {
 void setup() {
   Serial.begin(115200);
   delay(2000);
+
+  initPowerHoldControl();
+  assertPowerHold("boot");
 
   initNVS();
   loadNodeConfig();
@@ -1027,6 +1213,8 @@ void loop() {
 
   unsigned long nowMs = millis();
   NodeState st = currentNodeState();
+
+  processPowerCut();
 
   loopCounter++;
 

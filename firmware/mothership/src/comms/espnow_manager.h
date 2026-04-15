@@ -37,7 +37,24 @@ struct NodeInfo {
 
     // NEW: millis() at last TIME_SYNC sent from mothership to this node (0 = never)
     uint32_t  lastTimeSyncMs;
+    // Wake interval last sent to this node via SET_SCHEDULE (0 = not yet scheduled)
+    uint8_t   wakeIntervalMin;
+    // Last config version ACKed by this node (0 = never applied)
+    uint8_t   configVersionApplied;
 };
+
+// Desired configuration for each node, stored in mothership NVS.
+// Bumping configVersion causes mothership to push a CONFIG_SNAPSHOT on next HELLO.
+struct NodeDesiredConfig {
+    uint8_t  configVersion;
+    uint8_t  wakeIntervalMin;
+    uint16_t syncIntervalMin;
+    uint32_t syncPhaseUnix;
+};
+
+// Get/set the desired config for a node by its firmware nodeId.
+NodeDesiredConfig getDesiredConfig(const char* nodeId);
+void setDesiredConfig(const char* nodeId, const NodeDesiredConfig& cfg);
 
 typedef void (*SensorDataEventCallback)(const sensor_data_message_t& sample, const uint8_t mac[6]);
 
@@ -47,6 +64,10 @@ typedef void (*SensorDataEventCallback)(const sensor_data_message_t& sample, con
 // -----------------------------------------------------------------------------
 void setupESPNOW();
 void espnow_loop();
+
+// Handle a NODE_HELLO received from a node (called from OnDataRecv).
+// Sends CONFIG_SNAPSHOT back if mothership has a newer config version.
+void handleNodeHello(const uint8_t* senderMac, const node_hello_message_t& hello);
 
 // -----------------------------------------------------------------------------
 // Commands / broadcasts (mothership -> nodes)

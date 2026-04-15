@@ -117,8 +117,12 @@ bool enqueue(uint32_t sampleUnix,
   if (!g_ready && !begin()) return false;
 
   if (g_blob.used >= kCapacity) {
-    Serial.println("[QUEUE] full; enqueue rejected");
-    return false;
+    // DROP_OLDEST: overwrite the tail (oldest) entry to make room
+    Serial.printf("[QUEUE] full (%u/%u); dropping oldest (seq=%lu) for DROP_OLDEST policy\n",
+                  (unsigned)g_blob.used, (unsigned)kCapacity,
+                  (unsigned long)g_blob.records[g_blob.tail].sampleSeq);
+    g_blob.tail = (uint16_t)((g_blob.tail + 1) % kCapacity);
+    g_blob.used--;
   }
 
   QueuedSample rec{};

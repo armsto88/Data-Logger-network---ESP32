@@ -118,7 +118,9 @@ void registerNode(const uint8_t* mac,
     n.channel  = ESPNOW_CHANNEL;
 
     // NEW:
-    n.lastTimeSyncMs = 0;
+    n.lastTimeSyncMs       = 0;
+    n.wakeIntervalMin      = 0;
+    n.configVersionApplied = 0;
 
     // Populate user-facing meta from NVS for immediate consistency
     n.userId = getNodeUserId(n.nodeId);
@@ -353,6 +355,33 @@ static void OnDataRecv(const uint8_t * mac,
         return;
     }
 
+    // 5) NODE_HELLO pull handshake
+    if (len == sizeof(node_hello_message_t)) {
+        node_hello_message_t hello{};
+        memcpy(&hello, incomingBytes, sizeof(hello));
+        if (strcmp(hello.command, "NODE_HELLO") == 0) {
+            handleNodeHello(mac, hello);
+        }
+        return;
+    }
+
+    // 6) CONFIG_APPLY_ACK from node after applying CONFIG_SNAPSHOT
+    if (len == sizeof(config_apply_ack_message_t)) {
+        config_apply_ack_message_t ack{};
+        memcpy(&ack, incomingBytes, sizeof(ack));
+        if (strcmp(ack.command, "CONFIG_ACK") == 0) {
+            Serial.printf("✅ CONFIG_ACK from %s: appliedV=%u ok=%d\n",
+                          ack.nodeId, ack.appliedVersion, ack.ok);
+            for (auto& n : registeredNodes) {
+                if (n.nodeId == String(ack.nodeId)) {
+                    if (ack.ok) n.configVersionApplied = ack.appliedVersion;
+                    break;
+                }
+            }
+        }
+        return;
+    }
+
     // (any other packet types can be handled here if needed)
 }
 
@@ -400,7 +429,11 @@ void espnow_loop() {
 
     // Mark nodes inactive if not seen for 5 min
     for (auto& n : registeredNodes) {
-        if (n.isActive && (now - n.lastSeen > 300000UL)) {
+        // Adaptive threshold: 3× wake cycle + 2 min guard, fallback 5 min pre-schedule
+        uint32_t inactiveThreshMs = (n.wakeIntervalMin > 0)
+            ? (uint32_t)n.wakeIntervalMin * 3UL * 60000UL + 120000UL
+            : 300000UL;
+        if (n.isActive && (now - n.lastSeen > inactiveThreshMs)) {
             n.isActive = false;
             Serial.printf("⚠️ Node %s (%s) marked inactive (state=%s)\n",
                           n.nodeId.c_str(),
@@ -514,8 +547,9 @@ void loadPairedNodes() {
         newNode.channel  = ESPNOW_CHANNEL;
 
         // NEW:
-        newNode.lastTimeSyncMs = 0;
-
+        newNode.lastTimeSyncMs       = 0;
+        newNode.wakeIntervalMin      = 0;
+        newNode.configVersionApplied = 0;
 
         // Hydrate user-facing meta from node_meta
         newNode.userId = getNodeUserId(newNode.nodeId);
@@ -546,7 +580,7 @@ bool broadcastWakeInterval(int intervalMinutes) {
 
     bool anySent = false;
 
-    for (const auto& node : registeredNodes) {
+    for (auto& node : registeredNodes) {
         if (node.state != PAIRED && node.state != DEPLOYED) continue;
 
         ensurePeerOnChannel(node.mac, ESPNOW_CHANNEL);
@@ -558,9 +592,92 @@ bool broadcastWakeInterval(int intervalMinutes) {
                       node.nodeId.c_str(),
                       stateToStr(node.state),
                       (res==ESP_OK) ? "OK" : esp_err_to_name(res));
-        if (res == ESP_OK) anySent = true;
+        if (res == ESP_OK) {
+            anySent = true;
+            node.wakeIntervalMin = (uint8_t)min(intervalMinutes, 255);
+        }
     }
     return anySent;
+}
+
+// ===== Pull-handshake: desired config store + NODE_HELLO handler =====
+
+NodeDesiredConfig getDesiredConfig(const char* nodeId) {
+    Preferences prefs;
+    NodeDesiredConfig cfg{};
+    String key = String("dc_") + nodeId;
+    // Truncate key to 14 chars max (NVS namespace limit is 15)
+    if (key.length() > 14) key = key.substring(0, 14);
+    if (!prefs.begin("node_dcfg", true)) return cfg;
+    cfg.configVersion   = prefs.getUChar((key + "v").c_str(), 0);
+    cfg.wakeIntervalMin = prefs.getUChar((key + "w").c_str(), 0);
+    cfg.syncIntervalMin = prefs.getUShort((key + "s").c_str(), 15);
+    cfg.syncPhaseUnix   = prefs.getULong((key + "p").c_str(), 0);
+    prefs.end();
+    return cfg;
+}
+
+void setDesiredConfig(const char* nodeId, const NodeDesiredConfig& cfg) {
+    Preferences prefs;
+    String key = String("dc_") + nodeId;
+    if (key.length() > 14) key = key.substring(0, 14);
+    if (!prefs.begin("node_dcfg", false)) {
+        Serial.println("❌ setDesiredConfig: NVS open failed");
+        return;
+    }
+    prefs.putUChar((key + "v").c_str(), cfg.configVersion);
+    prefs.putUChar((key + "w").c_str(), cfg.wakeIntervalMin);
+    prefs.putUShort((key + "s").c_str(), cfg.syncIntervalMin);
+    prefs.putULong((key + "p").c_str(), cfg.syncPhaseUnix);
+    prefs.end();
+    Serial.printf("💾 setDesiredConfig: %s v=%u wakeMin=%u syncMin=%u\n",
+                  nodeId, cfg.configVersion, cfg.wakeIntervalMin, cfg.syncIntervalMin);
+}
+
+void handleNodeHello(const uint8_t* senderMac, const node_hello_message_t& hello) {
+    Serial.printf("👋 NODE_HELLO from %s: cfgV=%u wakeMin=%u qDepth=%u rtcUnix=%lu\n",
+                  hello.nodeId, hello.configVersion,
+                  hello.wakeIntervalMin, hello.queueDepth,
+                  (unsigned long)hello.rtcUnix);
+
+    // Register/refresh the node as active (HELLO counts as contact)
+    registerNode(senderMac, hello.nodeId, hello.nodeType, DEPLOYED);
+
+    // Update the per-node wake interval from what the node reports
+    for (auto& n : registeredNodes) {
+        if (n.nodeId == String(hello.nodeId)) {
+            n.wakeIntervalMin = hello.wakeIntervalMin;
+            break;
+        }
+    }
+
+    // Check if we have a newer config to push
+    NodeDesiredConfig desired = getDesiredConfig(hello.nodeId);
+    if (desired.configVersion == 0) {
+        Serial.printf("   ↪ No desired config stored for %s; skipping snapshot\n", hello.nodeId);
+        return;
+    }
+    if (desired.configVersion <= hello.configVersion) {
+        Serial.printf("   ↪ Node config up-to-date (v%u <= v%u)\n",
+                      desired.configVersion, hello.configVersion);
+        return;
+    }
+
+    // Push CONFIG_SNAPSHOT
+    config_snapshot_message_t snap{};
+    strcpy(snap.command, "CONFIG_SNAPSHOT");
+    strncpy(snap.mothership_id, DEVICE_ID, sizeof(snap.mothership_id) - 1);
+    snap.configVersion    = desired.configVersion;
+    snap.wakeIntervalMin  = desired.wakeIntervalMin;
+    snap.syncIntervalMin  = desired.syncIntervalMin;
+    snap.syncPhaseUnix    = desired.syncPhaseUnix;
+
+    ensurePeerOnChannel(senderMac, ESPNOW_CHANNEL);
+    esp_wifi_set_channel(ESPNOW_CHANNEL, WIFI_SECOND_CHAN_NONE);
+    esp_err_t res = esp_now_send(senderMac, (uint8_t*)&snap, sizeof(snap));
+    Serial.printf("   ↪ Sent CONFIG_SNAPSHOT v%u to %s: %s\n",
+                  snap.configVersion, hello.nodeId,
+                  (res == ESP_OK) ? "OK" : esp_err_to_name(res));
 }
 
 bool broadcastSyncSchedule(int syncIntervalMinutes, unsigned long phaseUnix) {
@@ -652,7 +769,19 @@ bool broadcastTimeSyncAll() {
         uint32_t nowLogMs = millis();
         if (g_lastNoEligibleLogMs == 0 ||
             (uint32_t)(nowLogMs - g_lastNoEligibleLogMs) >= NO_ELIGIBLE_LOG_INTERVAL_MS) {
-            Serial.println("⚠️ Fleet TIME_SYNC: no eligible PAIRED/DEPLOYED nodes");
+            // Distinguish "nodes exist but sleeping" from "no nodes registered at all"
+            bool hasPairedOrDeployed = false;
+            for (const auto& node : registeredNodes) {
+                if (node.state == PAIRED || node.state == DEPLOYED) {
+                    hasPairedOrDeployed = true;
+                    break;
+                }
+            }
+            if (hasPairedOrDeployed) {
+                Serial.println("💤 Fleet TIME_SYNC: PAIRED/DEPLOYED nodes exist but all asleep (isActive=false) — will retry when awake");
+            } else {
+                Serial.println("⚠️ Fleet TIME_SYNC: no PAIRED/DEPLOYED nodes registered");
+            }
             g_lastNoEligibleLogMs = nowLogMs;
         }
     } else {

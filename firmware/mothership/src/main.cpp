@@ -2,6 +2,7 @@
 
 // ---------- Config toggles ----------
 #define ENABLE_SPIFFS_ASSETS 0  // set to 1 if you upload /style.css.gz and /app.js.gz
+#define ENABLE_WIFI_AP_WEBSERVER 1  // set to 1 to enable AP + web UI
 
 // ---------- Includes ----------
 #include <Arduino.h>
@@ -31,8 +32,10 @@ const char* password = "logger123";
 
 Preferences gPrefs;
 int gWakeIntervalMin = 5;          // default shown in UI & used at boot
-int gSyncIntervalMin = 15;         // fleet sync schedule (broadcast)
-unsigned long gLastSyncSchedBroadcastMs = 0;
+int gSyncIntervalMin = 15;         // transport interval still used in sync schedule payload
+int gSyncDailyHour = 6;            // local daily sync trigger time (HH)
+int gSyncDailyMinute = 0;          // local daily sync trigger time (MM)
+long gLastSyncBroadcastEpochDay = -1;
 const int kAllowedIntervals[] = {1, 5, 10, 20, 30, 60};
 const size_t kAllowedCount = sizeof(kAllowedIntervals) / sizeof(kAllowedIntervals[0]);
 
@@ -88,6 +91,86 @@ static void saveSyncIntervalToNVS(int mins) {
     gPrefs.putInt("sync_min", mins);
     gPrefs.end();
   }
+}
+
+static void loadDailySyncTimeFromNVS() {
+  if (gPrefs.begin("ui", true)) {
+    int hh = gPrefs.getInt("sync_hh", gSyncDailyHour);
+    int mm = gPrefs.getInt("sync_mm", gSyncDailyMinute);
+    gPrefs.end();
+
+    if (hh < 0 || hh > 23) hh = 6;
+    if (mm < 0 || mm > 59) mm = 0;
+    gSyncDailyHour = hh;
+    gSyncDailyMinute = mm;
+  }
+}
+
+static void saveDailySyncTimeToNVS(int hh, int mm) {
+  if (gPrefs.begin("ui", false)) {
+    gPrefs.putInt("sync_hh", hh);
+    gPrefs.putInt("sync_mm", mm);
+    gPrefs.end();
+  }
+}
+
+static String formatSyncTimeHHMM(int hh, int mm) {
+  char b[6];
+  snprintf(b, sizeof(b), "%02d:%02d", hh, mm);
+  return String(b);
+}
+
+static bool parseHHMM(const String& hhmm, int& outHour, int& outMinute) {
+  if (hhmm.length() != 5 || hhmm[2] != ':') return false;
+  if (!isDigit(hhmm[0]) || !isDigit(hhmm[1]) || !isDigit(hhmm[3]) || !isDigit(hhmm[4])) return false;
+
+  int hh = (hhmm[0] - '0') * 10 + (hhmm[1] - '0');
+  int mm = (hhmm[3] - '0') * 10 + (hhmm[4] - '0');
+  if (hh < 0 || hh > 23 || mm < 0 || mm > 59) return false;
+
+  outHour = hh;
+  outMinute = mm;
+  return true;
+}
+
+static String computeNextSyncIsoLocal() {
+  const uint32_t nowUnix = getRTCTimeUnix();
+  DateTime now(nowUnix);
+  DateTime next(now.year(), now.month(), now.day(), gSyncDailyHour, gSyncDailyMinute, 0);
+  if (now.unixtime() >= next.unixtime()) {
+    next = DateTime(now.unixtime() + 24UL * 60UL * 60UL);
+    next = DateTime(next.year(), next.month(), next.day(), gSyncDailyHour, gSyncDailyMinute, 0);
+  }
+
+  char b[20];
+  snprintf(b, sizeof(b), "%04d-%02d-%02d %02d:%02d:%02d",
+           next.year(), next.month(), next.day(), next.hour(), next.minute(), next.second());
+  return String(b);
+}
+
+static String computeNextWakeIsoLocal(int intervalMin) {
+  if (intervalMin <= 0) return String("n/a");
+
+  const uint32_t nowUnix = getRTCTimeUnix();
+  DateTime now(nowUnix);
+
+  DateTime base(now.year(), now.month(), now.day(), now.hour(), now.minute(), 0);
+  if (now.second() != 0) {
+    base = base + TimeSpan(0, 0, 1, 0);
+  }
+
+  const int mod = base.minute() % intervalMin;
+  const int addMin = (mod == 0) ? intervalMin : (intervalMin - mod);
+  DateTime next = base + TimeSpan(0, 0, addMin, 0);
+
+  const uint32_t deltaSec = (next.unixtime() > now.unixtime()) ? (next.unixtime() - now.unixtime()) : 0;
+  const uint32_t deltaMin = (deltaSec + 59UL) / 60UL;
+
+  char b[40];
+  snprintf(b, sizeof(b), "%04d-%02d-%02d %02d:%02d:%02d (in %lu min)",
+           next.year(), next.month(), next.day(), next.hour(), next.minute(), next.second(),
+           (unsigned long)deltaMin);
+  return String(b);
 }
 
 // ---------- Node meta helpers (numeric ID + Name in NVS) ----------
@@ -302,6 +385,12 @@ static String buildBleStatusDataJson() {
   json += "\"syncIntervalMinutes\":";
   json += String(gSyncIntervalMin);
   json += ",";
+  json += "\"syncDailyTime\":\"";
+  json += formatSyncTimeHHMM(gSyncDailyHour, gSyncDailyMinute);
+  json += "\",";
+  json += "\"nextSyncLocal\":\"";
+  json += computeNextSyncIsoLocal();
+  json += "\",";
   json += "\"fleet\":{";
   json += "\"total\":";
   json += String((unsigned)allNodes.size());
@@ -543,6 +632,16 @@ static bool handleBleCommand(
     gWakeIntervalMin = interval;
     saveWakeIntervalToNVS(interval);
 
+    // Bump desired config version so CONFIG_SNAPSHOT is pushed on next NODE_HELLO
+    for (const auto& node : registeredNodes) {
+      if (node.state == PAIRED || node.state == DEPLOYED) {
+        NodeDesiredConfig dc = getDesiredConfig(node.nodeId.c_str());
+        dc.wakeIntervalMin = (uint8_t)interval;
+        dc.configVersion   = max((int)dc.configVersion + 1, 1);
+        setDesiredConfig(node.nodeId.c_str(), dc);
+      }
+    }
+
     responseType = "ack";
     responseDataJson = String("{\"command\":\"set_wake_interval\",\"intervalMinutes\":")
       + String(interval)
@@ -572,7 +671,7 @@ static bool handleBleCommand(
 
     bool sent = broadcastSyncSchedule(interval, (unsigned long)phase);
     gSyncIntervalMin = interval;
-    gLastSyncSchedBroadcastMs = millis();
+    gLastSyncBroadcastEpochDay = (long)(((unsigned long)phase) / 86400UL);
     saveSyncIntervalToNVS(interval);
 
     responseType = "ack";
@@ -640,7 +739,7 @@ static bool handleBleCommand(
         const unsigned long phaseUnix = (hasPhase && phase > 0) ? (unsigned long)phase : getRTCTimeUnix();
         syncSent = broadcastSyncSchedule(iv, phaseUnix);
         gSyncIntervalMin = iv;
-        gLastSyncSchedBroadcastMs = millis();
+        gLastSyncBroadcastEpochDay = (long)(phaseUnix / 86400UL);
         saveSyncIntervalToNVS(iv);
       }
     }
@@ -792,6 +891,9 @@ a{color:var(--primary);text-decoration:none}
 .chip--state-deployed{border-color:#c8e6c9;background:#f1f8e9;color:#256029}
 .chip--state-paired{border-color:#ffe0b2;background:#fff3e0;color:#e65100}
 .chip--state-unpaired{border-color:#ffcdd2;background:#ffebee;color:#b71c1c}
+.chip--link-awake{border-color:#b3e5fc;background:#e1f5fe;color:#01579b}
+.chip--link-asleep{border-color:#e1bee7;background:#f3e5f5;color:#4a148c}
+.chip--link-offline{border-color:#ffcdd2;background:#ffebee;color:#b71c1c}
 
 /* Forms */
 .label{display:block;margin:8px 0 6px;color:var(--sub);font-size:.95rem}
@@ -853,15 +955,63 @@ a{color:var(--primary);text-decoration:none}
 )CSS";
 
 const char COMMON_JS[] PROGMEM = R"JS(
-// Prevent double submits
-document.addEventListener('submit', function (e) {
-  const btn = e.target.querySelector('button[type="submit"],input[type="submit"]');
-  if (btn && !btn.disabled) {
-    btn.disabled = true;
-    btn.dataset.originalText = btn.textContent;
-    btn.textContent = 'Working…';
-  }
-}, {capture:true});
+function showUiStatus(message, ok){
+  const box = document.getElementById('ui-status');
+  if (!box) return;
+  box.style.display = 'block';
+  box.style.borderColor = ok ? '#16a34a' : '#dc2626';
+  box.style.color = ok ? '#166534' : '#991b1b';
+  box.textContent = message;
+}
+
+function asFormBody(form){
+  const data = new FormData(form);
+  data.append('ajax', '1');
+  return new URLSearchParams(data);
+}
+
+function wireAsyncForms(){
+  const forms = document.querySelectorAll('form.async-form');
+  forms.forEach(form => {
+    form.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const btn = form.querySelector('button[type="submit"],input[type="submit"]');
+      const original = btn ? (btn.textContent || btn.value) : '';
+      if (btn) {
+        btn.disabled = true;
+        if (btn.tagName === 'INPUT') btn.value = 'Working...';
+        else btn.textContent = 'Working...';
+      }
+
+      try {
+        const resp = await fetch(form.action, {
+          method: 'POST',
+          body: asFormBody(form),
+          headers: {'Content-Type': 'application/x-www-form-urlencoded'}
+        });
+
+        const text = await resp.text();
+        let msg = text;
+        let ok = resp.ok;
+        try {
+          const json = JSON.parse(text);
+          ok = !!json.ok;
+          msg = json.message || (ok ? 'Done' : 'Request failed');
+        } catch (_) {}
+
+        showUiStatus(msg, ok);
+      } catch (err) {
+        showUiStatus('Request failed: ' + err, false);
+      } finally {
+        if (btn) {
+          btn.disabled = false;
+          if (btn.tagName === 'INPUT') btn.value = original;
+          else btn.textContent = original;
+        }
+      }
+    });
+  });
+}
 
 // Set datetime input to browser time
 function setCurrentTime(){
@@ -876,7 +1026,10 @@ function toggleSettings(){
   const showing=panel.style.display==='block';
   panel.style.display = showing ? 'none' : 'block';
 }
-window.onload=setCurrentTime;
+window.addEventListener('DOMContentLoaded', () => {
+  setCurrentTime();
+  wireAsyncForms();
+});
 
 // Live 1s ticking of the displayed RTC time
 (function(){
@@ -913,6 +1066,21 @@ window.onload=setCurrentTime;
   }
 })();
 )JS";
+
+static bool isAjaxRequest() {
+  return server.hasArg("ajax") && server.arg("ajax") == "1";
+}
+
+static void sendAjaxResult(bool ok, const String& message) {
+  String body;
+  body.reserve(message.length() + 40);
+  body += "{\"ok\":";
+  body += ok ? "true" : "false";
+  body += ",\"message\":\"";
+  body += message;
+  body += "\"}";
+  server.send(ok ? 200 : 400, "application/json", body);
+}
 
 // ---------- Common page frame ----------
 static String headCommon(const String& title){
@@ -951,6 +1119,7 @@ void handleNodeConfigForm();
 void handleNodeConfigSave();
 void handleNodesPage();
 void handleSetSyncInterval();
+void handleSetSyncTime();
 
 // ---------- Routes / Handlers ----------
 
@@ -1018,6 +1187,7 @@ void handleRoot() {
   html += F("<div class='section' aria-live='polite'>"
             "<h3>⏱ Timing &amp; RTC</h3>"
             "<p class='muted'>Live DS3231 clock plus the wake interval used by nodes.</p>"
+            "<div id='ui-status' class='help' style='display:none;margin-bottom:10px;border:1px solid var(--border);border-radius:8px;padding:8px 10px'></div>"
             "<div class='row'>");
 
   // Left: RTC
@@ -1031,7 +1201,7 @@ void handleRoot() {
 
   // Right: wake interval
   html += F("<div class='col'>"
-              "<form action='/set-wake-interval' method='POST'>"
+              "<form class='async-form' action='/set-wake-interval' method='POST'>"
               "<label class='label'><strong>Wake interval (minutes)</strong></label>"
               "<select class='input' name='interval'>");
 
@@ -1052,26 +1222,18 @@ void handleRoot() {
             "<div class='help'>Current default: <strong>");
   html += String(gWakeIntervalMin);
   html += F(" min</strong></div>"
-            "</form>"
-            "<form action='/set-sync-interval' method='POST' style='margin-top:12px'>"
-            "<label class='label'><strong>Sync interval (minutes)</strong></label>"
-            "<select class='input' name='interval'>");
-
-  for (size_t i = 0; i < kAllowedCount; ++i) {
-    int v = kAllowedIntervals[i];
-    html += F("<option value='");
-    html += String(v);
-    html += F("'");
-    if (v == gSyncIntervalMin) html += F(" selected");
-    html += F(">");
-    html += String(v);
-    html += F("</option>");
-  }
-
-  html += F("</select>"
+            "</form>");
+  html += F("<form class='async-form' action='/set-sync-time' method='POST' style='margin-top:12px'>"
+            "<label class='label'><strong>Daily sync time</strong></label>"
+            "<input class='input' type='time' name='sync_time' value='");
+  html += formatSyncTimeHHMM(gSyncDailyHour, gSyncDailyMinute);
+  html += F("'>"
             "<button type='submit' class='btn btn--warn' style='margin-top:8px'>"
-            "Broadcast sync schedule</button>"
-            "<div class='help'>Nodes open WiFi at this cadence to flush queued data.</div>"
+            "Set daily sync time</button>"
+            "<div class='help'>Next sync: <strong>");
+  html += computeNextSyncIsoLocal();
+  html += F("</strong>."
+            "</div>"
             "</form>"
             "</div>"); // end col
 
@@ -1128,7 +1290,7 @@ void handleRoot() {
   html += String(unpairedNodes.size());
   html += F("</span></div>"
             "</div>"
-            "<form action='/discover-nodes' method='POST'>"
+            "<form class='async-form' action='/discover-nodes' method='POST'>"
             "<button type='submit' class='btn btn--primary'>🔍 Discover New Nodes</button>"
             "</form>"
             "<a href='/nodes' class='btn btn--success' style='margin-top:8px'>🧩 Open Node Manager</a>"
@@ -1139,9 +1301,6 @@ void handleRoot() {
             "<a href='/' class='btn'>🔄 Refresh</a>"
             "<a href='/download-csv' class='btn btn--success'>⬇️ CSV</a>"
             "</div>");
-
-  // Auto-refresh every 15s (dashboard only)
-  html += F("<script>setTimeout(()=>location.reload(),15000);</script>");
 
   html += footCommon();
   server.send(200, "text/html", html);
@@ -1194,6 +1353,11 @@ void handleDiscoverNodes() {
   Serial.println("🔍 Starting node discovery...");
   sendDiscoveryBroadcast();
 
+  if (isAjaxRequest()) {
+    sendAjaxResult(true, "Discovery broadcast sent");
+    return;
+  }
+
   String html = headCommon("ESP32 Data Logger");
   html += F("<meta http-equiv='refresh' content='3;url=/'>");
   html += F("<div class='section center'><h3>🔍 Discovery Broadcast Sent</h3>"
@@ -1218,10 +1382,25 @@ void handleSetWakeInterval() {
   gWakeIntervalMin = interval;
   saveWakeIntervalToNVS(interval);
 
+  // Bump desired config version so CONFIG_SNAPSHOT is pushed on next NODE_HELLO
+  for (const auto& node : registeredNodes) {
+    if (node.state == PAIRED || node.state == DEPLOYED) {
+      NodeDesiredConfig dc = getDesiredConfig(node.nodeId.c_str());
+      dc.wakeIntervalMin = (uint8_t)interval;
+      dc.configVersion   = max((int)dc.configVersion + 1, 1);
+      setDesiredConfig(node.nodeId.c_str(), dc);
+    }
+  }
+
   // Log with richer serial output
   Serial.printf("[UI] Wake interval set to %d min → broadcast %s\n",
                 interval, sent ? "SENT" : "NOT_SENT");
   logCommandSend("SET_SCHEDULE", String("ALL"), sent, "via /set-wake-interval");
+
+  if (isAjaxRequest()) {
+    sendAjaxResult(true, sent ? "Wake interval broadcast sent" : "No eligible nodes to receive wake interval");
+    return;
+  }
 
   String html = F("<!doctype html><meta name='viewport' content='width=device-width,initial-scale=1'>"
                   "<body style='font-family:sans-serif;padding:20px;text-align:center'>"
@@ -1249,7 +1428,7 @@ void handleSetSyncInterval() {
   bool sent = broadcastSyncSchedule(interval, phaseUnix);
 
   gSyncIntervalMin = interval;
-  gLastSyncSchedBroadcastMs = millis();
+  gLastSyncBroadcastEpochDay = (long)(phaseUnix / 86400UL);
   saveSyncIntervalToNVS(interval);
 
   Serial.printf("[UI] Sync schedule set to %d min phase=%lu -> broadcast %s\n",
@@ -1263,6 +1442,47 @@ void handleSetSyncInterval() {
   html += String(interval);
   html += F(" min.</p><p style='color:#666'>");
   html += sent ? F("Broadcast sent to fleet.") : F("Broadcast failed.");
+  html += F("</p><a href='/' style='display:inline-block;padding:10px 16px;"
+            "background:#2196F3;color:#fff;text-decoration:none;border-radius:6px'>Back</a></body>");
+  server.send(200, "text/html", html);
+}
+
+void handleSetSyncTime() {
+  String hhmm = server.arg("sync_time");
+  int hh = 0;
+  int mm = 0;
+  if (!parseHHMM(hhmm, hh, mm)) {
+    if (isAjaxRequest()) {
+      sendAjaxResult(false, "Invalid sync time. Use HH:MM");
+      return;
+    }
+    String html = F("<!doctype html><meta name='viewport' content='width=device-width,initial-scale=1'>"
+                    "<body style='font-family:sans-serif;padding:20px;text-align:center'>"
+                    "<h3>⚠️ Invalid sync time</h3><p>Please provide HH:MM (24h).</p>"
+                    "<a href='/' style='display:inline-block;padding:10px 16px;"
+                    "background:#2196F3;color:#fff;text-decoration:none;border-radius:6px'>Back</a></body>");
+    server.send(400, "text/html", html);
+    return;
+  }
+
+  gSyncDailyHour = hh;
+  gSyncDailyMinute = mm;
+  saveDailySyncTimeToNVS(hh, mm);
+  gLastSyncBroadcastEpochDay = -1;  // allow immediate trigger when schedule matches current day/time
+
+  Serial.printf("[UI] Daily sync time set to %02d:%02d\n", gSyncDailyHour, gSyncDailyMinute);
+
+  if (isAjaxRequest()) {
+    sendAjaxResult(true, String("Daily sync time set to ") + formatSyncTimeHHMM(gSyncDailyHour, gSyncDailyMinute));
+    return;
+  }
+
+  String html = F("<!doctype html><meta name='viewport' content='width=device-width,initial-scale=1'>"
+                  "<body style='font-family:sans-serif;padding:20px;text-align:center'>"
+                  "<h3>📶 Daily Sync Time Updated</h3><p>New daily sync time: ");
+  html += formatSyncTimeHHMM(gSyncDailyHour, gSyncDailyMinute);
+  html += F("</p><p style='color:#666'>Next sync: ");
+  html += computeNextSyncIsoLocal();
   html += F("</p><a href='/' style='display:inline-block;padding:10px 16px;"
             "background:#2196F3;color:#fff;text-decoration:none;border-radius:6px'>Back</a></body>");
   server.send(200, "text/html", html);
@@ -1399,6 +1619,17 @@ void handleNodeConfigSave() {
   bool scheduleSent = broadcastWakeInterval(interval);
   gWakeIntervalMin  = interval;
   saveWakeIntervalToNVS(interval);
+
+  // Bump desired config version so CONFIG_SNAPSHOT is pushed on next NODE_HELLO
+  for (const auto& node : registeredNodes) {
+    if (node.state == PAIRED || node.state == DEPLOYED) {
+      NodeDesiredConfig dc = getDesiredConfig(node.nodeId.c_str());
+      dc.wakeIntervalMin = (uint8_t)interval;
+      dc.configVersion   = max((int)dc.configVersion + 1, 1);
+      setDesiredConfig(node.nodeId.c_str(), dc);
+    }
+  }
+
   Serial.printf("[CONFIG] Interval via Configure & Start set to %d min, broadcast=%s\n",
                 interval, scheduleSent ? "OK" : "NO_ELIGIBLE_NODES");
   logCommandSend("SET_SCHEDULE", String("ALL"), scheduleSent, "via Configure & Start");
@@ -1546,14 +1777,18 @@ void handleNodeConfigSave() {
 
 void handleNodesPage() {
   String html = headCommon("Node Manager");
-    unsigned long nowMsUi = millis();
+  unsigned long nowMsUi = millis();
 
 
   auto allNodes = getRegisteredNodes();
+  const String nextWake = computeNextWakeIsoLocal(gWakeIntervalMin);
 
   html += F("<div class='section'>"
             "<h3>🧩 Node Manager</h3>"
-            "<p class='muted'>Tap a node to configure its ID, name, interval and start/stop state.</p>");
+            "<p class='muted'>Tap a node to configure its ID, name, interval and start/stop state.</p>"
+            "<div class='help' style='margin:10px 0'>"
+            "Wake flow: RTC alarm powers the node, node asserts <strong>PWR_HOLD</strong>, captures/queues readings, "
+            "re-arms the next alarm, then releases <strong>PWR_HOLD</strong> to power down.</div>");
 
   if (allNodes.empty()) {
     html += F("<p class='muted'>No nodes registered yet. Try discovering and pairing first.</p>");
@@ -1636,16 +1871,32 @@ void handleNodesPage() {
       html += F("</span>"
                 "<div class='health-subtext'>");
       html += healthSub;
-      html += F("</div></div>");
-
+      html += F("</div><div class='health-subtext'><strong>Next wake trigger:</strong> ");
+      if (node.state == DEPLOYED) {
+        html += nextWake;
+      } else {
+        html += F("After deploy (interval currently ");
+        html += String(gWakeIntervalMin);
+        html += F(" min)");
+      }
+      html += F("</div><div class='health-subtext'><strong>After run:</strong> queue sample, sync on schedule slot, then power down.</div>");
+      html += F("</div>");
       html += F("</div>"); // left column
 
-      // Right column: state chip
-      html += F("<div><span class='");
+      // Right column: desired-state chip + link health chip
+      html += F("<div style='text-align:right'><span class='");
       html += stateClass;
       html += F("'>");
       html += stateLabel;
-      html += F("</span></div>"
+      html += F("</span><br>");
+      if (node.isActive) {
+        html += F("<span class='chip chip--link-awake'>AWAKE</span>");
+      } else if (node.state == DEPLOYED) {
+        html += F("<span class='chip chip--link-asleep'>ASLEEP</span>");
+      } else {
+        html += F("<span class='chip chip--link-offline'>OFFLINE</span>");
+      }
+      html += F("</div>"
                 "</div>"   // .item-row
               "</a>");
     }
@@ -1672,11 +1923,19 @@ void setup() {
   Serial.println("Starting SD Card setup...");
   setupSD();
 
+  Serial.println("Starting WiFi setup...");
+#if ENABLE_WIFI_AP_WEBSERVER
   Serial.println("Starting WiFi AP (AP+STA mode)...");
   WiFi.mode(WIFI_AP_STA);
-  WiFi.setSleep(false);
+#else
+  // Keep WiFi radio in STA mode for ESP-NOW, but disable AP/web server during BLE soak tests.
+  WiFi.mode(WIFI_STA);
+#endif
+  // BLE + WiFi coexistence on ESP32-S3 requires modem sleep to be enabled.
+  WiFi.setSleep(true);
 
   // AP and ESP-NOW must share one RF channel on ESP32 to avoid coexistence issues.
+#if ENABLE_WIFI_AP_WEBSERVER
   bool apOk = WiFi.softAP(ssid.c_str(), password, ESPNOW_CHANNEL, false, 4);
 
   if (!apOk) {
@@ -1689,6 +1948,11 @@ void setup() {
   Serial.print("SoftAP IP: "); Serial.println(WiFi.softAPIP());
   Serial.print("SoftAP MAC: "); Serial.println(WiFi.softAPmacAddress());
   Serial.print("SoftAP channel: "); Serial.println(WiFi.channel());
+#else
+  Serial.println("WiFi AP/web server disabled for BLE stability test");
+  Serial.print("STA MAC: "); Serial.println(WiFi.macAddress());
+  Serial.print("WiFi channel: "); Serial.println(WiFi.channel());
+#endif
   Serial.print("Device ID: "); Serial.println(DEVICE_ID);
   Serial.print("WiFi Network: "); Serial.println(ssid);
   Serial.print("Firmware: "); Serial.print(FW_VERSION); Serial.print(" "); Serial.println(FW_BUILD);
@@ -1707,19 +1971,15 @@ void setup() {
 
   loadWakeIntervalFromNVS();
   loadSyncIntervalFromNVS();
+  loadDailySyncTimeFromNVS();
   Serial.printf("Current wake interval (from NVS): %d min\n", gWakeIntervalMin);
-  Serial.printf("Current sync interval (from NVS): %d min\n", gSyncIntervalMin);
-
-  // Prime the fleet sync schedule so deployed nodes can stay WiFi-off until sync windows.
-  unsigned long phaseUnix = getRTCTimeUnix();
-  if (broadcastSyncSchedule(gSyncIntervalMin, phaseUnix)) {
-    gLastSyncSchedBroadcastMs = millis();
-  }
+  Serial.printf("Current sync interval payload (from NVS): %d min\n", gSyncIntervalMin);
+  Serial.printf("Current daily sync time (from NVS): %s\n", formatSyncTimeHHMM(gSyncDailyHour, gSyncDailyMinute).c_str());
 
   // 🔎 One-shot boot summary so you can see the fleet state in one block
   logBootSummary();
 
-#if ENABLE_SPIFFS_ASSETS
+#if ENABLE_WIFI_AP_WEBSERVER && ENABLE_SPIFFS_ASSETS
   if (!SPIFFS.begin(true)) {
     Serial.println("SPIFFS mount failed; falling back to inline assets.");
   } else {
@@ -1738,6 +1998,7 @@ void setup() {
   }
 #endif
 
+#if ENABLE_WIFI_AP_WEBSERVER
   // Routes
   server.on("/", HTTP_GET, handleRoot);
   server.on("/set-time", HTTP_POST, handleSetTime);
@@ -1745,6 +2006,7 @@ void setup() {
   server.on("/discover-nodes", HTTP_POST, handleDiscoverNodes);
   server.on("/set-wake-interval", HTTP_POST, handleSetWakeInterval);
   server.on("/set-sync-interval", HTTP_POST, handleSetSyncInterval);
+  server.on("/set-sync-time", HTTP_POST, handleSetSyncTime);
 
   // Node manager + config routes
   server.on("/nodes", HTTP_GET, handleNodesPage);
@@ -1754,19 +2016,30 @@ void setup() {
 
   server.begin();
   Serial.println("✅ Web server started!");
+#else
+  Serial.println("Web server disabled");
+#endif
 }
 
 void loop() {
+#if ENABLE_WIFI_AP_WEBSERVER
   server.handleClient();
+#endif
   espnow_loop(); // Handle ESP-NOW node management
   bleLoop();
 
-  // Re-broadcast sync schedule as a keepalive so nodes that recently woke can align.
-  static const unsigned long kSyncSchedRebroadcastMs = 5UL * 60UL * 1000UL;
-  if (millis() - gLastSyncSchedBroadcastMs > kSyncSchedRebroadcastMs) {
-    unsigned long phaseUnix = getRTCTimeUnix();
-    if (broadcastSyncSchedule(gSyncIntervalMin, phaseUnix)) {
-      gLastSyncSchedBroadcastMs = millis();
+  // Daily sync trigger based on RTC local time.
+  {
+    const uint32_t nowUnix = getRTCTimeUnix();
+    const long epochDay = (long)(nowUnix / 86400UL);
+    DateTime now(nowUnix);
+    if (now.hour() == gSyncDailyHour && now.minute() == gSyncDailyMinute && gLastSyncBroadcastEpochDay != epochDay) {
+      const bool sent = broadcastSyncSchedule(gSyncIntervalMin, nowUnix);
+      gLastSyncBroadcastEpochDay = epochDay;
+      Serial.printf("[SYNC] Daily trigger %02d:%02d -> broadcast %s\n",
+                    gSyncDailyHour,
+                    gSyncDailyMinute,
+                    sent ? "SENT" : "NOT_SENT");
     }
   }
 

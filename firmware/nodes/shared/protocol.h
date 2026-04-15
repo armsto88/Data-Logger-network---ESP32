@@ -89,6 +89,38 @@ typedef struct sync_schedule_command_message {
     char mothership_id[16];
 } sync_schedule_command_message_t;
 
+// ===== Pull-handshake messages (Phase 2) =====
+
+// Node -> Mothership: sent at start of each wake cycle (before data flush)
+typedef struct node_hello_message {
+    char command[16];       // "NODE_HELLO"
+    char nodeId[16];
+    char nodeType[16];
+    uint8_t  configVersion; // config version node currently has applied (0 = none)
+    uint8_t  wakeIntervalMin;
+    uint8_t  queueDepth;    // samples currently queued
+    uint32_t rtcUnix;       // node RTC time at wake
+} node_hello_message_t;
+
+// Mothership -> Node: sent only when mothership has a newer config version
+typedef struct config_snapshot_message {
+    char     command[20];       // "CONFIG_SNAPSHOT"
+    char     mothership_id[16];
+    uint8_t  configVersion;     // version being pushed
+    uint8_t  wakeIntervalMin;
+    uint16_t syncIntervalMin;
+    uint32_t syncPhaseUnix;
+    uint8_t  reserved[4];       // padding for future fields
+} config_snapshot_message_t;
+
+// Node -> Mothership: ACK after applying a CONFIG_SNAPSHOT
+typedef struct config_apply_ack_message {
+    char    command[20];        // "CONFIG_ACK"
+    char    nodeId[16];
+    uint8_t appliedVersion;
+    uint8_t ok;                 // 1 = applied OK, 0 = failed
+} config_apply_ack_message_t;
+
 // Optional: RNT-compatible pairing struct
 typedef struct rnt_pairing_t {
     uint8_t msgType;            // 0 = PAIRING, 1 = DATA
