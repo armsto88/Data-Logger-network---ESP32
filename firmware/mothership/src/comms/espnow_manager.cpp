@@ -10,6 +10,18 @@
 #include <Preferences.h>
 #include "protocol.h"
 
+#ifndef ENABLE_VERBOSE_SENSOR_PACKET_LOG
+#define ENABLE_VERBOSE_SENSOR_PACKET_LOG 0
+#endif
+
+#ifndef ENABLE_SEND_CALLBACK_LOG
+#define ENABLE_SEND_CALLBACK_LOG 0
+#endif
+
+#ifndef ENABLE_CYCLE_MONITOR_LOG
+#define ENABLE_CYCLE_MONITOR_LOG 0
+#endif
+
 // External reference to DEVICE_ID from main.cpp
 extern const char* DEVICE_ID;
 
@@ -34,6 +46,35 @@ static const uint32_t FLEET_SYNC_NO_ELIGIBLE_RETRY_MS = 60UL * 1000UL;       // 
 static uint32_t g_lastNoEligibleLogMs = 0;
 static const uint32_t NO_ELIGIBLE_LOG_INTERVAL_MS = 30UL * 1000UL;           // 30 s
 static SensorDataEventCallback g_sensorDataEventCb = nullptr;
+static uint32_t g_lastCycleMonitorMs = 0;
+static const uint32_t CYCLE_MONITOR_INTERVAL_MS = 30UL * 1000UL;             // 30 s
+static void ensurePeerOnChannel(const uint8_t mac[6], uint8_t channel);
+static bool isReasonableWakeInterval(uint8_t mins) {
+    return mins >= 1 && mins <= 60;
+}
+
+static bool pushDesiredConfigSnapshot(const uint8_t* senderMac,
+                                      const char* nodeId,
+                                      const NodeDesiredConfig& desired) {
+    if (!senderMac || !nodeId || desired.configVersion == 0) return false;
+
+    config_snapshot_message_t snap{};
+    strcpy(snap.command, "CONFIG_SNAPSHOT");
+    strncpy(snap.mothership_id, DEVICE_ID, sizeof(snap.mothership_id) - 1);
+    snap.configVersion    = desired.configVersion;
+    snap.wakeIntervalMin  = desired.wakeIntervalMin;
+    snap.syncIntervalMin  = desired.syncIntervalMin;
+    snap.syncPhaseUnix    = desired.syncPhaseUnix;
+
+    ensurePeerOnChannel(senderMac, ESPNOW_CHANNEL);
+    esp_wifi_set_channel(ESPNOW_CHANNEL, WIFI_SECOND_CHAN_NONE);
+    esp_err_t res = esp_now_send(senderMac, (uint8_t*)&snap, sizeof(snap));
+    Serial.printf("↪ CONFIG_SNAPSHOT v%u push to %s on sensor contact: %s\n",
+                  (unsigned)snap.configVersion,
+                  nodeId,
+                  (res == ESP_OK) ? "OK" : esp_err_to_name(res));
+    return (res == ESP_OK);
+}
 
 
 // ----------------- small helpers -----------------
@@ -63,6 +104,27 @@ static const char* stateToStr(NodeState s) {
     }
 }
 
+static void logCycleMonitorSnapshot(unsigned long nowMs) {
+    bool anyTracked = false;
+    for (const auto& n : registeredNodes) {
+        if (n.state != PAIRED && n.state != DEPLOYED) continue;
+        anyTracked = true;
+
+        const unsigned long ageMs = (nowMs >= n.lastSeen) ? (nowMs - n.lastSeen) : 0;
+        Serial.printf("🛰️ Cycle monitor: %s state=%s link=%s lastSeen=%lus wakeMin=%u pending=%u\n",
+                      n.nodeId.c_str(),
+                      stateToStr(n.state),
+                      n.isActive ? "AWAKE" : "ASLEEP",
+                      ageMs / 1000UL,
+                      (unsigned)n.wakeIntervalMin,
+                      n.deployPending ? 1 : 0);
+    }
+
+    if (!anyTracked) {
+        Serial.println("🛰️ Cycle monitor: no paired/deployed nodes tracked yet");
+    }
+}
+
 // ----------------- registry -----------------
 void registerNode(const uint8_t* mac,
                   const char* nodeId,
@@ -81,6 +143,17 @@ void registerNode(const uint8_t* mac,
 
     if (existing) {
         bool upgraded = false;
+        bool macChanged = false;
+
+        if (memcmp(existing->mac, mac, 6) != 0) {
+            Serial.printf("🔄 Node %s MAC updated: %s -> %s\n",
+                          existing->nodeId.c_str(),
+                          macToStr(existing->mac).c_str(),
+                          macToStr(mac).c_str());
+            memcpy(existing->mac, mac, 6);
+            macChanged = true;
+            ensurePeerOnChannel(existing->mac, ESPNOW_CHANNEL);
+        }
 
         existing->lastSeen = millis();
         existing->isActive = true;
@@ -93,6 +166,9 @@ void registerNode(const uint8_t* mac,
                           stateToStr(existing->state),
                           stateToStr(state));
             existing->state = state;
+            if (state == DEPLOYED) {
+                existing->deployPending = false;
+            }
             upgraded = true;
         }
 
@@ -100,7 +176,8 @@ void registerNode(const uint8_t* mac,
         existing->userId = getNodeUserId(existing->nodeId);
         existing->name   = getNodeName(existing->nodeId);
 
-        if (upgraded && (existing->state == PAIRED || existing->state == DEPLOYED)) {
+        if ((upgraded || macChanged) &&
+            (existing->state == PAIRED || existing->state == DEPLOYED)) {
             savePairedNodes();  // keep NVS in sync when a node “promotes”
         }
 
@@ -120,7 +197,11 @@ void registerNode(const uint8_t* mac,
     // NEW:
     n.lastTimeSyncMs       = 0;
     n.wakeIntervalMin      = 0;
+    n.inferredWakeIntervalMin = 0;
+    n.lastNodeTimestamp    = 0;
     n.configVersionApplied = 0;
+    n.lastConfigPushMs     = 0;
+    n.deployPending        = false;
 
     // Populate user-facing meta from NVS for immediate consistency
     n.userId = getNodeUserId(n.nodeId);
@@ -163,6 +244,65 @@ static void OnDataRecv(const uint8_t * mac,
         }
 
         registerNode(mac, incoming.nodeId, incoming.sensorType, DEPLOYED);
+        NodeInfo* nodeInfo = nullptr;
+
+        for (auto& n : registeredNodes) {
+            if (n.nodeId == String(incoming.nodeId)) {
+                nodeInfo = &n;
+                if (incoming.nodeTimestamp > 0) {
+                    if (n.lastNodeTimestamp > 0 && incoming.nodeTimestamp > n.lastNodeTimestamp) {
+                        const uint32_t deltaSec = incoming.nodeTimestamp - n.lastNodeTimestamp;
+                        // Infer cadence from node timestamps; tolerate small jitter.
+                        const uint8_t mins = (uint8_t)((deltaSec + 30UL) / 60UL);
+                        const uint32_t expectedSec = (uint32_t)mins * 60UL;
+                        const uint32_t absErr = (deltaSec > expectedSec)
+                            ? (deltaSec - expectedSec)
+                            : (expectedSec - deltaSec);
+                        if (isReasonableWakeInterval(mins) && absErr <= 10UL) {
+                            if (n.inferredWakeIntervalMin != mins) {
+                                Serial.printf("🧭 Inferred wake cadence for %s: ~%u min (delta=%lus)\n",
+                                              incoming.nodeId,
+                                              (unsigned)mins,
+                                              (unsigned long)deltaSec);
+                            }
+                            n.inferredWakeIntervalMin = mins;
+                            if (n.wakeIntervalMin == 0) {
+                                n.wakeIntervalMin = mins;
+                            }
+                        }
+                    }
+                    if (incoming.nodeTimestamp > n.lastNodeTimestamp) {
+                        n.lastNodeTimestamp = incoming.nodeTimestamp;
+                    }
+                }
+                break;
+            }
+        }
+
+        // Fallback path: if HELLO is missed, still push pending config when sensor data proves contact.
+        if (nodeInfo) {
+            NodeDesiredConfig desired = getDesiredConfig(incoming.nodeId);
+            const bool cfgPending = (desired.configVersion > 0) &&
+                                    (nodeInfo->configVersionApplied < desired.configVersion);
+            const uint32_t nowMs = millis();
+            const bool canRetry = (nodeInfo->lastConfigPushMs == 0) ||
+                                  (nowMs - nodeInfo->lastConfigPushMs >= 5000UL);
+            if (cfgPending && canRetry) {
+                if (pushDesiredConfigSnapshot(mac, incoming.nodeId, desired)) {
+                    nodeInfo->lastConfigPushMs = nowMs;
+                }
+            }
+        }
+
+        // If a deployed node is producing data, clear stale deployPending even if HELLO/DEPLOY_ACK was missed.
+        for (auto& n : registeredNodes) {
+            if (n.nodeId == String(incoming.nodeId) && n.deployPending) {
+                n.deployPending = false;
+                Serial.printf("✅ Deploy pending cleared by SENSOR data from %s\n", incoming.nodeId);
+                savePairedNodes();
+                break;
+            }
+        }
 
         // MAC in lowercase colon format for CSV
         String macStr;
@@ -191,6 +331,8 @@ static void OnDataRecv(const uint8_t * mac,
         char ts[24];
         getRTCTimeString(ts, sizeof(ts));
 
+        // Keep packet logging concise in operator mode.
+    #if ENABLE_VERBOSE_SENSOR_PACKET_LOG
         Serial.printf(
           "📊 Data @ %s\n"
           "   from FW=%s, MAC=%s\n"
@@ -208,6 +350,14 @@ static void OnDataRecv(const uint8_t * mac,
                     (unsigned long)incoming.nodeTimestamp,
                     (unsigned)incoming.qualityFlags
         );
+    #else
+        Serial.printf("📊 SENSOR fw=%s id=%u label=%s val=%.3f node_ts=%lu\n",
+                  incoming.nodeId,
+                  (unsigned)incoming.sensorId,
+                  incoming.sensorLabel,
+                  incoming.value,
+                  (unsigned long)incoming.nodeTimestamp);
+    #endif
 
     // CSV row: timestamp,node_id,node_name,mac,event_type,sensor_type,value,meta
         String row;
@@ -365,7 +515,21 @@ static void OnDataRecv(const uint8_t * mac,
         return;
     }
 
-    // 6) CONFIG_APPLY_ACK from node after applying CONFIG_SNAPSHOT
+    // 6) DEPLOY_ACK from node after applying DEPLOY_NODE
+    if (len == sizeof(deployment_ack_message_t)) {
+        deployment_ack_message_t ack{};
+        memcpy(&ack, incomingBytes, sizeof(ack));
+        if (strcmp(ack.command, "DEPLOY_ACK") == 0 && ack.deployed == 1) {
+            Serial.printf("✅ DEPLOY_ACK from %s (rtcUnix=%lu)\n",
+                          ack.nodeId,
+                          (unsigned long)ack.rtcUnix);
+            registerNode(mac, ack.nodeId, "unknown", DEPLOYED);
+            savePairedNodes();
+        }
+        return;
+    }
+
+    // 7) CONFIG_APPLY_ACK from node after applying CONFIG_SNAPSHOT
     if (len == sizeof(config_apply_ack_message_t)) {
         config_apply_ack_message_t ack{};
         memcpy(&ack, incomingBytes, sizeof(ack));
@@ -382,7 +546,15 @@ static void OnDataRecv(const uint8_t * mac,
         return;
     }
 
-    // (any other packet types can be handled here if needed)
+    // Fallback debug: surface unknown packet shapes during field testing.
+    char preview[17] = {0};
+    int previewLen = (len < 16) ? len : 16;
+    for (int i = 0; i < previewLen; ++i) {
+        const uint8_t c = incomingBytes[i];
+        preview[i] = (c >= 32 && c <= 126) ? (char)c : '.';
+    }
+    Serial.printf("⚠️ Unhandled ESP-NOW packet from %s len=%d preview='%s'\n",
+                  macToStr(mac).c_str(), len, preview);
 }
 
 // ----------------- ESPNOW lifecycle -----------------
@@ -398,11 +570,19 @@ void setupESPNOW() {
         esp_now_register_recv_cb(OnDataRecv);
         esp_now_register_send_cb([](const uint8_t *mac_addr,
                                     esp_now_send_status_t status){
+#if ENABLE_SEND_CALLBACK_LOG
             Serial.print("📨 send_cb to ");
             if (mac_addr) Serial.print(macToStr(mac_addr));
             else          Serial.print("(null)");
             Serial.print("\n    status=");
             Serial.println(status == ESP_NOW_SEND_SUCCESS ? "OK" : "FAIL");
+#else
+            if (status != ESP_NOW_SEND_SUCCESS) {
+                Serial.print("📨 send_cb FAIL to ");
+                if (mac_addr) Serial.println(macToStr(mac_addr));
+                else          Serial.println("(null)");
+            }
+#endif
         });
     }
 
@@ -427,15 +607,20 @@ void setupESPNOW() {
 void espnow_loop() {
     unsigned long now = millis();
 
-    // Mark nodes inactive if not seen for 5 min
+    // Mark nodes not-awake shortly after contact so UI reflects real wake windows.
     for (auto& n : registeredNodes) {
-        // Adaptive threshold: 3× wake cycle + 2 min guard, fallback 5 min pre-schedule
-        uint32_t inactiveThreshMs = (n.wakeIntervalMin > 0)
-            ? (uint32_t)n.wakeIntervalMin * 3UL * 60000UL + 120000UL
-            : 300000UL;
+        // Keep this intentionally short: AWAKE means "recently heard from", not "online".
+        uint32_t inactiveThreshMs = 30000UL;
+        if (n.wakeIntervalMin > 0) {
+            // Scale a little with configured wake interval, but cap to avoid stale AWAKE chips.
+            uint32_t scaled = (uint32_t)n.wakeIntervalMin * 15000UL;
+            if (scaled < 12000UL) scaled = 12000UL;
+            if (scaled > 45000UL) scaled = 45000UL;
+            inactiveThreshMs = scaled;
+        }
         if (n.isActive && (now - n.lastSeen > inactiveThreshMs)) {
             n.isActive = false;
-            Serial.printf("⚠️ Node %s (%s) marked inactive (state=%s)\n",
+            Serial.printf("⚠️ Node %s (%s) marked asleep for UI (state=%s)\n",
                           n.nodeId.c_str(),
                           macToStr(n.mac).c_str(),
                           stateToStr(n.state));
@@ -444,6 +629,14 @@ void espnow_loop() {
 
     // NEW: periodic fleet-wide TIME_SYNC (every ~24 h)
     broadcastTimeSyncIfDue(false);
+
+#if ENABLE_CYCLE_MONITOR_LOG
+    // TEMP debug telemetry: helps validate node wake/sleep cycles without node serial.
+    if (now - g_lastCycleMonitorMs >= CYCLE_MONITOR_INTERVAL_MS) {
+        g_lastCycleMonitorMs = now;
+        logCycleMonitorSnapshot(now);
+    }
+#endif
 }
 
 
@@ -549,7 +742,11 @@ void loadPairedNodes() {
         // NEW:
         newNode.lastTimeSyncMs       = 0;
         newNode.wakeIntervalMin      = 0;
+        newNode.inferredWakeIntervalMin = 0;
+        newNode.lastNodeTimestamp    = 0;
         newNode.configVersionApplied = 0;
+        newNode.lastConfigPushMs     = 0;
+        newNode.deployPending        = false;
 
         // Hydrate user-facing meta from node_meta
         newNode.userId = getNodeUserId(newNode.nodeId);
@@ -639,6 +836,7 @@ void handleNodeHello(const uint8_t* senderMac, const node_hello_message_t& hello
                   hello.nodeId, hello.configVersion,
                   hello.wakeIntervalMin, hello.queueDepth,
                   (unsigned long)hello.rtcUnix);
+    Serial.printf("🔁 Cycle check-in from %s (node wake window open)\n", hello.nodeId);
 
     // Register/refresh the node as active (HELLO counts as contact)
     registerNode(senderMac, hello.nodeId, hello.nodeType, DEPLOYED);
@@ -647,6 +845,17 @@ void handleNodeHello(const uint8_t* senderMac, const node_hello_message_t& hello
     for (auto& n : registeredNodes) {
         if (n.nodeId == String(hello.nodeId)) {
             n.wakeIntervalMin = hello.wakeIntervalMin;
+            if (hello.configVersion > n.configVersionApplied) {
+                n.configVersionApplied = hello.configVersion;
+                Serial.printf("✅ Config version inferred from HELLO for %s: appliedV=%u\n",
+                              hello.nodeId,
+                              (unsigned)n.configVersionApplied);
+            }
+            if (n.deployPending) {
+                n.deployPending = false;
+                Serial.printf("✅ Deploy pending cleared by HELLO from %s\n", hello.nodeId);
+                savePairedNodes();
+            }
             break;
         }
     }
@@ -754,7 +963,6 @@ bool broadcastTimeSyncAll() {
     uint16_t okCount  = 0;
 
     for (auto &node : registeredNodes) {
-        if (!node.isActive) continue;
         if (node.state != PAIRED && node.state != DEPLOYED) continue;
 
         targeted++;
@@ -769,19 +977,7 @@ bool broadcastTimeSyncAll() {
         uint32_t nowLogMs = millis();
         if (g_lastNoEligibleLogMs == 0 ||
             (uint32_t)(nowLogMs - g_lastNoEligibleLogMs) >= NO_ELIGIBLE_LOG_INTERVAL_MS) {
-            // Distinguish "nodes exist but sleeping" from "no nodes registered at all"
-            bool hasPairedOrDeployed = false;
-            for (const auto& node : registeredNodes) {
-                if (node.state == PAIRED || node.state == DEPLOYED) {
-                    hasPairedOrDeployed = true;
-                    break;
-                }
-            }
-            if (hasPairedOrDeployed) {
-                Serial.println("💤 Fleet TIME_SYNC: PAIRED/DEPLOYED nodes exist but all asleep (isActive=false) — will retry when awake");
-            } else {
-                Serial.println("⚠️ Fleet TIME_SYNC: no PAIRED/DEPLOYED nodes registered");
-            }
+            Serial.println("⚠️ Fleet TIME_SYNC: no PAIRED/DEPLOYED nodes registered");
             g_lastNoEligibleLogMs = nowLogMs;
         }
     } else {
@@ -797,7 +993,6 @@ bool broadcastTimeSyncIfDue(bool force) {
     if (!force) {
         bool hasEligible = false;
         for (const auto &node : registeredNodes) {
-            if (!node.isActive) continue;
             if (node.state == PAIRED || node.state == DEPLOYED) {
                 hasEligible = true;
                 break;
@@ -822,19 +1017,6 @@ bool broadcastTimeSyncIfDue(bool force) {
 
         Serial.printf("⏰ Fleet TIME_SYNC triggered (force=%d) at %s\n",
                       force ? 1 : 0, ts);
-
-        // timestamp,node_id,node_name,mac,event_type,sensor_type,value,meta
-        String row = String(ts) + ","
-                  + "MOTHERSHIP"        + ","  // node_id
-                  + ""                  + ","  // node_name
-                  + getMothershipsMAC() + ","  // mac
-                  + "TIME_SYNC_FLEET"   + ","  // event_type
-                  + ""                  + ","  // sensor_type
-                  + ""                  + ","  // value
-                  + "OK";                    // meta
-
-        logCSVRow(row);
-
     }
     return any;
 }
@@ -878,6 +1060,8 @@ bool pairNode(const String& nodeId) {
             strncpy(pairCmd.mothership_id, DEVICE_ID, sizeof(pairCmd.mothership_id) - 1);
 
             esp_err_t sendPairCmd = esp_now_send(node.mac, (uint8_t*)&pairCmd, sizeof(pairCmd));
+            uint8_t bcast[6] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
+            esp_err_t sendPairCmdBcast = esp_now_send(bcast, (uint8_t*)&pairCmd, sizeof(pairCmd));
 
             // 2) Flip local state and persist
             node.state = PAIRED;
@@ -890,16 +1074,20 @@ bool pairNode(const String& nodeId) {
             strncpy(resp.mothership_id, DEVICE_ID, sizeof(resp.mothership_id) - 1);
 
             esp_err_t sendResp = esp_now_send(node.mac, (uint8_t*)&resp, sizeof(resp));
+            esp_err_t sendRespBcast = esp_now_send(bcast, (uint8_t*)&resp, sizeof(resp));
 
-            Serial.printf("📤 pairNode(%s): PAIR_NODE=%s, PAIRING_RESPONSE=%s\n",
+            Serial.printf("📤 pairNode(%s): PAIR_NODE=%s (bcast=%s), PAIRING_RESPONSE=%s (bcast=%s)\n",
                           nodeId.c_str(),
                           (sendPairCmd == ESP_OK ? "OK" : esp_err_to_name(sendPairCmd)),
-                          (sendResp   == ESP_OK ? "OK" : esp_err_to_name(sendResp)));
+                          (sendPairCmdBcast == ESP_OK ? "OK" : esp_err_to_name(sendPairCmdBcast)),
+                          (sendResp   == ESP_OK ? "OK" : esp_err_to_name(sendResp)),
+                          (sendRespBcast == ESP_OK ? "OK" : esp_err_to_name(sendRespBcast)));
 
             savePairedNodes();
 
-            // Success if either packet went out
-            return (sendPairCmd == ESP_OK) || (sendResp == ESP_OK);
+                 // Success if any direct or broadcast packet was queued
+                 return (sendPairCmd == ESP_OK) || (sendResp == ESP_OK) ||
+                     (sendPairCmdBcast == ESP_OK) || (sendRespBcast == ESP_OK);
         }
     }
     Serial.printf("⚠️ pairNode(%s): nodeId not found\n", nodeId.c_str());
@@ -908,8 +1096,8 @@ bool pairNode(const String& nodeId) {
 
 // Deploy selected paired nodes with RTC time
 bool deploySelectedNodes(const std::vector<String>& nodeIds) {
-    bool allSuccess  = true;
-    bool anyDeployed = false;
+    bool allSuccess   = true;
+    bool anyRequested = false;
 
     for (const String& nodeId : nodeIds) {
         for (auto& node : registeredNodes) {
@@ -940,15 +1128,24 @@ bool deploySelectedNodes(const std::vector<String>& nodeIds) {
                         esp_now_send(node.mac,
                                      (uint8_t*)&deployCmd,
                                      sizeof(deployCmd));
+                    uint8_t bcast[6] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
+                    esp_err_t resultBcast = esp_now_send(bcast,
+                                                         (uint8_t*)&deployCmd,
+                                                         sizeof(deployCmd));
 
-                    if (result == ESP_OK) {
-                        node.state = DEPLOYED;
-                        anyDeployed = true;
-                        Serial.printf("🚀 Node deployed: %s at %s\n",
-                                      nodeId.c_str(), timeBuffer);
+                    if (result == ESP_OK || resultBcast == ESP_OK) {
+                        node.deployPending = true;
+                        anyRequested = true;
+                        Serial.printf("🚀 Deploy requested: %s at %s (direct=%s, bcast=%s, awaiting node runtime confirmation)\n",
+                                      nodeId.c_str(),
+                                      timeBuffer,
+                                      (result == ESP_OK ? "OK" : esp_err_to_name(result)),
+                                      (resultBcast == ESP_OK ? "OK" : esp_err_to_name(resultBcast)));
                     } else {
-                        Serial.printf("❌ Failed to deploy node: %s (%s)\n",
-                                      nodeId.c_str(), esp_err_to_name(result));
+                        Serial.printf("❌ Failed to deploy node: %s (direct=%s, bcast=%s)\n",
+                                      nodeId.c_str(),
+                                      esp_err_to_name(result),
+                                      esp_err_to_name(resultBcast));
                         allSuccess = false;
                     }
                 } else {
@@ -960,8 +1157,9 @@ bool deploySelectedNodes(const std::vector<String>& nodeIds) {
         }
     }
 
-    if (!anyDeployed) {
+    if (!anyRequested) {
         Serial.println("⚠️ deploySelectedNodes: no matching nodes in PAIRED/DEPLOYED state");
+        allSuccess = false;
     } else {
         savePairedNodes();
     }
@@ -973,7 +1171,7 @@ bool deploySelectedNodes(const std::vector<String>& nodeIds) {
 std::vector<NodeInfo> getUnpairedNodes() {
     std::vector<NodeInfo> unpaired;
     for (const auto& node : registeredNodes) {
-        if (node.state == UNPAIRED && node.isActive) {
+        if (node.state == UNPAIRED) {
             unpaired.push_back(node);
         }
     }
@@ -983,7 +1181,7 @@ std::vector<NodeInfo> getUnpairedNodes() {
 std::vector<NodeInfo> getPairedNodes() {
     std::vector<NodeInfo> paired;
     for (const auto& node : registeredNodes) {
-        if (node.state == PAIRED && node.isActive) {
+        if (node.state == PAIRED) {
             paired.push_back(node);
         }
     }

@@ -55,6 +55,14 @@ typedef struct deployment_command {
     char mothership_id[16];
 } deployment_command_t;
 
+// Node -> mothership deployment confirmation (sent immediately after apply)
+typedef struct deployment_ack_message {
+    char command[20];           // "DEPLOY_ACK"
+    char nodeId[16];
+    uint8_t deployed;           // 1=deployed applied, 0=failed
+    uint32_t rtcUnix;           // node RTC unix at ACK time
+} deployment_ack_message_t;
+
 // Time sync request/response
 typedef struct time_sync_request {
     char nodeId[16];

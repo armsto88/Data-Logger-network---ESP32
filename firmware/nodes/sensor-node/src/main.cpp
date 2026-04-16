@@ -104,7 +104,22 @@ static void processPowerCut() {
   if (waitMs > 0) return;
 
   Serial.println("[PWR_HOLD] releasing hold now (expect power-off)");
+  pinMode(PWR_HOLD_PIN, OUTPUT);
   digitalWrite(PWR_HOLD_PIN, kPwrHoldOffLevel);
+
+  // Briefly sample the pin latch/readback for bench diagnostics.
+  delay(2);
+  Serial.printf("[PWR_HOLD] off-level written=%d readback=%d\n",
+                (int)kPwrHoldOffLevel,
+                (int)digitalRead(PWR_HOLD_PIN));
+
+  // Prevent accidental float/leakback from re-enabling the gate path.
+#if PWR_HOLD_ACTIVE_HIGH
+  pinMode(PWR_HOLD_PIN, INPUT_PULLDOWN);
+#else
+  pinMode(PWR_HOLD_PIN, INPUT_PULLUP);
+#endif
+
   delay(20);
 
   while (true) {
@@ -415,6 +430,25 @@ static bool shouldSyncAt(uint32_t unixNow);
 static void captureSensorsToQueue();
 static void flushQueuedToMothership();
 
+// Guard against stale g_espNowReady state by retrying once after a forced re-init.
+static esp_err_t espnowSendWithRecover(const uint8_t* mac, const uint8_t* payload, size_t len) {
+  if (!bringupEspNow()) return ESP_ERR_ESPNOW_NOT_INIT;
+
+  esp_wifi_set_channel(ESPNOW_CHANNEL, WIFI_SECOND_CHAN_NONE);
+  esp_err_t res = esp_now_send(mac, payload, len);
+  if (res != ESP_ERR_ESPNOW_NOT_INIT) return res;
+
+  Serial.println("⚠️ ESP-NOW reported NOT_INIT during send; forcing re-init and retrying once");
+  g_espNowReady = false;
+  esp_now_deinit();
+  WiFi.mode(WIFI_OFF);
+  delay(20);
+
+  if (!bringupEspNow()) return ESP_ERR_ESPNOW_NOT_INIT;
+  esp_wifi_set_channel(ESPNOW_CHANNEL, WIFI_SECOND_CHAN_NONE);
+  return esp_now_send(mac, payload, len);
+}
+
 static bool bringupEspNow() {
   if (g_espNowReady) return true;
 
@@ -536,8 +570,7 @@ static void flushQueuedToMothership() {
     msg.nodeTimestamp = rec.sampleUnix;
     msg.qualityFlags = rec.qualityFlags;
 
-    esp_wifi_set_channel(ESPNOW_CHANNEL, WIFI_SECOND_CHAN_NONE);
-    esp_err_t res = esp_now_send(mothershipMAC, (uint8_t*)&msg, sizeof(msg));
+    esp_err_t res = espnowSendWithRecover(mothershipMAC, (uint8_t*)&msg, sizeof(msg));
     if (res != ESP_OK) {
       Serial.printf("❌ queue flush send failed at seq=%lu: %s\n",
                     (unsigned long)rec.sampleSeq,
@@ -667,6 +700,16 @@ static void onDataReceived(const uint8_t *mac, const uint8_t *incomingData, int 
                     (unsigned long)lastTimeSyncUnix);
       Serial.println("✅ Node deployed; ready for alarm-driven sends");
       debugState("after DEPLOY");
+
+      // Send explicit deployment ACK so mothership can mark DEPLOYED immediately.
+      deployment_ack_message_t dack{};
+      strcpy(dack.command, "DEPLOY_ACK");
+      strncpy(dack.nodeId, NODE_ID, sizeof(dack.nodeId) - 1);
+      dack.deployed = 1;
+      dack.rtcUnix  = rtc.now().unixtime();
+      esp_err_t dackRes = espnowSendWithRecover(mac, (uint8_t*)&dack, sizeof(dack));
+      Serial.printf("📨 DEPLOY_ACK sent: %s\n",
+            dackRes == ESP_OK ? "OK" : esp_err_to_name(dackRes));
 
       // Arm first RTC alarm based on current interval
       bool ok = false;
@@ -955,8 +998,7 @@ static void sendNodeHello() {
   hello.rtcUnix         = rtc.now().unixtime();
 
   // bringupEspNow() already registers the mothership peer; send directly
-  esp_wifi_set_channel(ESPNOW_CHANNEL, WIFI_SECOND_CHAN_NONE);
-  esp_err_t res = esp_now_send(mothershipMAC, (uint8_t*)&hello, sizeof(hello));
+  esp_err_t res = espnowSendWithRecover(mothershipMAC, (uint8_t*)&hello, sizeof(hello));
   Serial.printf("👋 NODE_HELLO sent: cfgV=%u wakeMin=%u qDepth=%u : %s\n",
                 hello.configVersion, hello.wakeIntervalMin, hello.queueDepth,
                 res == ESP_OK ? "OK" : esp_err_to_name(res));

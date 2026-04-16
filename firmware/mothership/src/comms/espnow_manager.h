@@ -39,8 +39,16 @@ struct NodeInfo {
     uint32_t  lastTimeSyncMs;
     // Wake interval last sent to this node via SET_SCHEDULE (0 = not yet scheduled)
     uint8_t   wakeIntervalMin;
+    // Wake interval inferred from nodeTimestamp cadence in sensor data (0 = unknown)
+    uint8_t   inferredWakeIntervalMin;
+    // Last seen nodeTimestamp used for cadence inference (unix seconds)
+    uint32_t  lastNodeTimestamp;
     // Last config version ACKed by this node (0 = never applied)
     uint8_t   configVersionApplied;
+    // Last time mothership pushed CONFIG_SNAPSHOT to this node (ms, for throttling)
+    uint32_t  lastConfigPushMs;
+    // True after DEPLOY_NODE command is queued, cleared when runtime evidence confirms deploy
+    bool      deployPending;
 };
 
 // Desired configuration for each node, stored in mothership NVS.
