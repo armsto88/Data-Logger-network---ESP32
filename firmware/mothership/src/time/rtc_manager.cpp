@@ -52,8 +52,8 @@ void setupRTC() {
     gLastGoodRtcUnix = now.unixtime();
     gLastGoodRtcMs = millis();
     rtcUnlock();
-    Serial.printf("✅ RTC initialized: %04d-%02d-%02d %02d:%02d:%02d\n",
-                 now.year(), now.month(), now.day(), now.hour(), now.minute(), now.second());
+    Serial.printf("✅ RTC initialized: %02d:%02d:%02d %02d-%02d-%04d\n",
+                 now.hour(), now.minute(), now.second(), now.day(), now.month(), now.year());
 }
 
 static unsigned long estimatedUnixFromCache() {
@@ -64,13 +64,13 @@ static unsigned long estimatedUnixFromCache() {
 
 void getRTCTimeString(char* buffer, size_t bufferSize) {
     if (!rtcLock()) {
-        snprintf(buffer, bufferSize, "1970-01-01 00:00:00");
+        snprintf(buffer, bufferSize, "00:00:00 01-01-1970");
         return;
     }
     DateTime now = rtc.now();
     rtcUnlock();
-    snprintf(buffer, bufferSize, "%04d-%02d-%02d %02d:%02d:%02d",
-            now.year(), now.month(), now.day(), now.hour(), now.minute(), now.second());
+        snprintf(buffer, bufferSize, "%02d:%02d:%02d %02d-%02d-%04d",
+            now.hour(), now.minute(), now.second(), now.day(), now.month(), now.year());
 }
 
 unsigned long getRTCTimeUnix() {
@@ -88,8 +88,8 @@ unsigned long getRTCTimeUnix() {
 }
 
 bool setRTCTime(int year, int month, int day, int hour, int minute, int second) {
-    Serial.printf("Setting RTC time to: %04d-%02d-%02d %02d:%02d:%02d\n", 
-                  year, month, day, hour, minute, second);
+    Serial.printf("Setting RTC time to: %02d:%02d:%02d %02d-%02d-%04d\n", 
+                  hour, minute, second, day, month, year);
     
     if (!rtcLock()) {
         Serial.println("❌ RTC lock failed during setRTCTime");
@@ -105,8 +105,8 @@ bool setRTCTime(int year, int month, int day, int hour, int minute, int second) 
     gLastGoodRtcUnix = verify.unixtime();
     gLastGoodRtcMs = millis();
     rtcUnlock();
-    Serial.printf("✅ RTC verification: %04d-%02d-%02d %02d:%02d:%02d\n",
-                 verify.year(), verify.month(), verify.day(), verify.hour(), verify.minute(), verify.second());
+    Serial.printf("✅ RTC verification: %02d:%02d:%02d %02d-%02d-%04d\n",
+                 verify.hour(), verify.minute(), verify.second(), verify.day(), verify.month(), verify.year());
     
     return true;
 }
@@ -122,5 +122,5 @@ void resetRTCToDefault() {
     gLastGoodRtcUnix = defaultTime.unixtime();
     gLastGoodRtcMs = millis();
     rtcUnlock();
-    Serial.println("✅ RTC reset to: 2025-01-01 12:00:00");
+    Serial.println("✅ RTC reset to: 12:00:00 01-01-2025");
 }

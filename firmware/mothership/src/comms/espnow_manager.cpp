@@ -920,7 +920,7 @@ bool sendTimeSync(const uint8_t* mac, const char* nodeId) {
     getRTCTimeString(ts, sizeof(ts));
 
     int y,m,d,H,M,S;
-    if (sscanf(ts, "%d-%d-%d %d:%d:%d", &y,&m,&d,&H,&M,&S) == 6) {
+    if (sscanf(ts, "%d:%d:%d %d-%d-%d", &H,&M,&S,&d,&m,&y) == 6) {
         resp.year   = y;
         resp.month  = m;
         resp.day    = d;
@@ -1113,9 +1113,9 @@ bool deploySelectedNodes(const std::vector<String>& nodeIds) {
                 getRTCTimeString(timeBuffer, sizeof(timeBuffer));
 
                 int year, month, day, hour, minute, second;
-                if (sscanf(timeBuffer, "%d-%d-%d %d:%d:%d",
-                           &year, &month, &day,
-                           &hour, &minute, &second) == 6)
+                if (sscanf(timeBuffer, "%d:%d:%d %d-%d-%d",
+                           &hour, &minute, &second,
+                           &day, &month, &year) == 6)
                 {
                     deployCmd.year   = year;
                     deployCmd.month  = month;

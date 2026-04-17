@@ -39,7 +39,7 @@ const char* password = "logger123";
 #endif
 
 Preferences gPrefs;
-int gWakeIntervalMin = 5;          // fleet default shown in UI; per-node interval is authoritative
+int gWakeIntervalMin = 0;          // 0=OFF, >0 applies global wake interval to paired/deployed nodes
 int gSyncIntervalMin = 15;         // transport interval still used in sync schedule payload
 int gSyncDailyHour = 6;            // local daily sync trigger time (HH)
 int gSyncDailyMinute = 0;          // local daily sync trigger time (MM)
@@ -72,13 +72,26 @@ static String formatMac(const uint8_t mac[6]) {
 }
 
 static void loadWakeIntervalFromNVS() {
-  if (gPrefs.begin("ui", true)) {
+  bool migrated = false;
+  if (gPrefs.begin("ui", false)) {
+    // One-time migration: force OFF as the new default for global interval trigger.
+    if (!gPrefs.getBool("wake_v2_init", false)) {
+      gPrefs.putInt("wake_min", 0);
+      gPrefs.putBool("wake_v2_init", true);
+      migrated = true;
+    }
     int v = gPrefs.getInt("wake_min", gWakeIntervalMin);
     gPrefs.end();
-    bool ok = false;
-    for (size_t i = 0; i < kAllowedCount; i++)
+
+    bool ok = (v == 0);
+    for (size_t i = 0; i < kAllowedCount; i++) {
       if (v == kAllowedIntervals[i]) { ok = true; break; }
-    gWakeIntervalMin = ok ? v : 5;
+    }
+    gWakeIntervalMin = ok ? v : 0;
+  }
+
+  if (migrated) {
+    Serial.println("[UI] wake interval migration applied: defaulted global trigger to OFF");
   }
 }
 
@@ -170,6 +183,13 @@ static bool parseHHMM(const String& hhmm, int& outHour, int& outMinute) {
   return true;
 }
 
+static String formatDateTimeDisplay(const DateTime& dt) {
+  char b[20];
+  snprintf(b, sizeof(b), "%02d:%02d:%02d %02d-%02d-%04d",
+           dt.hour(), dt.minute(), dt.second(), dt.day(), dt.month(), dt.year());
+  return String(b);
+}
+
 static String computeNextSyncIsoLocal() {
   const uint32_t nowUnix = getRTCTimeUnix();
   DateTime next(nowUnix);
@@ -187,10 +207,7 @@ static String computeNextSyncIsoLocal() {
     }
   }
 
-  char b[20];
-  snprintf(b, sizeof(b), "%04d-%02d-%02d %02d:%02d:%02d",
-           next.year(), next.month(), next.day(), next.hour(), next.minute(), next.second());
-  return String(b);
+  return formatDateTimeDisplay(next);
 }
 
 static uint32_t computeNextSyncUnix(uint32_t nowUnix) {
@@ -228,11 +245,11 @@ static String computeNextWakeIsoLocal(int intervalMin) {
   const uint32_t deltaSec = (next.unixtime() > now.unixtime()) ? (next.unixtime() - now.unixtime()) : 0;
   const uint32_t deltaMin = (deltaSec + 59UL) / 60UL;
 
-  char b[40];
-  snprintf(b, sizeof(b), "%04d-%02d-%02d %02d:%02d:%02d (in %lu min)",
-           next.year(), next.month(), next.day(), next.hour(), next.minute(), next.second(),
-           (unsigned long)deltaMin);
-  return String(b);
+  String out = formatDateTimeDisplay(next);
+  out += " (in ";
+  out += String((unsigned long)deltaMin);
+  out += " min)";
+  return out;
 }
 
 // ---------- Node meta helpers (numeric ID + Name in NVS) ----------
@@ -316,6 +333,16 @@ static void setNodeName(const String& nodeId, String name) {
   const size_t kMaxLen = 32;
   if (name.length() > kMaxLen) name = name.substring(0, kMaxLen);
   storeNodeMeta(nodeId, "name_", name);
+}
+
+String getNodeNotes(const String& nodeId) {
+  return loadNodeMeta(nodeId, "note_");
+}
+
+static void setNodeNotes(const String& nodeId, String notes) {
+  const size_t kMaxLen = 180;
+  if (notes.length() > kMaxLen) notes = notes.substring(0, kMaxLen);
+  storeNodeMeta(nodeId, "note_", notes);
 }
 
 // Helpers intended for CSV logging (non-static so espnow_manager.cpp can use them)
@@ -554,6 +581,102 @@ static bool isAllowedInterval(int interval) {
   return false;
 }
 
+static String formatBytesUi(uint64_t bytes) {
+  char b[24];
+  if (bytes < 1024ULL) {
+    snprintf(b, sizeof(b), "%lu B", (unsigned long)bytes);
+  } else if (bytes < (1024ULL * 1024ULL)) {
+    const double kb = (double)bytes / 1024.0;
+    snprintf(b, sizeof(b), "%.1f KB", kb);
+  } else if (bytes < (1024ULL * 1024ULL * 1024ULL)) {
+    const double mb = (double)bytes / (1024.0 * 1024.0);
+    snprintf(b, sizeof(b), "%.1f MB", mb);
+  } else {
+    const double gb = (double)bytes / (1024.0 * 1024.0 * 1024.0);
+    snprintf(b, sizeof(b), "%.2f GB", gb);
+  }
+  return String(b);
+}
+
+static String buildDataStatusSectionHtml() {
+  bool hasFile = SD.exists("/datalog.csv");
+  uint32_t records = 0;
+  uint64_t fileBytes = 0;
+  String lastConfirmedSync = "n/a";
+
+  if (hasFile) {
+    File file = SD.open("/datalog.csv", FILE_READ);
+    if (file) {
+      fileBytes = (uint64_t)file.size();
+
+      uint32_t lineNo = 0;
+      String lastDataLine;
+      while (file.available()) {
+        String line = file.readStringUntil('\n');
+        line.trim();
+        if (line.length() == 0) continue;
+
+        lineNo++;
+        if (lineNo == 1) continue; // header
+
+        records++;
+        lastDataLine = line;
+      }
+      file.close();
+
+      if (lastDataLine.length() > 0) {
+        const int comma = lastDataLine.indexOf(',');
+        if (comma > 0) {
+          lastConfirmedSync = lastDataLine.substring(0, comma);
+        }
+      }
+    } else {
+      hasFile = false;
+    }
+  }
+
+  const uint64_t totalBytes = (uint64_t)SD.totalBytes();
+  const uint64_t usedBytes  = (uint64_t)SD.usedBytes();
+  const uint64_t freeBytes  = (totalBytes > usedBytes) ? (totalBytes - usedBytes) : 0;
+
+  String out;
+  out.reserve(900);
+  out += F("<div class='section'><h3>Data status</h3>");
+
+  out += F("<div class='stats' style='margin:0 0 10px 0'>"
+           "<div class='stat'><strong>Records</strong><span class='num'>");
+  out += String(records);
+  out += F("</span></div>"
+           "<div class='stat'><strong>CSV size</strong><span class='num' style='font-size:16px'>");
+  out += hasFile ? formatBytesUi(fileBytes) : String("n/a");
+  out += F("</span></div>"
+           "<div class='stat'><strong>Card free</strong><span class='num' style='font-size:16px'>");
+  out += (totalBytes > 0) ? formatBytesUi(freeBytes) : String("n/a");
+  out += F("</span></div></div>");
+
+  if (!hasFile) {
+    out += F("<p class='muted'>No datalog.csv file yet.</p>");
+  }
+
+  if (totalBytes > 0) {
+    const uint32_t usedPct = (uint32_t)((usedBytes * 100ULL) / totalBytes);
+    out += F("<p class='muted'><strong>Card usage:</strong> ");
+    out += String(usedPct);
+    out += F("% used (" );
+    out += formatBytesUi(usedBytes);
+    out += F(" of ");
+    out += formatBytesUi(totalBytes);
+    out += F(")</p>");
+  }
+
+  out += F("<p class='muted'><strong>Last confirmed sync:</strong> ");
+  out += lastConfirmedSync;
+  out += F("</p>");
+
+  out += F("<p class='muted'>Use the CSV button at the top to export data.</p></div>");
+  return out;
+}
+
 static String buildListNodesDataJson() {
   auto nodes = getRegisteredNodes();
 
@@ -736,10 +859,12 @@ static bool handleBleCommand(
 
     bool sent = broadcastSyncSchedule(interval, (unsigned long)phase);
     gSyncIntervalMin = interval;
+    gSyncMode = SYNC_MODE_INTERVAL;
     gLastSyncBroadcastEpochDay = (long)(((unsigned long)phase) / 86400UL);
     gLastSyncBroadcastUnix = (unsigned long)phase;
     gLastSyncIntervalSlot = (long long)((unsigned long)phase / ((unsigned long)max(interval, 1) * 60UL));
     saveSyncIntervalToNVS(interval);
+    saveSyncModeToNVS(gSyncMode);
 
     responseType = "ack";
     responseDataJson = String("{\"command\":\"set_sync_interval\",\"intervalMinutes\":")
@@ -806,10 +931,12 @@ static bool handleBleCommand(
         const unsigned long phaseUnix = (hasPhase && phase > 0) ? (unsigned long)phase : getRTCTimeUnix();
         syncSent = broadcastSyncSchedule(iv, phaseUnix);
         gSyncIntervalMin = iv;
+        gSyncMode = SYNC_MODE_INTERVAL;
         gLastSyncBroadcastEpochDay = (long)(phaseUnix / 86400UL);
         gLastSyncBroadcastUnix = phaseUnix;
         gLastSyncIntervalSlot = (long long)(phaseUnix / ((unsigned long)max(iv, 1) * 60UL));
         saveSyncIntervalToNVS(iv);
+        saveSyncModeToNVS(gSyncMode);
       }
     }
 
@@ -923,14 +1050,17 @@ static bool handleBleCommand(
 // ---------- CSS / JS ----------
 const char COMMON_CSS[] PROGMEM = R"CSS(
 :root{
-  --bg:#f5f5f5; --panel:#ffffff; --text:#1b1f23; --sub:#5f6b7a; --border:#e5e7eb;
-  --primary:#2196F3; --success:#4CAF50; --warn:#ff9800; --danger:#f44336;
+  --bg:#f1f2eb; --panel:#ffffff; --text:#4a4a48; --sub:#566246; --border:#d8dad3;
+  --primary:#566246; --success:#a4c2a5; --warn:#566246; --danger:#8b5e5e;
+  --btn-solid:#4F6D7A;
+  --input-bg:#f5f7ef;
+  --input-bg-active:#edf2e2;
   --radius:10px; --sp-1:8px; --sp-2:12px; --sp-3:16px; --sp-4:20px;
-  --shadow:0 2px 10px rgba(0,0,0,.08);
+  --shadow:0 2px 10px rgba(74,74,72,.12);
 }
 *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
 html{scroll-behior:smooth}
-html,body{margin:0;padding:0;background:var(--bg);color:var(--text);
+html,body{margin:0;padding:0;background:linear-gradient(180deg,#f1f2eb 0%, #d8dad3 100%);color:var(--text);
   font:16px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,system-ui,sans-serif}
 a{color:var(--primary);text-decoration:none}
 :focus-visible{outline:3px solid rgba(33,150,243,.35);outline-offset:2px}
@@ -938,10 +1068,17 @@ a{color:var(--primary);text-decoration:none}
 /* Layout */
 .container{max-width:600px;margin:0 auto;padding:var(--sp-3)}
 .header{padding:var(--sp-3) 0;text-align:center}
-.h1{font-size:22px;font-weight:700;margin:0 0 var(--sp-2)}
+.header-top{display:flex;align-items:center;justify-content:space-between;gap:10px}
+.header-actions{display:flex;align-items:center;gap:8px}
+.h1{font-size:22px;font-weight:700;margin:0}
+.top-time{display:flex;align-items:center;justify-content:space-between;gap:10px;background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:14px 16px;margin-bottom:12px;min-height:62px}
+.top-time__label{color:var(--sub);font-size:.95rem;font-weight:600}
+.top-time__value{font-weight:700;color:#566246;font-size:1.25rem}
 .section{background:var(--panel);border:1px solid var(--border);border-radius:var(--radius);
   padding:var(--sp-3);box-shadow:var(--shadow);margin:var(--sp-3) 0}
 .section h3{margin:0 0 var(--sp-2);font-size:18px}
+.section-head{display:flex;align-items:center;justify-content:space-between;gap:10px;margin:0 0 var(--sp-2)}
+.section-head h3{margin:0}
 .muted{color:var(--sub);font-size:.95rem}
 
 /* Stats */
@@ -949,17 +1086,57 @@ a{color:var(--primary);text-decoration:none}
 .stat{background:#fafafa;border:1px solid var(--border);border-radius:8px;padding:10px}
 .stat strong{display:block;font-size:13px;color:var(--sub);margin-bottom:2px}
 .stat .num{font-size:18px;font-weight:700}
+.stats--kpi .stat{padding:14px}
+.stats--kpi .stat strong{font-size:12px;letter-spacing:.02em;text-transform:uppercase}
+.stats--kpi .stat .num{font-size:24px}
+.stats--kpi .stat--deployed-active{background:rgba(164,194,165,.28);border-color:#bcd1bd}
+.stats--kpi .stat--paired-active{background:rgba(225,177,122,.28);border-color:#E1B17A}
+.stats--kpi .stat--unpaired-active{background:rgba(219,22,47,.14);border-color:#DB162F}
 
 /* Lists/cards */
 .list{display:grid;gap:var(--sp-1)}
 .item{background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:12px;display:block;color:inherit}
 .item-row{display:flex;align-items:center;justify-content:space-between;gap:12px}
+.item--node{
+  padding:14px 12px;
+  min-height:86px;
+  cursor:pointer;
+  border-width:2px;
+  border-color:#c9d0c3;
+  background:linear-gradient(180deg,#ffffff 0%, #f4f7ef 100%);
+  box-shadow:0 4px 12px rgba(74,74,72,.12);
+  transition:transform .12s ease, box-shadow .12s ease, border-color .12s ease, background .12s ease;
+}
+.item--node:hover{
+  border-color:#9faf97;
+  box-shadow:0 8px 18px rgba(74,74,72,.18);
+  background:linear-gradient(180deg,#ffffff 0%, #eef3e5 100%);
+}
+.item--node:focus-visible{
+  outline:3px solid rgba(79,109,122,.35);
+  outline-offset:2px;
+}
+.item--node:active{
+  transform:translateY(1px) scale(.995);
+  box-shadow:0 3px 9px rgba(74,74,72,.14);
+}
+.node-row{display:grid;grid-template-columns:minmax(0,1fr) auto auto;align-items:center;gap:12px}
+.node-main{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.node-name{margin-left:10px}
+.node-timing{display:grid;grid-template-columns:auto auto;gap:10px}
+.node-timing-cell{display:flex;flex-direction:column;align-items:flex-start;gap:3px;min-width:86px}
+.node-timing-label{font-size:.72rem;color:var(--sub);font-weight:700;letter-spacing:.02em;text-transform:uppercase}
+.node-timing-value{font-size:.86rem}
+.node-status{display:grid;grid-template-columns:auto auto;gap:10px}
+.node-status-cell{display:flex;flex-direction:column;align-items:flex-start;gap:3px;min-width:86px}
+.item--node .chip{font-weight:600}
+.item--node .chip{white-space:nowrap}
 
 /* Chips */
 .chip{display:inline-block;padding:2px 8px;border-radius:999px;border:1px solid var(--border);font-size:.85rem;color:var(--sub)}
-.chip--state-deployed{border-color:#c8e6c9;background:#f1f8e9;color:#256029}
-.chip--state-paired{border-color:#ffe0b2;background:#fff3e0;color:#e65100}
-.chip--state-unpaired{border-color:#ffcdd2;background:#ffebee;color:#b71c1c}
+.chip--state-deployed{border-color:#bcd1bd;background:rgba(164,194,165,.28);color:#2f4f35}
+.chip--state-paired{border-color:#E1B17A;background:rgba(225,177,122,.28);color:#7a4b13}
+.chip--state-unpaired{border-color:#DB162F;background:rgba(219,22,47,.14);color:#7f1020}
 .chip--link-awake{border-color:#b3e5fc;background:#e1f5fe;color:#01579b}
 .chip--link-asleep{border-color:#e1bee7;background:#f3e5f5;color:#4a148c}
 .chip--link-offline{border-color:#ffcdd2;background:#ffebee;color:#b71c1c}
@@ -969,29 +1146,46 @@ a{color:var(--primary);text-decoration:none}
 /* Forms */
 .label{display:block;margin:8px 0 6px;color:var(--sub);font-size:.95rem}
 .input, input[type="text"], input[type="number"], select{
-  width:100%;padding:12px;border:1px solid var(--border);border-radius:8px;background:#fff
+  width:100%;padding:12px;border:1px solid var(--border);border-radius:8px;background:var(--input-bg)
+}
+.input:focus, input[type="text"]:focus, input[type="number"]:focus, select:focus{
+  background:var(--input-bg-active)
 }
 .help{color:var(--sub);font-size:.85rem;margin-top:6px}
 .row{display:flex;gap:var(--sp-1);flex-wrap:wrap}
 .col{flex:1 1 220px;min-width:0}
+.subpanel{display:none;margin-top:12px;padding:10px;border:1px solid var(--border);border-radius:8px;background:#fafafa}
+.action-stack .btn{padding:14px 16px;min-height:52px;font-size:1rem}
 
 /* Buttons */
 .btn{display:inline-flex;align-items:center;justify-content:center;gap:8px;
   padding:12px 16px;border-radius:8px;border:1px solid var(--border);background:#fff;color:var(--text);
   cursor:pointer;width:100%;margin-top:8px;text-decoration:none}
-.btn--primary{background:var(--primary);color:#fff;border-color:transparent}
-.btn--success{background:var(--success);color:#fff;border-color:transparent}
-.btn--warn{background:var(--warn);color:#fff;border-color:transparent}
+.btn--primary,.btn--success,.btn--warn{background:var(--btn-solid);color:#fff;border-color:transparent}
+.btn--sm{width:auto;min-height:36px;padding:8px 12px;margin-top:0;font-size:.9rem}
+.btn--action{padding:14px 16px;min-height:52px;font-size:1rem}
 .btn:disabled{opacity:.6;cursor:not-allowed}
+.action-choices{display:grid;gap:8px;margin-top:10px}
+.action-choice input{position:absolute;opacity:0;pointer-events:none}
+.action-choice span{display:flex;align-items:center;justify-content:center;min-height:46px;padding:10px 12px;border-radius:8px;border:1px solid var(--border);font-weight:700;cursor:pointer;transition:filter .12s ease, transform .12s ease, box-shadow .12s ease}
+.action-choice--start span{border-color:#bcd1bd;background:#fff;color:#2f4f35}
+.action-choice--stop span{border-color:#E1B17A;background:#fff;color:#7a4b13}
+.action-choice--unpair span{border-color:#DB162F;background:#fff;color:#7f1020}
+.action-choice span:hover{filter:brightness(.98)}
+.action-choice input:checked + span{box-shadow:0 0 0 2px rgba(79,109,122,.35) inset;transform:translateY(1px)}
+.action-choice--start input:checked + span{background:rgba(164,194,165,.28)}
+.action-choice--stop input:checked + span{background:rgba(225,177,122,.28)}
+.action-choice--unpair input:checked + span{background:rgba(219,22,47,.14)}
+.icon{width:1.2em;height:1.2em;display:inline-block;vertical-align:-0.12em;fill:currentColor}
+.quick-row{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px;margin:0 0 12px}
+.quick-row .btn{margin-top:0;min-height:52px}
+.quick-row .subpanel{grid-column:2 / 3;margin-top:0}
+.quick-row form{margin:0}
+.quick-row form .btn{width:100%}
 
 /* Utility */
 .center{text-align:center}
 .badge{display:inline-block;padding:2px 8px;border:1px solid var(--border);border-radius:999px;color:var(--sub);font-size:.85rem}
-.footer-bar{
-  position:sticky;bottom:0;background:var(--panel);border:1px solid var(--border);
-  padding:calc(var(--sp-2) + env(safe-area-inset-bottom)) var(--sp-3);
-  border-radius:12px;box-shadow:var(--shadow);display:flex;gap:12px;justify-content:space-between
-}
 
 /* Time health pills in Node Manager */
 .time-health{
@@ -1020,7 +1214,6 @@ a{color:var(--primary);text-decoration:none}
   font-size:.7rem;
   color:#6b7280;
 }
-
 
 @media(min-width:768px){.container{max-width:720px}}
 )CSS";
@@ -1088,7 +1281,7 @@ function wireAsyncForms(){
 function setCurrentTime(){
   const n=new Date();
   const z=n=>String(n).padStart(2,'0');
-  const s=`${n.getFullYear()}-${z(n.getMonth()+1)}-${z(n.getDate())} ${z(n.getHours())}:${z(n.getMinutes())}:${z(n.getSeconds())}`;
+  const s=`${z(n.getHours())}:${z(n.getMinutes())}:${z(n.getSeconds())} ${z(n.getDate())}-${z(n.getMonth()+1)}-${n.getFullYear()}`;
   const el=document.getElementById('datetime'); if(el) el.value=s;
 }
 function toggleSettings(){
@@ -1103,6 +1296,18 @@ function toggleSyncSchedule(){
   const showing=panel.style.display==='block';
   panel.style.display = showing ? 'none' : 'block';
 }
+function toggleGlobalInterval(){
+  const panel=document.getElementById('global-interval-panel');
+  if(!panel) return;
+  const showing=panel.style.display==='block';
+  panel.style.display = showing ? 'none' : 'block';
+}
+function toggleInfoPanel(){
+  const panel=document.getElementById('info-panel');
+  if(!panel) return;
+  const showing=panel.style.display==='block';
+  panel.style.display = showing ? 'none' : 'block';
+}
 window.addEventListener('DOMContentLoaded', () => {
   setCurrentTime();
   wireAsyncForms();
@@ -1111,27 +1316,27 @@ window.addEventListener('DOMContentLoaded', () => {
 // Live 1s ticking of the displayed RTC time
 (function(){
   const pad = n => String(n).padStart(2,'0');
-  function parseYMDHMS(str){
+  function parseHMSDMY(str){
     if (!str || str.length < 19) return NaN;
-    const y = +str.slice(0,4), m = +str.slice(5,7), d = +str.slice(8,10);
-    const H = +str.slice(11,13), M = +str.slice(14,16), S = +str.slice(17,19);
+    const H = +str.slice(0,2), M = +str.slice(3,5), S = +str.slice(6,8);
+    const d = +str.slice(9,11), m = +str.slice(12,14), y = +str.slice(15,19);
     const dt = new Date(y, m-1, d, H, M, S); // local
     return isNaN(dt) ? NaN : dt.getTime();
   }
-  function formatYMDHMS(ms){
+  function formatHMSDMY(ms){
     const dt = new Date(ms);
-    return `${dt.getFullYear()}-${pad(dt.getMonth()+1)}-${pad(dt.getDate())} ` +
-           `${pad(dt.getHours())}:${pad(dt.getMinutes())}:${pad(dt.getSeconds())}`;
+    return `${pad(dt.getHours())}:${pad(dt.getMinutes())}:${pad(dt.getSeconds())} ` +
+           `${pad(dt.getDate())}-${pad(dt.getMonth()+1)}-${dt.getFullYear()}`;
   }
   function startClock(){
     const el = document.getElementById('rtc-now');
     if (!el) return;
     const initial = (el.textContent || '').trim();
-    const rtcMs   = parseYMDHMS(initial);
+    const rtcMs   = parseHMSDMY(initial);
     const offset  = isNaN(rtcMs) ? 0 : (rtcMs - Date.now());
     function draw(){
       const nowMs = Date.now() + offset;
-      el.textContent = formatYMDHMS(nowMs);
+      el.textContent = formatHMSDMY(nowMs);
     }
     draw();
     setInterval(draw, 1000);
@@ -1160,7 +1365,7 @@ static void sendAjaxResult(bool ok, const String& message) {
 }
 
 // ---------- Common page frame ----------
-static String headCommon(const String& title){
+static String headCommon(const String& title, const String& actionsHtml = String()){
   String h;
   h.reserve(4500);
   h += F("<!DOCTYPE html><html><head>");
@@ -1176,17 +1381,17 @@ static String headCommon(const String& title){
 
   h += F("</head><body><div class='container'>");
   h += F("<div class='header'>");
+  h += F("<div class='header-top'>");
   h += F("<div class='h1'>"); h += title; h += F("</div>");
-  h += F("<div class='badge'>Device ID: <strong>");
-  h += DEVICE_ID;
-  h += F("</strong></div>");
-  h += F("<div class='muted'>Wi-Fi: ");
-  h += ssid;
-  h += F(" • ");
-  h += FW_VERSION;
-  h += F(" — ");
-  h += FW_BUILD;
-  h += F("</div></div>");
+  h += F("<div class='header-actions'>");
+  if (actionsHtml.length()) {
+    h += actionsHtml;
+  } else {
+    h += F("<a href='/' class='btn btn--sm'>Refresh</a>");
+  }
+  h += F("</div>");
+  h += F("</div>");
+  h += F("</div>");
   return h;
 }
 static inline String footCommon(){ return String(F("</div></body></html>")); }
@@ -1238,7 +1443,7 @@ void handleRevertNode() {
   } else {
     html += F("<h3>Node not found or not deployed</h3><p>No action taken.</p>");
   }
-  html += F("<a href='/nodes' class='btn btn--primary'>Back to Node Manager</a></div>");
+  html += F("<a href='/nodes' class='btn btn--primary'>Back to Node manager</a></div>");
   html += footCommon();
   server.send(200, "text/html", html);
 }
@@ -1250,8 +1455,6 @@ void handleRoot() {
   char currentTime[24];
   getRTCTimeString(currentTime, sizeof(currentTime));
 
-  String csvStats = getCSVStats();
-
   auto allNodes      = getRegisteredNodes();
   auto unpairedNodes = getUnpairedNodes();
   auto pairedNodes   = getPairedNodes();
@@ -1261,27 +1464,118 @@ void handleRoot() {
     if (node.state == DEPLOYED) deployedNodes++;
   }
 
-  // --- Timing & RTC section ---
-  html += F("<div class='section' aria-live='polite'>"
-            "<h3>⏱ Timing &amp; RTC</h3>"
-            "<p class='muted'>Live DS3231 clock plus fleet default timing templates.</p>"
-            "<div id='ui-status' class='help' style='display:none;margin-bottom:10px;border:1px solid var(--border);border-radius:8px;padding:8px 10px'></div>"
-            "<div class='row'>");
-
-  // Left: RTC
-  html += F("<div class='col'>"
-              "<strong>Current RTC Time</strong><br>"
-              "<div id='rtc-now' style='font-size:18px;color:#1976D2;margin-top:6px'>");
+  html += F("<div class='top-time'><span class='top-time__label'>Mothership time</span><span id='rtc-now' class='top-time__value'>");
   html += currentTime;
+  html += F("</span></div>");
+
+  html += F("<div class='quick-row'>"
+            "<form class='async-form' action='/discover-nodes' method='POST'>"
+            "<button type='submit' class='btn btn--primary'><svg class='icon' viewBox='0 0 24 24' aria-hidden='true'><path d='M12 3c-3.9 0-7.4 1.6-9.9 4.1l1.4 1.4C5.6 6.4 8.7 5 12 5s6.4 1.4 8.5 3.5l1.4-1.4C19.4 4.6 15.9 3 12 3zm0 5c-2.6 0-5 .9-6.9 2.6l1.4 1.4C8 10.5 9.9 10 12 10s4 .5 5.5 2l1.4-1.4C17 8.9 14.6 8 12 8zm0 5c-1.3 0-2.5.5-3.5 1.5l1.4 1.4c.6-.6 1.3-.9 2.1-.9s1.5.3 2.1.9l1.4-1.4c-1-1-2.2-1.5-3.5-1.5zm0 4a2 2 0 100 4 2 2 0 000-4z'/></svg> Discover Nodes</button>"
+            "</form>"
+            "<button class='btn' type='button' onclick='toggleInfoPanel()'><svg class='icon' viewBox='0 0 24 24' aria-hidden='true'><path d='M12 2a10 10 0 1010 10A10 10 0 0012 2zm0 4a1.25 1.25 0 11-1.25 1.25A1.25 1.25 0 0112 6zm2 12h-4v-1.8h1.1v-4.2H10v-1.8h3v6h1z'/></svg> INFO</button>"
+            "<a href='/download-csv' class='btn btn--success'><svg class='icon' viewBox='0 0 24 24' aria-hidden='true'><path d='M12 3a1 1 0 011 1v8.59l2.3-2.3 1.4 1.42-4.7 4.7-4.7-4.7 1.4-1.42 2.3 2.3V4a1 1 0 011-1zm-7 14h14v2H5v-2z'/></svg> CSV</a>"
+            "<div id='info-panel' class='subpanel'>"
+            "<h3><svg class='icon' viewBox='0 0 24 24' aria-hidden='true'><path d='M12 2a10 10 0 1010 10A10 10 0 0012 2zm0 4a1.25 1.25 0 11-1.25 1.25A1.25 1.25 0 0112 6zm2 12h-4v-1.8h1.1v-4.2H10v-1.8h3v6h1z'/></svg> INFO</h3>"
+            "<div class='help'><strong>Device ID:</strong> ");
+  html += DEVICE_ID;
+  html += F("<br><strong>Firmware:</strong> ");
+  html += FW_VERSION;
+  html += F("<br><strong>Build:</strong> ");
+  html += FW_BUILD;
   html += F("</div>"
-            "<div class='help'>Clock is driven by the DS3231 on this mothership.</div>"
+            "<div class='help'><strong>SSID:</strong> ");
+  html += ssid;
+  html += F("<br><strong>URL:</strong> http://192.168.4.1/"
+            "<br><strong>IP:</strong> 192.168.4.1"
+            "<br><strong>MAC:</strong> ");
+  html += getMothershipsMAC();
+  html += F("</div>"
+            "</div>"
             "</div>");
 
-  // Right: fleet default wake interval template
-  html += F("<div class='col'>"
+  // --- Overview section ---
+  html += F("<div class='section' aria-live='polite'>"
+            "<div id='ui-status' class='help' style='display:none;margin-bottom:10px;border:1px solid var(--border);border-radius:8px;padding:8px 10px'></div>");
+
+  html += F("<div class='stats stats--kpi' style='margin:0 0 12px 0'>"
+              "<div class='stat");
+  if (deployedNodes > 0) html += F(" stat--deployed-active");
+  html += F("'><strong>Deployed</strong><span class='num'>");
+  html += String(deployedNodes);
+  html += F("</span></div>"
+              "<div class='stat");
+  if (pairedNodes.size() > 0) html += F(" stat--paired-active");
+  html += F("'><strong>Paired</strong><span class='num'>");
+  html += String(pairedNodes.size());
+  html += F("</span></div>"
+              "<div class='stat");
+  if (unpairedNodes.size() > 0) html += F(" stat--unpaired-active");
+  html += F("'><strong>Unpaired</strong><span class='num'>");
+  html += String(unpairedNodes.size());
+  html += F("</span></div>"
+            "</div>");
+
+  html += F("<div class='row'>");
+  html += F("<div class='col action-stack'>"
+            "<a href='/nodes' class='btn btn--success' style='margin-top:8px'><svg class='icon' viewBox='0 0 24 24' aria-hidden='true'><path d='M12 2a4 4 0 110 8 4 4 0 010-8zm-7 12a3 3 0 110 6 3 3 0 010-6zm14 0a3 3 0 110 6 3 3 0 010-6zM9.3 9.8l-3 3.9 1.6 1.2 3-3.9-1.6-1.2zm5.4 0l-1.6 1.2 3 3.9 1.6-1.2-3-3.9z'/></svg> Node manager</a>"
+            "</div>");
+
+  html += F("</div>"); // end row
+
+  html += F("</div>"); // end overview section
+
+  int activeSyncIntervalMin = gSyncIntervalMin;
+  if (!isAllowedInterval(activeSyncIntervalMin)) activeSyncIntervalMin = 15;
+
+  String activeSyncPlan =
+    (gSyncMode == SYNC_MODE_INTERVAL)
+      ? (String("Every ") + String(activeSyncIntervalMin) + String(" min"))
+      : (String("Daily @ ") + formatSyncTimeHHMM(gSyncDailyHour, gSyncDailyMinute));
+
+  // --- Schedule section ---
+  html += F("<div class='section'>"
+            "<div class='section-head'>"
+            "<h3><svg class='icon' viewBox='0 0 24 24' aria-hidden='true'><circle cx='12' cy='12' r='9' fill='none' stroke='currentColor' stroke-width='2'/><path d='M12 7v5l3 2' fill='none' stroke='currentColor' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'/></svg> Global schedules</h3>"
+            "<button id='settings-btn' class='btn btn--sm' type='button' onclick='toggleSettings()'>SET TIME</button>"
+            "</div>"
+            "<div id='settings-panel' class='subpanel' style='margin-top:0;margin-bottom:12px'>"
+            "<h3>⚙️ SET TIME</h3>"
+            "<p class='muted'>Only needed for initial setup or DS3231 correction.</p>"
+            "<form action='/set-time' method='POST'>"
+            "<label class='label' for='datetime'><strong>Set new time</strong></label>"
+            "<input class='input' id='datetime' name='datetime' type='text' "
+            "placeholder='HH:MM:SS DD-MM-YYYY' inputmode='numeric' autocomplete='off'>"
+            "<div class='row'>"
+            "<button type='button' class='btn' onclick='setCurrentTime()'>Use browser time</button>"
+            "<button type='submit' class='btn btn--success'>Set Time</button>"
+            "</div>"
+            "<div class='help'>Example: 21:05:00 14-11-2026</div>"
+            "</form>"
+            "</div>"
+            "<div class='stats' style='margin:0 0 12px 0'>"
+            "<div class='stat'><strong>Sync mode</strong><span class='num' style='font-size:16px'>");
+  html += syncModeLabel();
+  html += F("</span></div>"
+            "<div class='stat'><strong>Active sync</strong><span class='num' style='font-size:16px'>");
+  html += activeSyncPlan;
+  html += F("</span></div>"
+            "<div class='stat'><strong>Next sync</strong><span class='num' style='font-size:16px'>");
+  html += computeNextSyncIsoLocal();
+  html += F("</span></div>"
+            "</div>"
+            "<div class='row'>"
+            "<div class='col'>"
+              "<button id='global-interval-btn' class='btn btn--warn btn--action' type='button' onclick='toggleGlobalInterval()' style='margin-top:10px'>"
+              "<svg class='icon' viewBox='0 0 24 24' aria-hidden='true'><path d='M12 4V1L8 5l4 4V6c3.3 0 6 2.7 6 6 0 1-.2 1.9-.7 2.7l1.5 1.3A8 8 0 0020 12c0-4.4-3.6-8-8-8zm-6.8.3A8 8 0 004 12c0 4.4 3.6 8 8 8v3l4-4-4-4v3c-3.3 0-6-2.7-6-6 0-1 .2-2 .7-2.8z'/></svg> Node interval"
+              "</button>"
+              "<div id='global-interval-panel' style='display:none;margin-top:10px;padding:10px;border:1px solid var(--border);border-radius:8px;background:#fafafa'>"
               "<form class='async-form' action='/set-wake-interval' method='POST'>"
-              "<label class='label'><strong>Default wake interval (minutes)</strong></label>"
+              "<label class='label'><strong>Global interval trigger</strong></label>"
               "<select class='input' name='interval'>");
+
+  html += F("<option value='0'");
+  if (gWakeIntervalMin <= 0) html += F(" selected");
+  html += F(">Off</option>");
 
   for (size_t i = 0; i < kAllowedCount; ++i) {
     int v = kAllowedIntervals[i];
@@ -1296,20 +1590,14 @@ void handleRoot() {
 
   html += F("</select>"
             "<button type='submit' class='btn btn--primary' style='margin-top:8px'>"
-            "Save default</button>"
-            "<div class='help'>Used as a template for Node Manager intervals. Current default: <strong>");
-  html += String(gWakeIntervalMin);
-  html += F(" min</strong></div>"
-            "</form>");
+            "Apply global interval</button>"
+            "</form>"
+            "</div>");
 
-  html += F("<div class='help' style='margin-top:10px'>Current sync mode: <strong>");
-  html += syncModeLabel();
-  html += F("</strong><br>Next sync: <strong>");
-  html += computeNextSyncIsoLocal();
-  html += F("</strong></div>");
+  html += F("<div class='col'>");
 
-  html += F("<button id='sync-btn' class='btn btn--warn' type='button' onclick='toggleSyncSchedule()' style='margin-top:10px'>"
-            "⚙️ Sync schedule controls"
+  html += F("<button id='sync-btn' class='btn btn--warn btn--action' type='button' onclick='toggleSyncSchedule()' style='margin-top:10px'>"
+            "<svg class='icon' viewBox='0 0 24 24' aria-hidden='true'><path d='M12 2C7 2 3 3.8 3 6v12c0 2.2 4 4 9 4s9-1.8 9-4V6c0-2.2-4-4-9-4zm0 2c4.4 0 7 .9 7 2s-2.6 2-7 2-7-.9-7-2 2.6-2 7-2zm0 16c-4.4 0-7-.9-7-2v-2c1.6 1.1 4.4 1.7 7 1.7s5.4-.6 7-1.7v2c0 1.1-2.6 2-7 2zm0-6c-4.4 0-7-.9-7-2v-2c1.6 1.1 4.4 1.7 7 1.7s5.4-.6 7-1.7v2c0 1.1-2.6 2-7 2z'/></svg> Data sync interval"
             "</button>");
 
   html += F("<div id='sync-panel' style='display:none;margin-top:10px;padding:10px;border:1px solid var(--border);border-radius:8px;background:#fafafa'>"
@@ -1321,11 +1609,10 @@ void handleRoot() {
   html += F(">Daily (recommended)</option>"
             "<option value='interval'");
   if (gSyncMode == SYNC_MODE_INTERVAL) html += F(" selected");
-  html += F(">Interval (testing / advanced)</option>"
+  html += F(">Interval</option>"
             "</select>"
             "<button type='submit' class='btn btn--warn' style='margin-top:8px'>"
             "Save sync mode</button>"
-            "<div class='help'>Sets how global sync triggers are generated.</div>"
             "</form>");
 
   if (gSyncMode == SYNC_MODE_DAILY) {
@@ -1336,10 +1623,12 @@ void handleRoot() {
     html += F("'>"
               "<button type='submit' class='btn btn--warn' style='margin-top:8px'>"
               "Set daily sync time</button>"
-              "<div class='help'>Runs once per day at the selected time.</div>"
               "</form>");
   } else {
     html += F("<form class='async-form' action='/set-sync-interval' method='POST' style='margin-top:12px'>"
+              "<div><strong>Current active:</strong> ");
+    html += String(activeSyncIntervalMin);
+    html += F(" min</div>"
               "<label class='label'><strong>Sync every (minutes)</strong></label>"
               "<select class='input' name='interval'>");
 
@@ -1348,7 +1637,7 @@ void handleRoot() {
       html += F("<option value='");
       html += String(v);
       html += F("'");
-      if (v == gSyncIntervalMin) html += F(" selected");
+      if (v == activeSyncIntervalMin) html += F(" selected");
       html += F(">");
       html += String(v);
       html += F("</option>");
@@ -1357,77 +1646,16 @@ void handleRoot() {
     html += F("</select>"
               "<button type='submit' class='btn btn--warn' style='margin-top:8px'>"
               "Set sync interval</button>"
-              "<div class='help'>Runs at fixed RTC-aligned interval boundaries.</div>"
               "</form>");
   }
 
   html += F("</div>"
-            "</div>"); // end col
+            "</div>" // end col
+            "</div>" // end row
+            "</div>"); // end schedule section
 
-  html += F("</div>"); // end row
-
-  // RTC settings toggle + panel
-  html += F("<div style='margin-top:12px'>"
-            "<button id='settings-btn' class='btn' type='button' onclick='toggleSettings()'>"
-            "⚙️ Set RTC time…"
-            "</button>"
-            "</div>");
-
-  html += F("<div id='settings-panel' class='section' style='display:none;margin-top:12px'>"
-            "<h3>⚙️ RTC Time Configuration</h3>"
-            "<p class='muted'>Only needed for initial setup or DS3231 correction.</p>"
-            "<form action='/set-time' method='POST'>"
-            "<label class='label' for='datetime'><strong>Set new time</strong></label>"
-            "<input class='input' id='datetime' name='datetime' type='text' "
-            "placeholder='YYYY-MM-DD HH:MM:SS' inputmode='numeric' autocomplete='off'>"
-            "<div class='row'>"
-            "<button type='button' class='btn' onclick='setCurrentTime()'>Use browser time</button>"
-            "<button type='submit' class='btn btn--success'>Set RTC</button>"
-            "</div>"
-            "<div class='help'>Example: 2025-11-14 21:05:00</div>"
-            "</form>"
-            "</div>");
-
-  html += F("</div>"); // end Timing & RTC section
-
-  // --- Data logging section ---
-  html += F("<div class='section'>"
-            "<h3>📊 Data Logging</h3>"
-            "<p class='muted'><strong>Status:</strong> ");
-  html += csvStats;
-  html += F("</p>"
-            "<a href='/download-csv' class='btn btn--success'>⬇️ Download CSV Data</a>"
-            "<div class='help'>Downloads all logged sensor data from /datalog.csv.</div>"
-            "</div>");
-
-  // --- Node discovery & fleet overview ---
-  html += F("<div class='section'>"
-            "<h3>📡 Node Discovery &amp; Fleet Overview</h3>"
-            "<p class='muted'><strong>Mothership MAC:</strong> ");
-  html += getMothershipsMAC();
-  html += F("</p>"
-            "<div class='stats' style='margin:12px 0'>"
-              "<div class='stat'><strong>Deployed</strong><span class='num'>");
-  html += String(deployedNodes);
-  html += F("</span></div>"
-              "<div class='stat'><strong>Paired</strong><span class='num'>");
-  html += String(pairedNodes.size());
-  html += F("</span></div>"
-              "<div class='stat'><strong>Unpaired</strong><span class='num'>");
-  html += String(unpairedNodes.size());
-  html += F("</span></div>"
-            "</div>"
-            "<form class='async-form' action='/discover-nodes' method='POST'>"
-            "<button type='submit' class='btn btn--primary'>🔍 Discover New Nodes</button>"
-            "</form>"
-            "<a href='/nodes' class='btn btn--success' style='margin-top:8px'>🧩 Open Node Manager</a>"
-            "</div>");
-
-  // --- Footer bar ---
-  html += F("<div class='footer-bar'>"
-            "<a href='/' class='btn'>🔄 Refresh</a>"
-            "<a href='/download-csv' class='btn btn--success'>⬇️ CSV</a>"
-            "</div>");
+  // --- Data status section ---
+  html += buildDataStatusSectionHtml();
 
   html += footCommon();
   server.send(200, "text/html", html);
@@ -1435,9 +1663,9 @@ void handleRoot() {
 
 void handleSetTime() {
   String dt = server.arg("datetime");
-  int yy, mm, dd, hh, mi, ss;
-  if (sscanf(dt.c_str(), "%d-%d-%d %d:%d:%d", &yy, &mm, &dd, &hh, &mi, &ss) == 6) {
-    if (setRTCTime(yy, mm, dd, hh, mi, ss)) {
+  int year, mm, dd, hh, mi, ss;
+  if (sscanf(dt.c_str(), "%d:%d:%d %d-%d-%d", &hh, &mi, &ss, &dd, &mm, &year) == 6 && year >= 2000) {
+    if (setRTCTime(year, mm, dd, hh, mi, ss)) {
       String html = headCommon("ESP32 Data Logger");
       html += F("<div class='section center'><h3>SUCCESS: RTC Time Updated</h3><p>New time:<br><strong>");
       html += dt;
@@ -1454,7 +1682,7 @@ void handleSetTime() {
   } else {
     String html = headCommon("ESP32 Data Logger");
     html += F("<div class='section center'><h3>WARNING: Invalid Time Format</h3>"
-              "<p>Please use the format: YYYY-MM-DD HH:MM:SS</p><p>You entered: <em>");
+              "<p>Please use the format: HH:MM:SS DD-MM-YYYY</p><p>You entered: <em>");
     html += dt;
     html += F("</em></p><a href='/' class='btn btn--primary'>Try Again</a></div>");
     html += footCommon();
@@ -1499,27 +1727,52 @@ void handleDiscoverNodes() {
 
 void handleSetWakeInterval() {
   int interval = server.hasArg("interval") ? server.arg("interval").toInt() : 0;
-  bool ok = false;
+  bool ok = (interval == 0);
   for (size_t i = 0; i < kAllowedCount; ++i)
     if (interval == kAllowedIntervals[i]) { ok = true; break; }
-  if (!ok) interval = 5;
+  if (!ok) interval = 0;
 
   gWakeIntervalMin = interval;
   saveWakeIntervalToNVS(interval);
 
-  Serial.printf("[UI] Default wake interval template set to %d min (no fleet broadcast)\n",
-                interval);
+  bool sent = false;
+  if (interval > 0) {
+    sent = broadcastWakeInterval(interval);
+
+    for (const auto& node : registeredNodes) {
+      if (node.state == PAIRED || node.state == DEPLOYED) {
+        NodeDesiredConfig dc = getDesiredConfig(node.nodeId.c_str());
+        dc.wakeIntervalMin = (uint8_t)interval;
+        dc.configVersion   = max((int)dc.configVersion + 1, 1);
+        setDesiredConfig(node.nodeId.c_str(), dc);
+      }
+    }
+  }
+
+  Serial.printf("[UI] Global wake interval set to %d min (off=0, broadcast=%s)\n",
+                interval,
+                sent ? "yes" : "no");
 
   if (isAjaxRequest()) {
-    sendAjaxResult(true, "Default wake interval saved (Node Manager per-node intervals are unchanged)");
+    if (interval > 0) {
+      sendAjaxResult(true, sent ? "Global interval applied to fleet" : "No eligible paired/deployed nodes");
+    } else {
+      sendAjaxResult(true, "Global interval trigger is OFF");
+    }
     return;
   }
 
   String html = F("<!doctype html><meta name='viewport' content='width=device-width,initial-scale=1'>"
                   "<body style='font-family:sans-serif;padding:20px;text-align:center'>"
-                  "<h3>⏰ Default Wake Interval</h3><p>Saved template: ");
-  html += String(interval);
-  html += F(" min.</p><p style='color:#666'>Existing node intervals are unchanged. Configure each node in Node Manager.</p>");
+                  "<h3>⏰ Global Wake Interval</h3><p>Selected: ");
+  if (interval > 0) {
+    html += String(interval);
+    html += F(" min.</p><p style='color:#666'>");
+    html += sent ? F("Broadcast applied to eligible nodes.") : F("No eligible paired/deployed nodes.");
+    html += F("</p>");
+  } else {
+    html += F("OFF.</p><p style='color:#666'>Global interval trigger disabled.</p>");
+  }
   html += F("<a href='/' style='display:inline-block;padding:10px 16px;"
             "background:#2196F3;color:#fff;text-decoration:none;border-radius:6px'>Back</a></body>");
   server.send(200, "text/html", html);
@@ -1568,11 +1821,13 @@ void handleSetSyncInterval() {
   bool sent = broadcastSyncSchedule(interval, phaseUnix);
 
   gSyncIntervalMin = interval;
+  gSyncMode = SYNC_MODE_INTERVAL;
   gLastSyncBroadcastEpochDay = (long)(phaseUnix / 86400UL);
   gLastSyncBroadcastUnix = phaseUnix;
   gLastSyncBroadcastMs = millis();
   gLastSyncIntervalSlot = (long long)(phaseUnix / ((unsigned long)max(interval, 1) * 60UL));
   saveSyncIntervalToNVS(interval);
+  saveSyncModeToNVS(gSyncMode);
 
   Serial.printf("[UI] Sync interval set to %d min phase=%lu -> broadcast %s (mode=%s)\n",
                 interval,
@@ -1644,13 +1899,16 @@ void handleNodeConfigForm() {
     if (n.nodeId == nodeId) { target = &n; break; }
   }
 
-  String html = headCommon("Configure Node");
+  String actionsHtml = String("<a href='/nodes' class='btn btn--sm'>Back</a><a href='/node-config?node_id=")
+    + nodeId
+    + String("' class='btn btn--sm'>Refresh</a>");
+  String html = headCommon("Configure", actionsHtml);
   html += F("<div class='section'>");
 
   if (!target) {
     html += F("<h3>Node not found</h3>"
               "<p class='muted'>No node with that ID is currently registered.</p>"
-              "<a href='/nodes' class='btn btn--primary'>Back to Node Manager</a>");
+              "<a href='/nodes' class='btn btn--primary'>Back to Node manager</a>");
     html += F("</div>");
     html += footCommon();
     server.send(404, "text/html", html);
@@ -1659,42 +1917,101 @@ void handleNodeConfigForm() {
 
   String userId  = getNodeUserId(target->nodeId);
   String name    = getNodeName(target->nodeId);
+  String notes   = getNodeNotes(target->nodeId);
+  const bool isDeployed = (target->state == DEPLOYED);
+  uint8_t observedWakeMin = (target->wakeIntervalMin > 0)
+    ? target->wakeIntervalMin
+    : target->inferredWakeIntervalMin;
+  int activeIntervalMin = (observedWakeMin > 0)
+    ? observedWakeMin
+    : (isAllowedInterval(gWakeIntervalMin) ? gWakeIntervalMin : 5);
 
   const char* stateLabel = "Unknown";
   if (target->state == UNPAIRED) stateLabel = "Unpaired";
   else if (target->state == PAIRED) stateLabel = "Paired";
   else if (target->state == DEPLOYED) stateLabel = "Deployed";
 
-  html += F("<h3>⚙️ Configure &amp; Start</h3>"
-            "<p class='muted'>Set a numeric Node ID and a descriptive name, then start or stop the node.</p>");
+  html += F("<div style='display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:10px'>"
+            "<div style='display:flex;align-items:center;gap:8px'>"
+            "<strong>Status</strong>");
+  if (target->state == DEPLOYED) html += F("<span class='chip chip--state-deployed'>Deployed</span>");
+  else if (target->state == PAIRED) html += F("<span class='chip chip--state-paired'>Paired</span>");
+  else html += F("<span class='chip chip--state-unpaired'>Unpaired</span>");
+  html += F("</div>"
+            "<div style='display:flex;align-items:center;gap:8px'>"
+            "<button type='button' class='btn btn--sm' style='width:auto' "
+            "onclick=\"var p=document.getElementById('node-info-panel');p.style.display=(p.style.display==='block')?'none':'block';\">Info</button>"
+            );
+  if (isDeployed) {
+    html += F("<button type='button' class='btn btn--sm' style='width:auto' "
+              "onclick=\"var s=document.getElementById('identity-edit-section');var f=document.getElementById('edit-identity-flag');var on=s.style.display==='block';s.style.display=on?'none':'block';f.value=on?'0':'1';\">"
+              "<svg class='icon' viewBox='0 0 24 24' aria-hidden='true'><path d='M19.14 12.94c.04-.31.06-.63.06-.94s-.02-.63-.06-.94l2.03-1.58a.5.5 0 00.12-.64l-1.92-3.32a.5.5 0 00-.6-.22l-2.39.96a7.2 7.2 0 00-1.63-.94l-.36-2.54a.5.5 0 00-.49-.42h-3.84a.5.5 0 00-.49.42l-.36 2.54c-.58.22-1.12.53-1.63.94l-2.39-.96a.5.5 0 00-.6.22L2.7 8.84a.5.5 0 00.12.64l2.03 1.58c-.04.31-.06.63-.06.94s.02.63.06.94L2.82 14.5a.5.5 0 00-.12.64l1.92 3.32c.13.22.39.31.6.22l2.39-.96c.5.41 1.05.72 1.63.94l.36 2.54c.04.24.25.42.49.42h3.84c.24 0 .45-.18.49-.42l.36-2.54c.58-.22 1.12-.53 1.63-.94l2.39.96c.22.09.47 0 .6-.22l1.92-3.32a.5.5 0 00-.12-.64l-2.03-1.56zM12 15.5A3.5 3.5 0 1112 8a3.5 3.5 0 010 7.5z'/></svg>"
+              " Other"
+              "</button>");
+  }
+  html += F("</div>"
+            "</div>");
 
-  html += F("<p><strong>Firmware ID:</strong> ");
-  html += target->nodeId;
-  html += F("<br><strong>Current state:</strong> ");
-  html += stateLabel;
-  html += F("</p>");
+  html += F("<div class='muted' style='margin:0 0 10px 0'>"
+            "<strong>Node ID:</strong> ");
+  html += (userId.length() ? userId : String("-"));
+  html += F(" &nbsp;|&nbsp; <strong>Name:</strong> ");
+  html += (name.length() ? name : String("-"));
+  html += F(" &nbsp;|&nbsp; <strong>Current active interval:</strong> ");
+  html += String(activeIntervalMin);
+  html += F(" min</div>");
 
   html += F("<form action='/node-config' method='POST'>"
             "<input type='hidden' name='node_id' value='");
   html += target->nodeId;
   html += F("'>"
+            "<input type='hidden' name='edit_identity' id='edit-identity-flag' value='0'>");
 
-            "<label class='label'>Node ID (numeric, e.g. 001)</label>"
-            "<input class='input' type='text' name='user_id' maxlength='3' "
-            "placeholder='001' value='");
-  html += userId;
-  html += F("'>"
+  html += F("<div id='node-info-panel' style='display:none;margin-bottom:10px;padding:10px;border:1px solid var(--border);border-radius:8px;background:#fafafa'>"
+            "<div><strong>FW ID:</strong> ");
+  html += target->nodeId;
+  html += F("</div>"
+            "<label class='label' style='margin-top:8px'>Notes</label>"
+            "<input class='input' type='text' name='notes' maxlength='180' placeholder='Notes for this node' value='");
+  html += notes;
+  html += F("'></div>");
 
-            "<label class='label'>Name</label>"
-            "<input class='input' type='text' name='name' "
-            "placeholder='e.g. North Hedge 01' value='");
-  html += name;
-  html += F("'>"
+  if (!isDeployed) {
+    html += F("<label class='label'>Node ID (numeric, e.g. 001)</label>"
+              "<input class='input' type='text' name='user_id' maxlength='3' "
+              "placeholder='001' value='");
+    html += userId;
+    html += F("'>"
+              "<label class='label'>Name</label>"
+              "<input class='input' type='text' name='name' "
+              "placeholder='e.g. North Hedge 01' value='");
+    html += name;
+    html += F("'>");
+  } else {
+    html += F("<div id='identity-edit-section' style='display:none;margin-top:10px;padding:10px;border:1px solid #E1B17A;border-radius:8px;background:#fff8e1'>"
+              "<div style='font-weight:700;color:#8a4b00;margin-bottom:6px'>Are you sure?</div>"
+              "<div class='muted' style='margin-bottom:8px'>Changing Node ID/Name on a deployed node can break tracking if used incorrectly.</div>"
+              "<label style='display:flex;gap:8px;align-items:flex-start;margin-bottom:8px'>"
+              "<input type='checkbox' name='edit_identity_confirm' value='yes' onchange=\"var en=this.checked;document.getElementById('dep-user-id').disabled=!en;document.getElementById('dep-name').disabled=!en;\">"
+              "<span>I understand and want to edit Node ID/Name for this deployed node.</span>"
+              "</label>"
+              "<label class='label'>Node ID (numeric, e.g. 001)</label>"
+              "<input id='dep-user-id' class='input' type='text' name='user_id' maxlength='3' placeholder='001' disabled value='");
+    html += userId;
+    html += F("'>"
+              "<label class='label'>Name</label>"
+              "<input id='dep-name' class='input' type='text' name='name' placeholder='e.g. North Hedge 01' disabled value='");
+    html += name;
+    html += F("'>"
+              "</div>");
+  }
+
+  html += F(
 
             "<label class='label'>Interval (minutes)</label>"
             "<select class='input' name='interval'>");
 
-  uint8_t intervalSel = gWakeIntervalMin;
+  uint8_t intervalSel = isAllowedInterval(gWakeIntervalMin) ? (uint8_t)gWakeIntervalMin : (uint8_t)5;
   NodeDesiredConfig desired = getDesiredConfig(target->nodeId.c_str());
   if (desired.wakeIntervalMin > 0) intervalSel = desired.wakeIntervalMin;
   else if (target->wakeIntervalMin > 0) intervalSel = target->wakeIntervalMin;
@@ -1711,24 +2028,16 @@ void handleNodeConfigForm() {
   }
 
   html += F("</select>"
-
-            "<label class='label'>Action</label>"
-            "<div class='row'>"
-              "<label style='flex:1'><input type='radio' name='action' value='start' checked> Start / deploy</label>"
-              "<label style='flex:1'><input type='radio' name='action' value='stop'>  Stop / keep paired (or pair-only if currently unpaired)</label>"
-              "<label style='flex:1'><input type='radio' name='action' value='unpair'> Unpair / forget</label>"
+            "<div class='action-choices'>"
+              "<label class='action-choice action-choice--start'><input type='radio' name='action' value='start' checked><span>Start / deploy</span></label>"
+              "<label class='action-choice action-choice--stop'><input type='radio' name='action' value='stop'><span>Stop / keep paired</span></label>"
+              "<label class='action-choice action-choice--unpair'><input type='radio' name='action' value='unpair'><span>Unpair / forget</span></label>"
             "</div>"
             "<button type='submit' class='btn btn--success' style='margin-top:12px'>"
-            "Apply &amp; send</button>"
+            "Confirm</button>"
 
-            "</form>"
-           "<div class='help'>"
-            "If the node is unpaired, <em>Start</em> will attempt to pair then deploy. "
-            "If it is deployed, <em>Stop</em> will revert it to the paired state. "
-            "<em>Unpair</em> will forget this node on the mothership and tell the node to reset itself."
-            "</div>");
+            "</form>");
 
-  html += F("<a href='/nodes' class='btn' style='margin-top:12px'>↩️ Back to Node Manager</a>");
   html += F("</div>");
   html += footCommon();
   server.send(200, "text/html", html);
@@ -1739,12 +2048,12 @@ void handleNodeConfigSave() {
   String nodeId   = server.arg("node_id");   // firmware ID
   String userId   = server.arg("user_id");   // numeric
   String name     = server.arg("name");      // friendly name
+  String notes    = server.arg("notes");
+  bool editIdentityRequested = server.hasArg("edit_identity") && server.arg("edit_identity") == "1";
+  bool editIdentityConfirmed = server.hasArg("edit_identity_confirm") && server.arg("edit_identity_confirm") == "yes";
   String action   = server.arg("action");
-  int interval    = server.hasArg("interval") ? server.arg("interval").toInt() : gWakeIntervalMin;
-
-  // --- 1) Persist numeric ID + name to NVS ---
-  setNodeUserId(nodeId, userId);
-  setNodeName(nodeId, name);
+  const int safeIntervalDefault = isAllowedInterval(gWakeIntervalMin) ? gWakeIntervalMin : 5;
+  int interval    = server.hasArg("interval") ? server.arg("interval").toInt() : safeIntervalDefault;
 
   // --- 2) Clamp interval ---
   bool intervalOk = false;
@@ -1754,7 +2063,7 @@ void handleNodeConfigSave() {
       break;
     }
   }
-  if (!intervalOk) interval = gWakeIntervalMin;
+  if (!intervalOk) interval = safeIntervalDefault;
 
   // --- 3) Find node entry ---
   NodeInfo* target = nullptr;
@@ -1765,7 +2074,16 @@ void handleNodeConfigSave() {
     }
   }
 
-  // --- 4) Apply interval for this node only (via desired config snapshot) ---
+  // --- 4) Persist user metadata to NVS with deployed safety gate ---
+  const bool isCurrentlyDeployed = (target && target->state == DEPLOYED);
+  const bool allowIdentityEdit = (!isCurrentlyDeployed) || (editIdentityRequested && editIdentityConfirmed);
+  if (allowIdentityEdit) {
+    if (server.hasArg("user_id")) setNodeUserId(nodeId, userId);
+    if (server.hasArg("name")) setNodeName(nodeId, name);
+  }
+  if (server.hasArg("notes")) setNodeNotes(nodeId, notes);
+
+  // --- 5) Apply interval for this node only (via desired config snapshot) ---
   NodeDesiredConfig dc = getDesiredConfig(nodeId.c_str());
   bool cfgChanged = false;
   if (dc.wakeIntervalMin != (uint8_t)interval) {
@@ -1849,6 +2167,7 @@ void handleNodeConfigSave() {
       // 3) Clear user-facing metadata
       setNodeUserId(nodeId, "");  // removes id_<nodeId> key
       setNodeName(nodeId, "");    // removes name_<nodeId> key
+      setNodeNotes(nodeId, "");   // removes note_<nodeId> key
       target->userId = "";
       target->name   = "";
 
@@ -1870,6 +2189,7 @@ void handleNodeConfigSave() {
   // Read back from NVS, but fall back to raw form input if empty
   String finalUserId = getNodeUserId(nodeId);
   String finalName   = getNodeName(nodeId);
+  String finalNotes  = getNodeNotes(nodeId);
 
   if (finalUserId.isEmpty()) finalUserId = userId;
   if (finalName.isEmpty())   finalName   = name;
@@ -1881,7 +2201,10 @@ void handleNodeConfigSave() {
   }
 
   // --- 7) Feedback page ---
-  String html = headCommon("Configure Node");
+  String actionsHtml = String("<a href='/nodes' class='btn btn--sm'>Back</a><a href='/node-config?node_id=")
+    + nodeId
+    + String("' class='btn btn--sm'>Refresh</a>");
+  String html = headCommon("Configure", actionsHtml);
   html += F("<div class='section center'>"
             "<h3>Node configuration applied</h3>");
 
@@ -1896,6 +2219,8 @@ void handleNodeConfigSave() {
   html += (finalUserId.length() ? finalUserId : String("-"));
   html += F("<br><strong>Name:</strong> ");
   html += (finalName.length() ? finalName : String("-"));
+  html += F("<br><strong>Notes:</strong> ");
+  html += (finalNotes.length() ? finalNotes : String("-"));
   html += F("<br><strong>Interval:</strong> ");
   html += String(interval);
   html += F(" min<br><strong>Action:</strong> ");
@@ -1914,7 +2239,7 @@ void handleNodeConfigSave() {
   html += F("<br>Unpair / forget: ");
   html += unpairOk ? "OK" : "not requested / failed";
   html += F("</p>"
-            "<a href='/nodes' class='btn btn--primary'>Back to Node Manager</a>"
+            "<a href='/nodes' class='btn btn--primary'>Back to Node manager</a>"
             "</div>");
 
   html += footCommon();
@@ -1923,14 +2248,11 @@ void handleNodeConfigSave() {
 
 
 void handleNodesPage() {
-  String html = headCommon("Node Manager");
-  const unsigned long nowMs = millis();
+  String html = headCommon("Node manager",
+    "<a href='/' class='btn btn--sm'>Back</a><a href='/nodes' class='btn btn--sm'>Refresh</a>");
   auto allNodes = getRegisteredNodes();
 
-  html += F("<div class='section'>"
-            "<h3>🧩 Node Manager</h3>"
-            "<p class='muted'>Each row shows only operational status: Next wake, Config status, and Awake state."
-            " Auto-refresh: every 15 seconds.</p>");
+  html += F("<div class='section'>");
 
   if (allNodes.empty()) {
     html += F("<p class='muted'>No nodes registered yet. Try discovering and pairing first.</p>");
@@ -1952,10 +2274,9 @@ void handleNodesPage() {
         : node.inferredWakeIntervalMin;
       int nodeIntervalCurrentMin = (observedWakeMin > 0)
         ? observedWakeMin
-        : gWakeIntervalMin;
+        : (isAllowedInterval(gWakeIntervalMin) ? gWakeIntervalMin : 5);
       const String nextWake = computeNextWakeIsoLocal(nodeIntervalCurrentMin);
-      const unsigned long ageSec = (nowMs >= node.lastSeen) ? ((nowMs - node.lastSeen) / 1000UL) : 0;
-
+      const String nextWakeTime = (nextWake.length() >= 8) ? nextWake.substring(0, 8) : String("n/a");
       if (cfgPending && node.state == DEPLOYED && !node.deployPending &&
           nodeDesired.wakeIntervalMin > 0 && observedWakeMin > 0 &&
           nodeDesired.wakeIntervalMin == observedWakeMin) {
@@ -1963,105 +2284,61 @@ void handleNodesPage() {
         cfgPending = false;
       }
 
+      String deployState = "Unpaired";
+      if (node.state == DEPLOYED) deployState = "Deployed";
+      else if (node.state == PAIRED) deployState = "Paired";
+
+      String displayId = userId.length() ? userId : node.nodeId;
+
       html += F("<a href='/node-config?node_id=");
       html += node.nodeId;
-      html += F("' class='item'>"
-                "<div class='item-row'>"
-                  "<div>");
-
-      // First line: Node ID (numeric if set) + firmware ID in muted text
-      html += F("<strong>");
-      if (userId.length()) {
-        html += userId;
-      } else {
-        html += node.nodeId;
-      }
+      html += F("' class='item item--node'>"
+                "<div class='node-row'>"
+                "<div class='node-main'>"
+                "<strong>");
+      html += displayId;
       html += F("</strong>");
-
-      html += F("<br><span class='muted'>FW: ");
-      html += node.nodeId;
-      html += F("</span>");
-
-      // Name (if any)
       if (name.length()) {
-        html += F("<br><span class='muted'>");
+        html += F("<span class='muted node-name'>");
         html += name;
         html += F("</span>");
       }
-
-      html += F("<br><div class='muted' style='font-size:.8rem;margin-top:4px'><strong>Next wake trigger:</strong> ");
-      if (node.state == DEPLOYED) {
-        if (observedWakeMin > 0) {
-          html += nextWake;
-        } else {
-          html += F("Awaiting node check-in");
-        }
-      } else {
-        html += F("After deploy (interval currently ");
-        html += String(nodeIntervalCurrentMin);
-        html += F(" min)");
-      }
-      html += F("</div>");
-
-      html += F("<div class='muted' style='font-size:.8rem;margin-top:4px'>");
-      if (node.state == DEPLOYED) {
-        html += F("Sampling every ");
-        html += String(nodeIntervalCurrentMin);
-        html += F(" min. Last contact ");
-        html += String(ageSec);
-        html += F("s ago. ");
-        if (cfgPending) {
-          html += F("Config pending");
-          if (nodeDesired.wakeIntervalMin > 0 && observedWakeMin > 0) {
-            html += F(" (desired ");
-            html += String((int)nodeDesired.wakeIntervalMin);
-            html += F(" min, observed ");
-            html += String((int)observedWakeMin);
-            html += F(" min).");
-          } else if (nodeDesired.wakeIntervalMin > 0) {
-            html += F(" (desired ");
-            html += String((int)nodeDesired.wakeIntervalMin);
-            html += F(" min, waiting for apply evidence).");
-          } else {
-            html += F(" (waiting for apply evidence).");
-          }
-          html += F(" ");
-        } else {
-          html += F("Config is current. ");
-        }
-        html += node.isActive ? F("Node is awake now.") : F("Node is asleep between intervals.");
-      } else if (node.state == PAIRED) {
-        html += F("Paired and waiting for deploy. Configure interval and start when ready.");
-      } else {
-        html += F("Discovered but not paired yet.");
-      }
-      html += F("</div>");
-
-      html += F("</div>"); // left column
-
-      // Right column: only requested status chips
-      html += F("<div style='text-align:right;min-width:150px'>");
-      if (cfgPending) {
-        html += F("<span class='chip chip--cfg-pending'>Config pending</span>");
-      } else {
-        html += F("<span class='chip chip--cfg-ok'>Config updated</span>");
-      }
-      html += F("<br>");
-      if (node.isActive) {
-        html += F("<span class='chip chip--link-awake'>Awake</span>");
-      } else {
-        html += F("<span class='chip chip--link-asleep'>Asleep</span>");
-      }
       html += F("</div>"
-                "</div>"   // .item-row
-              "</a>");
+                "<div class='node-timing'>"
+                "<div class='node-timing-cell'>"
+                "<span class='node-timing-label'>Interval</span>"
+                "<span class='chip node-timing-value'>");
+      html += String(nodeIntervalCurrentMin);
+      html += F(" min</span>"
+                "</div>"
+                "<div class='node-timing-cell'>"
+                "<span class='node-timing-label'>Next wake</span>"
+                "<span class='chip node-timing-value'>");
+      html += nextWakeTime;
+      html += F("</span>"
+                "</div>"
+                "</div>"
+                "<div class='node-status'>"
+                "<div class='node-status-cell'>"
+                "<span class='node-timing-label'>Deploy</span>");
+
+      if (node.state == DEPLOYED) html += F("<span class='chip chip--state-deployed'>Deployed</span>");
+      else if (node.state == PAIRED) html += F("<span class='chip chip--state-paired'>Paired</span>");
+      else html += F("<span class='chip chip--state-unpaired'>Unpaired</span>");
+
+      html += F("</div>"
+                "<div class='node-status-cell'>"
+                "<span class='node-timing-label'>Config</span>");
+
+      if (cfgPending) html += F("<span class='chip chip--cfg-pending'>Config pending</span>");
+      else html += F("<span class='chip chip--cfg-ok'>Config updated</span>");
+
+      html += F("</div></div></div></a>");
     }
 
 
     html += F("</div>"); // .list
   }
-
-  html += F("<a href='/' class='btn' style='margin-top:12px'>↩️ Back to Dashboard</a>");
   html += F("</div>"); // .section
 
   html += F("<script>setTimeout(function(){ location.reload(); }, 15000);</script>");
