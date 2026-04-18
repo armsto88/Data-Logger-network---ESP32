@@ -4,6 +4,7 @@
 #include <Wire.h>
 #include <RTClib.h>
 #include <esp_wifi.h>
+#include <esp_mac.h>
 #include <Preferences.h>
 #include <nvs_flash.h>
 #include <nvs.h>
@@ -19,8 +20,34 @@
 #endif
 
 // -------------------- Node config --------------------
+#ifndef NODE_ID
 #define NODE_ID   "ENV_001"
+#endif
+
+#ifndef NODE_TYPE
 #define NODE_TYPE "MULTI_ENV_V1"
+#endif
+
+#ifndef NODE_ID_AUTO_FROM_MAC
+#define NODE_ID_AUTO_FROM_MAC 1
+#endif
+
+// Runtime node identity. By default it is generated from STA MAC so each board
+// is unique without per-device firmware edits.
+static char gNodeId[16] = NODE_ID;
+#undef NODE_ID
+#define NODE_ID gNodeId
+
+static void initNodeIdentity() {
+#if NODE_ID_AUTO_FROM_MAC
+  uint8_t mac[6] = {0};
+  if (esp_read_mac(mac, ESP_MAC_WIFI_STA) == ESP_OK) {
+    snprintf(gNodeId, sizeof(gNodeId), "ENV_%02X%02X%02X", mac[3], mac[4], mac[5]);
+  } else {
+    strlcpy(gNodeId, "ENV_UNKNOWN", sizeof(gNodeId));
+  }
+#endif
+}
 
 // -------------------- I2C bus & mux --------------------
 // Single I2C bus (I2C0) for RTC + PCA9548A + ADS1115
@@ -192,6 +219,23 @@ static void ds3231EnableAlarmInterrupt() {
   uint8_t ctrl = WireRtc.available() ? WireRtc.read() : 0;
 
   ctrl |= 0b00000101;  // INTCN (bit2) + A1IE (bit0)
+
+  WireRtc.beginTransmission(0x68);
+  WireRtc.write(0x0E);
+  WireRtc.write(ctrl);
+  WireRtc.endTransmission();
+}
+
+// Disable A1 interrupt while leaving INTCN set.
+static void ds3231DisableAlarmInterrupt() {
+  WireRtc.beginTransmission(0x68);
+  WireRtc.write(0x0E);  // CTRL
+  WireRtc.endTransmission(false);
+  WireRtc.requestFrom((uint8_t)0x68, (uint8_t)1);
+  uint8_t ctrl = WireRtc.available() ? WireRtc.read() : 0;
+
+  ctrl &= (uint8_t)~0b00000001;  // clear A1IE
+  ctrl |= 0b00000100;            // keep INTCN
 
   WireRtc.beginTransmission(0x68);
   WireRtc.write(0x0E);
@@ -647,6 +691,13 @@ static void onDataReceived(const uint8_t *mac, const uint8_t *incomingData, int 
       if (pr.isPaired) {
         Serial.println("📋 Pairing confirmed via PAIRING_RESPONSE");
         memcpy(mothershipMAC, mac, 6);
+        rtcSynced        = false;
+        deployedFlag     = false;
+        lastTimeSyncUnix = 0;
+        ds3231DisableAlarmInterrupt();
+        clearDS3231_A1F();
+        local_queue::clear();
+        Serial.println("🧹 Cleared local queue after PAIRING_RESPONSE");
         persistNodeConfig();
         debugState("after PAIRING_RESPONSE");
       } else {
@@ -669,6 +720,10 @@ static void onDataReceived(const uint8_t *mac, const uint8_t *incomingData, int 
       rtcSynced        = false;
       deployedFlag     = false;
       lastTimeSyncUnix = 0;
+      ds3231DisableAlarmInterrupt();
+      clearDS3231_A1F();
+      local_queue::clear();
+      Serial.println("🧹 Cleared local queue after PAIR_NODE");
       persistNodeConfig();
       Serial.println("💾 Node state persisted after PAIR_NODE (rtcSynced=false, deployed=false)");
 
@@ -752,6 +807,8 @@ static void onDataReceived(const uint8_t *mac, const uint8_t *incomingData, int 
       deployedFlag     = false;
       lastTimeSyncUnix = 0;
       g_lastSyncSlot   = 0xFFFFFFFFUL;
+      ds3231DisableAlarmInterrupt();
+      clearDS3231_A1F();
       persistNodeConfig();
       local_queue::clear();
       Serial.println("💾 Node config persisted after UNPAIR");
@@ -770,26 +827,33 @@ static void onDataReceived(const uint8_t *mac, const uint8_t *incomingData, int 
       uint8_t oldInterval = g_intervalMin;
       g_intervalMin = (uint8_t)cmd.intervalMinutes;
 
-      bool ok = false;
+      bool ok = true;
       DateTime next;
-      if (g_intervalMin <= 1) {
-        ok = ds3231EveryMinute();
-        DateTime now = rtc.now();
-        DateTime nextDisplay = (now.second() == 0)
-            ? now + TimeSpan(0,0,1,0)
-            : DateTime(now.year(),now.month(),now.day(),now.hour(),now.minute(),0)
-              + TimeSpan(0,0,1,0);
-        next = nextDisplay;
-      } else {
-        ok = ds3231ArmNextInNMinutes(g_intervalMin, &next);
-      }
-
-      ds3231EnableAlarmInterrupt();
-      clearDS3231_A1F();   // flag low until first match
-
       char nowStr[24], nextStr[24];
       formatTime(rtc.now(), nowStr, sizeof(nowStr));
-      formatTime(next,       nextStr, sizeof(nextStr));
+
+      // Intention: paired/unpaired nodes store interval but remain idle.
+      if (currentNodeState() == STATE_DEPLOYED && rtcSynced) {
+        if (g_intervalMin <= 1) {
+          ok = ds3231EveryMinute();
+          DateTime now = rtc.now();
+          DateTime nextDisplay = (now.second() == 0)
+              ? now + TimeSpan(0,0,1,0)
+              : DateTime(now.year(),now.month(),now.day(),now.hour(),now.minute(),0)
+                + TimeSpan(0,0,1,0);
+          next = nextDisplay;
+        } else {
+          ok = ds3231ArmNextInNMinutes(g_intervalMin, &next);
+        }
+
+        ds3231EnableAlarmInterrupt();
+        clearDS3231_A1F();   // flag low until first match
+        formatTime(next, nextStr, sizeof(nextStr));
+      } else {
+        ds3231DisableAlarmInterrupt();
+        clearDS3231_A1F();
+        snprintf(nextStr, sizeof(nextStr), "(idle: not deployed)");
+      }
 
       Serial.println("[SET_SCHEDULE] received");
       Serial.printf("   interval: %u -> %u minutes\n", oldInterval, g_intervalMin);
@@ -1140,6 +1204,8 @@ void setup() {
   Serial.begin(115200);
   delay(2000);
 
+  initNodeIdentity();
+
   initPowerHoldControl();
   assertPowerHold("boot");
 
@@ -1312,9 +1378,16 @@ if (nowMs - lastA1Check > 1000UL) {
     Serial.printf("[RTC] %s A1F=%u\n", tbuf, a1);
 
     if (a1 == 1) {
-      Serial.println("⚡ A1F=1 → handleRtcAlarmEvent()");
-      handleRtcAlarmEvent();
-      // handleRtcAlarmEvent() will clear A1F, so next check should see 0
+      if (currentNodeState() == STATE_DEPLOYED) {
+        Serial.println("⚡ A1F=1 → handleRtcAlarmEvent()");
+        handleRtcAlarmEvent();
+        // handleRtcAlarmEvent() will clear A1F, so next check should see 0
+      } else {
+        // Ignore stale/deferred alarms outside deployed mode.
+        clearDS3231_A1F();
+        ds3231DisableAlarmInterrupt();
+        Serial.println("⏸️ A1F cleared/ignored (node not deployed)");
+      }
     }
   }
 }

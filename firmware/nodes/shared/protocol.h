@@ -165,7 +165,7 @@ typedef struct rnt_pairing_t {
 #define SENSOR_ID_AUX1          3001
 #define SENSOR_ID_AUX2          3002
 
-#define ESPNOW_CHANNEL 1
+#define ESPNOW_CHANNEL 11
 
 // I2C pins (ESP32-C3 Mini) — used by node builds
 #ifndef RTC_SDA_PIN

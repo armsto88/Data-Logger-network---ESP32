@@ -49,6 +49,70 @@ static SensorDataEventCallback g_sensorDataEventCb = nullptr;
 static uint32_t g_lastCycleMonitorMs = 0;
 static const uint32_t CYCLE_MONITOR_INTERVAL_MS = 30UL * 1000UL;             // 30 s
 static void ensurePeerOnChannel(const uint8_t mac[6], uint8_t channel);
+static const uint32_t PENDING_RETRY_INTERVAL_MS = 5000UL;
+
+static const char* pendingStateToStr(NodePendingState s) {
+    switch (s) {
+      case PENDING_TO_UNPAIRED: return "UNPAIRED";
+      case PENDING_TO_PAIRED: return "PAIRED";
+      case PENDING_TO_DEPLOYED: return "DEPLOYED";
+      default: return "NONE";
+    }
+}
+
+static void clearPendingState(NodeInfo& node, const char* reason) {
+    if (!node.stateChangePending) return;
+    Serial.printf("✅ Pending state cleared for %s (%s)\n",
+                  node.nodeId.c_str(),
+                  reason ? reason : "no reason");
+    node.lastStateAppliedMs = millis();
+    node.lastAppliedTargetState = node.pendingTargetState;
+    node.stateChangePending = false;
+    node.pendingTargetState = PENDING_NONE;
+    node.pendingSinceMs = 0;
+    node.pendingLastAttemptMs = 0;
+}
+
+static void queuePendingState(NodeInfo& node, NodePendingState target) {
+    const uint32_t nowMs = millis();
+    const bool changed = (!node.stateChangePending) || (node.pendingTargetState != target);
+    node.stateChangePending = true;
+    node.pendingTargetState = target;
+    node.pendingLastAttemptMs = nowMs;
+    if (changed || node.pendingSinceMs == 0) {
+        node.pendingSinceMs = nowMs;
+    }
+    Serial.printf("📝 Pending state queued for %s -> %s\n",
+                  node.nodeId.c_str(), pendingStateToStr(target));
+}
+
+static void processPendingStateCommand(NodeInfo& node, const char* reason) {
+    if (!node.stateChangePending) return;
+    const uint32_t nowMs = millis();
+    if (node.pendingLastAttemptMs > 0 &&
+        (nowMs - node.pendingLastAttemptMs) < PENDING_RETRY_INTERVAL_MS) {
+        return;
+    }
+
+    bool sent = false;
+    if (node.pendingTargetState == PENDING_TO_UNPAIRED) {
+        sent = sendUnpairToNode(node.nodeId);
+    } else if (node.pendingTargetState == PENDING_TO_PAIRED) {
+        sent = pairNode(node.nodeId);
+    } else if (node.pendingTargetState == PENDING_TO_DEPLOYED) {
+        std::vector<String> ids;
+        ids.push_back(node.nodeId);
+        sent = deploySelectedNodes(ids);
+    }
+
+    node.pendingLastAttemptMs = nowMs;
+    Serial.printf("🔁 Pending state replay for %s -> %s on %s: %s\n",
+                  node.nodeId.c_str(),
+                  pendingStateToStr(node.pendingTargetState),
+                  reason ? reason : "contact",
+                  sent ? "SENT" : "FAILED");
+}
+
 static bool isReasonableWakeInterval(uint8_t mins) {
     return mins >= 1 && mins <= 60;
 }
@@ -133,9 +197,10 @@ void registerNode(const uint8_t* mac,
 {
     NodeInfo* existing = nullptr;
 
-    // Find existing entry by MAC or firmware nodeId
+    // Find existing entry by immutable hardware identity (MAC).
+    // Do not merge by nodeId; labels can collide and must not alias devices.
     for (auto& node : registeredNodes) {
-        if (memcmp(node.mac, mac, 6) == 0 || node.nodeId == String(nodeId)) {
+        if (memcmp(node.mac, mac, 6) == 0) {
             existing = &node;
             break;
         }
@@ -144,6 +209,7 @@ void registerNode(const uint8_t* mac,
     if (existing) {
         bool upgraded = false;
         bool macChanged = false;
+        bool idChanged = false;
 
         if (memcmp(existing->mac, mac, 6) != 0) {
             Serial.printf("🔄 Node %s MAC updated: %s -> %s\n",
@@ -157,6 +223,14 @@ void registerNode(const uint8_t* mac,
 
         existing->lastSeen = millis();
         existing->isActive = true;
+        if (nodeId && nodeId[0] != '\0' && existing->nodeId != String(nodeId)) {
+            Serial.printf("🔄 Node MAC %s runtime ID updated: %s -> %s\n",
+                          macToStr(existing->mac).c_str(),
+                          existing->nodeId.c_str(),
+                          nodeId);
+            existing->nodeId = String(nodeId);
+            idChanged = true;
+        }
         existing->nodeType = String(nodeType);  // keep type fresh
 
         // Only ever upgrade: UNPAIRED < PAIRED < DEPLOYED
@@ -168,6 +242,10 @@ void registerNode(const uint8_t* mac,
             existing->state = state;
             if (state == DEPLOYED) {
                 existing->deployPending = false;
+                if (existing->stateChangePending &&
+                    existing->pendingTargetState == PENDING_TO_DEPLOYED) {
+                    clearPendingState(*existing, "node confirmed DEPLOYED");
+                }
             }
             upgraded = true;
         }
@@ -176,7 +254,7 @@ void registerNode(const uint8_t* mac,
         existing->userId = getNodeUserId(existing->nodeId);
         existing->name   = getNodeName(existing->nodeId);
 
-        if ((upgraded || macChanged) &&
+        if ((upgraded || macChanged || idChanged) &&
             (existing->state == PAIRED || existing->state == DEPLOYED)) {
             savePairedNodes();  // keep NVS in sync when a node “promotes”
         }
@@ -202,6 +280,12 @@ void registerNode(const uint8_t* mac,
     n.configVersionApplied = 0;
     n.lastConfigPushMs     = 0;
     n.deployPending        = false;
+    n.stateChangePending   = false;
+    n.pendingTargetState   = PENDING_NONE;
+    n.pendingSinceMs       = 0;
+    n.pendingLastAttemptMs = 0;
+    n.lastStateAppliedMs   = 0;
+    n.lastAppliedTargetState = PENDING_NONE;
 
     // Populate user-facing meta from NVS for immediate consistency
     n.userId = getNodeUserId(n.nodeId);
@@ -243,7 +327,30 @@ static void OnDataRecv(const uint8_t * mac,
             g_sensorDataEventCb(incoming, mac);
         }
 
-        registerNode(mac, incoming.nodeId, incoming.sensorType, DEPLOYED);
+        // Honor local unpair authority: if this MAC is currently UNPAIRED in the registry,
+        // do not auto-promote to DEPLOYED from passive sensor contact.
+        NodeState observedState = UNPAIRED;
+        bool pendingBlocksAutoDeploy = false;
+        bool knownMac = false;
+        for (const auto& n : registeredNodes) {
+            if (memcmp(n.mac, mac, 6) == 0) {
+                observedState = n.state;
+                pendingBlocksAutoDeploy = n.stateChangePending &&
+                                          n.pendingTargetState != PENDING_TO_DEPLOYED;
+                knownMac = true;
+                break;
+            }
+        }
+
+        if (knownMac && (observedState == UNPAIRED || pendingBlocksAutoDeploy)) {
+            registerNode(mac, incoming.nodeId, incoming.sensorType, UNPAIRED);
+            Serial.printf("🛡️ Ignoring auto-deploy promotion from sensor data for %s (state=%s, pending=%d)\n",
+                          incoming.nodeId,
+                          stateToStr(observedState),
+                          pendingBlocksAutoDeploy ? 1 : 0);
+        } else {
+            registerNode(mac, incoming.nodeId, incoming.sensorType, DEPLOYED);
+        }
         NodeInfo* nodeInfo = nullptr;
 
         for (auto& n : registeredNodes) {
@@ -277,6 +384,10 @@ static void OnDataRecv(const uint8_t * mac,
                 }
                 break;
             }
+        }
+
+        if (nodeInfo) {
+            processPendingStateCommand(*nodeInfo, "sensor contact");
         }
 
         // Fallback path: if HELLO is missed, still push pending config when sensor data proves contact.
@@ -423,6 +534,15 @@ static void OnDataRecv(const uint8_t * mac,
                 }
             }
             registerNode(mac, discovery.nodeId, discovery.nodeType, keep);
+            for (auto& n : registeredNodes) {
+                if (n.nodeId == String(discovery.nodeId) || memcmp(n.mac, mac, 6) == 0) {
+                    if (n.stateChangePending && n.pendingTargetState == PENDING_TO_UNPAIRED) {
+                        clearPendingState(n, "discovery from unpaired node");
+                    }
+                    processPendingStateCommand(n, "discovery contact");
+                    break;
+                }
+            }
 
             discovery_response_t response{};
             strcpy(response.command, "DISCOVER_RESPONSE");
@@ -453,6 +573,10 @@ static void OnDataRecv(const uint8_t * mac,
                 if (n.nodeId == String(req.nodeId) ||
                     memcmp(n.mac, mac, 6) == 0) {
                     n.lastTimeSyncMs = millis();
+                    if (n.stateChangePending && n.pendingTargetState == PENDING_TO_PAIRED) {
+                        clearPendingState(n, "REQUEST_TIME indicates paired/unsynced runtime");
+                        savePairedNodes();
+                    }
                     break;
                 }
             }
@@ -483,7 +607,28 @@ static void OnDataRecv(const uint8_t * mac,
             }
             registerNode(mac, request.nodeId, "unknown", keep);
 
+            for (auto& n : registeredNodes) {
+                if (n.nodeId == String(request.nodeId) || memcmp(n.mac, mac, 6) == 0) {
+                    processPendingStateCommand(n, "pairing poll");
+                    break;
+                }
+            }
+
             NodeState current = getNodeState(request.nodeId);
+
+            // Node pairing poll is evidence the node is in active pairing flow.
+            // If we were waiting for a PAIRED transition, clear pending once state is PAIRED.
+            if (current == PAIRED) {
+                for (auto& n : registeredNodes) {
+                    if (n.nodeId == String(request.nodeId) || memcmp(n.mac, mac, 6) == 0) {
+                        if (n.stateChangePending && n.pendingTargetState == PENDING_TO_PAIRED) {
+                            clearPendingState(n, "PAIRING_REQUEST confirms paired state");
+                            savePairedNodes();
+                        }
+                        break;
+                    }
+                }
+            }
 
             pairing_response_t response{};
             strcpy(response.command, "PAIRING_RESPONSE");
@@ -511,6 +656,12 @@ static void OnDataRecv(const uint8_t * mac,
         memcpy(&hello, incomingBytes, sizeof(hello));
         if (strcmp(hello.command, "NODE_HELLO") == 0) {
             handleNodeHello(mac, hello);
+            for (auto& n : registeredNodes) {
+                if (n.nodeId == String(hello.nodeId) || memcmp(n.mac, mac, 6) == 0) {
+                    processPendingStateCommand(n, "NODE_HELLO");
+                    break;
+                }
+            }
         }
         return;
     }
@@ -523,8 +674,32 @@ static void OnDataRecv(const uint8_t * mac,
             Serial.printf("✅ DEPLOY_ACK from %s (rtcUnix=%lu)\n",
                           ack.nodeId,
                           (unsigned long)ack.rtcUnix);
-            registerNode(mac, ack.nodeId, "unknown", DEPLOYED);
+            bool blockDeployPromotion = false;
+            for (const auto& n : registeredNodes) {
+                if (n.nodeId == String(ack.nodeId) || memcmp(n.mac, mac, 6) == 0) {
+                    blockDeployPromotion = n.stateChangePending &&
+                                           n.pendingTargetState != PENDING_TO_DEPLOYED;
+                    if (blockDeployPromotion) {
+                        Serial.printf("🛡️ DEPLOY_ACK promotion blocked for %s while pending target=%s\n",
+                                      ack.nodeId,
+                                      pendingStateToStr(n.pendingTargetState));
+                    }
+                    break;
+                }
+            }
+
+            if (!blockDeployPromotion) {
+                registerNode(mac, ack.nodeId, "unknown", DEPLOYED);
+            }
             savePairedNodes();
+            for (auto& n : registeredNodes) {
+                if (n.nodeId == String(ack.nodeId) || memcmp(n.mac, mac, 6) == 0) {
+                    if (n.stateChangePending && n.pendingTargetState == PENDING_TO_DEPLOYED) {
+                        clearPendingState(n, "DEPLOY_ACK received");
+                    }
+                    break;
+                }
+            }
         }
         return;
     }
@@ -747,6 +922,12 @@ void loadPairedNodes() {
         newNode.configVersionApplied = 0;
         newNode.lastConfigPushMs     = 0;
         newNode.deployPending        = false;
+        newNode.stateChangePending   = false;
+        newNode.pendingTargetState   = PENDING_NONE;
+        newNode.pendingSinceMs       = 0;
+        newNode.pendingLastAttemptMs = 0;
+        newNode.lastStateAppliedMs   = 0;
+        newNode.lastAppliedTargetState = PENDING_NONE;
 
         // Hydrate user-facing meta from node_meta
         newNode.userId = getNodeUserId(newNode.nodeId);
@@ -838,8 +1019,21 @@ void handleNodeHello(const uint8_t* senderMac, const node_hello_message_t& hello
                   (unsigned long)hello.rtcUnix);
     Serial.printf("🔁 Cycle check-in from %s (node wake window open)\n", hello.nodeId);
 
-    // Register/refresh the node as active (HELLO counts as contact)
-    registerNode(senderMac, hello.nodeId, hello.nodeType, DEPLOYED);
+    // Register/refresh the node as active (HELLO counts as contact).
+    // If UI has a pending non-deploy target, do not let HELLO re-promote to DEPLOYED.
+    NodeState helloState = DEPLOYED;
+    for (const auto& n : registeredNodes) {
+        if (n.nodeId == String(hello.nodeId) || memcmp(n.mac, senderMac, 6) == 0) {
+            if (n.stateChangePending && n.pendingTargetState != PENDING_TO_DEPLOYED) {
+                helloState = n.state;
+                Serial.printf("🛡️ HELLO promotion blocked for %s while pending target=%s\n",
+                              hello.nodeId,
+                              pendingStateToStr(n.pendingTargetState));
+            }
+            break;
+        }
+    }
+    registerNode(senderMac, hello.nodeId, hello.nodeType, helloState);
 
     // Update the per-node wake interval from what the node reports
     for (auto& n : registeredNodes) {
@@ -1065,6 +1259,7 @@ bool pairNode(const String& nodeId) {
 
             // 2) Flip local state and persist
             node.state = PAIRED;
+            queuePendingState(node, PENDING_TO_PAIRED);
 
             // 3) Immediate PAIRING_RESPONSE
             pairing_response_t resp{};
@@ -1133,16 +1328,20 @@ bool deploySelectedNodes(const std::vector<String>& nodeIds) {
                                                          (uint8_t*)&deployCmd,
                                                          sizeof(deployCmd));
 
+                    // Reflect requested UI intent immediately; node confirms on next contact/wake.
+                    node.state = DEPLOYED;
+                    node.deployPending = true;
+                    queuePendingState(node, PENDING_TO_DEPLOYED);
+                    anyRequested = true;
+
                     if (result == ESP_OK || resultBcast == ESP_OK) {
-                        node.deployPending = true;
-                        anyRequested = true;
                         Serial.printf("🚀 Deploy requested: %s at %s (direct=%s, bcast=%s, awaiting node runtime confirmation)\n",
                                       nodeId.c_str(),
                                       timeBuffer,
                                       (result == ESP_OK ? "OK" : esp_err_to_name(result)),
                                       (resultBcast == ESP_OK ? "OK" : esp_err_to_name(resultBcast)));
                     } else {
-                        Serial.printf("❌ Failed to deploy node: %s (direct=%s, bcast=%s)\n",
+                        Serial.printf("⚠️ Deploy send missed for %s (direct=%s, bcast=%s) — pending replay queued\n",
                                       nodeId.c_str(),
                                       esp_err_to_name(result),
                                       esp_err_to_name(resultBcast));
@@ -1225,6 +1424,7 @@ bool unpairNode(const String& nodeId) {
             esp_now_del_peer(n.mac);   // remove peer
             n.state    = UNPAIRED;
             n.isActive = true;
+            queuePendingState(n, PENDING_TO_UNPAIRED);
             savePairedNodes();
             Serial.print("🗑️ Unpaired node: ");
             Serial.println(nodeId);
@@ -1244,10 +1444,19 @@ bool sendUnpairToNode(const String& nodeId) {
             ensurePeerOnChannel(n.mac, ESPNOW_CHANNEL);
             esp_wifi_set_channel(ESPNOW_CHANNEL, WIFI_SECOND_CHAN_NONE);
 
-            esp_err_t res = esp_now_send(n.mac, (uint8_t*)&cmd, sizeof(cmd));
-            Serial.printf("📤 UNPAIR_NODE -> %s (%s)\n",
-                          nodeId.c_str(), esp_err_to_name(res));
-            return (res == ESP_OK);
+            // Burst send improves delivery when node wake windows are short.
+            uint8_t bcast[6] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
+            bool anyOk = false;
+            for (int i = 0; i < 3; ++i) {
+                esp_err_t resDirect = esp_now_send(n.mac, (uint8_t*)&cmd, sizeof(cmd));
+                esp_err_t resBcast  = esp_now_send(bcast, (uint8_t*)&cmd, sizeof(cmd));
+                if (resDirect == ESP_OK || resBcast == ESP_OK) anyOk = true;
+                delay(20);
+            }
+
+            Serial.printf("📤 UNPAIR_NODE -> %s (burst=%s)\n",
+                          nodeId.c_str(), anyOk ? "OK" : "FAILED");
+            return anyOk;
         }
     }
     Serial.printf("⚠️ sendUnpairToNode: node %s not found\n", nodeId.c_str());

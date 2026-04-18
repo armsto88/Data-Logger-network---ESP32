@@ -24,6 +24,13 @@ enum NodeState : uint8_t {
   DEPLOYED = 2
 };
 
+enum NodePendingState : uint8_t {
+  PENDING_NONE = 0,
+  PENDING_TO_UNPAIRED = 1,
+  PENDING_TO_PAIRED = 2,
+  PENDING_TO_DEPLOYED = 3,
+};
+
 struct NodeInfo {
     uint8_t   mac[6];
     String    nodeId;
@@ -49,6 +56,18 @@ struct NodeInfo {
     uint32_t  lastConfigPushMs;
     // True after DEPLOY_NODE command is queued, cleared when runtime evidence confirms deploy
     bool      deployPending;
+    // True when mothership has queued a state change that must be applied on node wake.
+    bool      stateChangePending;
+    // Target state the node should eventually adopt.
+    NodePendingState pendingTargetState;
+    // millis() when pending state was queued.
+    uint32_t  pendingSinceMs;
+    // millis() of the most recent resend attempt for pending state command.
+    uint32_t  pendingLastAttemptMs;
+    // millis() when a pending state transition was confirmed/applied.
+    uint32_t  lastStateAppliedMs;
+    // Last applied target that was confirmed.
+    NodePendingState lastAppliedTargetState;
 };
 
 // Desired configuration for each node, stored in mothership NVS.

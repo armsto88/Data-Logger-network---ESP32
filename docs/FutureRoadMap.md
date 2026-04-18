@@ -138,6 +138,7 @@ UI displays:
 - Syncing configuration profiles
 - Version tracking per node
 - Auto-detection of incompatible configs
+- Manual `Sync now` controls in UI (per-node and fleet-wide) to force immediate state/config refresh while an operator is actively monitoring the dashboard
 
 ---
 

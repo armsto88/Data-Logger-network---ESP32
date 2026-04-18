@@ -3,12 +3,17 @@
 // ---------- Config toggles ----------
 #define ENABLE_SPIFFS_ASSETS 0  // set to 1 if you upload /style.css.gz and /app.js.gz
 #define ENABLE_WIFI_AP_WEBSERVER 1  // set to 1 to enable AP + web UI
+#define ENABLE_BLE_GATT 0  // keep BLE off while stabilizing AP visibility
+#define ENABLE_ESPNOW_RUNTIME 1  // production: AP and ESP-NOW both enabled
+#define FORCE_AP_TEST_SSID 0  // production: use Logger + DEVICE_ID SSID
+#define ENABLE_CAPTIVE_PORTAL 1  // improve phone onboarding to local AP web UI
 
 // ---------- Includes ----------
 #include <Arduino.h>
 #include <vector>
 #include <WiFi.h>
 #include <WebServer.h>
+#include <DNSServer.h>
 #if ENABLE_SPIFFS_ASSETS
   #include <FS.h>
   #include <SPIFFS.h>
@@ -25,7 +30,11 @@
 // ---------- Device identification and WiFi ----------
 const char* DEVICE_ID = "001";  // Simplified ID
 const char* BASE_SSID = "Logger";
+#if FORCE_AP_TEST_SSID
+String ssid = "Logger001_TEST";
+#else
 String ssid = String(BASE_SSID) + String(DEVICE_ID);  // "Logger001"
+#endif
 const char* password = "logger123";
 #define FW_VERSION "v1.0.0"
 #define FW_BUILD   __DATE__ " " __TIME__
@@ -59,6 +68,9 @@ const size_t kAllowedCount = sizeof(kAllowedIntervals) / sizeof(kAllowedInterval
 
 // ---------- Web server ----------
 WebServer server(80);
+#if ENABLE_WIFI_AP_WEBSERVER && ENABLE_CAPTIVE_PORTAL
+DNSServer dnsServer;
+#endif
 
 // NodeInfo is defined in your ESP-NOW / protocol headers
 extern std::vector<NodeInfo> registeredNodes;
@@ -70,6 +82,23 @@ static String formatMac(const uint8_t mac[6]) {
            mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
   return String(b);
 }
+
+#if ENABLE_WIFI_AP_WEBSERVER && ENABLE_CAPTIVE_PORTAL
+static void sendCaptivePortalLanding() {
+  if (server.method() == HTTP_OPTIONS || server.method() == HTTP_HEAD) {
+    server.sendHeader("Cache-Control", "no-store, no-cache, must-revalidate");
+    server.send(204);
+    return;
+  }
+  server.send(200, "text/html",
+              "<!doctype html><html><head><meta charset='utf-8'>"
+              "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+              "<title>Logger Portal</title></head><body>"
+              "<h2>Logger Portal</h2><p>Open local dashboard:</p>"
+              "<p><a href='http://192.168.4.1/'>http://192.168.4.1/</a></p>"
+              "</body></html>");
+}
+#endif
 
 static void loadWakeIntervalFromNVS() {
   bool migrated = false;
@@ -190,22 +219,12 @@ static String formatDateTimeDisplay(const DateTime& dt) {
   return String(b);
 }
 
+static uint32_t computeNextSyncUnix(uint32_t nowUnix);
+
 static String computeNextSyncIsoLocal() {
   const uint32_t nowUnix = getRTCTimeUnix();
-  DateTime next(nowUnix);
-
-  if (gSyncMode == SYNC_MODE_INTERVAL) {
-    const uint32_t periodSec = (uint32_t)max(gSyncIntervalMin, 1) * 60UL;
-    const uint32_t nextUnix = ((nowUnix / periodSec) + 1UL) * periodSec;
-    next = DateTime(nextUnix);
-  } else {
-    DateTime now(nowUnix);
-    next = DateTime(now.year(), now.month(), now.day(), gSyncDailyHour, gSyncDailyMinute, 0);
-    if (now.unixtime() >= next.unixtime()) {
-      DateTime tomorrow(now.unixtime() + 24UL * 60UL * 60UL);
-      next = DateTime(tomorrow.year(), tomorrow.month(), tomorrow.day(), gSyncDailyHour, gSyncDailyMinute, 0);
-    }
-  }
+  const uint32_t nextUnix = computeNextSyncUnix(nowUnix);
+  DateTime next(nextUnix > 0 ? nextUnix : nowUnix);
 
   return formatDateTimeDisplay(next);
 }
@@ -215,7 +234,20 @@ static uint32_t computeNextSyncUnix(uint32_t nowUnix) {
 
   if (gSyncMode == SYNC_MODE_INTERVAL) {
     const uint32_t periodSec = (uint32_t)max(gSyncIntervalMin, 1) * 60UL;
-    return ((nowUnix / periodSec) + 1UL) * periodSec;
+    const uint32_t spacingReadyUnix = (gLastSyncBroadcastUnix > 0)
+      ? (gLastSyncBroadcastUnix + periodSec)
+      : nowUnix;
+    const uint32_t slotReadyUnix = (gLastSyncIntervalSlot >= 0)
+      ? (uint32_t)(((long long)gLastSyncIntervalSlot + 1LL) * (long long)periodSec)
+      : nowUnix;
+
+    // Earliest unix timestamp that satisfies BOTH runtime loop guards:
+    // 1) slot > gLastSyncIntervalSlot
+    // 2) now >= gLastSyncBroadcastUnix + periodSec
+    uint32_t nextUnix = nowUnix;
+    if (nextUnix < spacingReadyUnix) nextUnix = spacingReadyUnix;
+    if (nextUnix < slotReadyUnix) nextUnix = slotReadyUnix;
+    return nextUnix;
   }
 
   DateTime now(nowUnix);
@@ -268,7 +300,8 @@ static String loadNodeMeta(const String& nodeId, const char* fieldPrefix) {
     return "";
   }
   String key = String(fieldPrefix) + nodeId;  // e.g. "id_TEMP_001"
-  String value = prefs.getString(key.c_str(), "");
+  // Avoid noisy nvs_get_str errors when key does not exist.
+  String value = prefs.isKey(key.c_str()) ? prefs.getString(key.c_str(), "") : "";
   prefs.end();
   return value;
 }
@@ -438,8 +471,16 @@ static String buildBleStatusDataJson() {
   auto allNodes = getRegisteredNodes();
 
   size_t deployedCount = 0;
+  size_t pendingCount = 0;
+  size_t pendingToPairedCount = 0;
+  size_t pendingToUnpairedCount = 0;
   for (const auto& n : allNodes) {
     if (n.state == DEPLOYED) deployedCount++;
+    if (n.stateChangePending) {
+      pendingCount++;
+      if (n.pendingTargetState == PENDING_TO_PAIRED) pendingToPairedCount++;
+      if (n.pendingTargetState == PENDING_TO_UNPAIRED) pendingToUnpairedCount++;
+    }
   }
 
   const size_t pairedCount = getPairedNodes().size();
@@ -495,6 +536,15 @@ static String buildBleStatusDataJson() {
   json += ",";
   json += "\"deployed\":";
   json += String((unsigned)deployedCount);
+  json += ",";
+  json += "\"pending\":";
+  json += String((unsigned)pendingCount);
+  json += ",";
+  json += "\"pendingToPaired\":";
+  json += String((unsigned)pendingToPairedCount);
+  json += ",";
+  json += "\"pendingToUnpaired\":";
+  json += String((unsigned)pendingToUnpairedCount);
   json += "}";
   json += "}";
   return json;
@@ -1234,6 +1284,43 @@ function asFormBody(form){
   return new URLSearchParams(data);
 }
 
+async function refreshKpiCards(){
+  try {
+    const resp = await fetch('/ui-status');
+    if (!resp.ok) return;
+    const status = await resp.json();
+
+    const fleet = status && status.fleet ? status.fleet : null;
+    if (fleet) {
+      const deployedEl = document.getElementById('kpi-deployed-num');
+      const pairedEl = document.getElementById('kpi-paired-num');
+      const unpairedEl = document.getElementById('kpi-unpaired-num');
+      if (deployedEl) deployedEl.textContent = String(fleet.deployed ?? deployedEl.textContent);
+      if (pairedEl) pairedEl.textContent = String(fleet.paired ?? pairedEl.textContent);
+      if (unpairedEl) unpairedEl.textContent = String(fleet.unpaired ?? unpairedEl.textContent);
+    }
+
+    const modeEl = document.getElementById('kpi-sync-mode');
+    if (modeEl && status && status.syncMode) {
+      modeEl.textContent = (status.syncMode === 'interval') ? 'Interval' : 'Daily';
+    }
+
+    const activeEl = document.getElementById('kpi-active-sync');
+    if (activeEl && status) {
+      if (status.syncMode === 'interval') {
+        activeEl.textContent = 'Every ' + String(status.syncIntervalMinutes || 0) + ' min';
+      } else {
+        activeEl.textContent = 'Daily @ ' + String(status.syncDailyTime || '--:--');
+      }
+    }
+
+    const nextEl = document.getElementById('kpi-next-sync');
+    if (nextEl && status && status.nextSyncLocal) {
+      nextEl.textContent = status.nextSyncLocal;
+    }
+  } catch (_) {}
+}
+
 function wireAsyncForms(){
   const forms = document.querySelectorAll('form.async-form');
   forms.forEach(form => {
@@ -1264,6 +1351,19 @@ function wireAsyncForms(){
         } catch (_) {}
 
         showUiStatus(msg, ok);
+
+        if (ok && form.action && form.action.indexOf('/discover-nodes') !== -1) {
+          // Discovery responses land shortly after broadcast; refresh the list quickly.
+          setTimeout(() => location.reload(), 900);
+        }
+
+        if (ok && form.action && (
+            form.action.indexOf('/set-sync-mode') !== -1 ||
+            form.action.indexOf('/set-sync-interval') !== -1 ||
+            form.action.indexOf('/set-sync-time') !== -1 ||
+            form.action.indexOf('/set-wake-interval') !== -1)) {
+          await refreshKpiCards();
+        }
       } catch (err) {
         showUiStatus('Request failed: ' + err, false);
       } finally {
@@ -1500,17 +1600,17 @@ void handleRoot() {
   html += F("<div class='stats stats--kpi' style='margin:0 0 12px 0'>"
               "<div class='stat");
   if (deployedNodes > 0) html += F(" stat--deployed-active");
-  html += F("'><strong>Deployed</strong><span class='num'>");
+  html += F("'><strong>Deployed</strong><span id='kpi-deployed-num' class='num'>");
   html += String(deployedNodes);
   html += F("</span></div>"
               "<div class='stat");
   if (pairedNodes.size() > 0) html += F(" stat--paired-active");
-  html += F("'><strong>Paired</strong><span class='num'>");
+  html += F("'><strong>Paired</strong><span id='kpi-paired-num' class='num'>");
   html += String(pairedNodes.size());
   html += F("</span></div>"
               "<div class='stat");
   if (unpairedNodes.size() > 0) html += F(" stat--unpaired-active");
-  html += F("'><strong>Unpaired</strong><span class='num'>");
+  html += F("'><strong>Unpaired</strong><span id='kpi-unpaired-num' class='num'>");
   html += String(unpairedNodes.size());
   html += F("</span></div>"
             "</div>");
@@ -1553,15 +1653,17 @@ void handleRoot() {
             "</form>"
             "</div>"
             "<div class='stats' style='margin:0 0 12px 0'>"
-            "<div class='stat'><strong>Sync mode</strong><span class='num' style='font-size:16px'>");
+            "<div class='stat'><strong>Sync mode</strong><span class='num' style='font-size:16px'><span id='kpi-sync-mode'>");
   html += syncModeLabel();
-  html += F("</span></div>"
+  html += F("</span></span></div>"
             "<div class='stat'><strong>Active sync</strong><span class='num' style='font-size:16px'>");
+  html += F("<span id='kpi-active-sync'>");
   html += activeSyncPlan;
-  html += F("</span></div>"
+  html += F("</span></span></div>"
             "<div class='stat'><strong>Next sync</strong><span class='num' style='font-size:16px'>");
+  html += F("<span id='kpi-next-sync'>");
   html += computeNextSyncIsoLocal();
-  html += F("</span></div>"
+  html += F("</span></span></div>"
             "</div>"
             "<div class='row'>"
             "<div class='col'>"
@@ -1706,10 +1808,16 @@ void handleDownloadCSV() {
 
 void handleDiscoverNodes() {
   Serial.println("🔍 Starting node discovery...");
-  sendDiscoveryBroadcast();
+  // Send a short burst so sleepy/late responders are less likely to be missed.
+  const uint8_t kDiscoveryBursts = 3;
+  bool sentAny = false;
+  for (uint8_t i = 0; i < kDiscoveryBursts; ++i) {
+    sentAny = sendDiscoveryBroadcast() || sentAny;
+    if (i + 1 < kDiscoveryBursts) delay(150);
+  }
 
   if (isAjaxRequest()) {
-    sendAjaxResult(true, "Discovery broadcast sent");
+    sendAjaxResult(sentAny, sentAny ? "Discovery scan sent (3 bursts). Refreshing list..." : "Discovery scan failed");
     return;
   }
 
@@ -1918,6 +2026,19 @@ void handleNodeConfigForm() {
   String userId  = getNodeUserId(target->nodeId);
   String name    = getNodeName(target->nodeId);
   String notes   = getNodeNotes(target->nodeId);
+  String appliedLabel = "";
+  if (!target->stateChangePending && target->lastStateAppliedMs > 0) {
+    const unsigned long ageSec = (millis() >= target->lastStateAppliedMs)
+      ? ((millis() - target->lastStateAppliedMs) / 1000UL)
+      : 0;
+    if (target->lastAppliedTargetState == PENDING_TO_PAIRED) appliedLabel = "State applied: Paired";
+    else if (target->lastAppliedTargetState == PENDING_TO_UNPAIRED) appliedLabel = "State applied: Unpaired";
+    else if (target->lastAppliedTargetState == PENDING_TO_DEPLOYED) appliedLabel = "State applied: Deployed";
+    else appliedLabel = "State applied";
+    appliedLabel += " (";
+    appliedLabel += String(ageSec);
+    appliedLabel += "s ago)";
+  }
   const bool isDeployed = (target->state == DEPLOYED);
   uint8_t observedWakeMin = (target->wakeIntervalMin > 0)
     ? target->wakeIntervalMin
@@ -1937,6 +2058,11 @@ void handleNodeConfigForm() {
   if (target->state == DEPLOYED) html += F("<span class='chip chip--state-deployed'>Deployed</span>");
   else if (target->state == PAIRED) html += F("<span class='chip chip--state-paired'>Paired</span>");
   else html += F("<span class='chip chip--state-unpaired'>Unpaired</span>");
+  if (appliedLabel.length()) {
+    html += F("<span class='chip chip--cfg-ok'>");
+    html += appliedLabel;
+    html += F("</span>");
+  }
   html += F("</div>"
             "<div style='display:flex;align-items:center;gap:8px'>"
             "<button type='button' class='btn btn--sm' style='width:auto' "
@@ -2288,6 +2414,20 @@ void handleNodesPage() {
       if (node.state == DEPLOYED) deployState = "Deployed";
       else if (node.state == PAIRED) deployState = "Paired";
 
+      String appliedLabel = "";
+      if (!node.stateChangePending && node.lastStateAppliedMs > 0) {
+        const unsigned long ageSec = (millis() >= node.lastStateAppliedMs)
+          ? ((millis() - node.lastStateAppliedMs) / 1000UL)
+          : 0;
+        if (node.lastAppliedTargetState == PENDING_TO_PAIRED) appliedLabel = "Paired applied";
+        else if (node.lastAppliedTargetState == PENDING_TO_UNPAIRED) appliedLabel = "Unpaired applied";
+        else if (node.lastAppliedTargetState == PENDING_TO_DEPLOYED) appliedLabel = "Deploy applied";
+        else appliedLabel = "Applied";
+        appliedLabel += " (";
+        appliedLabel += String(ageSec);
+        appliedLabel += "s)";
+      }
+
       String displayId = userId.length() ? userId : node.nodeId;
 
       html += F("<a href='/node-config?node_id=");
@@ -2325,6 +2465,11 @@ void handleNodesPage() {
       if (node.state == DEPLOYED) html += F("<span class='chip chip--state-deployed'>Deployed</span>");
       else if (node.state == PAIRED) html += F("<span class='chip chip--state-paired'>Paired</span>");
       else html += F("<span class='chip chip--state-unpaired'>Unpaired</span>");
+      if (appliedLabel.length()) {
+        html += F("<span class='chip chip--cfg-ok' style='margin-top:4px'>");
+        html += appliedLabel;
+        html += F("</span>");
+      }
 
       html += F("</div>"
                 "<div class='node-status-cell'>"
@@ -2360,14 +2505,23 @@ void setup() {
 
   Serial.println("Starting WiFi setup...");
 #if ENABLE_WIFI_AP_WEBSERVER
-  Serial.println("Starting WiFi AP (AP+STA mode)...");
+  Serial.println("Starting WiFi AP...");
+#if ENABLE_ESPNOW_RUNTIME
   WiFi.mode(WIFI_AP_STA);
+#else
+  WiFi.mode(WIFI_AP);
+#endif
 #else
   // Keep WiFi radio in STA mode for ESP-NOW, but disable AP/web server during BLE soak tests.
   WiFi.mode(WIFI_STA);
 #endif
+#if ENABLE_BLE_GATT
   // BLE + WiFi coexistence on ESP32-S3 requires modem sleep to be enabled.
   WiFi.setSleep(true);
+#else
+  // Keep AP beacons fully active while BLE is disabled.
+  WiFi.setSleep(false);
+#endif
 
   // AP and ESP-NOW must share one RF channel on ESP32 to avoid coexistence issues.
 #if ENABLE_WIFI_AP_WEBSERVER
@@ -2393,12 +2547,20 @@ void setup() {
   Serial.print("Firmware: "); Serial.print(FW_VERSION); Serial.print(" "); Serial.println(FW_BUILD);
 
   delay(1000);
+#if ENABLE_ESPNOW_RUNTIME
   Serial.println("Starting ESP-NOW setup...");
   setupESPNOW();
+#else
+  Serial.println("ESP-NOW runtime disabled (ENABLE_ESPNOW_RUNTIME=0)");
+#endif
+#if ENABLE_BLE_GATT
   setSensorDataEventCallback(onBleSensorTelemetry);
 
   Serial.println("Starting BLE GATT setup...");
   bleSetup(DEVICE_ID, FW_VERSION, buildBleStatusDataJson, getRTCTimeUnix, handleBleCommand);
+#else
+  Serial.println("BLE GATT disabled (ENABLE_BLE_GATT=0)");
+#endif
 
   char timeStr[32];
   getRTCTimeString(timeStr, sizeof(timeStr));
@@ -2436,7 +2598,22 @@ void setup() {
 
 #if ENABLE_WIFI_AP_WEBSERVER
   // Routes
-  server.on("/", HTTP_GET, handleRoot);
+  server.on("/", HTTP_ANY, handleRoot);
+  #if ENABLE_CAPTIVE_PORTAL
+  // Common mobile captive-portal probes: return a local landing page.
+  server.on("/generate_204", HTTP_ANY, sendCaptivePortalLanding);
+  server.on("/gen_204", HTTP_ANY, sendCaptivePortalLanding);
+  server.on("/hotspot-detect.html", HTTP_ANY, sendCaptivePortalLanding);
+  server.on("/library/test/success.html", HTTP_ANY, sendCaptivePortalLanding);
+  server.on("/connecttest.txt", HTTP_ANY, sendCaptivePortalLanding);
+  server.on("/ncsi.txt", HTTP_ANY, sendCaptivePortalLanding);
+  server.on("/success.txt", HTTP_ANY, sendCaptivePortalLanding);
+  server.on("/wpad.dat", HTTP_ANY, sendCaptivePortalLanding);
+  server.on("/redirect", HTTP_ANY, sendCaptivePortalLanding);
+  server.on("/fwlink", HTTP_ANY, sendCaptivePortalLanding);
+  server.on("/mobile/status.php", HTTP_ANY, sendCaptivePortalLanding);
+  server.on("/favicon.ico", HTTP_ANY, [](){ server.send(204); });
+  #endif
   server.on("/set-time", HTTP_POST, handleSetTime);
   server.on("/download-csv", HTTP_GET, handleDownloadCSV);
   server.on("/discover-nodes", HTTP_POST, handleDiscoverNodes);
@@ -2444,12 +2621,21 @@ void setup() {
   server.on("/set-sync-mode", HTTP_POST, handleSetSyncMode);
   server.on("/set-sync-interval", HTTP_POST, handleSetSyncInterval);
   server.on("/set-sync-time", HTTP_POST, handleSetSyncTime);
+  server.on("/ui-status", HTTP_GET, []() {
+    server.send(200, "application/json", buildBleStatusDataJson());
+  });
 
   // Node manager + config routes
   server.on("/nodes", HTTP_GET, handleNodesPage);
   server.on("/node-config", HTTP_GET, handleNodeConfigForm);
   server.on("/node-config", HTTP_POST, handleNodeConfigSave);
   server.on("/revert-node", HTTP_POST, handleRevertNode); // still available if you use it elsewhere
+
+  #if ENABLE_CAPTIVE_PORTAL
+  server.onNotFound(sendCaptivePortalLanding);
+  dnsServer.start(53, "*", WiFi.softAPIP());
+  Serial.println("Captive portal DNS enabled");
+  #endif
 
   server.begin();
   Serial.println("✅ Web server started!");
@@ -2460,12 +2646,20 @@ void setup() {
 
 void loop() {
 #if ENABLE_WIFI_AP_WEBSERVER
+  #if ENABLE_CAPTIVE_PORTAL
+  dnsServer.processNextRequest();
+  #endif
   server.handleClient();
 #endif
+#if ENABLE_ESPNOW_RUNTIME
   espnow_loop(); // Handle ESP-NOW node management
+#endif
+#if ENABLE_BLE_GATT
   bleLoop();
+#endif
 
   // Global sync trigger driven by selected sync mode.
+#if ENABLE_ESPNOW_RUNTIME
   {
     const uint32_t nowUnix = getRTCTimeUnix();
     if (nowUnix > 946684800UL) {
@@ -2516,6 +2710,7 @@ void loop() {
 #endif
     }
   }
+#endif
 
 #if ENABLE_PERIODIC_RTC_SERIAL_LOG
   // Print current RTC time every 10s (verbose mode)
