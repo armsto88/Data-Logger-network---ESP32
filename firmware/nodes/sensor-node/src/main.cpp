@@ -82,6 +82,15 @@ RTC_DS3231 rtc;
 #define POST_WAKE_WINDOW_MS 1500
 #endif
 
+// Sync wake behavior (minute-resolution DS3231 Alarm2 windowing)
+#ifndef SYNC_PRE_WAKE_SEC
+#define SYNC_PRE_WAKE_SEC 30
+#endif
+
+#ifndef SYNC_LISTEN_WINDOW_MS
+#define SYNC_LISTEN_WINDOW_MS 60000
+#endif
+
 #if ENABLE_POWER_HOLD_CONTROL && (PWR_HOLD_PIN >= 0)
 static const uint8_t kPwrHoldOnLevel  = PWR_HOLD_ACTIVE_HIGH ? HIGH : LOW;
 static const uint8_t kPwrHoldOffLevel = PWR_HOLD_ACTIVE_HIGH ? LOW  : HIGH;
@@ -157,6 +166,22 @@ static void processPowerCut() {
 
 // ---- DS3231 helpers ----
 
+static uint8_t readDS3231StatusReg() {
+  WireRtc.beginTransmission(0x68);
+  WireRtc.write(0x0F);                 // STATUS register
+  WireRtc.endTransmission(false);
+  WireRtc.requestFrom((uint8_t)0x68, (uint8_t)1);
+  if (WireRtc.available()) return WireRtc.read();
+  return 0xFF;
+}
+
+static void writeDS3231StatusReg(uint8_t s) {
+  WireRtc.beginTransmission(0x68);
+  WireRtc.write(0x0F);
+  WireRtc.write(s);
+  WireRtc.endTransmission();
+}
+
 static inline void formatTime(const DateTime& dt, char* out, size_t n) {
   snprintf(out, n, "%04d-%02d-%02d %02d:%02d:%02d",
            dt.year(), dt.month(), dt.day(),
@@ -182,32 +207,38 @@ static void initNVS()
 
 // Read DS3231 A1F (Alarm1 Flag). Returns 0 or 1, or 0xFF on I2C error.
 static uint8_t readDS3231_A1F() {
-  WireRtc.beginTransmission(0x68);
-  WireRtc.write(0x0F);                 // STATUS register
-  WireRtc.endTransmission(false);
-  WireRtc.requestFrom((uint8_t)0x68, (uint8_t)1);
-  if (WireRtc.available()) {
-    uint8_t s = WireRtc.read();
-    return (s & 0x01) ? 1 : 0;         // bit0 = A1F
-  }
+  uint8_t s = readDS3231StatusReg();
+  if (s != 0xFF) return (s & 0x01) ? 1 : 0;         // bit0 = A1F
+  return 0xFF;
+}
+
+// Read DS3231 A2F (Alarm2 Flag). Returns 0 or 1, or 0xFF on I2C error.
+static uint8_t readDS3231_A2F() {
+  uint8_t s = readDS3231StatusReg();
+  if (s != 0xFF) return (s & 0x02) ? 1 : 0;         // bit1 = A2F
   return 0xFF;
 }
 
 // Clear A1F (Alarm1 Flag) while preserving other status bits.
 static void clearDS3231_A1F() {
-  WireRtc.beginTransmission(0x68);
-  WireRtc.write(0x0F);      // STATUS
-  WireRtc.endTransmission(false);
-  WireRtc.requestFrom((uint8_t)0x68, (uint8_t)1);
-  uint8_t s = WireRtc.available() ? WireRtc.read() : 0;
+  uint8_t s = readDS3231StatusReg();
+  if (s == 0xFF) return;
+  s &= (uint8_t)~0x01;
+  writeDS3231StatusReg(s);
+}
 
-  // Clear A1F (bit0) AND A2F (bit1) to be safe
-  s &= ~0x03;
+static void clearDS3231_A2F() {
+  uint8_t s = readDS3231StatusReg();
+  if (s == 0xFF) return;
+  s &= (uint8_t)~0x02;
+  writeDS3231StatusReg(s);
+}
 
-  WireRtc.beginTransmission(0x68);
-  WireRtc.write(0x0F);
-  WireRtc.write(s);
-  WireRtc.endTransmission();
+static void clearDS3231_AlarmFlags() {
+  uint8_t s = readDS3231StatusReg();
+  if (s == 0xFF) return;
+  s &= (uint8_t)~0x03;
+  writeDS3231StatusReg(s);
 }
 
 // Enable INTCN + A1IE (Alarm1 interrupt)
@@ -219,6 +250,21 @@ static void ds3231EnableAlarmInterrupt() {
   uint8_t ctrl = WireRtc.available() ? WireRtc.read() : 0;
 
   ctrl |= 0b00000101;  // INTCN (bit2) + A1IE (bit0)
+
+  WireRtc.beginTransmission(0x68);
+  WireRtc.write(0x0E);
+  WireRtc.write(ctrl);
+  WireRtc.endTransmission();
+}
+
+static void ds3231EnableAlarm2Interrupt() {
+  WireRtc.beginTransmission(0x68);
+  WireRtc.write(0x0E);  // CTRL
+  WireRtc.endTransmission(false);
+  WireRtc.requestFrom((uint8_t)0x68, (uint8_t)1);
+  uint8_t ctrl = WireRtc.available() ? WireRtc.read() : 0;
+
+  ctrl |= 0b00000110;  // INTCN (bit2) + A2IE (bit1)
 
   WireRtc.beginTransmission(0x68);
   WireRtc.write(0x0E);
@@ -243,11 +289,36 @@ static void ds3231DisableAlarmInterrupt() {
   WireRtc.endTransmission();
 }
 
+static void ds3231DisableAlarm2Interrupt() {
+  WireRtc.beginTransmission(0x68);
+  WireRtc.write(0x0E);  // CTRL
+  WireRtc.endTransmission(false);
+  WireRtc.requestFrom((uint8_t)0x68, (uint8_t)1);
+  uint8_t ctrl = WireRtc.available() ? WireRtc.read() : 0;
+
+  ctrl &= (uint8_t)~0b00000010;  // clear A2IE
+  ctrl |= 0b00000100;            // keep INTCN
+
+  WireRtc.beginTransmission(0x68);
+  WireRtc.write(0x0E);
+  WireRtc.write(ctrl);
+  WireRtc.endTransmission();
+}
+
 // Low-level: write DS3231 Alarm1 registers
 static bool ds3231WriteA1(uint8_t secReg, uint8_t minReg, uint8_t hourReg, uint8_t dayReg) {
   WireRtc.beginTransmission(0x68);
   WireRtc.write(0x07);                // A1 seconds register
   WireRtc.write(secReg);
+  WireRtc.write(minReg);
+  WireRtc.write(hourReg);
+  WireRtc.write(dayReg);
+  return WireRtc.endTransmission() == 0;
+}
+
+static bool ds3231WriteA2(uint8_t minReg, uint8_t hourReg, uint8_t dayReg) {
+  WireRtc.beginTransmission(0x68);
+  WireRtc.write(0x0B);                // A2 minutes register
   WireRtc.write(minReg);
   WireRtc.write(hourReg);
   WireRtc.write(dayReg);
@@ -266,37 +337,52 @@ static bool ds3231EveryMinute() {
   return ds3231WriteA1(A1SEC, A1MIN, A1HOUR, A1DAY);
 }
 
-// Compute next trigger (aligned to interval; seconds=00), program A1.
+// Compute next trigger as now + interval minutes (relative scheduling), program A1.
 static bool ds3231ArmNextInNMinutes(uint8_t intervalMin, DateTime* nextOut = nullptr) {
+  if (intervalMin == 0) intervalMin = 1;
+
   DateTime now = rtc.now();
+  DateTime next = now + TimeSpan(0, 0, intervalMin, 0);
 
-  // If not at :00, hop to the next minute :00
-  if (now.second() != 0) {
-    now = now + TimeSpan(0, 0, 1, 0);
-    now = DateTime(now.year(), now.month(), now.day(),
-                   now.hour(), now.minute(), 0);
-  }
-
-  // Minutes to add to hit the NEXT multiple of intervalMin
-  uint8_t mod    = now.minute() % intervalMin;
-  uint8_t addMin = (mod == 0) ? intervalMin : (intervalMin - mod);
-
-  DateTime next = now + TimeSpan(0, 0, addMin, 0); // seconds already 0
-
-  // Safety: if somehow next <= real RTC "now", push one minute
-  DateTime chk = rtc.now();
-  if (next <= chk) next = next + TimeSpan(0, 0, 1, 0);
-
-  const uint8_t secBCD  = 0x00; // A1M1=0 (match seconds)
+  const uint8_t secBCD  = uint8_t(((next.second()/10)<<4) | (next.second()%10)); // A1M1=0
   const uint8_t minBCD  = uint8_t(((next.minute()/10)<<4) | (next.minute()%10)); // A1M2=0
   const uint8_t hourBCD = uint8_t(((next.hour()/10)<<4)   | (next.hour()%10));   // A1M3=0 (24h)
   const uint8_t dayReg  = 0b10000000; // A1M4=1 ignore day/date
 
   char buf[24]; formatTime(next, buf, sizeof(buf));
-  Serial.print("[A1] Next alarm at "); Serial.println(buf);
+  Serial.printf("[A1] Next alarm in %u min at %s\n", intervalMin, buf);
 
   if (nextOut) *nextOut = next;
   return ds3231WriteA1(secBCD, minBCD, hourBCD, dayReg);
+}
+
+static bool ds3231ArmSyncWake(uint16_t syncIntervalMin,
+                              uint32_t syncPhaseUnix,
+                              uint32_t preWakeSec,
+                              DateTime* wakeOut = nullptr) {
+  if (syncIntervalMin == 0) return false;
+
+  uint32_t nowUnix = rtc.now().unixtime();
+  uint32_t periodSec = (uint32_t)syncIntervalMin * 60UL;
+  uint32_t phase = syncPhaseUnix;
+  if (phase == 0 || phase > nowUnix) phase = nowUnix;
+
+  uint32_t slot = (nowUnix - phase) / periodSec;
+  uint32_t nextSyncUnix = phase + (slot + 1UL) * periodSec;
+  uint32_t wakeUnix = (nextSyncUnix > preWakeSec) ? (nextSyncUnix - preWakeSec) : nextSyncUnix;
+
+  DateTime wake(wakeUnix);
+  const uint8_t minBCD  = uint8_t(((wake.minute()/10)<<4) | (wake.minute()%10));
+  const uint8_t hourBCD = uint8_t(((wake.hour()/10)<<4)   | (wake.hour()%10));
+  const uint8_t dayReg  = 0b10000000; // ignore day/date
+
+  char wakeStr[24]; formatTime(wake, wakeStr, sizeof(wakeStr));
+  char syncStr[24]; formatTime(DateTime(nextSyncUnix), syncStr, sizeof(syncStr));
+  Serial.printf("[A2] Sync wake armed for %s (target sync %s, pre=%lus)\n",
+                wakeStr, syncStr, (unsigned long)preWakeSec);
+
+  if (wakeOut) *wakeOut = wake;
+  return ds3231WriteA2(minBCD, hourBCD, dayReg);
 }
 
 // -------------------- Node state --------------------
@@ -321,6 +407,8 @@ RTC_DATA_ATTR uint32_t  g_syncPhaseUnix = 0;
 RTC_DATA_ATTR uint32_t  g_lastSyncSlot = 0xFFFFFFFFUL;
 
 static bool g_espNowReady = false;
+static volatile bool g_syncWindowMarkerSeen = false;
+static volatile uint32_t g_syncWindowMarkerMs = 0;
 
 // --- Derived state helpers ---
 static bool hasMothershipMAC() {
@@ -473,6 +561,9 @@ static void shutdownEspNow();
 static bool shouldSyncAt(uint32_t unixNow);
 static void captureSensorsToQueue();
 static void flushQueuedToMothership();
+static void sendSensorData();
+static bool armDeploymentWakeAlarms(DateTime* nextDataOut = nullptr, DateTime* nextSyncOut = nullptr);
+static void finalizeWakeAndSleep(const char* reason);
 
 // Guard against stale g_espNowReady state by retrying once after a forced re-init.
 static esp_err_t espnowSendWithRecover(const uint8_t* mac, const uint8_t* payload, size_t len) {
@@ -695,7 +786,8 @@ static void onDataReceived(const uint8_t *mac, const uint8_t *incomingData, int 
         deployedFlag     = false;
         lastTimeSyncUnix = 0;
         ds3231DisableAlarmInterrupt();
-        clearDS3231_A1F();
+        ds3231DisableAlarm2Interrupt();
+        clearDS3231_AlarmFlags();
         local_queue::clear();
         Serial.println("🧹 Cleared local queue after PAIRING_RESPONSE");
         persistNodeConfig();
@@ -721,7 +813,8 @@ static void onDataReceived(const uint8_t *mac, const uint8_t *incomingData, int 
       deployedFlag     = false;
       lastTimeSyncUnix = 0;
       ds3231DisableAlarmInterrupt();
-      clearDS3231_A1F();
+      ds3231DisableAlarm2Interrupt();
+      clearDS3231_AlarmFlags();
       local_queue::clear();
       Serial.println("🧹 Cleared local queue after PAIR_NODE");
       persistNodeConfig();
@@ -766,30 +859,12 @@ static void onDataReceived(const uint8_t *mac, const uint8_t *incomingData, int 
       Serial.printf("📨 DEPLOY_ACK sent: %s\n",
             dackRes == ESP_OK ? "OK" : esp_err_to_name(dackRes));
 
-      // Arm first RTC alarm based on current interval
-      bool ok = false;
-      DateTime next;
-      if (g_intervalMin <= 1) {
-        ok = ds3231EveryMinute();
-        DateTime now = rtc.now();
-        DateTime nextDisplay = (now.second() == 0)
-            ? now + TimeSpan(0,0,1,0)
-            : DateTime(now.year(),now.month(),now.day(),now.hour(),now.minute(),0)
-              + TimeSpan(0,0,1,0);
-        next = nextDisplay;
-      } else {
-        ok = ds3231ArmNextInNMinutes(g_intervalMin, &next);
-      }
-      ds3231EnableAlarmInterrupt();
-      clearDS3231_A1F();  // ensure flag low until first alarm
+      // Immediate first cycle on deploy, then schedule next wake from cycle end.
+      Serial.println("🧾 DEPLOY immediate cycle start");
+      captureSensorsToQueue();
+      Serial.printf("🧾 DEPLOY immediate sample done; pending queue=%u\n", (unsigned)local_queue::count());
 
-      char nextStr[24]; formatTime(next, nextStr, sizeof(nextStr));
-      Serial.printf("[DEPLOY] First alarm armed for %s (ok=%d, interval=%u min)\n",
-                    nextStr, ok, g_intervalMin);
-
-      // Deployed mode is queue-first with WiFi duty-cycled.
-      Serial.println("🧾 DEPLOYED queue-first mode enabled");
-      shutdownEspNow();
+      finalizeWakeAndSleep("deploy immediate cycle complete");
     }
     return;
   }
@@ -808,7 +883,8 @@ static void onDataReceived(const uint8_t *mac, const uint8_t *incomingData, int 
       lastTimeSyncUnix = 0;
       g_lastSyncSlot   = 0xFFFFFFFFUL;
       ds3231DisableAlarmInterrupt();
-      clearDS3231_A1F();
+      ds3231DisableAlarm2Interrupt();
+      clearDS3231_AlarmFlags();
       persistNodeConfig();
       local_queue::clear();
       Serial.println("💾 Node config persisted after UNPAIR");
@@ -834,24 +910,16 @@ static void onDataReceived(const uint8_t *mac, const uint8_t *incomingData, int 
 
       // Intention: paired/unpaired nodes store interval but remain idle.
       if (currentNodeState() == STATE_DEPLOYED && rtcSynced) {
-        if (g_intervalMin <= 1) {
-          ok = ds3231EveryMinute();
-          DateTime now = rtc.now();
-          DateTime nextDisplay = (now.second() == 0)
-              ? now + TimeSpan(0,0,1,0)
-              : DateTime(now.year(),now.month(),now.day(),now.hour(),now.minute(),0)
-                + TimeSpan(0,0,1,0);
-          next = nextDisplay;
-        } else {
-          ok = ds3231ArmNextInNMinutes(g_intervalMin, &next);
-        }
+        ok = ds3231ArmNextInNMinutes(g_intervalMin, &next);
 
         ds3231EnableAlarmInterrupt();
+        ds3231EnableAlarm2Interrupt();
         clearDS3231_A1F();   // flag low until first match
         formatTime(next, nextStr, sizeof(nextStr));
       } else {
         ds3231DisableAlarmInterrupt();
-        clearDS3231_A1F();
+        ds3231DisableAlarm2Interrupt();
+        clearDS3231_AlarmFlags();
         snprintf(nextStr, sizeof(nextStr), "(idle: not deployed)");
       }
 
@@ -881,7 +949,23 @@ static void onDataReceived(const uint8_t *mac, const uint8_t *incomingData, int 
                     (unsigned)oldMin,
                     (unsigned)g_syncIntervalMin,
                     (unsigned long)g_syncPhaseUnix);
+
+      if (currentNodeState() == STATE_DEPLOYED && rtcSynced) {
+        DateTime nextData;
+        DateTime nextSync;
+        const bool rearmOk = armDeploymentWakeAlarms(&nextData, &nextSync);
+        char dataStr[24]; formatTime(nextData, dataStr, sizeof(dataStr));
+        char syncStr[24]; formatTime(nextSync, syncStr, sizeof(syncStr));
+        Serial.printf("[SET_SYNC_SCHED] immediate re-arm data=%s sync=%s (%s)\n",
+                      dataStr, syncStr, rearmOk ? "OK" : "PARTIAL");
+      }
+
       persistNodeConfig();
+    } else if (strcmp(sc.command, "SYNC_WINDOW_OPEN") == 0) {
+      g_syncWindowMarkerSeen = true;
+      g_syncWindowMarkerMs = millis();
+      Serial.printf("[SYNC_WINDOW_OPEN] marker received phaseUnix=%lu\n",
+                    (unsigned long)sc.phaseUnix);
     }
     return;
   }
@@ -1084,72 +1168,78 @@ static void sendSensorData() {
   }
 }
 
+static bool armDeploymentWakeAlarms(DateTime* nextDataOut, DateTime* nextSyncOut) {
+  bool okData = ds3231ArmNextInNMinutes(g_intervalMin, nextDataOut);
+  bool okSync = ds3231ArmSyncWake(g_syncIntervalMin, g_syncPhaseUnix, SYNC_PRE_WAKE_SEC, nextSyncOut);
+
+  ds3231EnableAlarmInterrupt();
+  ds3231EnableAlarm2Interrupt();
+  clearDS3231_AlarmFlags();
+
+  return okData && okSync;
+}
+
+static void finalizeWakeAndSleep(const char* reason) {
+  DateTime nextData;
+  DateTime nextSync;
+  bool okBoth = armDeploymentWakeAlarms(&nextData, &nextSync);
+
+  char dataStr[24]; formatTime(nextData, dataStr, sizeof(dataStr));
+  char syncStr[24]; formatTime(nextSync, syncStr, sizeof(syncStr));
+  Serial.printf("🔁 Re-armed alarms data=%s sync=%s (%s)\n",
+                dataStr, syncStr, okBoth ? "OK" : "PARTIAL");
+
+  shutdownEspNow();
+  schedulePowerCut(reason ? reason : "wake cycle complete");
+}
+
 
 
 // -------------------- Per-alarm handler --------------------
-static void handleRtcAlarmEvent() {
+static void handleRtcWakeEvents(bool dataWake, bool syncWake) {
   DateTime fired = rtc.now();
   char firedStr[24];
   formatTime(fired, firedStr, sizeof(firedStr));
-  uint8_t a1fBefore = readDS3231_A1F();
+  Serial.printf("⚡ RTC wake @ %s  dataWake=%d syncWake=%d\n",
+                firedStr, dataWake ? 1 : 0, syncWake ? 1 : 0);
 
-  Serial.println("⚡ DS3231 alarm detected → sample to local queue");
-  Serial.printf("⏰ RTC alarm context @ %s  | A1F(before)=%u\n",
-                firedStr, a1fBefore);
-
-  // 1) Sample to queue every alarm, flush only on sync schedule slots.
-  NodeState s = currentNodeState();
-  if (s == STATE_DEPLOYED && rtcSynced && hasMothershipMAC()) {
-    // Pull-handshake: announce wake, pick up any pending config update
-    sendNodeHello();
-#if POST_WAKE_WINDOW_MS > 0
-    // Post-wake command window: stay awake for incoming CONFIG_SNAPSHOT
-    Serial.printf("⏳ Post-wake window: %d ms\n", POST_WAKE_WINDOW_MS);
-    delay(POST_WAKE_WINDOW_MS);
-#endif
-
-    Serial.println("🧾 Alarm → capture sensors to local queue (sync on schedule)");
-    sendSensorData();
-  } else {
-    Serial.println("⚠️ Alarm but node not ready (not DEPLOYED / RTC unsynced / no mothership)");
+  if (!(currentNodeState() == STATE_DEPLOYED && rtcSynced && hasMothershipMAC())) {
+    Serial.println("⚠️ Wake but node not ready (not DEPLOYED / RTC unsynced / no mothership)");
+    clearDS3231_AlarmFlags();
+    return;
   }
 
-  // 2) Re-arm the next alarm based on g_intervalMin
-  bool ok = false;
-  DateTime next;
-  if (g_intervalMin <= 1) {
-    ok = ds3231EveryMinute();
-    DateTime now = rtc.now();
-    DateTime nextDisplay = (now.second() == 0)
-        ? now + TimeSpan(0,0,1,0)
-        : DateTime(now.year(),now.month(),now.day(),now.hour(),now.minute(),0)
-          + TimeSpan(0,0,1,0);
-    next = nextDisplay;
-  } else {
-    ok = ds3231ArmNextInNMinutes(g_intervalMin, &next);
+  if (dataWake) {
+    clearDS3231_A1F();
+    Serial.println("🧾 Data wake: sample locally (radio remains off)");
+    captureSensorsToQueue();
+    Serial.printf("🧾 Data wake complete; pending queue=%u\n", (unsigned)local_queue::count());
   }
-  ds3231EnableAlarmInterrupt();
 
-  char nextStr[24];
-  formatTime(next, nextStr, sizeof(nextStr));
-  Serial.printf("   🔁 Next alarm armed at %s (%s)\n",
-                nextStr, ok ? "OK" : "FAIL");
+  if (syncWake) {
+    clearDS3231_A2F();
+    Serial.println("📶 Sync wake: enabling radio + listening for mothership sync burst");
+    g_syncWindowMarkerSeen = false;
+    g_syncWindowMarkerMs = 0;
+    if (bringupEspNow()) {
+      sendNodeHello();
+      const uint32_t windowStart = millis();
+      while ((millis() - windowStart) < (uint32_t)SYNC_LISTEN_WINDOW_MS) {
+        if (g_syncWindowMarkerSeen) break;
+        delay(50);
+      }
 
-  // 3) NOW clear A1F so INT/SQW goes HIGH again
-  clearDS3231_A1F();
-  delay(5);
-
-  uint8_t a1fAfter = readDS3231_A1F();
-  Serial.printf("🔚 DS3231 A1F cleared → A1F(after)=%u\n", a1fAfter);
-  Serial.println("   → Alarm cycle complete");
-
-  if (currentNodeState() == STATE_DEPLOYED) {
-    // Ensure WiFi/ESP-NOW is off before releasing power hold.
-    // HELLO may have left it up if this was not a sync slot.
-    shutdownEspNow();
-    // Power can be dropped once sampling/sync work is done and next wake is armed.
-    schedulePowerCut("alarm cycle complete + next wake armed");
+      if (g_syncWindowMarkerSeen) {
+        Serial.printf("📶 Sync marker seen after %lums -> flushing queue\n",
+                      (unsigned long)(g_syncWindowMarkerMs - windowStart));
+        flushQueuedToMothership();
+      } else {
+        Serial.println("⚠️ Sync marker not seen in listen window; flush skipped this cycle");
+      }
+    }
   }
+
+  finalizeWakeAndSleep("wake cycle complete + next alarms armed");
 }
 
 // -------------------- I2C / Mux / ADS1115 Self-test --------------------
@@ -1248,39 +1338,27 @@ void setup() {
       bool ok = false;
       DateTime next;
 
-      if (g_intervalMin <= 1) {
-        ok = ds3231EveryMinute();
-        DateTime now = rtc.now();
-        DateTime nextDisplay = (now.second() == 0)
-            ? now + TimeSpan(0,0,1,0)
-            : DateTime(now.year(),now.month(),now.day(),now.hour(),now.minute(),0)
-              + TimeSpan(0,0,1,0);
-        next = nextDisplay;
-      } else {
-        ok = ds3231ArmNextInNMinutes(g_intervalMin, &next);
-      }
-
-      ds3231EnableAlarmInterrupt();
-      clearDS3231_A1F();
+      ok = ds3231ArmNextInNMinutes(g_intervalMin, &next);
+      armDeploymentWakeAlarms();
 
       char nextStr[24];
       formatTime(next, nextStr, sizeof(nextStr));
-      Serial.printf("[BOOT] Re-armed RTC alarm based on stored interval=%u → next=%s (ok=%d)\n",
+      Serial.printf("[BOOT] Re-armed RTC wake alarms based on stored interval=%u → nextData=%s (ok=%d)\n",
                     g_intervalMin, nextStr, ok);
     }
 
 
-    // Normalise A1F at boot so we don't start on a stale alarm
-    uint8_t a1fInit = readDS3231_A1F();
-    if (a1fInit == 0xFF) {
-      Serial.println("⚠️ readDS3231_A1F() at boot returned 0xFF (I2C error?)");
-    } else if (a1fInit == 1) {
-      Serial.println("⚠️ A1F was already set at boot → clearing so next alarm edge is visible");
-      clearDS3231_A1F();
-      uint8_t a1fPost = readDS3231_A1F();
-      Serial.printf("   ↪ A1F(after clear)=%u\n", a1fPost);
+    // Normalise alarm flags at boot so we don't start on stale edges.
+    uint8_t statusInit = readDS3231StatusReg();
+    if (statusInit == 0xFF) {
+      Serial.println("⚠️ DS3231 status read failed at boot (I2C error?)");
+    } else if ((statusInit & 0x03) != 0) {
+      Serial.printf("⚠️ Alarm flags set at boot (A1F=%u A2F=%u) → clearing\n",
+                    (statusInit & 0x01) ? 1 : 0,
+                    (statusInit & 0x02) ? 1 : 0);
+      clearDS3231_AlarmFlags();
     } else {
-      Serial.println("[RTC] A1F=0 at boot (idle)");
+      Serial.println("[RTC] A1F=0 A2F=0 at boot (idle)");
     }
   }
 
@@ -1362,7 +1440,7 @@ void loop() {
     }
   }
 
-// --- RTC alarm handling: check A1F once per second ---
+// --- RTC alarm handling: check A1F/A2F once per second ---
 if (nowMs - lastA1Check > 1000UL) {
   lastA1Check = nowMs;
 
@@ -1370,23 +1448,25 @@ if (nowMs - lastA1Check > 1000UL) {
   char tbuf[24];
   formatTime(nowRtc, tbuf, sizeof(tbuf));
 
-  uint8_t a1 = readDS3231_A1F();
+  uint8_t status = readDS3231StatusReg();
 
-  if (a1 == 0xFF) {
-    Serial.printf("[RTC] %s A1F=ERR(0xFF)\n", tbuf);
+  if (status == 0xFF) {
+    Serial.printf("[RTC] %s A1F/A2F=ERR(0xFF)\n", tbuf);
   } else {
-    Serial.printf("[RTC] %s A1F=%u\n", tbuf, a1);
+    const bool a1 = (status & 0x01) != 0;
+    const bool a2 = (status & 0x02) != 0;
+    Serial.printf("[RTC] %s A1F=%u A2F=%u\n", tbuf, a1 ? 1 : 0, a2 ? 1 : 0);
 
-    if (a1 == 1) {
+    if (a1 || a2) {
       if (currentNodeState() == STATE_DEPLOYED) {
-        Serial.println("⚡ A1F=1 → handleRtcAlarmEvent()");
-        handleRtcAlarmEvent();
-        // handleRtcAlarmEvent() will clear A1F, so next check should see 0
+        Serial.println("⚡ Alarm wake detected → handleRtcWakeEvents()");
+        handleRtcWakeEvents(a1, a2);
       } else {
         // Ignore stale/deferred alarms outside deployed mode.
-        clearDS3231_A1F();
+        clearDS3231_AlarmFlags();
         ds3231DisableAlarmInterrupt();
-        Serial.println("⏸️ A1F cleared/ignored (node not deployed)");
+        ds3231DisableAlarm2Interrupt();
+        Serial.println("⏸️ A1F/A2F cleared/ignored (node not deployed)");
       }
     }
   }

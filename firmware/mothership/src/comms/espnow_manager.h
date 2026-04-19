@@ -124,6 +124,7 @@ bool broadcastWakeInterval(int intervalMinutes);
  * and upload queued samples.
  */
 bool broadcastSyncSchedule(int syncIntervalMinutes, unsigned long phaseUnix);
+bool broadcastSyncWindowOpen(unsigned long phaseUnix);
 
 /**
  * Set node to PAIRED and notify it.

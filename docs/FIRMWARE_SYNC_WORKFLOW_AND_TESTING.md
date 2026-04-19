@@ -350,3 +350,208 @@ Keeping this informal for now so nothing gets lost.
 
 - Keep goal practical: improve reliability and interpretation without overcomplicating the wire format.
 
+## 10) Future Sync-Alarms Architecture (Planned)
+
+Date added: 2026-04-19
+Status: Planned design direction for next sync reliability iteration.
+
+### 10.1 Why this change is needed
+
+- Current sync behavior is slot-based and robust, but node wake timing can drift relative to a single fleet sync broadcast window.
+- For larger fleets, we want all deployed nodes awake and listening inside the same global sync window.
+- Minute-level resolution is acceptable as long as windows include safety buffers.
+
+### 10.2 Target behavior (global sync truth)
+
+1. One global sync phase and interval applies to all deployed nodes.
+2. Node sampling interval remains independent from sync interval.
+3. Each node wakes into a sync window before the mothership sync broadcast.
+4. Mothership emits sync broadcast bursts during the shared window.
+5. Nodes flush queued records during that window, then return to low power.
+
+### 10.3 DS3231 dual-alarm strategy
+
+- Alarm1 (A1): data-cycle wake path.
+  - Trigger next sample wake from end of data cycle using node data interval.
+- Alarm2 (A2): global sync-window wake path.
+  - Trigger at next global sync minute boundary (or buffered pre-sync minute logic).
+- Both A1F and A2F must be checked and cleared each wake.
+- If both alarms are due, do one combined wake cycle:
+  - sample,
+  - then sync flush,
+  - then re-arm both alarms,
+  - then power down.
+
+### 10.4 Sync-window buffer policy (minute-resolution)
+
+Initial defaults for bench validation:
+
+- Pre-sync wake buffer: 15 to 30 seconds.
+- Post-sync listen buffer: 30 to 60 seconds.
+- Mothership sync burst count: 2 to 3 broadcasts spaced about 200 ms.
+
+Acceptance intent:
+
+- All deployed nodes should have radio up before first burst.
+- At least one burst is received by every listening node in normal RF conditions.
+
+### 10.5 Command/config contract expectations
+
+- On deploy, mothership provides:
+  - node data interval,
+  - global sync interval,
+  - global sync phase anchor.
+- Node stores all three and computes:
+  - next data alarm (A1),
+  - next sync alarm/window (A2).
+- Global sync interval changes must propagate to all desired node configs so late deployments still converge to the same sync phase.
+
+### 10.6 Planned implementation steps
+
+1. Add A2 read/write helpers and A2F handling in node firmware.
+2. Introduce explicit wake-reason evaluation (A1, A2, both).
+3. Add shared re-arm routine that always reprograms both alarms before power cut.
+4. Add configurable sync window constants (pre/post buffer) behind compile-time flags.
+5. Add mothership sync broadcast burst scheduling tied to global phase boundary.
+6. Add debug counters:
+  - sync window entered,
+  - bursts sent,
+  - bursts received,
+  - queue before/after flush,
+  - missed window count.
+
+### 10.7 Validation checklist for this architecture
+
+Bench checklist (single node first):
+
+1. Deploy node with data interval and sync interval set.
+2. Confirm immediate data cycle on deploy.
+3. Confirm A1 and A2 are both armed before power-down.
+4. Confirm wake reason logs correctly identify A1/A2/both.
+5. Confirm node is awake during pre-sync buffer and receives mothership burst.
+6. Confirm queue drains during sync window.
+
+Fleet checklist (4+ nodes):
+
+1. All nodes report same sync phase and interval.
+2. All nodes enter sync window for the same global slot.
+3. Mothership receives uploads from all nodes within configured window budget.
+4. No persistent starvation of any node across 10+ sync slots.
+
+### 10.8 Risks and mitigations
+
+- Risk: Minute-only A2 precision can cause edge misses.
+  - Mitigation: keep pre/post buffers and burst broadcasts.
+- Risk: Combined A1+A2 cycles increase awake time.
+  - Mitigation: bounded windows and deterministic shutdown.
+- Risk: Fleet airtime collisions in bigger deployments.
+  - Mitigation: add deterministic per-node upload offset within sync window.
+
+## 11) Detailed Deploy Workflow (Current Code, 2026-04-19)
+
+This section captures the deploy path exactly as currently implemented in firmware.
+
+### 11.1 Mothership-side workflow
+
+1. Operator opens node config and submits action `start` with interval.
+2. Mothership clamps interval to allowed set and resolves the node record.
+3. Mothership writes desired config snapshot:
+  - `wakeIntervalMin` from UI,
+  - `syncIntervalMin` from current global sync interval,
+  - `syncPhaseUnix` from current global phase (`gLastSyncBroadcastUnix`, fallback to RTC now),
+  - increments `configVersion` when changed.
+4. If node is `UNPAIRED`, mothership sends pair commands (`PAIR_NODE` + `PAIRING_RESPONSE`) and flips local state to `PAIRED`.
+5. Mothership sends deploy request:
+  - pushes pre-deploy `CONFIG_SNAPSHOT` if available,
+  - sends `DEPLOY_NODE` with RTC timestamp payload,
+  - marks local node state `DEPLOYED` immediately,
+  - queues pending target `PENDING_TO_DEPLOYED`.
+6. Mothership persists paired/deployed state and waits for runtime evidence (`DEPLOY_ACK`, HELLO, sensor contact, etc.) to clear pending.
+
+### 11.2 Node-side deploy workflow
+
+1. Node receives `DEPLOY_NODE` and validates node id.
+2. Node sets RTC from deploy payload and marks runtime state:
+  - `rtcSynced=true`,
+  - `deployedFlag=true`,
+  - `lastTimeSyncUnix=rtc.now()`,
+  - initializes sync slot tracking.
+3. Node sends `DEPLOY_ACK` to mothership.
+4. Node executes immediate first deployed cycle:
+  - samples sensors,
+  - appends records to local queue,
+  - does not require radio flush in this immediate step.
+5. Node re-arms wake alarms before sleep:
+  - Alarm1 (A1): next data wake from `now + data interval`,
+  - Alarm2 (A2): next sync wake from global phase/interval with pre-wake buffer.
+6. Node enables both alarm interrupts, clears alarm flags, powers radio off, then schedules power cut.
+
+### 11.3 Node wake behavior while deployed
+
+Wake source resolution is flag-based:
+
+1. Data wake (`A1F=1`):
+  - clear A1 flag,
+  - sample to queue,
+  - keep radio off.
+2. Sync wake (`A2F=1`):
+  - clear A2 flag,
+  - bring radio up,
+  - send `NODE_HELLO`,
+  - hold listen window,
+  - flush queued data.
+3. Combined wake (`A1F=1` and `A2F=1`):
+  - execute both steps in one cycle,
+  - re-arm both alarms,
+  - power down.
+
+### 11.4 Global sync behavior (current)
+
+1. Global sync interval changes update all desired node configs to same interval/phase.
+2. `SET_SYNC_SCHED` broadcast now uses burst send (3 packets, 200 ms spacing).
+3. Node stores `syncIntervalMin` and `syncPhaseUnix` and uses these for sync-wake scheduling.
+
+### 11.5 Current fail points / considerations
+
+1. `SET_SYNC_SCHED` apply path does not currently force immediate re-arm of Alarm2.
+  - Effect: node may continue with previously armed A2 until next cycle re-arm.
+  - Mitigation: on receiving `SET_SYNC_SCHED`, immediately call shared alarm re-arm helper when deployed.
+
+2. Sync wake flush is time-window driven, not explicit "broadcast received" gated.
+  - Effect: node may flush after listen window even if no sync burst was observed.
+  - Mitigation: add explicit sync-burst marker command/flag and gate flush on marker or timeout policy.
+
+3. Radio-on window cost can dominate battery if oversized.
+  - Effect: strong battery penalty with long `SYNC_LISTEN_WINDOW_MS`.
+  - Mitigation: tune pre/post buffers from measured success rate and keep hard max window.
+
+4. Combined A1+A2 wake can increase cycle duration under heavy backlog.
+  - Effect: longer awake time and potential missed next intervals in extreme queue conditions.
+  - Mitigation: add per-cycle flush budget and resume remainder next sync window.
+
+5. Mothership burst broadcasts improve reception but do not guarantee all-node capture in congested RF.
+  - Effect: occasional missed sync windows for some nodes.
+  - Mitigation: maintain deterministic retries and add per-node success/miss counters for adaptive tuning.
+
+### 11.5.1 Fixed in current code (2026-04-19)
+
+1. `SET_SYNC_SCHED` now immediately re-arms deployed node alarms.
+- Previous risk: node could keep stale A2 timing until next cycle.
+- Current behavior: on receiving `SET_SYNC_SCHED`, deployed+synced node re-arms A1/A2 immediately.
+
+2. Sync wake flush is now gated by explicit sync-window marker.
+- Previous risk: node could flush after a listen delay even if no sync call was observed.
+- Current behavior: mothership broadcasts `SYNC_WINDOW_OPEN` marker bursts; sync wake listens for marker and only flushes when marker is seen.
+
+3. Mothership now emits separate sync-window marker bursts during sync trigger.
+- Current behavior: interval/daily sync trigger sends both schedule burst and marker burst.
+
+### 11.6 Validation checklist for this implemented flow
+
+1. Deploy one node and confirm immediate sample is queued before first sleep.
+2. Confirm both A1 and A2 are armed after deploy.
+3. Confirm data wake samples with radio off.
+4. Confirm sync wake brings radio up, listens, then flushes queue.
+5. Change global sync interval and verify all desired configs update to same phase.
+6. Verify pending deploy clears on runtime confirmation evidence.
+

@@ -1096,12 +1096,48 @@ bool broadcastSyncSchedule(int syncIntervalMinutes, unsigned long phaseUnix) {
     ensurePeerOnChannel(bcast, ESPNOW_CHANNEL);
     esp_wifi_set_channel(ESPNOW_CHANNEL, WIFI_SECOND_CHAN_NONE);
 
-    esp_err_t res = esp_now_send(bcast, (uint8_t*)&cmd, sizeof(cmd));
-    Serial.printf("📤 SET_SYNC_SCHED %d min phase=%lu -> BROADCAST : %s\n",
-                  syncIntervalMinutes,
-                  phaseUnix,
-                  (res == ESP_OK) ? "OK" : esp_err_to_name(res));
-    return (res == ESP_OK);
+    bool anyOk = false;
+    const uint8_t burstCount = 3;
+    for (uint8_t i = 0; i < burstCount; ++i) {
+        esp_err_t res = esp_now_send(bcast, (uint8_t*)&cmd, sizeof(cmd));
+        if (res == ESP_OK) anyOk = true;
+        Serial.printf("📤 SET_SYNC_SCHED burst %u/%u %d min phase=%lu -> %s\n",
+                      (unsigned)(i + 1),
+                      (unsigned)burstCount,
+                      syncIntervalMinutes,
+                      phaseUnix,
+                      (res == ESP_OK) ? "OK" : esp_err_to_name(res));
+        if (i + 1 < burstCount) delay(200);
+    }
+    return anyOk;
+}
+
+bool broadcastSyncWindowOpen(unsigned long phaseUnix) {
+    sync_schedule_command_message_t cmd{};
+    strcpy(cmd.command, "SYNC_WINDOW_OPEN");
+    strncpy(cmd.mothership_id, DEVICE_ID,
+            sizeof(cmd.mothership_id) - 1);
+    cmd.syncIntervalMinutes = 0;
+    cmd.phaseUnix = phaseUnix;
+
+    uint8_t bcast[6] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
+
+    ensurePeerOnChannel(bcast, ESPNOW_CHANNEL);
+    esp_wifi_set_channel(ESPNOW_CHANNEL, WIFI_SECOND_CHAN_NONE);
+
+    bool anyOk = false;
+    const uint8_t burstCount = 3;
+    for (uint8_t i = 0; i < burstCount; ++i) {
+        esp_err_t res = esp_now_send(bcast, (uint8_t*)&cmd, sizeof(cmd));
+        if (res == ESP_OK) anyOk = true;
+        Serial.printf("📤 SYNC_WINDOW_OPEN burst %u/%u phase=%lu -> %s\n",
+                      (unsigned)(i + 1),
+                      (unsigned)burstCount,
+                      phaseUnix,
+                      (res == ESP_OK) ? "OK" : esp_err_to_name(res));
+        if (i + 1 < burstCount) delay(200);
+    }
+    return anyOk;
 }
 
 bool sendTimeSync(const uint8_t* mac, const char* nodeId) {
@@ -1318,6 +1354,20 @@ bool deploySelectedNodes(const std::vector<String>& nodeIds) {
                     deployCmd.hour   = hour;
                     deployCmd.minute = minute;
                     deployCmd.second = second;
+
+                    // Push desired per-node wake/sync config before deploy so node can
+                    // use the selected intervals in the first deployed cycle.
+                    NodeDesiredConfig desired = getDesiredConfig(node.nodeId.c_str());
+                    if (desired.configVersion > 0) {
+                        bool cfgSent = pushDesiredConfigSnapshot(node.mac, node.nodeId.c_str(), desired);
+                        Serial.printf("📤 Pre-deploy CONFIG_SNAPSHOT for %s v%u: %s\n",
+                                      nodeId.c_str(),
+                                      (unsigned)desired.configVersion,
+                                      cfgSent ? "OK" : "FAILED");
+                    } else {
+                        Serial.printf("⚠️ Pre-deploy CONFIG_SNAPSHOT skipped for %s (no desired config)\n",
+                                      nodeId.c_str());
+                    }
 
                     esp_err_t result =
                         esp_now_send(node.mac,

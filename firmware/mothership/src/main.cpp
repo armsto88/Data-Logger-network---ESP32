@@ -1937,6 +1937,29 @@ void handleSetSyncInterval() {
   saveSyncIntervalToNVS(interval);
   saveSyncModeToNVS(gSyncMode);
 
+  // Keep all desired node snapshots aligned to the same global sync schedule.
+  for (const auto& node : registeredNodes) {
+    NodeDesiredConfig dc = getDesiredConfig(node.nodeId.c_str());
+    bool changed = false;
+    if (dc.syncIntervalMin != (uint16_t)interval) {
+      dc.syncIntervalMin = (uint16_t)interval;
+      changed = true;
+    }
+    if (dc.syncPhaseUnix != phaseUnix) {
+      dc.syncPhaseUnix = phaseUnix;
+      changed = true;
+    }
+    if (dc.configVersion == 0) {
+      dc.configVersion = 1;
+      changed = true;
+    } else if (changed) {
+      dc.configVersion = (uint8_t)max((int)dc.configVersion + 1, 1);
+    }
+    if (changed) {
+      setDesiredConfig(node.nodeId.c_str(), dc);
+    }
+  }
+
   Serial.printf("[UI] Sync interval set to %d min phase=%lu -> broadcast %s (mode=%s)\n",
                 interval,
                 phaseUnix,
@@ -2212,16 +2235,20 @@ void handleNodeConfigSave() {
   // --- 5) Apply interval for this node only (via desired config snapshot) ---
   NodeDesiredConfig dc = getDesiredConfig(nodeId.c_str());
   bool cfgChanged = false;
+  uint32_t globalPhaseUnix = gLastSyncBroadcastUnix;
+  if (globalPhaseUnix == 0) {
+    globalPhaseUnix = getRTCTimeUnix();
+  }
   if (dc.wakeIntervalMin != (uint8_t)interval) {
     dc.wakeIntervalMin = (uint8_t)interval;
     cfgChanged = true;
   }
-  if (dc.syncIntervalMin == 0) {
+  if (dc.syncIntervalMin != (uint16_t)gSyncIntervalMin) {
     dc.syncIntervalMin = (uint16_t)gSyncIntervalMin;
     cfgChanged = true;
   }
-  if (dc.syncPhaseUnix == 0) {
-    dc.syncPhaseUnix = getRTCTimeUnix();
+  if (dc.syncPhaseUnix != globalPhaseUnix) {
+    dc.syncPhaseUnix = globalPhaseUnix;
     cfgChanged = true;
   }
   if (dc.configVersion == 0) {
@@ -2668,14 +2695,16 @@ void loop() {
       DateTime now(nowUnix);
       if (now.hour() == gSyncDailyHour && now.minute() == gSyncDailyMinute && gLastSyncBroadcastEpochDay != epochDay) {
         const bool sent = broadcastSyncSchedule(gSyncIntervalMin, nowUnix);
+        const bool markerSent = broadcastSyncWindowOpen(nowUnix);
         gLastSyncBroadcastEpochDay = epochDay;
         gLastSyncBroadcastUnix = nowUnix;
         gLastSyncBroadcastMs = millis();
         gSyncTriggerCount++;
-        Serial.printf("[SYNC] Daily trigger %02d:%02d -> broadcast %s\n",
+        Serial.printf("[SYNC] Daily trigger %02d:%02d -> schedule=%s marker=%s\n",
                       gSyncDailyHour,
                       gSyncDailyMinute,
-                      sent ? "SENT" : "NOT_SENT");
+                      sent ? "SENT" : "NOT_SENT",
+                      markerSent ? "SENT" : "NOT_SENT");
       }
     } else {
       const uint32_t periodSec = (uint32_t)max(gSyncIntervalMin, 1) * 60UL;
@@ -2683,13 +2712,15 @@ void loop() {
       const bool spacedOk = (gLastSyncBroadcastUnix == 0) || (nowUnix >= (gLastSyncBroadcastUnix + periodSec));
       if ((gLastSyncIntervalSlot < 0 || slot > gLastSyncIntervalSlot) && spacedOk) {
         const bool sent = broadcastSyncSchedule(gSyncIntervalMin, nowUnix);
+        const bool markerSent = broadcastSyncWindowOpen(nowUnix);
         gLastSyncBroadcastMs = millis();
         gLastSyncBroadcastUnix = nowUnix;
         gLastSyncIntervalSlot = slot;
         gSyncTriggerCount++;
-        Serial.printf("[SYNC] Interval trigger %d min -> broadcast %s\n",
+        Serial.printf("[SYNC] Interval trigger %d min -> schedule=%s marker=%s\n",
                       gSyncIntervalMin,
-                      sent ? "SENT" : "NOT_SENT");
+                      sent ? "SENT" : "NOT_SENT",
+                      markerSent ? "SENT" : "NOT_SENT");
       }
     }
 #if ENABLE_SYNC_AUDIT_LOG
