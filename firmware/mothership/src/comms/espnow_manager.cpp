@@ -980,30 +980,57 @@ bool broadcastWakeInterval(int intervalMinutes) {
 
 // ===== Pull-handshake: desired config store + NODE_HELLO handler =====
 
+static uint32_t fnv1a32NodeId(const char* s) {
+    if (!s) return 0;
+    uint32_t h = 2166136261u;
+    while (*s) {
+        h ^= (uint8_t)(*s++);
+        h *= 16777619u;
+    }
+    return h;
+}
+
+static String desiredConfigKeyPrefix(const char* nodeId) {
+    const uint32_t h = fnv1a32NodeId(nodeId);
+    char b[10];
+    snprintf(b, sizeof(b), "d%08X", (unsigned)h);
+    return String(b);
+}
+
+static String legacyDesiredConfigKeyPrefix(const char* nodeId) {
+    String key = String("dc_") + (nodeId ? nodeId : "");
+    if (key.length() > 14) key = key.substring(0, 14);
+    return key;
+}
+
 NodeDesiredConfig getDesiredConfig(const char* nodeId) {
     Preferences prefs;
     NodeDesiredConfig cfg{};
-    String key = String("dc_") + nodeId;
-    // Truncate key to 14 chars max (NVS namespace limit is 15)
-    if (key.length() > 14) key = key.substring(0, 14);
+    const String key = desiredConfigKeyPrefix(nodeId);
+    const String legacyKey = legacyDesiredConfigKeyPrefix(nodeId);
+
     if (!prefs.begin("node_dcfg", true)) return cfg;
-    cfg.configVersion   = prefs.getUChar((key + "v").c_str(), 0);
-    cfg.wakeIntervalMin = prefs.getUChar((key + "w").c_str(), 0);
-    cfg.syncIntervalMin = prefs.getUShort((key + "s").c_str(), 15);
-    cfg.syncPhaseUnix   = prefs.getULong((key + "p").c_str(), 0);
+
+    const String keyV = key + "v";
+    const bool hasNew = prefs.isKey(keyV.c_str());
+    const String activeKey = hasNew ? key : legacyKey;
+
+    cfg.configVersion   = prefs.getUShort((activeKey + "v").c_str(), 0);
+    cfg.wakeIntervalMin = prefs.getUChar((activeKey + "w").c_str(), 0);
+    cfg.syncIntervalMin = prefs.getUShort((activeKey + "s").c_str(), 15);
+    cfg.syncPhaseUnix   = prefs.getULong((activeKey + "p").c_str(), 0);
     prefs.end();
     return cfg;
 }
 
 void setDesiredConfig(const char* nodeId, const NodeDesiredConfig& cfg) {
     Preferences prefs;
-    String key = String("dc_") + nodeId;
-    if (key.length() > 14) key = key.substring(0, 14);
+    const String key = desiredConfigKeyPrefix(nodeId);
     if (!prefs.begin("node_dcfg", false)) {
         Serial.println("❌ setDesiredConfig: NVS open failed");
         return;
     }
-    prefs.putUChar((key + "v").c_str(), cfg.configVersion);
+    prefs.putUShort((key + "v").c_str(), cfg.configVersion);
     prefs.putUChar((key + "w").c_str(), cfg.wakeIntervalMin);
     prefs.putUShort((key + "s").c_str(), cfg.syncIntervalMin);
     prefs.putULong((key + "p").c_str(), cfg.syncPhaseUnix);
@@ -1348,26 +1375,32 @@ bool deploySelectedNodes(const std::vector<String>& nodeIds) {
                            &hour, &minute, &second,
                            &day, &month, &year) == 6)
                 {
+                    const uint32_t nowUnix = getRTCTimeUnix();
+                    NodeDesiredConfig desired = getDesiredConfig(node.nodeId.c_str());
+
                     deployCmd.year   = year;
                     deployCmd.month  = month;
                     deployCmd.day    = day;
                     deployCmd.hour   = hour;
                     deployCmd.minute = minute;
                     deployCmd.second = second;
+                    deployCmd.configVersion = (desired.configVersion > 0) ? desired.configVersion : 1;
+                    deployCmd.wakeIntervalMin = (desired.wakeIntervalMin > 0)
+                        ? desired.wakeIntervalMin
+                        : (node.wakeIntervalMin > 0 ? node.wakeIntervalMin : DEFAULT_WAKE_INTERVAL_MINUTES);
+                    deployCmd.syncIntervalMin = (desired.syncIntervalMin > 0)
+                        ? desired.syncIntervalMin
+                        : 15;
+                    deployCmd.syncPhaseUnix = (desired.syncPhaseUnix > 0)
+                        ? desired.syncPhaseUnix
+                        : nowUnix;
 
-                    // Push desired per-node wake/sync config before deploy so node can
-                    // use the selected intervals in the first deployed cycle.
-                    NodeDesiredConfig desired = getDesiredConfig(node.nodeId.c_str());
-                    if (desired.configVersion > 0) {
-                        bool cfgSent = pushDesiredConfigSnapshot(node.mac, node.nodeId.c_str(), desired);
-                        Serial.printf("📤 Pre-deploy CONFIG_SNAPSHOT for %s v%u: %s\n",
-                                      nodeId.c_str(),
-                                      (unsigned)desired.configVersion,
-                                      cfgSent ? "OK" : "FAILED");
-                    } else {
-                        Serial.printf("⚠️ Pre-deploy CONFIG_SNAPSHOT skipped for %s (no desired config)\n",
-                                      nodeId.c_str());
-                    }
+                    Serial.printf("📤 DEPLOY payload for %s: cfgV=%u wakeMin=%u syncMin=%u phase=%lu\n",
+                                  nodeId.c_str(),
+                                  (unsigned)deployCmd.configVersion,
+                                  (unsigned)deployCmd.wakeIntervalMin,
+                                  (unsigned)deployCmd.syncIntervalMin,
+                                  (unsigned long)deployCmd.syncPhaseUnix);
 
                     esp_err_t result =
                         esp_now_send(node.mac,

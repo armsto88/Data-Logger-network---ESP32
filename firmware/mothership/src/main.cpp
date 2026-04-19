@@ -875,7 +875,7 @@ static bool handleBleCommand(
       if (node.state == PAIRED || node.state == DEPLOYED) {
         NodeDesiredConfig dc = getDesiredConfig(node.nodeId.c_str());
         dc.wakeIntervalMin = (uint8_t)interval;
-        dc.configVersion   = max((int)dc.configVersion + 1, 1);
+        dc.configVersion   = (dc.configVersion < 0xFFFFu) ? (dc.configVersion + 1u) : 1u;
         setDesiredConfig(node.nodeId.c_str(), dc);
       }
     }
@@ -1851,7 +1851,7 @@ void handleSetWakeInterval() {
       if (node.state == PAIRED || node.state == DEPLOYED) {
         NodeDesiredConfig dc = getDesiredConfig(node.nodeId.c_str());
         dc.wakeIntervalMin = (uint8_t)interval;
-        dc.configVersion   = max((int)dc.configVersion + 1, 1);
+        dc.configVersion   = (dc.configVersion < 0xFFFFu) ? (dc.configVersion + 1u) : 1u;
         setDesiredConfig(node.nodeId.c_str(), dc);
       }
     }
@@ -1953,7 +1953,7 @@ void handleSetSyncInterval() {
       dc.configVersion = 1;
       changed = true;
     } else if (changed) {
-      dc.configVersion = (uint8_t)max((int)dc.configVersion + 1, 1);
+      dc.configVersion = (dc.configVersion < 0xFFFFu) ? (dc.configVersion + 1u) : 1u;
     }
     if (changed) {
       setDesiredConfig(node.nodeId.c_str(), dc);
@@ -2255,7 +2255,7 @@ void handleNodeConfigSave() {
     dc.configVersion = 1;
     cfgChanged = true;
   } else if (cfgChanged) {
-    dc.configVersion = (uint8_t)max((int)dc.configVersion + 1, 1);
+    dc.configVersion = (dc.configVersion < 0xFFFFu) ? (dc.configVersion + 1u) : 1u;
   }
   setDesiredConfig(nodeId.c_str(), dc);
   if (target) {
@@ -2419,8 +2419,8 @@ void handleNodesPage() {
       if (userId.isEmpty()) userId = getNodeUserId(node.nodeId);
       if (name.isEmpty())   name   = getNodeName(node.nodeId);
       NodeDesiredConfig nodeDesired = getDesiredConfig(node.nodeId.c_str());
-      uint8_t desiredCfgV = nodeDesired.configVersion;
-      uint8_t appliedCfgV = node.configVersionApplied;
+      uint16_t desiredCfgV = nodeDesired.configVersion;
+      uint16_t appliedCfgV = node.configVersionApplied;
       bool cfgPending = (desiredCfgV > 0 && appliedCfgV < desiredCfgV);
       uint8_t observedWakeMin = (node.wakeIntervalMin > 0)
         ? node.wakeIntervalMin
@@ -2691,20 +2691,39 @@ void loop() {
     const uint32_t nowUnix = getRTCTimeUnix();
     if (nowUnix > 946684800UL) {
     if (gSyncMode == SYNC_MODE_DAILY) {
+      static const uint8_t kDailyRetryWindowMin = 15;
+      static const uint32_t kDailyRetryIntervalMs = 30000UL;
       const long epochDay = (long)(nowUnix / 86400UL);
       DateTime now(nowUnix);
-      if (now.hour() == gSyncDailyHour && now.minute() == gSyncDailyMinute && gLastSyncBroadcastEpochDay != epochDay) {
+      const int nowMinOfDay = now.hour() * 60 + now.minute();
+      const int targetMinOfDay = gSyncDailyHour * 60 + gSyncDailyMinute;
+      int minsSinceTarget = nowMinOfDay - targetMinOfDay;
+      if (minsSinceTarget < 0) minsSinceTarget += 24 * 60;
+
+      const bool inDailyRetryWindow = (minsSinceTarget >= 0) && (minsSinceTarget < (int)kDailyRetryWindowMin);
+      const bool dayNotCompleted = (gLastSyncBroadcastEpochDay != epochDay);
+      const bool retryDue = (gLastSyncBroadcastMs == 0) || ((millis() - gLastSyncBroadcastMs) >= kDailyRetryIntervalMs);
+
+      if (inDailyRetryWindow && dayNotCompleted && retryDue) {
         const bool sent = broadcastSyncSchedule(gSyncIntervalMin, nowUnix);
         const bool markerSent = broadcastSyncWindowOpen(nowUnix);
-        gLastSyncBroadcastEpochDay = epochDay;
-        gLastSyncBroadcastUnix = nowUnix;
         gLastSyncBroadcastMs = millis();
-        gSyncTriggerCount++;
-        Serial.printf("[SYNC] Daily trigger %02d:%02d -> schedule=%s marker=%s\n",
-                      gSyncDailyHour,
-                      gSyncDailyMinute,
-                      sent ? "SENT" : "NOT_SENT",
-                      markerSent ? "SENT" : "NOT_SENT");
+        if (sent || markerSent) {
+          gLastSyncBroadcastEpochDay = epochDay;
+          gLastSyncBroadcastUnix = nowUnix;
+          gSyncTriggerCount++;
+          Serial.printf("[SYNC] Daily trigger %02d:%02d -> schedule=%s marker=%s\n",
+                        gSyncDailyHour,
+                        gSyncDailyMinute,
+                        sent ? "SENT" : "NOT_SENT",
+                        markerSent ? "SENT" : "NOT_SENT");
+        } else {
+          Serial.printf("[SYNC] Daily retry pending: %02d:%02d day=%ld (window+%umin)\n",
+                        gSyncDailyHour,
+                        gSyncDailyMinute,
+                        epochDay,
+                        (unsigned)kDailyRetryWindowMin);
+        }
       }
     } else {
       const uint32_t periodSec = (uint32_t)max(gSyncIntervalMin, 1) * 60UL;

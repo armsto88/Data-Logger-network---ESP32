@@ -394,21 +394,34 @@ enum NodeState {
 
 static NodeState nodeState = STATE_UNPAIRED;
 
-// -------------------- Persistent config in RTC RAM --------------------
-RTC_DATA_ATTR int       bootCount        = 0;
-RTC_DATA_ATTR bool      rtcSynced        = false;
-RTC_DATA_ATTR uint8_t   mothershipMAC[6] = {0};
-RTC_DATA_ATTR uint8_t   g_intervalMin    = 1;
-RTC_DATA_ATTR bool      deployedFlag     = false;
+// -------------------- Persistent config (NVS-backed) --------------------
+// Under hard power-cut sleep, RTC RAM does not survive. NVS is the source of truth.
+int       bootCount        = 0;
+bool      rtcSynced        = false;
+uint8_t   mothershipMAC[6] = {0};
+uint8_t   g_intervalMin    = 1;
+bool      deployedFlag     = false;
 // New: unix time of last successful TIME_SYNC (also mirrored into NVS)
-RTC_DATA_ATTR uint32_t  lastTimeSyncUnix = 0;
-RTC_DATA_ATTR uint16_t  g_syncIntervalMin = 15;
-RTC_DATA_ATTR uint32_t  g_syncPhaseUnix = 0;
-RTC_DATA_ATTR uint32_t  g_lastSyncSlot = 0xFFFFFFFFUL;
+uint32_t  lastTimeSyncUnix = 0;
+uint16_t  g_syncIntervalMin = 15;
+uint32_t  g_syncPhaseUnix = 0;
+uint32_t  g_lastSyncSlot = 0xFFFFFFFFUL;
 
 static bool g_espNowReady = false;
-static volatile bool g_syncWindowMarkerSeen = false;
 static volatile uint32_t g_syncWindowMarkerMs = 0;
+static volatile bool g_lastSendDone = false;
+static volatile esp_now_send_status_t g_lastSendStatus = ESP_NOW_SEND_FAIL;
+
+static bool waitForSendDelivery(uint32_t timeoutMs) {
+  const uint32_t start = millis();
+  while ((millis() - start) < timeoutMs) {
+    if (g_lastSendDone) {
+      return g_lastSendStatus == ESP_NOW_SEND_SUCCESS;
+    }
+    delay(1);
+  }
+  return false;
+}
 
 // --- Derived state helpers ---
 static bool hasMothershipMAC() {
@@ -554,14 +567,13 @@ static void sendTimeSyncRequest();
 static void sendDiscoveryRequest();
 static void sendPairingRequest();
 static void sendNodeHello();
-static uint8_t getNodeConfigVersion();
-static void setNodeConfigVersion(uint8_t v);
+static uint16_t getNodeConfigVersion();
+static void setNodeConfigVersion(uint16_t v);
 static bool bringupEspNow();
 static void shutdownEspNow();
 static bool shouldSyncAt(uint32_t unixNow);
 static void captureSensorsToQueue();
-static void flushQueuedToMothership();
-static void sendSensorData();
+static void flushQueuedToMothership(uint32_t deadlineMs = 0);
 static bool armDeploymentWakeAlarms(DateTime* nextDataOut = nullptr, DateTime* nextSyncOut = nullptr);
 static void finalizeWakeAndSleep(const char* reason);
 
@@ -678,7 +690,7 @@ static void captureSensorsToQueue() {
   }
 }
 
-static void flushQueuedToMothership() {
+static void flushQueuedToMothership(uint32_t deadlineMs) {
   if (!hasMothershipMAC()) {
     Serial.println("⚠️ flush skipped: no mothership MAC");
     return;
@@ -691,6 +703,18 @@ static void flushQueuedToMothership() {
 
   size_t sent = 0;
   while (local_queue::count() > 0) {
+    if (deadlineMs != 0) {
+      int32_t msLeft = (int32_t)(deadlineMs - millis());
+      if (msLeft <= 0) {
+        Serial.println("⏱️ flush deadline reached; keeping remaining queue for next sync window");
+        break;
+      }
+      if (msLeft < 250) {
+        Serial.printf("⏱️ flush stopping with %ldms left; preserving queue\n", (long)msLeft);
+        break;
+      }
+    }
+
     local_queue::QueuedSample rec{};
     if (!local_queue::peek(rec)) break;
 
@@ -705,11 +729,21 @@ static void flushQueuedToMothership() {
     msg.nodeTimestamp = rec.sampleUnix;
     msg.qualityFlags = rec.qualityFlags;
 
+    g_lastSendDone = false;
+    g_lastSendStatus = ESP_NOW_SEND_FAIL;
+
     esp_err_t res = espnowSendWithRecover(mothershipMAC, (uint8_t*)&msg, sizeof(msg));
     if (res != ESP_OK) {
       Serial.printf("❌ queue flush send failed at seq=%lu: %s\n",
                     (unsigned long)rec.sampleSeq,
                     esp_err_to_name(res));
+      break;
+    }
+
+    if (!waitForSendDelivery(200)) {
+      Serial.printf("❌ queue flush delivery not confirmed at seq=%lu (status=%d)\n",
+                    (unsigned long)rec.sampleSeq,
+                    (int)g_lastSendStatus);
       break;
     }
 
@@ -731,6 +765,9 @@ static void flushQueuedToMothership() {
 }
 
 static void onDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
+  (void)mac_addr;
+  g_lastSendStatus = status;
+  g_lastSendDone = true;
   Serial.print("Send Status: ");
   Serial.println(status == ESP_NOW_SEND_SUCCESS ? "Success" : "Fail");
 }
@@ -834,6 +871,18 @@ static void onDataReceived(const uint8_t *mac, const uint8_t *incomingData, int 
       Serial.println("🚀 Deployment command received");
 
       rtc.adjust(DateTime(dc.year, dc.month, dc.day, dc.hour, dc.minute, dc.second));
+      if (dc.wakeIntervalMin > 0) {
+        g_intervalMin = dc.wakeIntervalMin;
+      }
+      if (dc.syncIntervalMin > 0) {
+        g_syncIntervalMin = dc.syncIntervalMin;
+      }
+      if (dc.syncPhaseUnix > 0) {
+        g_syncPhaseUnix = dc.syncPhaseUnix;
+      }
+      if (dc.configVersion > 0) {
+        setNodeConfigVersion(dc.configVersion);
+      }
       rtcSynced        = true;
       deployedFlag     = true;
       lastTimeSyncUnix = rtc.now().unixtime();   // treat deploy time as fresh sync
@@ -846,6 +895,11 @@ static void onDataReceived(const uint8_t *mac, const uint8_t *incomingData, int 
       Serial.println(rtc.now().timestamp());
       Serial.printf("⏰ lastTimeSyncUnix set to %lu at DEPLOY\n",
                     (unsigned long)lastTimeSyncUnix);
+      Serial.printf("⚙️ DEPLOY config applied: cfgV=%u wakeMin=%u syncMin=%u phase=%lu\n",
+            (unsigned)getNodeConfigVersion(),
+            (unsigned)g_intervalMin,
+            (unsigned)g_syncIntervalMin,
+            (unsigned long)g_syncPhaseUnix);
       Serial.println("✅ Node deployed; ready for alarm-driven sends");
       debugState("after DEPLOY");
 
@@ -904,29 +958,29 @@ static void onDataReceived(const uint8_t *mac, const uint8_t *incomingData, int 
       g_intervalMin = (uint8_t)cmd.intervalMinutes;
 
       bool ok = true;
-      DateTime next;
-      char nowStr[24], nextStr[24];
+      DateTime nextData;
+      DateTime nextSync;
+      char nowStr[24], nextStr[24], syncStr[24];
       formatTime(rtc.now(), nowStr, sizeof(nowStr));
 
       // Intention: paired/unpaired nodes store interval but remain idle.
       if (currentNodeState() == STATE_DEPLOYED && rtcSynced) {
-        ok = ds3231ArmNextInNMinutes(g_intervalMin, &next);
-
-        ds3231EnableAlarmInterrupt();
-        ds3231EnableAlarm2Interrupt();
-        clearDS3231_A1F();   // flag low until first match
-        formatTime(next, nextStr, sizeof(nextStr));
+        ok = armDeploymentWakeAlarms(&nextData, &nextSync);
+        formatTime(nextData, nextStr, sizeof(nextStr));
+        formatTime(nextSync, syncStr, sizeof(syncStr));
       } else {
         ds3231DisableAlarmInterrupt();
         ds3231DisableAlarm2Interrupt();
         clearDS3231_AlarmFlags();
         snprintf(nextStr, sizeof(nextStr), "(idle: not deployed)");
+        snprintf(syncStr, sizeof(syncStr), "(idle: not deployed)");
       }
 
       Serial.println("[SET_SCHEDULE] received");
       Serial.printf("   interval: %u -> %u minutes\n", oldInterval, g_intervalMin);
       Serial.printf("   now:  %s\n",  nowStr);
-      Serial.printf("   next: %s\n",  nextStr);
+      Serial.printf("   nextData: %s\n",  nextStr);
+      Serial.printf("   nextSync: %s\n",  syncStr);
       Serial.printf("   status: %s\n", ok ? "OK" : "FAIL");
 
       persistNodeConfig();
@@ -962,7 +1016,6 @@ static void onDataReceived(const uint8_t *mac, const uint8_t *incomingData, int 
 
       persistNodeConfig();
     } else if (strcmp(sc.command, "SYNC_WINDOW_OPEN") == 0) {
-      g_syncWindowMarkerSeen = true;
       g_syncWindowMarkerMs = millis();
       Serial.printf("[SYNC_WINDOW_OPEN] marker received phaseUnix=%lu\n",
                     (unsigned long)sc.phaseUnix);
@@ -1018,7 +1071,7 @@ static void onDataReceived(const uint8_t *mac, const uint8_t *incomingData, int 
     memcpy(&snap, incomingData, sizeof(snap));
 
     if (strcmp(snap.command, "CONFIG_SNAPSHOT") == 0) {
-      uint8_t currentVer = getNodeConfigVersion();
+      uint16_t currentVer = getNodeConfigVersion();
       Serial.printf("📦 CONFIG_SNAPSHOT received: v%u (current v%u) wakeMin=%u syncMin=%u\n",
                     snap.configVersion, currentVer,
                     snap.wakeIntervalMin, snap.syncIntervalMin);
@@ -1116,18 +1169,18 @@ static void sendPairingRequest() {
 }
 
 // Pull-handshake: current config version persisted in NVS
-static uint8_t getNodeConfigVersion() {
+static uint16_t getNodeConfigVersion() {
   Preferences p;
   if (!p.begin("node_cfg", true)) return 0;
-  uint8_t v = p.getUChar("cfgVer", 0);
+  uint16_t v = p.getUShort("cfgVer", 0);
   p.end();
   return v;
 }
 
-static void setNodeConfigVersion(uint8_t v) {
+static void setNodeConfigVersion(uint16_t v) {
   Preferences p;
   if (!p.begin("node_cfg", false)) return;
-  p.putUChar("cfgVer", v);
+  p.putUShort("cfgVer", v);
   p.end();
 }
 
@@ -1135,6 +1188,7 @@ static void setNodeConfigVersion(uint8_t v) {
 static void sendNodeHello() {
   if (!hasMothershipMAC()) return;
   if (!bringupEspNow()) return;
+  static const uint8_t broadcastAddress[6] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
 
   node_hello_message_t hello{};
   strcpy(hello.command, "NODE_HELLO");
@@ -1145,27 +1199,15 @@ static void sendNodeHello() {
   hello.queueDepth      = (uint8_t)min((int)local_queue::count(), 255);
   hello.rtcUnix         = rtc.now().unixtime();
 
-  // bringupEspNow() already registers the mothership peer; send directly
-  esp_err_t res = espnowSendWithRecover(mothershipMAC, (uint8_t*)&hello, sizeof(hello));
-  Serial.printf("👋 NODE_HELLO sent: cfgV=%u wakeMin=%u qDepth=%u : %s\n",
+  // Send direct first, then broadcast fallback to improve contact probability.
+  esp_err_t resDirect = espnowSendWithRecover(mothershipMAC, (uint8_t*)&hello, sizeof(hello));
+  esp_wifi_set_channel(ESPNOW_CHANNEL, WIFI_SECOND_CHAN_NONE);
+  esp_err_t resBcast = esp_now_send(broadcastAddress, (uint8_t*)&hello, sizeof(hello));
+
+  Serial.printf("👋 NODE_HELLO sent: cfgV=%u wakeMin=%u qDepth=%u : direct=%s bcast=%s\n",
                 hello.configVersion, hello.wakeIntervalMin, hello.queueDepth,
-                res == ESP_OK ? "OK" : esp_err_to_name(res));
-}
-
-static void sendSensorData() {
-  captureSensorsToQueue();
-
-  DateTime now = rtc.now();
-  uint32_t nowUnix = now.unixtime();
-
-  if (shouldSyncAt(nowUnix)) {
-    Serial.printf("📶 Sync slot due (every %u min). Enabling WiFi and flushing queue...\n",
-                  (unsigned)g_syncIntervalMin);
-    flushQueuedToMothership();
-  } else {
-    Serial.printf("🧾 Sampled locally only; pending queue=%u\n",
-                  (unsigned)local_queue::count());
-  }
+                resDirect == ESP_OK ? "OK" : esp_err_to_name(resDirect),
+                resBcast == ESP_OK ? "OK" : esp_err_to_name(resBcast));
 }
 
 static bool armDeploymentWakeAlarms(DateTime* nextDataOut, DateTime* nextSyncOut) {
@@ -1219,20 +1261,25 @@ static void handleRtcWakeEvents(bool dataWake, bool syncWake) {
   if (syncWake) {
     clearDS3231_A2F();
     Serial.println("📶 Sync wake: enabling radio + listening for mothership sync burst");
-    g_syncWindowMarkerSeen = false;
     g_syncWindowMarkerMs = 0;
     if (bringupEspNow()) {
       sendNodeHello();
       const uint32_t windowStart = millis();
       while ((millis() - windowStart) < (uint32_t)SYNC_LISTEN_WINDOW_MS) {
-        if (g_syncWindowMarkerSeen) break;
+        if (g_syncWindowMarkerMs != 0) break;
         delay(50);
       }
 
-      if (g_syncWindowMarkerSeen) {
+      if (g_syncWindowMarkerMs != 0) {
+        const uint32_t markerMs = g_syncWindowMarkerMs;
+        const uint32_t markerDelay = (markerMs >= windowStart) ? (markerMs - windowStart) : 0;
+        uint32_t flushDeadline = windowStart + (uint32_t)SYNC_LISTEN_WINDOW_MS;
+        if ((uint32_t)SYNC_LISTEN_WINDOW_MS > 2000UL) {
+          flushDeadline -= 2000UL;
+        }
         Serial.printf("📶 Sync marker seen after %lums -> flushing queue\n",
-                      (unsigned long)(g_syncWindowMarkerMs - windowStart));
-        flushQueuedToMothership();
+                      (unsigned long)markerDelay);
+        flushQueuedToMothership(flushDeadline);
       } else {
         Serial.println("⚠️ Sync marker not seen in listen window; flush skipped this cycle");
       }
@@ -1335,16 +1382,16 @@ void setup() {
 
     // After rtc.begin(...) block, once we know rtcSynced/deployedFlag/g_intervalMin
     if (rtcSynced && deployedFlag && g_intervalMin > 0) {
-      bool ok = false;
-      DateTime next;
+      DateTime nextData;
+      DateTime nextSync;
+      bool ok = armDeploymentWakeAlarms(&nextData, &nextSync);
 
-      ok = ds3231ArmNextInNMinutes(g_intervalMin, &next);
-      armDeploymentWakeAlarms();
-
-      char nextStr[24];
-      formatTime(next, nextStr, sizeof(nextStr));
-      Serial.printf("[BOOT] Re-armed RTC wake alarms based on stored interval=%u → nextData=%s (ok=%d)\n",
-                    g_intervalMin, nextStr, ok);
+      char nextDataStr[24];
+      char nextSyncStr[24];
+      formatTime(nextData, nextDataStr, sizeof(nextDataStr));
+      formatTime(nextSync, nextSyncStr, sizeof(nextSyncStr));
+      Serial.printf("[BOOT] Re-armed RTC wake alarms based on stored interval=%u -> data=%s sync=%s (ok=%d)\n",
+                    g_intervalMin, nextDataStr, nextSyncStr, ok);
     }
 
 

@@ -116,6 +116,8 @@ bool enqueue(uint32_t sampleUnix,
              uint16_t qualityFlags) {
   if (!g_ready && !begin()) return false;
 
+  uint16_t effectiveQualityFlags = qualityFlags;
+
   if (g_blob.used >= kCapacity) {
     // DROP_OLDEST: overwrite the tail (oldest) entry to make room
     Serial.printf("[QUEUE] full (%u/%u); dropping oldest (seq=%lu) for DROP_OLDEST policy\n",
@@ -123,6 +125,7 @@ bool enqueue(uint32_t sampleUnix,
                   (unsigned long)g_blob.records[g_blob.tail].sampleSeq);
     g_blob.tail = (uint16_t)((g_blob.tail + 1) % kCapacity);
     g_blob.used--;
+    effectiveQualityFlags |= local_queue::QF_DROPPED;
   }
 
   QueuedSample rec{};
@@ -130,7 +133,7 @@ bool enqueue(uint32_t sampleUnix,
   rec.sampleUnix = sampleUnix;
   rec.sensorId = sensorId;
   rec.value = value;
-  rec.qualityFlags = qualityFlags;
+  rec.qualityFlags = effectiveQualityFlags;
 
   if (sensorType && sensorType[0]) {
     strncpy(rec.sensorType, sensorType, sizeof(rec.sensorType) - 1);

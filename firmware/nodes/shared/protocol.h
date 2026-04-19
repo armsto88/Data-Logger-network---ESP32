@@ -52,6 +52,10 @@ typedef struct deployment_command {
     char command[20];           // "DEPLOY_NODE"
     char nodeId[16];
     unsigned long year, month, day, hour, minute, second;
+    uint16_t configVersion;     // desired config snapshot version at deploy time
+    uint8_t wakeIntervalMin;    // desired wake interval to apply immediately
+    uint16_t syncIntervalMin;   // desired sync interval to apply immediately
+    uint32_t syncPhaseUnix;     // desired sync phase anchor to apply immediately
     char mothership_id[16];
 } deployment_command_t;
 
@@ -104,7 +108,7 @@ typedef struct node_hello_message {
     char command[16];       // "NODE_HELLO"
     char nodeId[16];
     char nodeType[16];
-    uint8_t  configVersion; // config version node currently has applied (0 = none)
+    uint16_t configVersion; // config version node currently has applied (0 = none)
     uint8_t  wakeIntervalMin;
     uint8_t  queueDepth;    // samples currently queued
     uint32_t rtcUnix;       // node RTC time at wake
@@ -114,18 +118,18 @@ typedef struct node_hello_message {
 typedef struct config_snapshot_message {
     char     command[20];       // "CONFIG_SNAPSHOT"
     char     mothership_id[16];
-    uint8_t  configVersion;     // version being pushed
+    uint16_t configVersion;     // version being pushed
     uint8_t  wakeIntervalMin;
     uint16_t syncIntervalMin;
     uint32_t syncPhaseUnix;
-    uint8_t  reserved[4];       // padding for future fields
+    uint8_t  reserved[2];       // padding for future fields
 } config_snapshot_message_t;
 
 // Node -> Mothership: ACK after applying a CONFIG_SNAPSHOT
 typedef struct config_apply_ack_message {
     char    command[20];        // "CONFIG_ACK"
     char    nodeId[16];
-    uint8_t appliedVersion;
+    uint16_t appliedVersion;
     uint8_t ok;                 // 1 = applied OK, 0 = failed
 } config_apply_ack_message_t;
 

@@ -4,6 +4,8 @@
 
 namespace local_queue {
 
+static constexpr uint16_t QF_DROPPED = 0x0001;
+
 struct QueuedSample {
   uint32_t sampleSeq;
   uint32_t sampleUnix;

@@ -51,7 +51,7 @@ struct NodeInfo {
     // Last seen nodeTimestamp used for cadence inference (unix seconds)
     uint32_t  lastNodeTimestamp;
     // Last config version ACKed by this node (0 = never applied)
-    uint8_t   configVersionApplied;
+    uint16_t  configVersionApplied;
     // Last time mothership pushed CONFIG_SNAPSHOT to this node (ms, for throttling)
     uint32_t  lastConfigPushMs;
     // True after DEPLOY_NODE command is queued, cleared when runtime evidence confirms deploy
@@ -73,7 +73,7 @@ struct NodeInfo {
 // Desired configuration for each node, stored in mothership NVS.
 // Bumping configVersion causes mothership to push a CONFIG_SNAPSHOT on next HELLO.
 struct NodeDesiredConfig {
-    uint8_t  configVersion;
+    uint16_t configVersion;
     uint8_t  wakeIntervalMin;
     uint16_t syncIntervalMin;
     uint32_t syncPhaseUnix;
