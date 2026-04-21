@@ -1,6 +1,6 @@
 # Firmware Sync Workflow and Testing Strategy
 
-Date: 2026-04-16
+Date: 2026-04-21
 Scope: Mothership + sensor-node power, wake, sample, and sync behavior
 
 ## 1) Intended Operating Model (formalized)
@@ -45,11 +45,14 @@ This section is based on current code in:
 - firmware/nodes/sensor-node/src/main.cpp
 - firmware/nodes/sensor-node/src/storage/local_queue.cpp
 
+Note: Section 12 is the authoritative stale-recovery and UI-truth update as of 2026-04-21.
+
 ### 2.1 Implemented now (good alignment)
 
 1. Node queue-first design is implemented.
 - Node samples to local queue every alarm cycle.
-- Node flushes queue only when sync slot is due.
+- Node flushes queue only when sync logic is due and sync marker criteria are met.
+- Node stale-recovery path can also perform bounded assist-time flush when marker is seen during recovery window.
 - Evidence: shouldSyncAt(...) + captureSensorsToQueue(...) + flushQueuedToMothership(...).
 
 2. Node radio duty-cycling is implemented.
@@ -66,6 +69,10 @@ This section is based on current code in:
 
 5. Mothership node-liveness messaging has improved.
 - Distinguishes sleeping deployed nodes from absent/unpaired fleet cases.
+
+6. Sync-stale recovery is now bilateral.
+- Node performs local stale-age recovery attempts during data wake (bounded).
+- Mothership independently infers stale nodes and sends bounded unicast schedule/time assist.
 
 ### 2.2 Partially implemented / gaps
 
@@ -477,10 +484,11 @@ This section captures the deploy path exactly as currently implemented in firmwa
   - `lastTimeSyncUnix=rtc.now()`,
   - initializes sync slot tracking.
 3. Node sends `DEPLOY_ACK` to mothership.
-4. Node executes immediate first deployed cycle:
+4. Node executes immediate first deployed cycle (first deploy only):
   - samples sensors,
   - appends records to local queue,
   - does not require radio flush in this immediate step.
+  - duplicate DEPLOY while already deployed does not force an extra immediate cycle.
 5. Node re-arms wake alarms before sleep:
   - Alarm1 (A1): next data wake from `now + data interval`,
   - Alarm2 (A2): next sync wake from global phase/interval with pre-wake buffer.
@@ -498,8 +506,8 @@ Wake source resolution is flag-based:
   - clear A2 flag,
   - bring radio up,
   - send `NODE_HELLO`,
-  - hold listen window,
-  - flush queued data.
+  - hold listen window for `SYNC_WINDOW_OPEN`,
+  - flush queued data only if marker is observed.
 3. Combined wake (`A1F=1` and `A2F=1`):
   - execute both steps in one cycle,
   - re-arm both alarms,
@@ -511,7 +519,7 @@ Wake source resolution is flag-based:
 2. `SET_SYNC_SCHED` broadcast now uses burst send (3 packets, 200 ms spacing).
 3. Node stores `syncIntervalMin` and `syncPhaseUnix` and uses these for sync-wake scheduling.
 
-### 11.5 Current fail points / considerations
+### 11.5 Historical fail points / considerations (resolved items retained for traceability)
 
 1. `SET_SYNC_SCHED` apply path does not currently force immediate re-arm of Alarm2.
   - Effect: node may continue with previously armed A2 until next cycle re-arm.
@@ -551,7 +559,134 @@ Wake source resolution is flag-based:
 1. Deploy one node and confirm immediate sample is queued before first sleep.
 2. Confirm both A1 and A2 are armed after deploy.
 3. Confirm data wake samples with radio off.
-4. Confirm sync wake brings radio up, listens, then flushes queue.
+4. Confirm sync wake brings radio up, listens for marker, then flushes queue only on marker.
 5. Change global sync interval and verify all desired configs update to same phase.
 6. Verify pending deploy clears on runtime confirmation evidence.
+
+## 12) April 21 Update: Sync-Stale Recovery + UI/Operator Truth
+
+Date added: 2026-04-21
+Status: Implemented and ready for bench validation pass.
+
+### 12.1 What changed since April 19
+
+1. Node stale-sync recovery path added (data wake assist).
+- If node time-sync age exceeds 24h, node runs bounded recovery during data wake:
+  - brings up ESP-NOW,
+  - sends NODE_HELLO,
+  - sends REQUEST_TIME,
+  - listens briefly for TIME_SYNC and/or sync marker.
+- If sync marker is seen, node flushes queue within the recovery deadline window.
+
+2. Mothership independent stale inference + assist added.
+- Mothership infers stale node state from contact age/missed wake estimate.
+- Assist is bounded to a short predicted wake window.
+- Assist actions are:
+  - unicast SET_SYNC_SCHED,
+  - unicast TIME_SYNC.
+- No forced marker injection is used in this assist path.
+
+3. Deploy duplicate handling on node was hardened.
+- Duplicate DEPLOY while already deployed no longer forces an extra immediate sample cycle.
+- Older stale phase values in duplicate deploy payload are ignored.
+
+4. Boot alarm handling on node was hardened.
+- Pending DS3231 A1/A2 flags at boot are preserved for wake handling.
+- Boot no longer clears pending alarm flags before wake-reason logic can consume them.
+
+5. Node Manager display semantics were clarified.
+- Interval now prioritizes desired configured interval (target truth).
+- Queue depth from NODE_HELLO is surfaced.
+- Next wake display uses second-level cadence estimate (not minute bucket quantization).
+- AJAX response behavior for sync-interval update is corrected to avoid raw HTML artifacts.
+
+### 12.2 Updated runtime model (authoritative)
+
+1. Normal deployed wake flow
+- A1 data wake:
+  - sample to local queue,
+  - run stale-recovery probe only when sync age threshold is exceeded,
+  - re-arm alarms,
+  - sleep.
+- A2 sync wake:
+  - bring up radio,
+  - send HELLO,
+  - wait for SYNC_WINDOW_OPEN marker,
+  - flush queue only if marker observed,
+  - re-arm alarms,
+  - sleep.
+
+2. Stale-lock recovery ownership
+- Node owns self-recovery trigger based on local sync age.
+- Mothership owns independent stale inference based on observed contact behavior.
+- Either side can assist re-lock without requiring a dedicated stale-flag protocol message.
+
+3. Bounded radio duty rule
+- Recovery windows are explicitly time-bounded.
+- No unbounded listen loops or continuous retry loops are allowed.
+
+### 12.3 Updated bench test plan (priority order)
+
+Run these in order and keep paired node+mothership serial snippets per test.
+
+1. STALE-1: Node-only stale recovery trigger
+- Setup:
+  - force lastTimeSync age > 24h condition,
+  - keep normal sample interval active.
+- Expected:
+  - node logs stale recovery start,
+  - HELLO + REQUEST_TIME sent,
+  - bounded recovery window exit,
+  - node returns to low-power flow.
+
+2. STALE-2: Mothership stale assist window behavior
+- Setup:
+  - create missed-contact condition long enough to mark node stale.
+- Expected:
+  - mothership logs stale inference (miss count/age),
+  - assist sends SET_SYNC_SCHED + TIME_SYNC in bounded window,
+  - no forced marker message from assist path.
+
+3. STALE-3: Re-lock success without manual redeploy
+- Setup:
+  - start from stale condition,
+  - allow one or more normal wake cycles.
+- Expected:
+  - node receives schedule/time correction,
+  - subsequent sync wake observes marker,
+  - queued samples flush and stale condition clears.
+
+4. DEPLOY-2: Duplicate deploy non-regression
+- Setup:
+  - deploy node,
+  - send duplicate DEPLOY in same active session.
+- Expected:
+  - no extra immediate sample cycle,
+  - alarms re-armed correctly,
+  - node remains in stable deployed cadence.
+
+5. UI-6: Node Manager truth checks
+- Setup:
+  - update interval via UI,
+  - generate queue backlog,
+  - monitor next wake value.
+- Expected:
+  - interval reflects desired target,
+  - queue chip reflects last-reported queue depth,
+  - no raw HTML appears on async interval save,
+  - next wake countdown aligns with second-level cadence.
+
+### 12.4 Pass criteria for this update
+
+1. No repeat stale condition after successful re-lock over at least 3 sync windows.
+2. Duplicate deploy does not add unexpected wake/sampling cycles.
+3. Node powers down cleanly after data and sync paths.
+4. Mothership UI state aligns with observed protocol events (ACK, HELLO, queue depth).
+5. No operator action is required to recover from a temporary phase mismatch.
+
+### 12.5 Open follow-up items
+
+1. Complete compile + flash validation for latest mothership stale-assist patchset.
+2. Execute one controlled stale-recovery bench run and archive logs/screenshots.
+3. Revisit fleet-scale contention tuning after stale-recovery path is validated (4+ nodes).
 

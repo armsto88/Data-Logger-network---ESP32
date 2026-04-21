@@ -91,6 +91,14 @@ RTC_DS3231 rtc;
 #define SYNC_LISTEN_WINDOW_MS 60000
 #endif
 
+#ifndef SYNC_STALE_THRESHOLD_SEC
+#define SYNC_STALE_THRESHOLD_SEC (24UL * 60UL * 60UL)
+#endif
+
+#ifndef SYNC_STALE_RECOVERY_WINDOW_MS
+#define SYNC_STALE_RECOVERY_WINDOW_MS 12000UL
+#endif
+
 #if ENABLE_POWER_HOLD_CONTROL && (PWR_HOLD_PIN >= 0)
 static const uint8_t kPwrHoldOnLevel  = PWR_HOLD_ACTIVE_HIGH ? HIGH : LOW;
 static const uint8_t kPwrHoldOffLevel = PWR_HOLD_ACTIVE_HIGH ? LOW  : HIGH;
@@ -369,7 +377,19 @@ static bool ds3231ArmSyncWake(uint16_t syncIntervalMin,
 
   uint32_t slot = (nowUnix - phase) / periodSec;
   uint32_t nextSyncUnix = phase + (slot + 1UL) * periodSec;
-  uint32_t wakeUnix = (nextSyncUnix > preWakeSec) ? (nextSyncUnix - preWakeSec) : nextSyncUnix;
+  uint32_t wakeUnixRaw = (nextSyncUnix > preWakeSec) ? (nextSyncUnix - preWakeSec) : nextSyncUnix;
+
+  // DS3231 Alarm2 is minute-resolution (no seconds register). If we pass a
+  // wake time with seconds, programming minute/hour directly effectively floors
+  // to :00 and can wake up to 59s too early. Round up to next minute instead.
+  uint32_t wakeUnix = wakeUnixRaw;
+  DateTime wakeRaw(wakeUnixRaw);
+  if (wakeRaw.second() != 0) {
+    wakeUnix += (60UL - (uint32_t)wakeRaw.second());
+  }
+  if (wakeUnix > nextSyncUnix) {
+    wakeUnix = nextSyncUnix;
+  }
 
   DateTime wake(wakeUnix);
   const uint8_t minBCD  = uint8_t(((wake.minute()/10)<<4) | (wake.minute()%10));
@@ -377,9 +397,10 @@ static bool ds3231ArmSyncWake(uint16_t syncIntervalMin,
   const uint8_t dayReg  = 0b10000000; // ignore day/date
 
   char wakeStr[24]; formatTime(wake, wakeStr, sizeof(wakeStr));
+  char wakeRawStr[24]; formatTime(wakeRaw, wakeRawStr, sizeof(wakeRawStr));
   char syncStr[24]; formatTime(DateTime(nextSyncUnix), syncStr, sizeof(syncStr));
-  Serial.printf("[A2] Sync wake armed for %s (target sync %s, pre=%lus)\n",
-                wakeStr, syncStr, (unsigned long)preWakeSec);
+  Serial.printf("[A2] Sync wake armed for %s (raw %s, target sync %s, pre=%lus)\n",
+                wakeStr, wakeRawStr, syncStr, (unsigned long)preWakeSec);
 
   if (wakeOut) *wakeOut = wake;
   return ds3231WriteA2(minBCD, hourBCD, dayReg);
@@ -406,6 +427,21 @@ uint32_t  lastTimeSyncUnix = 0;
 uint16_t  g_syncIntervalMin = 15;
 uint32_t  g_syncPhaseUnix = 0;
 uint32_t  g_lastSyncSlot = 0xFFFFFFFFUL;
+
+static bool g_rescueModeActive = false;
+static uint32_t g_lastRescueBeaconMs = 0;
+
+#ifndef RESCUE_BOOT_THRESHOLD
+#define RESCUE_BOOT_THRESHOLD 3
+#endif
+
+#ifndef RESCUE_BOOT_WINDOW_SEC
+#define RESCUE_BOOT_WINDOW_SEC 20UL
+#endif
+
+#ifndef RESCUE_BEACON_INTERVAL_MS
+#define RESCUE_BEACON_INTERVAL_MS 5000UL
+#endif
 
 static bool g_espNowReady = false;
 static volatile uint32_t g_syncWindowMarkerMs = 0;
@@ -566,14 +602,20 @@ static void onDataReceived(const uint8_t *mac, const uint8_t *incomingData, int 
 static void sendTimeSyncRequest();
 static void sendDiscoveryRequest();
 static void sendPairingRequest();
+static void sendNodeStatusUpdate(const char* reason = nullptr);
 static void sendNodeHello();
 static uint16_t getNodeConfigVersion();
 static void setNodeConfigVersion(uint16_t v);
+static bool updateRescueBootStreak(uint32_t nowUnix);
+static void wipeNodeConfigToUnpaired();
+static void enterRescueMode();
 static bool bringupEspNow();
+static bool ensureEspNowPeer(const uint8_t* mac);
 static void shutdownEspNow();
 static bool shouldSyncAt(uint32_t unixNow);
 static void captureSensorsToQueue();
 static void flushQueuedToMothership(uint32_t deadlineMs = 0);
+static void runStaleSyncRecoveryIfNeeded();
 static bool armDeploymentWakeAlarms(DateTime* nextDataOut = nullptr, DateTime* nextSyncOut = nullptr);
 static void finalizeWakeAndSleep(const char* reason);
 
@@ -581,25 +623,54 @@ static void finalizeWakeAndSleep(const char* reason);
 static esp_err_t espnowSendWithRecover(const uint8_t* mac, const uint8_t* payload, size_t len) {
   if (!bringupEspNow()) return ESP_ERR_ESPNOW_NOT_INIT;
 
+  if (!ensureEspNowPeer(mac)) return ESP_ERR_ESPNOW_NOT_FOUND;
+
   esp_wifi_set_channel(ESPNOW_CHANNEL, WIFI_SECOND_CHAN_NONE);
   esp_err_t res = esp_now_send(mac, payload, len);
-  if (res != ESP_ERR_ESPNOW_NOT_INIT) return res;
+  if (res != ESP_ERR_ESPNOW_NOT_INIT && res != ESP_ERR_ESPNOW_IF) return res;
 
-  Serial.println("⚠️ ESP-NOW reported NOT_INIT during send; forcing re-init and retrying once");
+  Serial.printf("⚠️ ESP-NOW send error (%s); forcing re-init and retrying once\n",
+                esp_err_to_name(res));
   g_espNowReady = false;
   esp_now_deinit();
   WiFi.mode(WIFI_OFF);
-  delay(20);
+  delay(40);
 
   if (!bringupEspNow()) return ESP_ERR_ESPNOW_NOT_INIT;
+  if (!ensureEspNowPeer(mac)) return ESP_ERR_ESPNOW_NOT_FOUND;
   esp_wifi_set_channel(ESPNOW_CHANNEL, WIFI_SECOND_CHAN_NONE);
   return esp_now_send(mac, payload, len);
+}
+
+static bool ensureEspNowPeer(const uint8_t* mac) {
+  if (!mac) return false;
+
+  esp_now_peer_info_t pi{};
+  memcpy(pi.peer_addr, mac, 6);
+  pi.channel = ESPNOW_CHANNEL;
+  pi.ifidx   = WIFI_IF_STA;
+  pi.encrypt = false;
+
+  esp_now_del_peer(mac);
+  esp_err_t r = esp_now_add_peer(&pi);
+  if (r != ESP_OK && r != ESP_ERR_ESPNOW_EXIST) {
+    Serial.printf("⚠️ add peer failed for %02X:%02X:%02X:%02X:%02X:%02X: %s\n",
+                  mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
+                  esp_err_to_name(r));
+    return false;
+  }
+  return true;
 }
 
 static bool bringupEspNow() {
   if (g_espNowReady) return true;
 
-  WiFi.mode(WIFI_STA);
+  WiFi.mode(WIFI_OFF);
+  delay(20);
+  if (!WiFi.mode(WIFI_STA)) {
+    Serial.println("❌ WiFi STA mode set failed");
+    return false;
+  }
   WiFi.disconnect();
   delay(80);
 
@@ -619,7 +690,10 @@ static bool bringupEspNow() {
     pi.channel = ESPNOW_CHANNEL;
     pi.ifidx   = WIFI_IF_STA;
     pi.encrypt = false;
-    esp_now_add_peer(&pi);
+    esp_err_t r = esp_now_add_peer(&pi);
+    if (r != ESP_OK && r != ESP_ERR_ESPNOW_EXIST) {
+      Serial.printf("⚠️ add broadcast peer failed: %s\n", esp_err_to_name(r));
+    }
   }
 
   if (hasMothershipMAC()) {
@@ -629,7 +703,10 @@ static bool bringupEspNow() {
     pi.ifidx   = WIFI_IF_STA;
     pi.encrypt = false;
     esp_now_del_peer(mothershipMAC);
-    esp_now_add_peer(&pi);
+    esp_err_t r = esp_now_add_peer(&pi);
+    if (r != ESP_OK && r != ESP_ERR_ESPNOW_EXIST) {
+      Serial.printf("⚠️ add mothership peer failed: %s\n", esp_err_to_name(r));
+    }
   }
 
   esp_wifi_set_channel(ESPNOW_CHANNEL, WIFI_SECOND_CHAN_NONE);
@@ -785,6 +862,11 @@ static void onDataReceived(const uint8_t *mac, const uint8_t *incomingData, int 
       Serial.print("📡 Discovered by: ");
       Serial.println(resp.mothership_id);
 
+      if (g_rescueModeActive) {
+        Serial.println("🛟 RESCUE: ignoring DISCOVER_RESPONSE auto-bind; waiting for explicit pair command");
+        return;
+      }
+
       memcpy(mothershipMAC, mac, 6);
 
       esp_now_peer_info_t pi{};
@@ -816,6 +898,11 @@ static void onDataReceived(const uint8_t *mac, const uint8_t *incomingData, int 
     memcpy(&pr, incomingData, sizeof(pr));
 
     if (strcmp(pr.command, "PAIRING_RESPONSE") == 0 && strcmp(pr.nodeId, NODE_ID) == 0) {
+      if (g_rescueModeActive) {
+        Serial.println("🛟 RESCUE: ignoring PAIRING_RESPONSE; waiting for explicit PAIR_NODE command");
+        return;
+      }
+
       if (pr.isPaired) {
         Serial.println("📋 Pairing confirmed via PAIRING_RESPONSE");
         memcpy(mothershipMAC, mac, 6);
@@ -828,6 +915,10 @@ static void onDataReceived(const uint8_t *mac, const uint8_t *incomingData, int 
         local_queue::clear();
         Serial.println("🧹 Cleared local queue after PAIRING_RESPONSE");
         persistNodeConfig();
+        if (g_rescueModeActive) {
+          g_rescueModeActive = false;
+          Serial.println("✅ RESCUE: pairing response received, exiting rescue mode");
+        }
         debugState("after PAIRING_RESPONSE");
       } else {
         Serial.println("📋 Still unpaired; continuing discovery…");
@@ -856,6 +947,10 @@ static void onDataReceived(const uint8_t *mac, const uint8_t *incomingData, int 
       Serial.println("🧹 Cleared local queue after PAIR_NODE");
       persistNodeConfig();
       Serial.println("💾 Node state persisted after PAIR_NODE (rtcSynced=false, deployed=false)");
+      if (g_rescueModeActive) {
+        g_rescueModeActive = false;
+        Serial.println("✅ RESCUE: PAIR_NODE received, exiting rescue mode");
+      }
 
       debugState("after PAIR_NODE");
     }
@@ -870,7 +965,13 @@ static void onDataReceived(const uint8_t *mac, const uint8_t *incomingData, int 
     if (strcmp(dc.command, "DEPLOY_NODE") == 0 && strcmp(dc.nodeId, NODE_ID) == 0) {
       Serial.println("🚀 Deployment command received");
 
-      rtc.adjust(DateTime(dc.year, dc.month, dc.day, dc.hour, dc.minute, dc.second));
+      const bool wasAlreadyDeployed = (currentNodeState() == STATE_DEPLOYED) && deployedFlag && rtcSynced;
+      DateTime deployTime(dc.year, dc.month, dc.day, dc.hour, dc.minute, dc.second);
+      uint32_t deployUnix = deployTime.unixtime();
+
+      if (!wasAlreadyDeployed) {
+        rtc.adjust(deployTime);
+      }
       if (dc.wakeIntervalMin > 0) {
         g_intervalMin = dc.wakeIntervalMin;
       }
@@ -878,14 +979,26 @@ static void onDataReceived(const uint8_t *mac, const uint8_t *incomingData, int 
         g_syncIntervalMin = dc.syncIntervalMin;
       }
       if (dc.syncPhaseUnix > 0) {
-        g_syncPhaseUnix = dc.syncPhaseUnix;
+        if (!wasAlreadyDeployed || g_syncPhaseUnix == 0 || dc.syncPhaseUnix >= g_syncPhaseUnix) {
+          g_syncPhaseUnix = dc.syncPhaseUnix;
+        } else {
+          Serial.printf("↩️ Duplicate DEPLOY carried stale phase=%lu (current=%lu) -> ignored\n",
+                        (unsigned long)dc.syncPhaseUnix,
+                        (unsigned long)g_syncPhaseUnix);
+        }
       }
       if (dc.configVersion > 0) {
-        setNodeConfigVersion(dc.configVersion);
+        if (!wasAlreadyDeployed || dc.configVersion >= getNodeConfigVersion()) {
+          setNodeConfigVersion(dc.configVersion);
+        }
       }
       rtcSynced        = true;
       deployedFlag     = true;
-      lastTimeSyncUnix = rtc.now().unixtime();   // treat deploy time as fresh sync
+      if (!wasAlreadyDeployed) {
+        lastTimeSyncUnix = rtc.now().unixtime();   // treat first deploy time as fresh sync
+      } else if (deployUnix > lastTimeSyncUnix) {
+        lastTimeSyncUnix = deployUnix;
+      }
       if (g_syncPhaseUnix == 0) g_syncPhaseUnix = lastTimeSyncUnix;
       g_lastSyncSlot = 0xFFFFFFFFUL;
       memcpy(mothershipMAC, mac, 6);
@@ -913,12 +1026,27 @@ static void onDataReceived(const uint8_t *mac, const uint8_t *incomingData, int 
       Serial.printf("📨 DEPLOY_ACK sent: %s\n",
             dackRes == ESP_OK ? "OK" : esp_err_to_name(dackRes));
 
-      // Immediate first cycle on deploy, then schedule next wake from cycle end.
-      Serial.println("🧾 DEPLOY immediate cycle start");
-      captureSensorsToQueue();
-      Serial.printf("🧾 DEPLOY immediate sample done; pending queue=%u\n", (unsigned)local_queue::count());
+      if (!wasAlreadyDeployed) {
+        // Immediate first cycle only when transitioning into deployment.
+        Serial.println("🧾 DEPLOY immediate cycle start");
+        captureSensorsToQueue();
+        Serial.printf("🧾 DEPLOY immediate sample done; pending queue=%u\n", (unsigned)local_queue::count());
 
-      finalizeWakeAndSleep("deploy immediate cycle complete");
+        finalizeWakeAndSleep("deploy immediate cycle complete");
+      } else {
+        // Duplicate deploy refreshes config/time but must not force an extra cycle.
+        DateTime nextData;
+        DateTime nextSync;
+        bool okBoth = armDeploymentWakeAlarms(&nextData, &nextSync);
+        char dataStr[24]; formatTime(nextData, dataStr, sizeof(dataStr));
+        char syncStr[24]; formatTime(nextSync, syncStr, sizeof(syncStr));
+        Serial.printf("↩️ Duplicate DEPLOY while already active: re-armed data=%s sync=%s (%s)\n",
+                      dataStr, syncStr, okBoth ? "OK" : "PARTIAL");
+      }
+      if (g_rescueModeActive) {
+        g_rescueModeActive = false;
+        Serial.println("✅ RESCUE: DEPLOY received, exiting rescue mode");
+      }
     }
     return;
   }
@@ -992,6 +1120,14 @@ static void onDataReceived(const uint8_t *mac, const uint8_t *incomingData, int 
   if (len == sizeof(sync_schedule_command_message_t)) {
     sync_schedule_command_message_t sc{};
     memcpy(&sc, incomingData, sizeof(sc));
+
+    if (g_rescueModeActive) {
+      if (strcmp(sc.command, "SET_SYNC_SCHED") == 0 || strcmp(sc.command, "SYNC_WINDOW_OPEN") == 0) {
+        Serial.printf("🛟 RESCUE: ignoring %s while waiting for explicit PAIR/DEPLOY\n",
+                      sc.command);
+        return;
+      }
+    }
 
     if (strcmp(sc.command, "SET_SYNC_SCHED") == 0) {
       uint16_t oldMin = g_syncIntervalMin;
@@ -1127,14 +1263,65 @@ static void sendTimeSyncRequest() {
   strcpy(req.command, "REQUEST_TIME");
   req.requestTime = millis();
 
-  esp_wifi_set_channel(ESPNOW_CHANNEL, WIFI_SECOND_CHAN_NONE);
-  esp_err_t res = esp_now_send(broadcastAddress, (uint8_t*)&req, sizeof(req));
+  esp_err_t res = espnowSendWithRecover(broadcastAddress, (uint8_t*)&req, sizeof(req));
 
   if (res == ESP_OK) {
     Serial.println("⏰ Time sync request sent");
   } else {
     Serial.print("❌ Time sync request failed: ");
     Serial.println(esp_err_to_name(res));
+  }
+}
+
+static void runStaleSyncRecoveryIfNeeded() {
+  if (!rtcSynced || !hasMothershipMAC()) return;
+
+  const uint32_t nowUnix = rtc.now().unixtime();
+  if (lastTimeSyncUnix == 0 || nowUnix <= lastTimeSyncUnix) return;
+
+  const uint32_t ageSec = nowUnix - lastTimeSyncUnix;
+  if (ageSec < (uint32_t)SYNC_STALE_THRESHOLD_SEC) return;
+
+  Serial.printf("⚠️ Sync stale (age=%lus) -> data-wake recovery: HELLO + REQUEST_TIME\n",
+                (unsigned long)ageSec);
+
+  g_syncWindowMarkerMs = 0;
+  if (!bringupEspNow()) {
+    Serial.println("⚠️ Stale-sync recovery skipped: ESP-NOW bringup failed");
+    return;
+  }
+
+  const uint32_t syncBefore = lastTimeSyncUnix;
+  sendNodeHello();
+  sendTimeSyncRequest();
+
+  const uint32_t windowStart = millis();
+  const uint32_t deadline = windowStart + (uint32_t)SYNC_STALE_RECOVERY_WINDOW_MS;
+  while ((int32_t)(deadline - millis()) > 0) {
+    if (lastTimeSyncUnix > syncBefore) break;
+    if (g_syncWindowMarkerMs != 0) break;
+    delay(50);
+  }
+
+  const bool timeRecovered = (lastTimeSyncUnix > syncBefore);
+  const bool markerSeen = (g_syncWindowMarkerMs != 0);
+
+  if (markerSeen) {
+    uint32_t flushDeadline = deadline;
+    if ((uint32_t)SYNC_STALE_RECOVERY_WINDOW_MS > 1000UL) {
+      flushDeadline -= 1000UL;
+    }
+    Serial.println("📶 Stale-sync recovery saw marker -> flushing queue");
+    flushQueuedToMothership(flushDeadline);
+  }
+
+  if (timeRecovered) {
+    DateTime ls(lastTimeSyncUnix);
+    char lsStr[24];
+    formatTime(ls, lsStr, sizeof(lsStr));
+    Serial.printf("✅ Stale-sync recovery updated TIME_SYNC -> %s\n", lsStr);
+  } else if (!markerSeen) {
+    Serial.println("⚠️ Stale-sync recovery window ended with no marker/time response");
   }
 }
 
@@ -1166,6 +1353,111 @@ static void sendPairingRequest() {
   esp_wifi_set_channel(ESPNOW_CHANNEL, WIFI_SECOND_CHAN_NONE);
   esp_err_t res = esp_now_send(broadcastAddress, (uint8_t*)&m, sizeof(m));
   Serial.println(res == ESP_OK ? "📋 Pairing status request sent" : "❌ Pairing request failed");
+}
+
+static void sendNodeStatusUpdate(const char* reason) {
+  static const uint8_t broadcastAddress[6] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
+
+  if (!bringupEspNow()) return;
+
+  node_status_message_t st{};
+  strcpy(st.command, "NODE_STATUS");
+  strncpy(st.nodeId, NODE_ID, sizeof(st.nodeId) - 1);
+  st.state = (uint8_t)currentNodeState();
+  st.rtcSynced = rtcSynced ? 1 : 0;
+  st.deployed = deployedFlag ? 1 : 0;
+  st.rescueMode = g_rescueModeActive ? 1 : 0;
+  st.rtcUnix = rtc.now().unixtime();
+
+  esp_wifi_set_channel(ESPNOW_CHANNEL, WIFI_SECOND_CHAN_NONE);
+  esp_err_t bcastRes = esp_now_send(broadcastAddress, (uint8_t*)&st, sizeof(st));
+
+  esp_err_t directRes = ESP_ERR_INVALID_STATE;
+  if (hasMothershipMAC()) {
+    directRes = espnowSendWithRecover(mothershipMAC, (uint8_t*)&st, sizeof(st));
+  }
+
+  Serial.printf("📣 NODE_STATUS sent (%s): state=%u rtcSynced=%u deployed=%u rescue=%u rtcUnix=%lu direct=%s bcast=%s\n",
+                reason ? reason : "periodic",
+                (unsigned)st.state,
+                (unsigned)st.rtcSynced,
+                (unsigned)st.deployed,
+                (unsigned)st.rescueMode,
+                (unsigned long)st.rtcUnix,
+                (directRes == ESP_OK) ? "OK" : esp_err_to_name(directRes),
+                (bcastRes == ESP_OK) ? "OK" : esp_err_to_name(bcastRes));
+}
+
+static bool updateRescueBootStreak(uint32_t nowUnix) {
+  Preferences p;
+  if (!p.begin("rescue_ctl", false)) {
+    Serial.println("⚠️ Rescue streak: NVS open failed");
+    return false;
+  }
+
+  const uint32_t lastBootUnix = p.getULong("last_boot", 0);
+  uint8_t streak = p.getUChar("streak", 0);
+
+  if (lastBootUnix > 0 && nowUnix >= lastBootUnix &&
+      (nowUnix - lastBootUnix) <= (uint32_t)RESCUE_BOOT_WINDOW_SEC) {
+    if (streak < 255) streak++;
+  } else {
+    streak = 1;
+  }
+
+  const bool trigger = (streak >= (uint8_t)RESCUE_BOOT_THRESHOLD);
+
+  p.putULong("last_boot", nowUnix);
+  p.putUChar("streak", trigger ? 0 : streak);
+  p.end();
+
+  Serial.printf("[RESCUE] boot streak=%u/%u (window=%lus now=%lu last=%lu)%s\n",
+                (unsigned)streak,
+                (unsigned)RESCUE_BOOT_THRESHOLD,
+                (unsigned long)RESCUE_BOOT_WINDOW_SEC,
+                (unsigned long)nowUnix,
+                (unsigned long)lastBootUnix,
+                trigger ? " -> TRIGGER" : "");
+  return trigger;
+}
+
+static void wipeNodeConfigToUnpaired() {
+  nodeState = STATE_UNPAIRED;
+  rtcSynced = false;
+  deployedFlag = false;
+  g_intervalMin = 1;
+  g_syncIntervalMin = 15;
+  g_syncPhaseUnix = 0;
+  g_lastSyncSlot = 0xFFFFFFFFUL;
+  lastTimeSyncUnix = 0;
+  memset(mothershipMAC, 0, sizeof(mothershipMAC));
+
+  ds3231DisableAlarmInterrupt();
+  ds3231DisableAlarm2Interrupt();
+  clearDS3231_AlarmFlags();
+
+  setNodeConfigVersion(0);
+  persistNodeConfig();
+  debugState("after RESCUE wipe");
+}
+
+static void enterRescueMode() {
+  g_rescueModeActive = true;
+  g_lastRescueBeaconMs = 0;
+
+  Serial.println("==================================================");
+  Serial.println("RESCUE MODE ACTIVE");
+  Serial.println("- Trigger: rapid 3-boot gesture");
+  Serial.println("- Action: node config wiped to UNPAIRED");
+  Serial.println("- Behavior: stay awake with radio listening");
+  Serial.println("==================================================");
+
+  wipeNodeConfigToUnpaired();
+  if (!bringupEspNow()) {
+    Serial.println("⚠️ RESCUE: ESP-NOW bringup failed; retrying in loop");
+  }
+  sendNodeStatusUpdate("rescue-entry");
+  sendDiscoveryRequest();
 }
 
 // Pull-handshake: current config version persisted in NVS
@@ -1201,8 +1493,7 @@ static void sendNodeHello() {
 
   // Send direct first, then broadcast fallback to improve contact probability.
   esp_err_t resDirect = espnowSendWithRecover(mothershipMAC, (uint8_t*)&hello, sizeof(hello));
-  esp_wifi_set_channel(ESPNOW_CHANNEL, WIFI_SECOND_CHAN_NONE);
-  esp_err_t resBcast = esp_now_send(broadcastAddress, (uint8_t*)&hello, sizeof(hello));
+  esp_err_t resBcast = espnowSendWithRecover(broadcastAddress, (uint8_t*)&hello, sizeof(hello));
 
   Serial.printf("👋 NODE_HELLO sent: cfgV=%u wakeMin=%u qDepth=%u : direct=%s bcast=%s\n",
                 hello.configVersion, hello.wakeIntervalMin, hello.queueDepth,
@@ -1256,6 +1547,7 @@ static void handleRtcWakeEvents(bool dataWake, bool syncWake) {
     Serial.println("🧾 Data wake: sample locally (radio remains off)");
     captureSensorsToQueue();
     Serial.printf("🧾 Data wake complete; pending queue=%u\n", (unsigned)local_queue::count());
+    runStaleSyncRecoveryIfNeeded();
   }
 
   if (syncWake) {
@@ -1340,6 +1632,7 @@ static void testI2CBusesMuxAndADS() {
 void setup() {
   Serial.begin(115200);
   delay(2000);
+  bool rtcReady = false;
 
   initNodeIdentity();
 
@@ -1365,6 +1658,7 @@ void setup() {
   if (!rtc.begin(&WireRtc)) {
     Serial.println("❌ RTC not found!");
   } else {
+    rtcReady = true;
     Serial.println("✅ RTC initialized");
 
     if (rtc.lostPower()) {
@@ -1380,8 +1674,22 @@ void setup() {
       Serial.println("RTC not synchronized yet");
     }
 
-    // After rtc.begin(...) block, once we know rtcSynced/deployedFlag/g_intervalMin
-    if (rtcSynced && deployedFlag && g_intervalMin > 0) {
+    // Read alarm flags before any boot-time re-arm/clear. If an alarm is pending,
+    // preserve it for loop-time handling so wake reason is not masked.
+    uint8_t statusInit = readDS3231StatusReg();
+    const bool bootAlarmPending = (statusInit != 0xFF) && ((statusInit & 0x03) != 0);
+    if (statusInit == 0xFF) {
+      Serial.println("⚠️ DS3231 status read failed at boot (I2C error?)");
+    } else if (bootAlarmPending) {
+      Serial.printf("[BOOT] Alarm pending (A1F=%u A2F=%u) -> preserving for wake handler\n",
+                    (statusInit & 0x01) ? 1 : 0,
+                    (statusInit & 0x02) ? 1 : 0);
+    } else {
+      Serial.println("[RTC] A1F=0 A2F=0 at boot (idle)");
+    }
+
+    // Only re-arm alarms on boot when no wake alarm is pending.
+    if (rtcSynced && deployedFlag && g_intervalMin > 0 && !bootAlarmPending) {
       DateTime nextData;
       DateTime nextSync;
       bool ok = armDeploymentWakeAlarms(&nextData, &nextSync);
@@ -1393,24 +1701,17 @@ void setup() {
       Serial.printf("[BOOT] Re-armed RTC wake alarms based on stored interval=%u -> data=%s sync=%s (ok=%d)\n",
                     g_intervalMin, nextDataStr, nextSyncStr, ok);
     }
-
-
-    // Normalise alarm flags at boot so we don't start on stale edges.
-    uint8_t statusInit = readDS3231StatusReg();
-    if (statusInit == 0xFF) {
-      Serial.println("⚠️ DS3231 status read failed at boot (I2C error?)");
-    } else if ((statusInit & 0x03) != 0) {
-      Serial.printf("⚠️ Alarm flags set at boot (A1F=%u A2F=%u) → clearing\n",
-                    (statusInit & 0x01) ? 1 : 0,
-                    (statusInit & 0x02) ? 1 : 0);
-      clearDS3231_AlarmFlags();
-    } else {
-      Serial.println("[RTC] A1F=0 A2F=0 at boot (idle)");
-    }
   }
 
   if (!local_queue::begin()) {
     Serial.println("⚠️ Local queue init failed; logging/sync will be degraded");
+  }
+
+  if (rtcReady) {
+    const uint32_t bootUnix = rtc.now().unixtime();
+    if (updateRescueBootStreak(bootUnix)) {
+      enterRescueMode();
+    }
   }
 
   if (!bringupEspNow()) {
@@ -1448,6 +1749,25 @@ void loop() {
   NodeState st = currentNodeState();
 
   processPowerCut();
+
+  if (g_rescueModeActive) {
+    if (currentNodeState() != STATE_UNPAIRED) {
+      g_rescueModeActive = false;
+      Serial.println("✅ RESCUE: node no longer UNPAIRED, returning to normal loop");
+    } else {
+      if (!g_espNowReady) {
+        bringupEspNow();
+      }
+      if ((nowMs - g_lastRescueBeaconMs) >= (uint32_t)RESCUE_BEACON_INTERVAL_MS) {
+        g_lastRescueBeaconMs = nowMs;
+        Serial.println("🛟 RESCUE beacon: broadcasting discovery request");
+        sendNodeStatusUpdate("rescue-beacon");
+        sendDiscoveryRequest();
+      }
+      delay(100);
+      return;
+    }
+  }
 
   loopCounter++;
 

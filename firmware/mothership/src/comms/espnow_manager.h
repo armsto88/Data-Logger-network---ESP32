@@ -46,6 +46,8 @@ struct NodeInfo {
     uint32_t  lastTimeSyncMs;
     // Wake interval last sent to this node via SET_SCHEDULE (0 = not yet scheduled)
     uint8_t   wakeIntervalMin;
+    // Last queue depth reported by NODE_HELLO at wake start.
+    uint8_t   lastReportedQueueDepth;
     // Wake interval inferred from nodeTimestamp cadence in sensor data (0 = unknown)
     uint8_t   inferredWakeIntervalMin;
     // Last seen nodeTimestamp used for cadence inference (unix seconds)
@@ -68,6 +70,10 @@ struct NodeInfo {
     uint32_t  lastStateAppliedMs;
     // Last applied target that was confirmed.
     NodePendingState lastAppliedTargetState;
+    // Derived stale state (mothership-side inference only)
+    bool      syncStale;
+    uint8_t   staleMissCount;
+    uint32_t  lastStaleAssistMs;
 };
 
 // Desired configuration for each node, stored in mothership NVS.

@@ -114,6 +114,17 @@ typedef struct node_hello_message {
     uint32_t rtcUnix;       // node RTC time at wake
 } node_hello_message_t;
 
+// Node -> Mothership: asynchronous status push (used by rescue and field recovery flows)
+typedef struct node_status_message {
+    char command[16];       // "NODE_STATUS"
+    char nodeId[16];
+    uint8_t state;          // 0=UNPAIRED, 1=PAIRED, 2=DEPLOYED
+    uint8_t rtcSynced;      // 0/1
+    uint8_t deployed;       // 0/1 (node local deployedFlag)
+    uint8_t rescueMode;     // 0/1
+    uint32_t rtcUnix;       // node RTC unix when status was generated
+} node_status_message_t;
+
 // Mothership -> Node: sent only when mothership has a newer config version
 typedef struct config_snapshot_message {
     char     command[20];       // "CONFIG_SNAPSHOT"

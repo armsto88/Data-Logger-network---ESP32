@@ -50,6 +50,76 @@ static uint32_t g_lastCycleMonitorMs = 0;
 static const uint32_t CYCLE_MONITOR_INTERVAL_MS = 30UL * 1000UL;             // 30 s
 static void ensurePeerOnChannel(const uint8_t mac[6], uint8_t channel);
 static const uint32_t PENDING_RETRY_INTERVAL_MS = 5000UL;
+static const uint8_t STALE_MISS_THRESHOLD = 3;
+static const uint32_t STALE_MIN_AGE_MS = 24UL * 60UL * 60UL * 1000UL;
+static const uint32_t STALE_ASSIST_LEAD_MS = 20000UL;
+static const uint32_t STALE_ASSIST_LAG_MS = 45000UL;
+static const uint32_t STALE_ASSIST_RETRY_MS = 10000UL;
+
+// CSV writes are buffered from ESP-NOW callback context and drained from the main loop.
+static constexpr uint8_t kCsvQueueCapacity = 32;
+static constexpr size_t kCsvRowMaxLen = 320;
+static portMUX_TYPE g_csvQueueMux = portMUX_INITIALIZER_UNLOCKED;
+static char g_csvRowQueue[kCsvQueueCapacity][kCsvRowMaxLen];
+static uint8_t g_csvQueueHead = 0;
+static uint8_t g_csvQueueTail = 0;
+static uint8_t g_csvQueueCount = 0;
+static uint32_t g_csvQueueDropped = 0;
+static uint32_t g_csvQueueDroppedReported = 0;
+
+static bool enqueueCsvRowFromCallback(const String& row) {
+    bool queued = false;
+    portENTER_CRITICAL(&g_csvQueueMux);
+    if (g_csvQueueCount < kCsvQueueCapacity) {
+        const uint8_t idx = g_csvQueueHead;
+        strncpy(g_csvRowQueue[idx], row.c_str(), kCsvRowMaxLen - 1);
+        g_csvRowQueue[idx][kCsvRowMaxLen - 1] = '\0';
+        g_csvQueueHead = (uint8_t)((g_csvQueueHead + 1) % kCsvQueueCapacity);
+        g_csvQueueCount++;
+        queued = true;
+    } else {
+        g_csvQueueDropped++;
+    }
+    portEXIT_CRITICAL(&g_csvQueueMux);
+    return queued;
+}
+
+static bool dequeueCsvRowForSdWrite(char* outRow, size_t outLen) {
+    if (!outRow || outLen == 0) return false;
+
+    bool hadRow = false;
+    portENTER_CRITICAL(&g_csvQueueMux);
+    if (g_csvQueueCount > 0) {
+        const uint8_t idx = g_csvQueueTail;
+        strncpy(outRow, g_csvRowQueue[idx], outLen - 1);
+        outRow[outLen - 1] = '\0';
+        g_csvQueueTail = (uint8_t)((g_csvQueueTail + 1) % kCsvQueueCapacity);
+        g_csvQueueCount--;
+        hadRow = true;
+    }
+    portEXIT_CRITICAL(&g_csvQueueMux);
+    return hadRow;
+}
+
+static void drainCsvQueueToSd(uint8_t maxRowsPerLoop = 8) {
+    char rowBuf[kCsvRowMaxLen];
+    uint8_t written = 0;
+    while (written < maxRowsPerLoop && dequeueCsvRowForSdWrite(rowBuf, sizeof(rowBuf))) {
+        if (!logCSVRow(String(rowBuf))) {
+            Serial.println("❌ Failed to log node data");
+        }
+        written++;
+    }
+
+    if (g_csvQueueDropped != g_csvQueueDroppedReported) {
+        const uint32_t droppedNow = g_csvQueueDropped;
+        const uint32_t delta = droppedNow - g_csvQueueDroppedReported;
+        g_csvQueueDroppedReported = droppedNow;
+        Serial.printf("⚠️ CSV callback queue overflow: dropped %lu row(s) (total=%lu)\n",
+                      (unsigned long)delta,
+                      (unsigned long)droppedNow);
+    }
+}
 
 static const char* pendingStateToStr(NodePendingState s) {
     switch (s) {
@@ -140,6 +210,33 @@ static bool pushDesiredConfigSnapshot(const uint8_t* senderMac,
     return (res == ESP_OK);
 }
 
+static bool pushSyncScheduleToNode(const uint8_t* senderMac,
+                                   const char* nodeId,
+                                   const NodeDesiredConfig& desired) {
+    if (!senderMac || !nodeId) return false;
+
+    const uint16_t syncMin = (desired.syncIntervalMin > 0) ? desired.syncIntervalMin : 0;
+    uint32_t phaseUnix = desired.syncPhaseUnix;
+    if (phaseUnix == 0) phaseUnix = getRTCTimeUnix();
+    if (syncMin == 0 || phaseUnix == 0) return false;
+
+    sync_schedule_command_message_t sched{};
+    strcpy(sched.command, "SET_SYNC_SCHED");
+    strncpy(sched.mothership_id, DEVICE_ID, sizeof(sched.mothership_id) - 1);
+    sched.syncIntervalMinutes = (unsigned long)syncMin;
+    sched.phaseUnix = phaseUnix;
+
+    ensurePeerOnChannel(senderMac, ESPNOW_CHANNEL);
+    esp_wifi_set_channel(ESPNOW_CHANNEL, WIFI_SECOND_CHAN_NONE);
+    esp_err_t res = esp_now_send(senderMac, (uint8_t*)&sched, sizeof(sched));
+    Serial.printf("↪ Stale-assist SET_SYNC_SCHED to %s (syncMin=%u phase=%lu): %s\n",
+                  nodeId,
+                  (unsigned)syncMin,
+                  (unsigned long)phaseUnix,
+                  (res == ESP_OK) ? "OK" : esp_err_to_name(res));
+    return (res == ESP_OK);
+}
+
 
 // ----------------- small helpers -----------------
 static void ensurePeerOnChannel(const uint8_t mac[6], uint8_t channel) {
@@ -223,6 +320,8 @@ void registerNode(const uint8_t* mac,
 
         existing->lastSeen = millis();
         existing->isActive = true;
+        existing->syncStale = false;
+        existing->staleMissCount = 0;
         if (nodeId && nodeId[0] != '\0' && existing->nodeId != String(nodeId)) {
             Serial.printf("🔄 Node MAC %s runtime ID updated: %s -> %s\n",
                           macToStr(existing->mac).c_str(),
@@ -275,6 +374,7 @@ void registerNode(const uint8_t* mac,
     // NEW:
     n.lastTimeSyncMs       = 0;
     n.wakeIntervalMin      = 0;
+    n.lastReportedQueueDepth = 0;
     n.inferredWakeIntervalMin = 0;
     n.lastNodeTimestamp    = 0;
     n.configVersionApplied = 0;
@@ -286,6 +386,9 @@ void registerNode(const uint8_t* mac,
     n.pendingLastAttemptMs = 0;
     n.lastStateAppliedMs   = 0;
     n.lastAppliedTargetState = PENDING_NONE;
+    n.syncStale = false;
+    n.staleMissCount = 0;
+    n.lastStaleAssistMs = 0;
 
     // Populate user-facing meta from NVS for immediate consistency
     n.userId = getNodeUserId(n.nodeId);
@@ -318,6 +421,61 @@ static void OnDataRecv(const uint8_t * mac,
                        const uint8_t * incomingBytes,
                        int len)
 {
+    // 0) Node status push (authoritative state update from node runtime)
+    if (len == sizeof(node_status_message_t)) {
+        node_status_message_t st{};
+        memcpy(&st, incomingBytes, sizeof(st));
+
+        if (strcmp(st.command, "NODE_STATUS") == 0) {
+            NodeState reported = (st.state <= (uint8_t)DEPLOYED)
+                ? (NodeState)st.state
+                : UNPAIRED;
+
+            NodeInfo* target = nullptr;
+            for (auto& n : registeredNodes) {
+                if (memcmp(n.mac, mac, 6) == 0 || n.nodeId == String(st.nodeId)) {
+                    target = &n;
+                    break;
+                }
+            }
+
+            if (!target) {
+                registerNode(mac, st.nodeId, "status", reported);
+                for (auto& n : registeredNodes) {
+                    if (memcmp(n.mac, mac, 6) == 0 || n.nodeId == String(st.nodeId)) {
+                        target = &n;
+                        break;
+                    }
+                }
+            }
+
+            if (target) {
+                NodeState previous = target->state;
+                target->lastSeen = millis();
+                target->isActive = true;
+                target->state = reported;
+                target->deployPending = (reported == DEPLOYED) ? target->deployPending : false;
+
+                if (reported == UNPAIRED && target->stateChangePending) {
+                    clearPendingState(*target, "NODE_STATUS reports UNPAIRED");
+                }
+
+                Serial.printf("📣 NODE_STATUS from %s (%s): %s -> %s rtcSynced=%u deployed=%u rescue=%u rtcUnix=%lu\n",
+                              st.nodeId,
+                              macToStr(mac).c_str(),
+                              stateToStr(previous),
+                              stateToStr(target->state),
+                              (unsigned)st.rtcSynced,
+                              (unsigned)st.deployed,
+                              (unsigned)st.rescueMode,
+                              (unsigned long)st.rtcUnix);
+
+                savePairedNodes();
+            }
+        }
+        return;
+    }
+
     // 1) Sensor data packets → mark DEPLOYED + log CSV
     if (len == sizeof(sensor_data_message_t)) {
         sensor_data_message_t incoming{};
@@ -507,8 +665,9 @@ static void OnDataRecv(const uint8_t * mac,
 
         row += meta;
 
-        if (logCSVRow(row)) Serial.println("✅ Node data logged");
-        else                Serial.println("❌ Failed to log node data");
+        if (!enqueueCsvRowFromCallback(row)) {
+            Serial.println("⚠️ Node data queued for SD write failed: callback queue full");
+        }
 
         return;
     }
@@ -782,6 +941,9 @@ void setupESPNOW() {
 void espnow_loop() {
     unsigned long now = millis();
 
+    // Flush buffered SD writes outside ESP-NOW callback context.
+    drainCsvQueueToSd();
+
     // Mark nodes not-awake shortly after contact so UI reflects real wake windows.
     for (auto& n : registeredNodes) {
         // Keep this intentionally short: AWAKE means "recently heard from", not "online".
@@ -799,6 +961,47 @@ void espnow_loop() {
                           n.nodeId.c_str(),
                           macToStr(n.mac).c_str(),
                           stateToStr(n.state));
+        }
+    }
+
+    // Mothership-side stale inference: no node-side stale flag required.
+    for (auto& n : registeredNodes) {
+        if (!(n.state == PAIRED || n.state == DEPLOYED)) continue;
+
+        NodeDesiredConfig desired = getDesiredConfig(n.nodeId.c_str());
+        uint8_t wakeMin = 0;
+        if (desired.wakeIntervalMin > 0) wakeMin = desired.wakeIntervalMin;
+        else if (n.wakeIntervalMin > 0) wakeMin = n.wakeIntervalMin;
+        else if (n.inferredWakeIntervalMin > 0) wakeMin = n.inferredWakeIntervalMin;
+        if (!isReasonableWakeInterval(wakeMin)) continue;
+
+        const uint32_t periodMs = (uint32_t)wakeMin * 60000UL;
+        const uint32_t ageMs = (now >= n.lastSeen) ? (now - n.lastSeen) : 0;
+        const uint32_t missed = ageMs / periodMs;
+        n.staleMissCount = (uint8_t)((missed > 255UL) ? 255UL : missed);
+        n.syncStale = (missed >= (uint32_t)STALE_MISS_THRESHOLD) || (ageMs >= STALE_MIN_AGE_MS);
+
+        if (!n.syncStale) continue;
+
+        const uint32_t prevExpectedMs = n.lastSeen + (missed * periodMs);
+        const uint32_t assistStartMs = (prevExpectedMs > STALE_ASSIST_LEAD_MS)
+            ? (prevExpectedMs - STALE_ASSIST_LEAD_MS)
+            : 0;
+        const uint32_t assistEndMs = prevExpectedMs + STALE_ASSIST_LAG_MS;
+        const bool inAssistWindow = (now >= assistStartMs) && (now <= assistEndMs);
+        const bool retryDue = (n.lastStaleAssistMs == 0) || ((now - n.lastStaleAssistMs) >= STALE_ASSIST_RETRY_MS);
+
+        if (inAssistWindow && retryDue) {
+            bool schedOk = pushSyncScheduleToNode(n.mac, n.nodeId.c_str(), desired);
+            bool timeOk = sendTimeSync(n.mac, n.nodeId.c_str());
+            n.lastStaleAssistMs = now;
+            Serial.printf("🛟 Stale-assist for %s: missed=%lu age=%lus wakeMin=%u sched=%s time=%s\n",
+                          n.nodeId.c_str(),
+                          (unsigned long)missed,
+                          (unsigned long)(ageMs / 1000UL),
+                          (unsigned)wakeMin,
+                          schedOk ? "OK" : "FAIL",
+                          timeOk ? "OK" : "FAIL");
         }
     }
 
@@ -917,6 +1120,7 @@ void loadPairedNodes() {
         // NEW:
         newNode.lastTimeSyncMs       = 0;
         newNode.wakeIntervalMin      = 0;
+        newNode.lastReportedQueueDepth = 0;
         newNode.inferredWakeIntervalMin = 0;
         newNode.lastNodeTimestamp    = 0;
         newNode.configVersionApplied = 0;
@@ -928,6 +1132,9 @@ void loadPairedNodes() {
         newNode.pendingLastAttemptMs = 0;
         newNode.lastStateAppliedMs   = 0;
         newNode.lastAppliedTargetState = PENDING_NONE;
+        newNode.syncStale            = false;
+        newNode.staleMissCount       = 0;
+        newNode.lastStaleAssistMs    = 0;
 
         // Hydrate user-facing meta from node_meta
         newNode.userId = getNodeUserId(newNode.nodeId);
@@ -1066,6 +1273,7 @@ void handleNodeHello(const uint8_t* senderMac, const node_hello_message_t& hello
     for (auto& n : registeredNodes) {
         if (n.nodeId == String(hello.nodeId)) {
             n.wakeIntervalMin = hello.wakeIntervalMin;
+            n.lastReportedQueueDepth = hello.queueDepth;
             if (hello.configVersion > n.configVersionApplied) {
                 n.configVersionApplied = hello.configVersion;
                 Serial.printf("✅ Config version inferred from HELLO for %s: appliedV=%u\n",
@@ -1375,6 +1583,14 @@ bool deploySelectedNodes(const std::vector<String>& nodeIds) {
                            &hour, &minute, &second,
                            &day, &month, &year) == 6)
                 {
+                    if (year < 2024 || year > 2099) {
+                        Serial.printf("⚠️ RTC invalid (%04d-%02d-%02d %02d:%02d:%02d): aborting deploy for %s\n",
+                                      year, month, day, hour, minute, second,
+                                      nodeId.c_str());
+                        allSuccess = false;
+                        continue;
+                    }
+
                     const uint32_t nowUnix = getRTCTimeUnix();
                     NodeDesiredConfig desired = getDesiredConfig(node.nodeId.c_str());
 

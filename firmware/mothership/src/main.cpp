@@ -65,6 +65,8 @@ uint32_t gSyncTriggerCount = 0;
 long long gLastSyncIntervalSlot = -1;
 const int kAllowedIntervals[] = {1, 5, 10, 20, 30, 60};
 const size_t kAllowedCount = sizeof(kAllowedIntervals) / sizeof(kAllowedIntervals[0]);
+static uint32_t gBootMs = 0;
+static const uint32_t kSyncBootQuietMs = 120000UL;
 
 // ---------- Web server ----------
 WebServer server(80);
@@ -193,6 +195,24 @@ static void saveDailySyncTimeToNVS(int hh, int mm) {
   }
 }
 
+static void loadSyncRuntimeGuardsFromNVS() {
+  if (gPrefs.begin("ui", true)) {
+    gLastSyncBroadcastEpochDay = gPrefs.getLong("sync_day", -1);
+    gLastSyncBroadcastUnix = gPrefs.getULong("sync_last_unix", 0);
+    gLastSyncIntervalSlot = gPrefs.getLong64("sync_slot", -1);
+    gPrefs.end();
+  }
+}
+
+static void saveSyncRuntimeGuardsToNVS() {
+  if (gPrefs.begin("ui", false)) {
+    gPrefs.putLong("sync_day", gLastSyncBroadcastEpochDay);
+    gPrefs.putULong("sync_last_unix", gLastSyncBroadcastUnix);
+    gPrefs.putLong64("sync_slot", gLastSyncIntervalSlot);
+    gPrefs.end();
+  }
+}
+
 static String formatSyncTimeHHMM(int hh, int mm) {
   char b[6];
   snprintf(b, sizeof(b), "%02d:%02d", hh, mm);
@@ -263,16 +283,11 @@ static String computeNextWakeIsoLocal(int intervalMin) {
   if (intervalMin <= 0) return String("n/a");
 
   const uint32_t nowUnix = getRTCTimeUnix();
+  // Node firmware arms A1 as "now + intervalMin" (not minute-bucket aligned),
+  // so preserve second-level cadence in the UI estimate.
+  const uint32_t nextUnix = nowUnix + (uint32_t)intervalMin * 60UL;
   DateTime now(nowUnix);
-
-  DateTime base(now.year(), now.month(), now.day(), now.hour(), now.minute(), 0);
-  if (now.second() != 0) {
-    base = base + TimeSpan(0, 0, 1, 0);
-  }
-
-  const int mod = base.minute() % intervalMin;
-  const int addMin = (mod == 0) ? intervalMin : (intervalMin - mod);
-  DateTime next = base + TimeSpan(0, 0, addMin, 0);
+  DateTime next(nextUnix);
 
   const uint32_t deltaSec = (next.unixtime() > now.unixtime()) ? (next.unixtime() - now.unixtime()) : 0;
   const uint32_t deltaMin = (deltaSec + 59UL) / 60UL;
@@ -751,6 +766,9 @@ static String buildListNodesDataJson() {
     json += ",";
     json += "\"isActive\":";
     json += n.isActive ? "true" : "false";
+    json += ",";
+    json += "\"queueDepth\":";
+    json += String((unsigned)n.lastReportedQueueDepth);
     json += "}";
   }
   json += "]}";
@@ -913,6 +931,7 @@ static bool handleBleCommand(
     gLastSyncBroadcastEpochDay = (long)(((unsigned long)phase) / 86400UL);
     gLastSyncBroadcastUnix = (unsigned long)phase;
     gLastSyncIntervalSlot = (long long)((unsigned long)phase / ((unsigned long)max(interval, 1) * 60UL));
+    saveSyncRuntimeGuardsToNVS();
     saveSyncIntervalToNVS(interval);
     saveSyncModeToNVS(gSyncMode);
 
@@ -985,6 +1004,7 @@ static bool handleBleCommand(
         gLastSyncBroadcastEpochDay = (long)(phaseUnix / 86400UL);
         gLastSyncBroadcastUnix = phaseUnix;
         gLastSyncIntervalSlot = (long long)(phaseUnix / ((unsigned long)max(iv, 1) * 60UL));
+        saveSyncRuntimeGuardsToNVS();
         saveSyncIntervalToNVS(iv);
         saveSyncModeToNVS(gSyncMode);
       }
@@ -1895,6 +1915,7 @@ void handleSetSyncMode() {
   gLastSyncBroadcastMs = 0;
   gLastSyncBroadcastUnix = 0;
   gLastSyncIntervalSlot = -1;
+  saveSyncRuntimeGuardsToNVS();
 
   Serial.printf("[UI] Sync mode set to %s\n", syncModeLabel());
 
@@ -1934,6 +1955,7 @@ void handleSetSyncInterval() {
   gLastSyncBroadcastUnix = phaseUnix;
   gLastSyncBroadcastMs = millis();
   gLastSyncIntervalSlot = (long long)(phaseUnix / ((unsigned long)max(interval, 1) * 60UL));
+  saveSyncRuntimeGuardsToNVS();
   saveSyncIntervalToNVS(interval);
   saveSyncModeToNVS(gSyncMode);
 
@@ -1965,6 +1987,13 @@ void handleSetSyncInterval() {
                 phaseUnix,
                 sent ? "SENT" : "FAILED",
                 syncModeLabel());
+
+  if (isAjaxRequest()) {
+    sendAjaxResult(sent,
+      sent ? (String("Sync interval set to ") + String(interval) + " min")
+           : String("Sync broadcast failed"));
+    return;
+  }
 
   String html = F("<!doctype html><meta name='viewport' content='width=device-width,initial-scale=1'>"
                   "<body style='font-family:sans-serif;padding:20px;text-align:center'>"
@@ -2000,6 +2029,9 @@ void handleSetSyncTime() {
   saveDailySyncTimeToNVS(hh, mm);
   gLastSyncBroadcastEpochDay = -1;  // allow immediate trigger when schedule matches current day/time
   gLastSyncBroadcastMs = 0;
+  gLastSyncBroadcastUnix = 0;
+  gLastSyncIntervalSlot = -1;
+  saveSyncRuntimeGuardsToNVS();
 
   Serial.printf("[UI] Daily sync time set to %02d:%02d\n", gSyncDailyHour, gSyncDailyMinute);
 
@@ -2410,6 +2442,10 @@ void handleNodesPage() {
   if (allNodes.empty()) {
     html += F("<p class='muted'>No nodes registered yet. Try discovering and pairing first.</p>");
   } else {
+    html += F("<p class='muted' style='margin:0 0 10px 0'>"
+              "Interval shows the configured target for each node. "
+              "Queue is pending samples last reported by the node at wake start."
+              "</p>");
     html += F("<div class='list'>");
 
         for (auto &node : allNodes) {
@@ -2425,9 +2461,12 @@ void handleNodesPage() {
       uint8_t observedWakeMin = (node.wakeIntervalMin > 0)
         ? node.wakeIntervalMin
         : node.inferredWakeIntervalMin;
-      int nodeIntervalCurrentMin = (observedWakeMin > 0)
-        ? observedWakeMin
-        : (isAllowedInterval(gWakeIntervalMin) ? gWakeIntervalMin : 5);
+      int nodeIntervalCurrentMin = (nodeDesired.wakeIntervalMin > 0)
+        ? (int)nodeDesired.wakeIntervalMin
+        : ((observedWakeMin > 0)
+            ? (int)observedWakeMin
+            : (isAllowedInterval(gWakeIntervalMin) ? gWakeIntervalMin : 5));
+      const uint8_t nodeQueueDepth = node.lastReportedQueueDepth;
       const String nextWake = computeNextWakeIsoLocal(nodeIntervalCurrentMin);
       const String nextWakeTime = (nextWake.length() >= 8) ? nextWake.substring(0, 8) : String("n/a");
       if (cfgPending && node.state == DEPLOYED && !node.deployPending &&
@@ -2482,6 +2521,12 @@ void handleNodesPage() {
                 "<span class='node-timing-label'>Next wake</span>"
                 "<span class='chip node-timing-value'>");
       html += nextWakeTime;
+              html += F("</span>"
+                    "</div>"
+                    "<div class='node-timing-cell'>"
+                    "<span class='node-timing-label'>Queue</span>"
+                    "<span class='chip node-timing-value'>");
+              html += String((unsigned)nodeQueueDepth);
       html += F("</span>"
                 "</div>"
                 "</div>"
@@ -2523,6 +2568,7 @@ void handleNodesPage() {
 // ---------- Setup / Loop ----------
 void setup() {
   Serial.begin(115200);
+  gBootMs = millis();
 
   Serial.println("Starting RTC setup...");
   setupRTC();
@@ -2597,9 +2643,14 @@ void setup() {
   loadSyncIntervalFromNVS();
   loadSyncModeFromNVS();
   loadDailySyncTimeFromNVS();
+  loadSyncRuntimeGuardsFromNVS();
   Serial.printf("Current wake interval (from NVS): %d min\n", gWakeIntervalMin);
   Serial.printf("Current sync interval payload (from NVS): %d min\n", gSyncIntervalMin);
   Serial.printf("Current daily sync time (from NVS): %s\n", formatSyncTimeHHMM(gSyncDailyHour, gSyncDailyMinute).c_str());
+  Serial.printf("Sync guards (from NVS): day=%ld lastUnix=%lu slot=%lld\n",
+                gLastSyncBroadcastEpochDay,
+                gLastSyncBroadcastUnix,
+                gLastSyncIntervalSlot);
 
   // 🔎 One-shot boot summary so you can see the fleet state in one block
   logBootSummary();
@@ -2688,8 +2739,10 @@ void loop() {
   // Global sync trigger driven by selected sync mode.
 #if ENABLE_ESPNOW_RUNTIME
   {
+    const bool syncQuietPeriod = ((uint32_t)(millis() - gBootMs) < kSyncBootQuietMs);
+
     const uint32_t nowUnix = getRTCTimeUnix();
-    if (nowUnix > 946684800UL) {
+    if (!syncQuietPeriod && nowUnix > 946684800UL) {
     if (gSyncMode == SYNC_MODE_DAILY) {
       static const uint8_t kDailyRetryWindowMin = 15;
       static const uint32_t kDailyRetryIntervalMs = 30000UL;
@@ -2711,6 +2764,7 @@ void loop() {
         if (sent || markerSent) {
           gLastSyncBroadcastEpochDay = epochDay;
           gLastSyncBroadcastUnix = nowUnix;
+          saveSyncRuntimeGuardsToNVS();
           gSyncTriggerCount++;
           Serial.printf("[SYNC] Daily trigger %02d:%02d -> schedule=%s marker=%s\n",
                         gSyncDailyHour,
@@ -2735,6 +2789,7 @@ void loop() {
         gLastSyncBroadcastMs = millis();
         gLastSyncBroadcastUnix = nowUnix;
         gLastSyncIntervalSlot = slot;
+        saveSyncRuntimeGuardsToNVS();
         gSyncTriggerCount++;
         Serial.printf("[SYNC] Interval trigger %d min -> schedule=%s marker=%s\n",
                       gSyncIntervalMin,
