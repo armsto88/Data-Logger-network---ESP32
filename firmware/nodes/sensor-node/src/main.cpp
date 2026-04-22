@@ -5,6 +5,7 @@
 #include <RTClib.h>
 #include <esp_wifi.h>
 #include <esp_mac.h>
+#include <esp_sleep.h>
 #include <Preferences.h>
 #include <nvs_flash.h>
 #include <nvs.h>
@@ -74,6 +75,10 @@ RTC_DS3231 rtc;
 
 #ifndef PWR_HOLD_ACTIVE_HIGH
 #define PWR_HOLD_ACTIVE_HIGH 1
+#endif
+
+#ifndef PWR_HOLD_FALLBACK_SLEEP_DELAY_MS
+#define PWR_HOLD_FALLBACK_SLEEP_DELAY_MS 1500UL
 #endif
 
 // Post-wake command window: keep ESP-NOW alive for N ms after HELLO to receive
@@ -165,6 +170,23 @@ static void processPowerCut() {
 #endif
 
   delay(20);
+
+  // If hardware hold-gate does not actually cut power, force deep sleep as a fallback.
+  const uint32_t fallbackWaitStart = millis();
+  while ((millis() - fallbackWaitStart) < (uint32_t)PWR_HOLD_FALLBACK_SLEEP_DELAY_MS) {
+    delay(10);
+  }
+
+  Serial.println("[PWR_HOLD] still alive after hold release -> deep sleep fallback");
+  esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL);
+#if defined(RTC_INT_PIN) && (RTC_INT_PIN >= 0)
+  esp_err_t wakeCfg = esp_sleep_enable_ext0_wakeup((gpio_num_t)RTC_INT_PIN, 0);
+  Serial.printf("[PWR_HOLD] deep sleep wake via RTC_INT pin=%d level=0: %s\n",
+                RTC_INT_PIN,
+                (wakeCfg == ESP_OK) ? "OK" : esp_err_to_name(wakeCfg));
+#endif
+  Serial.println("[PWR_HOLD] entering deep sleep now");
+  esp_deep_sleep_start();
 
   while (true) {
     delay(1000);
@@ -447,6 +469,9 @@ static bool g_espNowReady = false;
 static volatile uint32_t g_syncWindowMarkerMs = 0;
 static volatile bool g_lastSendDone = false;
 static volatile esp_now_send_status_t g_lastSendStatus = ESP_NOW_SEND_FAIL;
+static volatile bool g_deployBootstrapPending = false;
+static volatile bool g_rearmAlarmsPending    = false;  // set by callbacks; serviced from loop
+static uint32_t      g_lastAlarmArmMs         = 0;      // millis() of last successful armDeploymentWakeAlarms
 
 static bool waitForSendDelivery(uint32_t timeoutMs) {
   const uint32_t start = millis();
@@ -898,11 +923,6 @@ static void onDataReceived(const uint8_t *mac, const uint8_t *incomingData, int 
     memcpy(&pr, incomingData, sizeof(pr));
 
     if (strcmp(pr.command, "PAIRING_RESPONSE") == 0 && strcmp(pr.nodeId, NODE_ID) == 0) {
-      if (g_rescueModeActive) {
-        Serial.println("🛟 RESCUE: ignoring PAIRING_RESPONSE; waiting for explicit PAIR_NODE command");
-        return;
-      }
-
       if (pr.isPaired) {
         Serial.println("📋 Pairing confirmed via PAIRING_RESPONSE");
         memcpy(mothershipMAC, mac, 6);
@@ -1027,21 +1047,14 @@ static void onDataReceived(const uint8_t *mac, const uint8_t *incomingData, int 
             dackRes == ESP_OK ? "OK" : esp_err_to_name(dackRes));
 
       if (!wasAlreadyDeployed) {
-        // Immediate first cycle only when transitioning into deployment.
-        Serial.println("🧾 DEPLOY immediate cycle start");
-        captureSensorsToQueue();
-        Serial.printf("🧾 DEPLOY immediate sample done; pending queue=%u\n", (unsigned)local_queue::count());
-
-        finalizeWakeAndSleep("deploy immediate cycle complete");
+        // Defer immediate bootstrap to loop context for deterministic RTC/I2C handling.
+        g_deployBootstrapPending = true;
+        Serial.println("🧾 DEPLOY bootstrap queued for loop context");
       } else {
-        // Duplicate deploy refreshes config/time but must not force an extra cycle.
-        DateTime nextData;
-        DateTime nextSync;
-        bool okBoth = armDeploymentWakeAlarms(&nextData, &nextSync);
-        char dataStr[24]; formatTime(nextData, dataStr, sizeof(dataStr));
-        char syncStr[24]; formatTime(nextSync, syncStr, sizeof(syncStr));
-        Serial.printf("↩️ Duplicate DEPLOY while already active: re-armed data=%s sync=%s (%s)\n",
-                      dataStr, syncStr, okBoth ? "OK" : "PARTIAL");
+        // Duplicate deploy: refresh config but do NOT arm alarms from callback context.
+        // Queueing here avoids I2C races with the loop's alarm flag polling.
+        g_rearmAlarmsPending = true;
+        Serial.println("↩️ Duplicate DEPLOY while already active: config updated, re-arm queued for loop");
       }
       if (g_rescueModeActive) {
         g_rescueModeActive = false;
@@ -1092,14 +1105,19 @@ static void onDataReceived(const uint8_t *mac, const uint8_t *incomingData, int 
       formatTime(rtc.now(), nowStr, sizeof(nowStr));
 
       // Intention: paired/unpaired nodes store interval but remain idle.
+      // IMPORTANT: do NOT call armDeploymentWakeAlarms from callback context – it races
+      // with the loop's A1F polling.  Set g_rearmAlarmsPending and let the loop handle it.
       if (currentNodeState() == STATE_DEPLOYED && rtcSynced) {
-        ok = armDeploymentWakeAlarms(&nextData, &nextSync);
-        formatTime(nextData, nextStr, sizeof(nextStr));
-        formatTime(nextSync, syncStr, sizeof(syncStr));
+        if (!g_deployBootstrapPending) {
+          g_rearmAlarmsPending = true;
+        }
+        snprintf(nextStr, sizeof(nextStr), "(queued for loop re-arm)");
+        snprintf(syncStr, sizeof(syncStr), "(queued for loop re-arm)");
       } else {
         ds3231DisableAlarmInterrupt();
         ds3231DisableAlarm2Interrupt();
         clearDS3231_AlarmFlags();
+        ok = false;
         snprintf(nextStr, sizeof(nextStr), "(idle: not deployed)");
         snprintf(syncStr, sizeof(syncStr), "(idle: not deployed)");
       }
@@ -1109,7 +1127,9 @@ static void onDataReceived(const uint8_t *mac, const uint8_t *incomingData, int 
       Serial.printf("   now:  %s\n",  nowStr);
       Serial.printf("   nextData: %s\n",  nextStr);
       Serial.printf("   nextSync: %s\n",  syncStr);
-      Serial.printf("   status: %s\n", ok ? "OK" : "FAIL");
+      Serial.printf("   re-arm: %s\n",
+                    g_rearmAlarmsPending ? "queued for loop" :
+                    (g_deployBootstrapPending ? "bootstrap will handle" : "not deployed"));
 
       persistNodeConfig();
     }
@@ -1141,13 +1161,11 @@ static void onDataReceived(const uint8_t *mac, const uint8_t *incomingData, int 
                     (unsigned long)g_syncPhaseUnix);
 
       if (currentNodeState() == STATE_DEPLOYED && rtcSynced) {
-        DateTime nextData;
-        DateTime nextSync;
-        const bool rearmOk = armDeploymentWakeAlarms(&nextData, &nextSync);
-        char dataStr[24]; formatTime(nextData, dataStr, sizeof(dataStr));
-        char syncStr[24]; formatTime(nextSync, syncStr, sizeof(syncStr));
-        Serial.printf("[SET_SYNC_SCHED] immediate re-arm data=%s sync=%s (%s)\n",
-                      dataStr, syncStr, rearmOk ? "OK" : "PARTIAL");
+        if (!g_deployBootstrapPending) {
+          g_rearmAlarmsPending = true;
+        }
+        Serial.printf("[SET_SYNC_SCHED] re-arm queued for loop context (bootstrap=%d)\n",
+                      g_deployBootstrapPending ? 1 : 0);
       }
 
       persistNodeConfig();
@@ -1194,9 +1212,19 @@ static void onDataReceived(const uint8_t *mac, const uint8_t *incomingData, int 
       Serial.printf("   ↪ New lastTimeSyncUnix: %lu (%s)\n",
                     (unsigned long)lastTimeSyncUnix, buf);
 
-      debugState("after TIME_SYNC");
+      if (currentNodeState() == STATE_DEPLOYED && rtcSynced) {
+        DateTime nextData;
+        DateTime nextSync;
+        const bool rearmOk = armDeploymentWakeAlarms(&nextData, &nextSync);
+        char dataStr[24]; formatTime(nextData, dataStr, sizeof(dataStr));
+        char syncStr[24]; formatTime(nextSync, syncStr, sizeof(syncStr));
+        Serial.printf("   ↪ TIME_SYNC re-arm data=%s sync=%s (%s)\n",
+                      dataStr,
+                      syncStr,
+                      rearmOk ? "OK" : "PARTIAL");
+      }
 
-      // NOTE: we do NOT touch alarms here.
+      debugState("after TIME_SYNC");
     }
     return;
   }
@@ -1509,21 +1537,37 @@ static bool armDeploymentWakeAlarms(DateTime* nextDataOut, DateTime* nextSyncOut
   ds3231EnableAlarm2Interrupt();
   clearDS3231_AlarmFlags();
 
+  if (okData || okSync) {
+    g_lastAlarmArmMs = millis();
+  }
   return okData && okSync;
 }
 
 static void finalizeWakeAndSleep(const char* reason) {
-  DateTime nextData;
-  DateTime nextSync;
-  bool okBoth = armDeploymentWakeAlarms(&nextData, &nextSync);
+  Serial.printf("⚙️ [FINALIZE] entry: %s\n", reason ? reason : "wake cycle complete");
+
+  DateTime nextData{};
+  DateTime nextSync{};
+  bool okBoth = false;
+
+  // Retry alarm arm up to 3 times – I2C can fail transiently.
+  for (int attempt = 1; attempt <= 3 && !okBoth; attempt++) {
+    okBoth = armDeploymentWakeAlarms(&nextData, &nextSync);
+    if (!okBoth && attempt < 3) {
+      Serial.printf("⚠️ [FINALIZE] Alarm arm failed (attempt %d/3) – retrying\n", attempt);
+      delay(10);
+    }
+  }
 
   char dataStr[24]; formatTime(nextData, dataStr, sizeof(dataStr));
   char syncStr[24]; formatTime(nextSync, syncStr, sizeof(syncStr));
-  Serial.printf("🔁 Re-armed alarms data=%s sync=%s (%s)\n",
+  Serial.printf("🔁 [FINALIZE] Alarms armed: data=%s sync=%s (%s)\n",
                 dataStr, syncStr, okBoth ? "OK" : "PARTIAL");
 
   shutdownEspNow();
   schedulePowerCut(reason ? reason : "wake cycle complete");
+  Serial.printf("💤 [FINALIZE] Power cut scheduled – reason: %s\n",
+                reason ? reason : "wake cycle complete");
 }
 
 
@@ -1750,6 +1794,48 @@ void loop() {
 
   processPowerCut();
 
+  if (g_deployBootstrapPending && currentNodeState() == STATE_DEPLOYED && rtcSynced) {
+    g_deployBootstrapPending = false;
+    Serial.println("🚦 [DEPLOY S1] Bootstrap start (loop context)");
+
+    Serial.println("🚦 [DEPLOY S2] Capturing sensors");
+    captureSensorsToQueue();
+    Serial.printf("🚦 [DEPLOY S2] Capture done; pending queue=%u\n", (unsigned)local_queue::count());
+
+    // S3: Best-effort immediate upload – do not wait for SYNC_WINDOW_OPEN.
+    Serial.println("🚦 [DEPLOY S3] Attempting immediate HELLO + flush");
+    if (bringupEspNow()) {
+      sendNodeHello();
+      flushQueuedToMothership(0);
+      Serial.printf("🚦 [DEPLOY S3] Flush done; pending queue=%u\n", (unsigned)local_queue::count());
+    } else {
+      Serial.println("⚠️ [DEPLOY S3] ESP-NOW bringup failed – flush skipped, data in queue for sync wake");
+    }
+
+    // S4: Finalize unconditionally – RF failure in S3 must not block alarms + power cut.
+    Serial.println("🚦 [DEPLOY S4] Calling finalizeWakeAndSleep");
+    finalizeWakeAndSleep("deploy-bootstrap");
+    return;
+  }
+
+  // Service alarm re-arm requests queued by callbacks (avoids I2C races with alarm polling).
+  if (g_rearmAlarmsPending && !g_deployBootstrapPending &&
+      currentNodeState() == STATE_DEPLOYED && rtcSynced) {
+    g_rearmAlarmsPending = false;
+    Serial.println("🔁 [LOOP] Servicing queued alarm re-arm");
+    DateTime reArmData{}, reArmSync{};
+    bool reArmOk = armDeploymentWakeAlarms(&reArmData, &reArmSync);
+    if (reArmOk) {
+      char dsStr[24], ssStr[24];
+      formatTime(reArmData, dsStr, sizeof(dsStr));
+      formatTime(reArmSync, ssStr, sizeof(ssStr));
+      Serial.printf("🔁 [LOOP] Re-arm OK: data=%s sync=%s\n", dsStr, ssStr);
+    } else {
+      Serial.println("⚠️ [LOOP] Re-arm PARTIAL – will retry next contact");
+      g_rearmAlarmsPending = true;  // retry
+    }
+  }
+
   if (g_rescueModeActive) {
     if (currentNodeState() != STATE_UNPAIRED) {
       g_rescueModeActive = false;
@@ -1834,6 +1920,18 @@ if (nowMs - lastA1Check > 1000UL) {
         ds3231DisableAlarmInterrupt();
         ds3231DisableAlarm2Interrupt();
         Serial.println("⏸️ A1F/A2F cleared/ignored (node not deployed)");
+      }
+    } else if (currentNodeState() == STATE_DEPLOYED && rtcSynced &&
+               !g_deployBootstrapPending && !g_rearmAlarmsPending &&
+               g_lastAlarmArmMs != 0) {
+      // Watchdog: if alarms were armed but haven't fired past the expected window, force re-arm.
+      // Grace = interval + 2 minutes to tolerate clock skew and boot time.
+      const uint32_t graceMs = ((uint32_t)g_intervalMin * 60UL + 120UL) * 1000UL;
+      if ((nowMs - g_lastAlarmArmMs) > graceMs) {
+        Serial.printf("⚠️ [WATCHDOG] Alarm overdue: armed %lus ago, interval=%umin – re-arming\n",
+                      (unsigned long)((nowMs - g_lastAlarmArmMs) / 1000UL),
+                      (unsigned)g_intervalMin);
+        g_rearmAlarmsPending = true;
       }
     }
   }

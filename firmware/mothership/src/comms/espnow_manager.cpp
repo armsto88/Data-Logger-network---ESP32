@@ -56,6 +56,69 @@ static const uint32_t STALE_ASSIST_LEAD_MS = 20000UL;
 static const uint32_t STALE_ASSIST_LAG_MS = 45000UL;
 static const uint32_t STALE_ASSIST_RETRY_MS = 10000UL;
 
+struct SyncRxTracker {
+    String nodeId;
+    uint32_t helloMs;
+    uint8_t expectedQueue;
+    uint16_t receivedInWindow;
+    uint32_t lastLogMs;
+    bool completionLogged;
+};
+static std::vector<SyncRxTracker> g_syncRxTrackers;
+
+static SyncRxTracker* getSyncRxTracker(const String& nodeId) {
+    for (auto& t : g_syncRxTrackers) {
+        if (t.nodeId == nodeId) return &t;
+    }
+    SyncRxTracker t{};
+    t.nodeId = nodeId;
+    t.helloMs = 0;
+    t.expectedQueue = 0;
+    t.receivedInWindow = 0;
+    t.lastLogMs = 0;
+    t.completionLogged = false;
+    g_syncRxTrackers.push_back(t);
+    return &g_syncRxTrackers.back();
+}
+
+static void noteNodeHelloForSyncRx(const char* nodeId, uint8_t queueDepth) {
+    if (!nodeId || !nodeId[0]) return;
+    SyncRxTracker* t = getSyncRxTracker(String(nodeId));
+    if (!t) return;
+    t->helloMs = millis();
+    t->expectedQueue = queueDepth;
+    t->receivedInWindow = 0;
+    t->lastLogMs = 0;
+    t->completionLogged = false;
+    Serial.printf("[SYNC_RX] %s hello: queued=%u\n", nodeId, (unsigned)queueDepth);
+}
+
+static void noteNodeSampleForSyncRx(const char* nodeId) {
+    if (!nodeId || !nodeId[0]) return;
+    SyncRxTracker* t = getSyncRxTracker(String(nodeId));
+    if (!t) return;
+
+    t->receivedInWindow++;
+    const uint32_t nowMs = millis();
+    const bool periodicLog = (t->lastLogMs == 0) || ((nowMs - t->lastLogMs) >= 5000UL);
+    if (periodicLog) {
+        Serial.printf("[SYNC_RX] %s received=%u", nodeId, (unsigned)t->receivedInWindow);
+        if (t->expectedQueue > 0) {
+            Serial.printf("/%u", (unsigned)t->expectedQueue);
+        }
+        Serial.println();
+        t->lastLogMs = nowMs;
+    }
+
+    if (t->expectedQueue > 0 && !t->completionLogged && t->receivedInWindow >= t->expectedQueue) {
+        t->completionLogged = true;
+        Serial.printf("[SYNC_RX] %s flush complete approx (%u/%u)\n",
+                      nodeId,
+                      (unsigned)t->receivedInWindow,
+                      (unsigned)t->expectedQueue);
+    }
+}
+
 // CSV writes are buffered from ESP-NOW callback context and drained from the main loop.
 static constexpr uint8_t kCsvQueueCapacity = 32;
 static constexpr size_t kCsvRowMaxLen = 320;
@@ -148,7 +211,8 @@ static void queuePendingState(NodeInfo& node, NodePendingState target) {
     const bool changed = (!node.stateChangePending) || (node.pendingTargetState != target);
     node.stateChangePending = true;
     node.pendingTargetState = target;
-    node.pendingLastAttemptMs = nowMs;
+    // Force an immediate retry on next contact when target changed.
+    node.pendingLastAttemptMs = changed ? 0 : nowMs;
     if (changed || node.pendingSinceMs == 0) {
         node.pendingSinceMs = nowMs;
     }
@@ -229,9 +293,50 @@ static bool pushSyncScheduleToNode(const uint8_t* senderMac,
     ensurePeerOnChannel(senderMac, ESPNOW_CHANNEL);
     esp_wifi_set_channel(ESPNOW_CHANNEL, WIFI_SECOND_CHAN_NONE);
     esp_err_t res = esp_now_send(senderMac, (uint8_t*)&sched, sizeof(sched));
-    Serial.printf("↪ Stale-assist SET_SYNC_SCHED to %s (syncMin=%u phase=%lu): %s\n",
+    Serial.printf("↪ SET_SYNC_SCHED to %s (syncMin=%u phase=%lu): %s\n",
                   nodeId,
                   (unsigned)syncMin,
+                  (unsigned long)phaseUnix,
+                  (res == ESP_OK) ? "OK" : esp_err_to_name(res));
+    return (res == ESP_OK);
+}
+
+static bool pushWakeScheduleToNode(const uint8_t* senderMac,
+                                   const char* nodeId,
+                                   uint8_t wakeMin) {
+    if (!senderMac || !nodeId || !isReasonableWakeInterval(wakeMin)) return false;
+
+    schedule_command_message_t cmd{};
+    strcpy(cmd.command, "SET_SCHEDULE");
+    strncpy(cmd.mothership_id, DEVICE_ID, sizeof(cmd.mothership_id) - 1);
+    cmd.intervalMinutes = wakeMin;
+
+    ensurePeerOnChannel(senderMac, ESPNOW_CHANNEL);
+    esp_wifi_set_channel(ESPNOW_CHANNEL, WIFI_SECOND_CHAN_NONE);
+    esp_err_t res = esp_now_send(senderMac, (uint8_t*)&cmd, sizeof(cmd));
+    Serial.printf("↪ Deploy-align SET_SCHEDULE to %s (%u min): %s\n",
+                  nodeId,
+                  (unsigned)wakeMin,
+                  (res == ESP_OK) ? "OK" : esp_err_to_name(res));
+    return (res == ESP_OK);
+}
+
+static bool pushSyncWindowOpenToNode(const uint8_t* senderMac,
+                                     const char* nodeId,
+                                     uint32_t phaseUnix) {
+    if (!senderMac || !nodeId || phaseUnix == 0) return false;
+
+    sync_schedule_command_message_t cmd{};
+    strcpy(cmd.command, "SYNC_WINDOW_OPEN");
+    strncpy(cmd.mothership_id, DEVICE_ID, sizeof(cmd.mothership_id) - 1);
+    cmd.syncIntervalMinutes = 0;
+    cmd.phaseUnix = phaseUnix;
+
+    ensurePeerOnChannel(senderMac, ESPNOW_CHANNEL);
+    esp_wifi_set_channel(ESPNOW_CHANNEL, WIFI_SECOND_CHAN_NONE);
+    esp_err_t res = esp_now_send(senderMac, (uint8_t*)&cmd, sizeof(cmd));
+    Serial.printf("↪ Deploy-align SYNC_WINDOW_OPEN to %s (phase=%lu): %s\n",
+                  nodeId,
                   (unsigned long)phaseUnix,
                   (res == ESP_OK) ? "OK" : esp_err_to_name(res));
     return (res == ESP_OK);
@@ -453,7 +558,15 @@ static void OnDataRecv(const uint8_t * mac,
                 NodeState previous = target->state;
                 target->lastSeen = millis();
                 target->isActive = true;
-                target->state = reported;
+                const bool lockUnpaired = (target->state == UNPAIRED) ||
+                                          (target->stateChangePending && target->pendingTargetState == PENDING_TO_UNPAIRED);
+                if (lockUnpaired && reported != UNPAIRED) {
+                    Serial.printf("🛡️ NODE_STATUS promotion blocked for %s while UI state is UNPAIRED/pending-unpair\n",
+                                  st.nodeId);
+                    target->state = UNPAIRED;
+                } else {
+                    target->state = reported;
+                }
                 target->deployPending = (reported == DEPLOYED) ? target->deployPending : false;
 
                 if (reported == UNPAIRED && target->stateChangePending) {
@@ -480,6 +593,8 @@ static void OnDataRecv(const uint8_t * mac,
     if (len == sizeof(sensor_data_message_t)) {
         sensor_data_message_t incoming{};
         memcpy(&incoming, incomingBytes, sizeof(incoming));
+
+        noteNodeSampleForSyncRx(incoming.nodeId);
 
         if (g_sensorDataEventCb) {
             g_sensorDataEventCb(incoming, mac);
@@ -563,12 +678,17 @@ static void OnDataRecv(const uint8_t * mac,
             }
         }
 
-        // If a deployed node is producing data, clear stale deployPending even if HELLO/DEPLOY_ACK was missed.
+        // If a deployed node is producing data, treat it as runtime deploy confirmation.
         for (auto& n : registeredNodes) {
-            if (n.nodeId == String(incoming.nodeId) && n.deployPending) {
-                n.deployPending = false;
-                Serial.printf("✅ Deploy pending cleared by SENSOR data from %s\n", incoming.nodeId);
-                savePairedNodes();
+            if (n.nodeId == String(incoming.nodeId)) {
+                if (n.stateChangePending && n.pendingTargetState == PENDING_TO_DEPLOYED) {
+                    clearPendingState(n, "SENSOR data confirms deployed runtime");
+                }
+                if (n.deployPending) {
+                    n.deployPending = false;
+                    Serial.printf("✅ Deploy pending cleared by SENSOR data from %s\n", incoming.nodeId);
+                    savePairedNodes();
+                }
                 break;
             }
         }
@@ -838,6 +958,9 @@ static void OnDataRecv(const uint8_t * mac,
                 if (n.nodeId == String(ack.nodeId) || memcmp(n.mac, mac, 6) == 0) {
                     blockDeployPromotion = n.stateChangePending &&
                                            n.pendingTargetState != PENDING_TO_DEPLOYED;
+                    if (!blockDeployPromotion && n.state == UNPAIRED) {
+                        blockDeployPromotion = true;
+                    }
                     if (blockDeployPromotion) {
                         Serial.printf("🛡️ DEPLOY_ACK promotion blocked for %s while pending target=%s\n",
                                       ack.nodeId,
@@ -853,6 +976,18 @@ static void OnDataRecv(const uint8_t * mac,
             savePairedNodes();
             for (auto& n : registeredNodes) {
                 if (n.nodeId == String(ack.nodeId) || memcmp(n.mac, mac, 6) == 0) {
+                    // Clear deploy-pending so the UI removes the "pending" indicator.
+                    if (n.deployPending) {
+                        n.deployPending = false;
+                        Serial.printf("✅ deployPending cleared by DEPLOY_ACK from %s\n", ack.nodeId);
+                    }
+                    // Infer config version applied from ACK (avoids waiting for CONFIG_ACK).
+                    NodeDesiredConfig desired = getDesiredConfig(ack.nodeId);
+                    if (desired.configVersion > 0 && n.configVersionApplied < desired.configVersion) {
+                        n.configVersionApplied = desired.configVersion;
+                        Serial.printf("✅ configVersionApplied inferred from DEPLOY_ACK for %s: v%u\n",
+                                      ack.nodeId, (unsigned)desired.configVersion);
+                    }
                     if (n.stateChangePending && n.pendingTargetState == PENDING_TO_DEPLOYED) {
                         clearPendingState(n, "DEPLOY_ACK received");
                     }
@@ -969,13 +1104,20 @@ void espnow_loop() {
         if (!(n.state == PAIRED || n.state == DEPLOYED)) continue;
 
         NodeDesiredConfig desired = getDesiredConfig(n.nodeId.c_str());
-        uint8_t wakeMin = 0;
-        if (desired.wakeIntervalMin > 0) wakeMin = desired.wakeIntervalMin;
-        else if (n.wakeIntervalMin > 0) wakeMin = n.wakeIntervalMin;
-        else if (n.inferredWakeIntervalMin > 0) wakeMin = n.inferredWakeIntervalMin;
-        if (!isReasonableWakeInterval(wakeMin)) continue;
+        uint16_t cadenceMin = 0;
+        if (n.state == DEPLOYED && desired.syncIntervalMin > 0) {
+            // Deployed nodes are expected to sync on fleet cadence, not every wake.
+            cadenceMin = desired.syncIntervalMin;
+        } else if (desired.wakeIntervalMin > 0) {
+            cadenceMin = desired.wakeIntervalMin;
+        } else if (n.wakeIntervalMin > 0) {
+            cadenceMin = n.wakeIntervalMin;
+        } else if (n.inferredWakeIntervalMin > 0) {
+            cadenceMin = n.inferredWakeIntervalMin;
+        }
+        if (!isReasonableWakeInterval((uint8_t)cadenceMin)) continue;
 
-        const uint32_t periodMs = (uint32_t)wakeMin * 60000UL;
+        const uint32_t periodMs = (uint32_t)cadenceMin * 60000UL;
         const uint32_t ageMs = (now >= n.lastSeen) ? (now - n.lastSeen) : 0;
         const uint32_t missed = ageMs / periodMs;
         n.staleMissCount = (uint8_t)((missed > 255UL) ? 255UL : missed);
@@ -999,7 +1141,7 @@ void espnow_loop() {
                           n.nodeId.c_str(),
                           (unsigned long)missed,
                           (unsigned long)(ageMs / 1000UL),
-                          (unsigned)wakeMin,
+                          (unsigned)cadenceMin,
                           schedOk ? "OK" : "FAIL",
                           timeOk ? "OK" : "FAIL");
         }
@@ -1252,13 +1394,15 @@ void handleNodeHello(const uint8_t* senderMac, const node_hello_message_t& hello
                   hello.wakeIntervalMin, hello.queueDepth,
                   (unsigned long)hello.rtcUnix);
     Serial.printf("🔁 Cycle check-in from %s (node wake window open)\n", hello.nodeId);
+    noteNodeHelloForSyncRx(hello.nodeId, hello.queueDepth);
 
     // Register/refresh the node as active (HELLO counts as contact).
     // If UI has a pending non-deploy target, do not let HELLO re-promote to DEPLOYED.
     NodeState helloState = DEPLOYED;
     for (const auto& n : registeredNodes) {
         if (n.nodeId == String(hello.nodeId) || memcmp(n.mac, senderMac, 6) == 0) {
-            if (n.stateChangePending && n.pendingTargetState != PENDING_TO_DEPLOYED) {
+            if ((n.stateChangePending && n.pendingTargetState != PENDING_TO_DEPLOYED) ||
+                n.state == UNPAIRED) {
                 helloState = n.state;
                 Serial.printf("🛡️ HELLO promotion blocked for %s while pending target=%s\n",
                               hello.nodeId,
@@ -1279,6 +1423,9 @@ void handleNodeHello(const uint8_t* senderMac, const node_hello_message_t& hello
                 Serial.printf("✅ Config version inferred from HELLO for %s: appliedV=%u\n",
                               hello.nodeId,
                               (unsigned)n.configVersionApplied);
+            }
+            if (n.stateChangePending && n.pendingTargetState == PENDING_TO_DEPLOYED) {
+                clearPendingState(n, "HELLO confirms deployed runtime");
             }
             if (n.deployPending) {
                 n.deployPending = false;
@@ -1326,23 +1473,29 @@ bool broadcastSyncSchedule(int syncIntervalMinutes, unsigned long phaseUnix) {
     cmd.syncIntervalMinutes = (unsigned long)syncIntervalMinutes;
     cmd.phaseUnix = phaseUnix;
 
-    uint8_t bcast[6] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
-
-    ensurePeerOnChannel(bcast, ESPNOW_CHANNEL);
-    esp_wifi_set_channel(ESPNOW_CHANNEL, WIFI_SECOND_CHAN_NONE);
-
     bool anyOk = false;
+    bool anyEligible = false;
     const uint8_t burstCount = 3;
-    for (uint8_t i = 0; i < burstCount; ++i) {
-        esp_err_t res = esp_now_send(bcast, (uint8_t*)&cmd, sizeof(cmd));
-        if (res == ESP_OK) anyOk = true;
-        Serial.printf("📤 SET_SYNC_SCHED burst %u/%u %d min phase=%lu -> %s\n",
-                      (unsigned)(i + 1),
-                      (unsigned)burstCount,
-                      syncIntervalMinutes,
-                      phaseUnix,
-                      (res == ESP_OK) ? "OK" : esp_err_to_name(res));
-        if (i + 1 < burstCount) delay(200);
+    for (auto& n : registeredNodes) {
+        if (n.state != PAIRED && n.state != DEPLOYED) continue;
+        anyEligible = true;
+        ensurePeerOnChannel(n.mac, ESPNOW_CHANNEL);
+        esp_wifi_set_channel(ESPNOW_CHANNEL, WIFI_SECOND_CHAN_NONE);
+        for (uint8_t i = 0; i < burstCount; ++i) {
+            esp_err_t res = esp_now_send(n.mac, (uint8_t*)&cmd, sizeof(cmd));
+            if (res == ESP_OK) anyOk = true;
+            Serial.printf("📤 SET_SYNC_SCHED %s burst %u/%u %d min phase=%lu -> %s\n",
+                          n.nodeId.c_str(),
+                          (unsigned)(i + 1),
+                          (unsigned)burstCount,
+                          syncIntervalMinutes,
+                          phaseUnix,
+                          (res == ESP_OK) ? "OK" : esp_err_to_name(res));
+            if (i + 1 < burstCount) delay(200);
+        }
+    }
+    if (!anyEligible) {
+        Serial.println("⚠️ SET_SYNC_SCHED skipped: no PAIRED/DEPLOYED nodes eligible");
     }
     return anyOk;
 }
@@ -1355,22 +1508,28 @@ bool broadcastSyncWindowOpen(unsigned long phaseUnix) {
     cmd.syncIntervalMinutes = 0;
     cmd.phaseUnix = phaseUnix;
 
-    uint8_t bcast[6] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
-
-    ensurePeerOnChannel(bcast, ESPNOW_CHANNEL);
-    esp_wifi_set_channel(ESPNOW_CHANNEL, WIFI_SECOND_CHAN_NONE);
-
     bool anyOk = false;
+    bool anyEligible = false;
     const uint8_t burstCount = 3;
-    for (uint8_t i = 0; i < burstCount; ++i) {
-        esp_err_t res = esp_now_send(bcast, (uint8_t*)&cmd, sizeof(cmd));
-        if (res == ESP_OK) anyOk = true;
-        Serial.printf("📤 SYNC_WINDOW_OPEN burst %u/%u phase=%lu -> %s\n",
-                      (unsigned)(i + 1),
-                      (unsigned)burstCount,
-                      phaseUnix,
-                      (res == ESP_OK) ? "OK" : esp_err_to_name(res));
-        if (i + 1 < burstCount) delay(200);
+    for (auto& n : registeredNodes) {
+        if (n.state != PAIRED && n.state != DEPLOYED) continue;
+        anyEligible = true;
+        ensurePeerOnChannel(n.mac, ESPNOW_CHANNEL);
+        esp_wifi_set_channel(ESPNOW_CHANNEL, WIFI_SECOND_CHAN_NONE);
+        for (uint8_t i = 0; i < burstCount; ++i) {
+            esp_err_t res = esp_now_send(n.mac, (uint8_t*)&cmd, sizeof(cmd));
+            if (res == ESP_OK) anyOk = true;
+            Serial.printf("📤 SYNC_WINDOW_OPEN %s burst %u/%u phase=%lu -> %s\n",
+                          n.nodeId.c_str(),
+                          (unsigned)(i + 1),
+                          (unsigned)burstCount,
+                          phaseUnix,
+                          (res == ESP_OK) ? "OK" : esp_err_to_name(res));
+            if (i + 1 < burstCount) delay(200);
+        }
+    }
+    if (!anyEligible) {
+        Serial.println("⚠️ SYNC_WINDOW_OPEN skipped: no PAIRED/DEPLOYED nodes eligible");
     }
     return anyOk;
 }
@@ -1639,6 +1798,28 @@ bool deploySelectedNodes(const std::vector<String>& nodeIds) {
                                       timeBuffer,
                                       (result == ESP_OK ? "OK" : esp_err_to_name(result)),
                                       (resultBcast == ESP_OK ? "OK" : esp_err_to_name(resultBcast)));
+
+                        // Immediate post-deploy alignment while radios are already awake.
+                        NodeDesiredConfig align = desired;
+                        align.configVersion = deployCmd.configVersion;
+                        align.wakeIntervalMin = deployCmd.wakeIntervalMin;
+                        align.syncIntervalMin = deployCmd.syncIntervalMin;
+                        align.syncPhaseUnix = deployCmd.syncPhaseUnix;
+
+                        bool wakeOk = pushWakeScheduleToNode(node.mac, nodeId.c_str(), deployCmd.wakeIntervalMin);
+                        bool snapOk = pushDesiredConfigSnapshot(node.mac, nodeId.c_str(), align);
+                        bool schedOk = pushSyncScheduleToNode(node.mac, nodeId.c_str(), align);
+                        bool markerOk = pushSyncWindowOpenToNode(node.mac, nodeId.c_str(), deployCmd.syncPhaseUnix);
+                        bool timeOk = sendTimeSync(node.mac, nodeId.c_str());
+                        node.wakeIntervalMin = deployCmd.wakeIntervalMin;
+
+                        Serial.printf("✅ Deploy-align bundle for %s: wake=%s snapshot=%s syncSched=%s marker=%s time=%s\n",
+                                      nodeId.c_str(),
+                                      wakeOk ? "OK" : "FAIL",
+                                      snapOk ? "OK" : "FAIL",
+                                      schedOk ? "OK" : "FAIL",
+                                      markerOk ? "OK" : "FAIL",
+                                      timeOk ? "OK" : "FAIL");
                     } else {
                         Serial.printf("⚠️ Deploy send missed for %s (direct=%s, bcast=%s) — pending replay queued\n",
                                       nodeId.c_str(),

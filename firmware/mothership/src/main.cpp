@@ -2083,16 +2083,10 @@ void handleNodeConfigForm() {
   String notes   = getNodeNotes(target->nodeId);
   String appliedLabel = "";
   if (!target->stateChangePending && target->lastStateAppliedMs > 0) {
-    const unsigned long ageSec = (millis() >= target->lastStateAppliedMs)
-      ? ((millis() - target->lastStateAppliedMs) / 1000UL)
-      : 0;
     if (target->lastAppliedTargetState == PENDING_TO_PAIRED) appliedLabel = "State applied: Paired";
     else if (target->lastAppliedTargetState == PENDING_TO_UNPAIRED) appliedLabel = "State applied: Unpaired";
     else if (target->lastAppliedTargetState == PENDING_TO_DEPLOYED) appliedLabel = "State applied: Deployed";
     else appliedLabel = "State applied";
-    appliedLabel += " (";
-    appliedLabel += String(ageSec);
-    appliedLabel += "s ago)";
   }
   const bool isDeployed = (target->state == DEPLOYED);
   uint8_t observedWakeMin = (target->wakeIntervalMin > 0)
@@ -2482,16 +2476,10 @@ void handleNodesPage() {
 
       String appliedLabel = "";
       if (!node.stateChangePending && node.lastStateAppliedMs > 0) {
-        const unsigned long ageSec = (millis() >= node.lastStateAppliedMs)
-          ? ((millis() - node.lastStateAppliedMs) / 1000UL)
-          : 0;
         if (node.lastAppliedTargetState == PENDING_TO_PAIRED) appliedLabel = "Paired applied";
         else if (node.lastAppliedTargetState == PENDING_TO_UNPAIRED) appliedLabel = "Unpaired applied";
         else if (node.lastAppliedTargetState == PENDING_TO_DEPLOYED) appliedLabel = "Deploy applied";
         else appliedLabel = "Applied";
-        appliedLabel += " (";
-        appliedLabel += String(ageSec);
-        appliedLabel += "s)";
       }
 
       String displayId = userId.length() ? userId : node.nodeId;
