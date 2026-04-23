@@ -279,23 +279,45 @@ static uint32_t computeNextSyncUnix(uint32_t nowUnix) {
   return next.unixtime();
 }
 
-static String computeNextWakeIsoLocal(int intervalMin) {
+static String computeNextWakeIsoLocal(int intervalMin, uint32_t nodeLastSeenMs, bool nodeIsActive) {
   if (intervalMin <= 0) return String("n/a");
 
   const uint32_t nowUnix = getRTCTimeUnix();
-  // Node firmware arms A1 as "now + intervalMin" (not minute-bucket aligned),
-  // so preserve second-level cadence in the UI estimate.
-  const uint32_t nextUnix = nowUnix + (uint32_t)intervalMin * 60UL;
+  if (nowUnix <= 946684800UL) return String("n/a");
+
+  const uint32_t periodSec = (uint32_t)intervalMin * 60UL;
+  uint32_t nextUnix = nowUnix + periodSec;
+  bool estimated = true;
+
+  // Prefer a cadence anchored to the node's last contact, not "now + interval".
+  if (nodeLastSeenMs > 0) {
+    const uint32_t nowMs = millis();
+    const uint32_t ageMs = (nowMs >= nodeLastSeenMs) ? (nowMs - nodeLastSeenMs) : 0;
+    const uint32_t ageSec = ageMs / 1000UL;
+    const uint32_t anchorUnix = (nowUnix > ageSec) ? (nowUnix - ageSec) : nowUnix;
+
+    nextUnix = anchorUnix + periodSec;
+    if (nextUnix <= nowUnix) {
+      const uint32_t behind = nowUnix - nextUnix;
+      const uint32_t jumps = (behind / periodSec) + 1UL;
+      nextUnix += jumps * periodSec;
+    }
+
+    // If node is currently active, this is a strong estimate (fresh wake anchor).
+    estimated = !nodeIsActive;
+  }
+
   DateTime now(nowUnix);
   DateTime next(nextUnix);
-
   const uint32_t deltaSec = (next.unixtime() > now.unixtime()) ? (next.unixtime() - now.unixtime()) : 0;
   const uint32_t deltaMin = (deltaSec + 59UL) / 60UL;
 
   String out = formatDateTimeDisplay(next);
   out += " (in ";
   out += String((unsigned long)deltaMin);
-  out += " min)";
+  out += " min";
+  if (estimated) out += ", est";
+  out += ")";
   return out;
 }
 
@@ -924,6 +946,7 @@ static bool handleBleCommand(
     if (!extractJsonIntFieldLocal(payloadJson, "phaseUnix", phase) || phase <= 0) {
       phase = (long)getRTCTimeUnix();
     }
+    phase -= (phase % 60L);
 
     bool sent = broadcastSyncSchedule(interval, (unsigned long)phase);
     gSyncIntervalMin = interval;
@@ -1917,6 +1940,30 @@ void handleSetSyncMode() {
   gLastSyncIntervalSlot = -1;
   saveSyncRuntimeGuardsToNVS();
 
+  const uint32_t modePhaseUnix = computeNextSyncUnix(getRTCTimeUnix());
+  const uint16_t modeSyncMin = (gSyncMode == SYNC_MODE_INTERVAL) ? (uint16_t)gSyncIntervalMin : 0u;
+  for (const auto& node : registeredNodes) {
+    NodeDesiredConfig dc = getDesiredConfig(node.nodeId.c_str());
+    bool changed = false;
+    if (dc.syncIntervalMin != modeSyncMin) {
+      dc.syncIntervalMin = modeSyncMin;
+      changed = true;
+    }
+    if (dc.syncPhaseUnix != modePhaseUnix) {
+      dc.syncPhaseUnix = modePhaseUnix;
+      changed = true;
+    }
+    if (dc.configVersion == 0) {
+      dc.configVersion = 1;
+      changed = true;
+    } else if (changed) {
+      dc.configVersion = (dc.configVersion < 0xFFFFu) ? (dc.configVersion + 1u) : 1u;
+    }
+    if (changed) {
+      setDesiredConfig(node.nodeId.c_str(), dc);
+    }
+  }
+
   Serial.printf("[UI] Sync mode set to %s\n", syncModeLabel());
 
   if (isAjaxRequest()) {
@@ -2032,6 +2079,31 @@ void handleSetSyncTime() {
   gLastSyncBroadcastUnix = 0;
   gLastSyncIntervalSlot = -1;
   saveSyncRuntimeGuardsToNVS();
+
+  if (gSyncMode == SYNC_MODE_DAILY) {
+    const uint32_t dailyPhaseUnix = computeNextSyncUnix(getRTCTimeUnix());
+    for (const auto& node : registeredNodes) {
+      NodeDesiredConfig dc = getDesiredConfig(node.nodeId.c_str());
+      bool changed = false;
+      if (dc.syncIntervalMin != 0u) {
+        dc.syncIntervalMin = 0u;
+        changed = true;
+      }
+      if (dc.syncPhaseUnix != dailyPhaseUnix) {
+        dc.syncPhaseUnix = dailyPhaseUnix;
+        changed = true;
+      }
+      if (dc.configVersion == 0) {
+        dc.configVersion = 1;
+        changed = true;
+      } else if (changed) {
+        dc.configVersion = (dc.configVersion < 0xFFFFu) ? (dc.configVersion + 1u) : 1u;
+      }
+      if (changed) {
+        setDesiredConfig(node.nodeId.c_str(), dc);
+      }
+    }
+  }
 
   Serial.printf("[UI] Daily sync time set to %02d:%02d\n", gSyncDailyHour, gSyncDailyMinute);
 
@@ -2265,12 +2337,21 @@ void handleNodeConfigSave() {
   if (globalPhaseUnix == 0) {
     globalPhaseUnix = getRTCTimeUnix();
   }
+  if (gSyncMode == SYNC_MODE_DAILY) {
+    const uint32_t dayStartUnix = (globalPhaseUnix / 86400UL) * 86400UL;
+    const uint32_t targetOffset = (uint32_t)gSyncDailyHour * 3600UL + (uint32_t)gSyncDailyMinute * 60UL;
+    uint32_t nextDailyUnix = dayStartUnix + targetOffset;
+    if (nextDailyUnix <= getRTCTimeUnix()) nextDailyUnix += 86400UL;
+    globalPhaseUnix = nextDailyUnix;
+  }
+  globalPhaseUnix -= (globalPhaseUnix % 60UL);
   if (dc.wakeIntervalMin != (uint8_t)interval) {
     dc.wakeIntervalMin = (uint8_t)interval;
     cfgChanged = true;
   }
-  if (dc.syncIntervalMin != (uint16_t)gSyncIntervalMin) {
-    dc.syncIntervalMin = (uint16_t)gSyncIntervalMin;
+  const uint16_t desiredSyncMin = (gSyncMode == SYNC_MODE_DAILY) ? 0u : (uint16_t)gSyncIntervalMin;
+  if (dc.syncIntervalMin != desiredSyncMin) {
+    dc.syncIntervalMin = desiredSyncMin;
     cfgChanged = true;
   }
   if (dc.syncPhaseUnix != globalPhaseUnix) {
@@ -2437,9 +2518,10 @@ void handleNodesPage() {
     html += F("<p class='muted'>No nodes registered yet. Try discovering and pairing first.</p>");
   } else {
     html += F("<p class='muted' style='margin:0 0 10px 0'>"
-              "Interval shows the configured target for each node. "
-              "Queue is pending samples last reported by the node at wake start."
-              "</p>");
+          "Interval shows the configured target for each node. "
+          "Next wake uses last node contact cadence (est while asleep). "
+          "Queue is buffered samples reported by the node at wake start."
+          "</p>");
     html += F("<div class='list'>");
 
         for (auto &node : allNodes) {
@@ -2461,7 +2543,7 @@ void handleNodesPage() {
             ? (int)observedWakeMin
             : (isAllowedInterval(gWakeIntervalMin) ? gWakeIntervalMin : 5));
       const uint8_t nodeQueueDepth = node.lastReportedQueueDepth;
-      const String nextWake = computeNextWakeIsoLocal(nodeIntervalCurrentMin);
+      const String nextWake = computeNextWakeIsoLocal(nodeIntervalCurrentMin, node.lastSeen, node.isActive);
       const String nextWakeTime = (nextWake.length() >= 8) ? nextWake.substring(0, 8) : String("n/a");
       if (cfgPending && node.state == DEPLOYED && !node.deployPending &&
           nodeDesired.wakeIntervalMin > 0 && observedWakeMin > 0 &&
@@ -2478,7 +2560,7 @@ void handleNodesPage() {
       if (!node.stateChangePending && node.lastStateAppliedMs > 0) {
         if (node.lastAppliedTargetState == PENDING_TO_PAIRED) appliedLabel = "Paired applied";
         else if (node.lastAppliedTargetState == PENDING_TO_UNPAIRED) appliedLabel = "Unpaired applied";
-        else if (node.lastAppliedTargetState == PENDING_TO_DEPLOYED) appliedLabel = "Deploy applied";
+        else if (node.lastAppliedTargetState == PENDING_TO_DEPLOYED) appliedLabel = "";
         else appliedLabel = "Applied";
       }
 
@@ -2746,12 +2828,19 @@ void loop() {
       const bool retryDue = (gLastSyncBroadcastMs == 0) || ((millis() - gLastSyncBroadcastMs) >= kDailyRetryIntervalMs);
 
       if (inDailyRetryWindow && dayNotCompleted && retryDue) {
-        const bool sent = broadcastSyncSchedule(gSyncIntervalMin, nowUnix);
-        const bool markerSent = broadcastSyncWindowOpen(nowUnix);
+        // Encode the precise target HH:MM in phaseUnix so nodes extract the correct
+        // daily time. Using nowUnix would cause the re-armed alarm to drift each day
+        // by the broadcast-arrival offset from the configured target.
+        const uint32_t dayStartUnix = (nowUnix / 86400UL) * 86400UL;
+        const uint32_t phaseUnix = dayStartUnix
+            + (uint32_t)gSyncDailyHour * 3600UL
+            + (uint32_t)gSyncDailyMinute * 60UL;
+        const bool sent = broadcastSyncSchedule(0, phaseUnix);
+        const bool markerSent = broadcastSyncWindowOpen(phaseUnix);
         gLastSyncBroadcastMs = millis();
         if (sent || markerSent) {
           gLastSyncBroadcastEpochDay = epochDay;
-          gLastSyncBroadcastUnix = nowUnix;
+          gLastSyncBroadcastUnix = phaseUnix;
           saveSyncRuntimeGuardsToNVS();
           gSyncTriggerCount++;
           Serial.printf("[SYNC] Daily trigger %02d:%02d -> schedule=%s marker=%s\n",

@@ -24,6 +24,9 @@
 
 // External reference to DEVICE_ID from main.cpp
 extern const char* DEVICE_ID;
+extern int gSyncMode;
+extern int gSyncDailyHour;
+extern int gSyncDailyMinute;
 
 // Defined once in espnow_manager_globals.cpp
 extern const uint8_t KNOWN_SENSOR_NODES[][6];
@@ -50,6 +53,7 @@ static uint32_t g_lastCycleMonitorMs = 0;
 static const uint32_t CYCLE_MONITOR_INTERVAL_MS = 30UL * 1000UL;             // 30 s
 static void ensurePeerOnChannel(const uint8_t mac[6], uint8_t channel);
 static const uint32_t PENDING_RETRY_INTERVAL_MS = 5000UL;
+static constexpr int kSyncModeDaily = 0;
 static const uint8_t STALE_MISS_THRESHOLD = 3;
 static const uint32_t STALE_MIN_AGE_MS = 24UL * 60UL * 60UL * 1000UL;
 static const uint32_t STALE_ASSIST_LEAD_MS = 20000UL;
@@ -251,6 +255,15 @@ static bool isReasonableWakeInterval(uint8_t mins) {
     return mins >= 1 && mins <= 60;
 }
 
+static uint32_t computeNextDailySyncPhaseUnix(uint32_t nowUnix) {
+    const uint32_t dayStartUnix = (nowUnix / 86400UL) * 86400UL;
+    const uint32_t targetOffset = (uint32_t)max(0, min(23, gSyncDailyHour)) * 3600UL
+                                + (uint32_t)max(0, min(59, gSyncDailyMinute)) * 60UL;
+    uint32_t targetUnix = dayStartUnix + targetOffset;
+    if (targetUnix <= nowUnix) targetUnix += 86400UL;
+    return targetUnix;
+}
+
 static bool pushDesiredConfigSnapshot(const uint8_t* senderMac,
                                       const char* nodeId,
                                       const NodeDesiredConfig& desired) {
@@ -279,10 +292,20 @@ static bool pushSyncScheduleToNode(const uint8_t* senderMac,
                                    const NodeDesiredConfig& desired) {
     if (!senderMac || !nodeId) return false;
 
-    const uint16_t syncMin = (desired.syncIntervalMin > 0) ? desired.syncIntervalMin : 0;
+    uint16_t syncMin = (desired.syncIntervalMin > 0) ? desired.syncIntervalMin : 0;
     uint32_t phaseUnix = desired.syncPhaseUnix;
-    if (phaseUnix == 0) phaseUnix = getRTCTimeUnix();
-    if (syncMin == 0 || phaseUnix == 0) return false;
+
+    // Daily mode is a global fleet slot: nodes sync once/day at mothership time.
+    if (gSyncMode == kSyncModeDaily) {
+        syncMin = 0;  // 0 = daily mode sentinel; node extracts HH:MM from phaseUnix
+        phaseUnix = computeNextDailySyncPhaseUnix(getRTCTimeUnix());
+    } else if (phaseUnix == 0) {
+        phaseUnix = getRTCTimeUnix();
+    }
+
+    phaseUnix -= (phaseUnix % 60UL);
+    // Allow syncMin==0 (daily sentinel); only reject when there is no valid phase anchor
+    if (phaseUnix == 0) return false;
 
     sync_schedule_command_message_t sched{};
     strcpy(sched.command, "SET_SYNC_SCHED");
@@ -1763,12 +1786,23 @@ bool deploySelectedNodes(const std::vector<String>& nodeIds) {
                     deployCmd.wakeIntervalMin = (desired.wakeIntervalMin > 0)
                         ? desired.wakeIntervalMin
                         : (node.wakeIntervalMin > 0 ? node.wakeIntervalMin : DEFAULT_WAKE_INTERVAL_MINUTES);
-                    deployCmd.syncIntervalMin = (desired.syncIntervalMin > 0)
-                        ? desired.syncIntervalMin
-                        : 15;
-                    deployCmd.syncPhaseUnix = (desired.syncPhaseUnix > 0)
-                        ? desired.syncPhaseUnix
-                        : nowUnix;
+                    if (gSyncMode == kSyncModeDaily) {
+                        deployCmd.syncIntervalMin = 0;  // 0 = daily sentinel; node extracts HH:MM from phaseUnix
+                        deployCmd.syncPhaseUnix = computeNextDailySyncPhaseUnix(nowUnix);
+                    } else {
+                        deployCmd.syncIntervalMin = desired.syncIntervalMin;
+                        if (deployCmd.syncIntervalMin == 0 && desired.syncPhaseUnix == 0) {
+                            // Only fall back to interval mode when no explicit sync mechanism exists.
+                            deployCmd.syncIntervalMin = 15;
+                        }
+
+                        // Use mothership-managed GLOBAL phase anchor for fleet slot alignment.
+                        // Do not re-anchor phase at deploy time, otherwise each node drifts to
+                        // its own "deploy+interval" schedule.
+                        deployCmd.syncPhaseUnix = (desired.syncPhaseUnix > 0)
+                            ? desired.syncPhaseUnix
+                            : (nowUnix - (nowUnix % 60UL));
+                    }
 
                     Serial.printf("📤 DEPLOY payload for %s: cfgV=%u wakeMin=%u syncMin=%u phase=%lu\n",
                                   nodeId.c_str(),

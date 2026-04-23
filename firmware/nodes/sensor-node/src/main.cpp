@@ -89,11 +89,15 @@ RTC_DS3231 rtc;
 
 // Sync wake behavior (minute-resolution DS3231 Alarm2 windowing)
 #ifndef SYNC_PRE_WAKE_SEC
-#define SYNC_PRE_WAKE_SEC 30
+#define SYNC_PRE_WAKE_SEC 0
 #endif
 
 #ifndef SYNC_LISTEN_WINDOW_MS
 #define SYNC_LISTEN_WINDOW_MS 60000
+#endif
+
+#ifndef SYNC_MARKER_GRACE_SEC
+#define SYNC_MARKER_GRACE_SEC 25UL
 #endif
 
 #ifndef SYNC_STALE_THRESHOLD_SEC
@@ -390,28 +394,46 @@ static bool ds3231ArmSyncWake(uint16_t syncIntervalMin,
                               uint32_t syncPhaseUnix,
                               uint32_t preWakeSec,
                               DateTime* wakeOut = nullptr) {
-  if (syncIntervalMin == 0) return false;
-
   uint32_t nowUnix = rtc.now().unixtime();
-  uint32_t periodSec = (uint32_t)syncIntervalMin * 60UL;
-  uint32_t phase = syncPhaseUnix;
-  if (phase == 0 || phase > nowUnix) phase = nowUnix;
+  uint32_t nextSyncUnix = 0;
 
-  uint32_t slot = (nowUnix - phase) / periodSec;
-  uint32_t nextSyncUnix = phase + (slot + 1UL) * periodSec;
+  if (syncIntervalMin == 0) {
+    // Daily mode: syncPhaseUnix carries the mothership's daily HH:MM anchor.
+    DateTime now(nowUnix);
+    DateTime phase((syncPhaseUnix > 0) ? syncPhaseUnix : nowUnix);
+    DateTime next(now.year(), now.month(), now.day(), phase.hour(), phase.minute(), 0);
+    if (now.unixtime() >= next.unixtime()) {
+      DateTime tomorrow(now.unixtime() + 24UL * 60UL * 60UL);
+      next = DateTime(tomorrow.year(), tomorrow.month(), tomorrow.day(), phase.hour(), phase.minute(), 0);
+    }
+    nextSyncUnix = next.unixtime();
+  } else {
+    uint32_t periodSec = (uint32_t)syncIntervalMin * 60UL;
+    uint32_t phase = syncPhaseUnix;
+    if (phase == 0 || phase > nowUnix) phase = nowUnix;
+
+    // Alarm2 is minute-resolution. Keep phase minute-aligned so each sync slot
+    // lands exactly on minute boundaries (e.g. 20:12:00, 20:17:00, ...).
+    if ((phase % 60UL) != 0UL) {
+      uint32_t oldPhase = phase;
+      phase -= (phase % 60UL);
+      Serial.printf("[A2] phase minute-aligned: %lu -> %lu\n",
+                    (unsigned long)oldPhase,
+                    (unsigned long)phase);
+    }
+
+    uint32_t slot = (nowUnix - phase) / periodSec;
+    nextSyncUnix = phase + (slot + 1UL) * periodSec;
+  }
   uint32_t wakeUnixRaw = (nextSyncUnix > preWakeSec) ? (nextSyncUnix - preWakeSec) : nextSyncUnix;
 
   // DS3231 Alarm2 is minute-resolution (no seconds register). If we pass a
   // wake time with seconds, programming minute/hour directly effectively floors
   // to :00 and can wake up to 59s too early. Round up to next minute instead.
-  uint32_t wakeUnix = wakeUnixRaw;
+  // Alarm2 is minute-resolution only, so use a deterministic programmed minute.
+  // This avoids logging impossible second-level wake values (e.g. xx:yy:49).
+  uint32_t wakeUnix = wakeUnixRaw - (wakeUnixRaw % 60UL);
   DateTime wakeRaw(wakeUnixRaw);
-  if (wakeRaw.second() != 0) {
-    wakeUnix += (60UL - (uint32_t)wakeRaw.second());
-  }
-  if (wakeUnix > nextSyncUnix) {
-    wakeUnix = nextSyncUnix;
-  }
 
   DateTime wake(wakeUnix);
   const uint8_t minBCD  = uint8_t(((wake.minute()/10)<<4) | (wake.minute()%10));
@@ -421,8 +443,13 @@ static bool ds3231ArmSyncWake(uint16_t syncIntervalMin,
   char wakeStr[24]; formatTime(wake, wakeStr, sizeof(wakeStr));
   char wakeRawStr[24]; formatTime(wakeRaw, wakeRawStr, sizeof(wakeRawStr));
   char syncStr[24]; formatTime(DateTime(nextSyncUnix), syncStr, sizeof(syncStr));
-  Serial.printf("[A2] Sync wake armed for %s (raw %s, target sync %s, pre=%lus)\n",
-                wakeStr, wakeRawStr, syncStr, (unsigned long)preWakeSec);
+  if (syncIntervalMin == 0) {
+    Serial.printf("[A2] Daily sync wake armed for %s (raw %s, target sync %s, pre=%lus, minute-resolution)\n",
+                  wakeStr, wakeRawStr, syncStr, (unsigned long)preWakeSec);
+  } else {
+    Serial.printf("[A2] Sync wake armed for %s (raw %s, target sync %s, pre=%lus, minute-resolution)\n",
+                  wakeStr, wakeRawStr, syncStr, (unsigned long)preWakeSec);
+  }
 
   if (wakeOut) *wakeOut = wake;
   return ds3231WriteA2(minBCD, hourBCD, dayReg);
@@ -761,6 +788,26 @@ static bool shouldSyncAt(uint32_t unixNow) {
   g_lastSyncSlot = slot;
   persistNodeConfig();
   return true;
+}
+
+static uint32_t nextSyncSlotUnix(uint32_t nowUnix) {
+  if (g_syncIntervalMin == 0) {
+    DateTime now(nowUnix);
+    DateTime phase((g_syncPhaseUnix > 0) ? g_syncPhaseUnix : nowUnix);
+    DateTime next(now.year(), now.month(), now.day(), phase.hour(), phase.minute(), 0);
+    if (now.unixtime() >= next.unixtime()) {
+      DateTime tomorrow(now.unixtime() + 24UL * 60UL * 60UL);
+      next = DateTime(tomorrow.year(), tomorrow.month(), tomorrow.day(), phase.hour(), phase.minute(), 0);
+    }
+    return next.unixtime();
+  }
+
+  const uint32_t periodSec = (uint32_t)g_syncIntervalMin * 60UL;
+  uint32_t phase = g_syncPhaseUnix;
+  if (phase == 0 || phase > nowUnix) phase = nowUnix;
+
+  const uint32_t slot = (nowUnix - phase) / periodSec;
+  return phase + (slot + 1UL) * periodSec;
 }
 
 static void captureSensorsToQueue() {
@@ -1213,15 +1260,11 @@ static void onDataReceived(const uint8_t *mac, const uint8_t *incomingData, int 
                     (unsigned long)lastTimeSyncUnix, buf);
 
       if (currentNodeState() == STATE_DEPLOYED && rtcSynced) {
-        DateTime nextData;
-        DateTime nextSync;
-        const bool rearmOk = armDeploymentWakeAlarms(&nextData, &nextSync);
-        char dataStr[24]; formatTime(nextData, dataStr, sizeof(dataStr));
-        char syncStr[24]; formatTime(nextSync, syncStr, sizeof(syncStr));
-        Serial.printf("   ↪ TIME_SYNC re-arm data=%s sync=%s (%s)\n",
-                      dataStr,
-                      syncStr,
-                      rearmOk ? "OK" : "PARTIAL");
+        // Queue re-arm for loop context to avoid I2C race with alarm flag polling.
+        if (!g_deployBootstrapPending) {
+          g_rearmAlarmsPending = true;
+        }
+        Serial.println("   ↪ TIME_SYNC re-arm queued for loop context");
       }
 
       debugState("after TIME_SYNC");
@@ -1530,6 +1573,11 @@ static void sendNodeHello() {
 }
 
 static bool armDeploymentWakeAlarms(DateTime* nextDataOut, DateTime* nextSyncOut) {
+  Serial.printf("[ARM] syncMode=%s syncMin=%u phase=%lu wakeMin=%u\n",
+                (g_syncIntervalMin == 0) ? "daily" : "interval",
+                (unsigned)g_syncIntervalMin,
+                (unsigned long)g_syncPhaseUnix,
+                (unsigned)g_intervalMin);
   bool okData = ds3231ArmNextInNMinutes(g_intervalMin, nextDataOut);
   bool okSync = ds3231ArmSyncWake(g_syncIntervalMin, g_syncPhaseUnix, SYNC_PRE_WAKE_SEC, nextSyncOut);
 
@@ -1600,8 +1648,29 @@ static void handleRtcWakeEvents(bool dataWake, bool syncWake) {
     g_syncWindowMarkerMs = 0;
     if (bringupEspNow()) {
       sendNodeHello();
+      const uint32_t nowUnix = rtc.now().unixtime();
+      const uint32_t targetSyncUnix = nextSyncSlotUnix(nowUnix);
+      const uint32_t baseListenSec = ((uint32_t)SYNC_LISTEN_WINDOW_MS + 999UL) / 1000UL;
+      uint32_t listenUntilUnix = nowUnix + baseListenSec;
+      if (targetSyncUnix > 0) {
+        const uint32_t targetPlusGraceUnix = targetSyncUnix + (uint32_t)SYNC_MARKER_GRACE_SEC;
+        if (listenUntilUnix < targetPlusGraceUnix) {
+          listenUntilUnix = targetPlusGraceUnix;
+        }
+      }
+
+      char targetStr[24];
+      if (targetSyncUnix > 0) formatTime(DateTime(targetSyncUnix), targetStr, sizeof(targetStr));
+      else snprintf(targetStr, sizeof(targetStr), "n/a");
+      char listenStr[24];
+      formatTime(DateTime(listenUntilUnix), listenStr, sizeof(listenStr));
+      Serial.printf("📶 Sync listen window until %s (target=%s, grace=%lus)\n",
+                    listenStr,
+                    targetStr,
+                    (unsigned long)SYNC_MARKER_GRACE_SEC);
+
       const uint32_t windowStart = millis();
-      while ((millis() - windowStart) < (uint32_t)SYNC_LISTEN_WINDOW_MS) {
+      while (rtc.now().unixtime() < listenUntilUnix) {
         if (g_syncWindowMarkerMs != 0) break;
         delay(50);
       }
