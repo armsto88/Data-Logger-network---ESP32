@@ -254,20 +254,15 @@ static uint32_t computeNextSyncUnix(uint32_t nowUnix) {
 
   if (gSyncMode == SYNC_MODE_INTERVAL) {
     const uint32_t periodSec = (uint32_t)max(gSyncIntervalMin, 1) * 60UL;
-    const uint32_t spacingReadyUnix = (gLastSyncBroadcastUnix > 0)
-      ? (gLastSyncBroadcastUnix + periodSec)
-      : nowUnix;
-    const uint32_t slotReadyUnix = (gLastSyncIntervalSlot >= 0)
-      ? (uint32_t)(((long long)gLastSyncIntervalSlot + 1LL) * (long long)periodSec)
-      : nowUnix;
-
-    // Earliest unix timestamp that satisfies BOTH runtime loop guards:
-    // 1) slot > gLastSyncIntervalSlot
-    // 2) now >= gLastSyncBroadcastUnix + periodSec
-    uint32_t nextUnix = nowUnix;
-    if (nextUnix < spacingReadyUnix) nextUnix = spacingReadyUnix;
-    if (nextUnix < slotReadyUnix) nextUnix = slotReadyUnix;
-    return nextUnix;
+    const uint32_t anchorUnix = (gLastSyncBroadcastUnix > 0)
+      ? gLastSyncBroadcastUnix
+      : (nowUnix - (nowUnix % 60UL));
+    if (nowUnix < anchorUnix) {
+      return anchorUnix;
+    }
+    const uint32_t elapsedSec = nowUnix - anchorUnix;
+    const uint32_t slotsElapsed = elapsedSec / periodSec;
+    return anchorUnix + (slotsElapsed + 1UL) * periodSec;
   }
 
   DateTime now(nowUnix);
@@ -1020,7 +1015,8 @@ static bool handleBleCommand(
     if (hasSync) {
       const int iv = (int)syncIv;
       if (isAllowedInterval(iv)) {
-        const unsigned long phaseUnix = (hasPhase && phase > 0) ? (unsigned long)phase : getRTCTimeUnix();
+        unsigned long phaseUnix = (hasPhase && phase > 0) ? (unsigned long)phase : getRTCTimeUnix();
+        phaseUnix -= (phaseUnix % 60UL);
         syncSent = broadcastSyncSchedule(iv, phaseUnix);
         gSyncIntervalMin = iv;
         gSyncMode = SYNC_MODE_INTERVAL;
@@ -1994,6 +1990,7 @@ void handleSetSyncInterval() {
   if (!ok) interval = 15;
 
   unsigned long phaseUnix = getRTCTimeUnix();
+  phaseUnix -= (phaseUnix % 60UL);
   bool sent = broadcastSyncSchedule(interval, phaseUnix);
 
   gSyncIntervalMin = interval;
@@ -2858,13 +2855,23 @@ void loop() {
       }
     } else {
       const uint32_t periodSec = (uint32_t)max(gSyncIntervalMin, 1) * 60UL;
-      const long long slot = (long long)(nowUnix / periodSec);
-      const bool spacedOk = (gLastSyncBroadcastUnix == 0) || (nowUnix >= (gLastSyncBroadcastUnix + periodSec));
+      const uint32_t anchorUnix = (gLastSyncBroadcastUnix > 0)
+        ? gLastSyncBroadcastUnix
+        : (nowUnix - (nowUnix % 60UL));
+      const long long slot = (nowUnix >= anchorUnix)
+        ? (long long)((nowUnix - anchorUnix) / periodSec)
+        : -1LL;
+      const bool spacedOk = (gLastSyncBroadcastMs == 0) || ((millis() - gLastSyncBroadcastMs) >= periodSec * 1000UL);
       if ((gLastSyncIntervalSlot < 0 || slot > gLastSyncIntervalSlot) && spacedOk) {
-        const bool sent = broadcastSyncSchedule(gSyncIntervalMin, nowUnix);
-        const bool markerSent = broadcastSyncWindowOpen(nowUnix);
+        const uint32_t currentSlotUnix = (slot >= 0)
+          ? (anchorUnix + (uint32_t)slot * periodSec)
+          : anchorUnix;
+        const bool sent = broadcastSyncSchedule(gSyncIntervalMin, anchorUnix);
+        const bool markerSent = broadcastSyncWindowOpen(currentSlotUnix);
         gLastSyncBroadcastMs = millis();
-        gLastSyncBroadcastUnix = nowUnix;
+        if (gLastSyncBroadcastUnix == 0) {
+          gLastSyncBroadcastUnix = anchorUnix;
+        }
         gLastSyncIntervalSlot = slot;
         saveSyncRuntimeGuardsToNVS();
         gSyncTriggerCount++;
@@ -2908,3 +2915,4 @@ void loop() {
 
   // Mothership-originated STATUS rows to SD are disabled.
 }
+

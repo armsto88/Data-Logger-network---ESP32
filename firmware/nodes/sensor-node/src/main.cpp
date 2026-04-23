@@ -1996,9 +1996,10 @@ if (nowMs - lastA1Check > 1000UL) {
       // Watchdog: if alarms were armed but haven't fired past the expected window, force re-arm.
       // Grace = interval + 2 minutes to tolerate clock skew and boot time.
       const uint32_t graceMs = ((uint32_t)g_intervalMin * 60UL + 120UL) * 1000UL;
-      if ((nowMs - g_lastAlarmArmMs) > graceMs) {
+      const uint32_t ageMs = (uint32_t)(millis() - g_lastAlarmArmMs);
+      if ((int32_t)(ageMs - graceMs) > 0) {
         Serial.printf("⚠️ [WATCHDOG] Alarm overdue: armed %lus ago, interval=%umin – re-arming\n",
-                      (unsigned long)((nowMs - g_lastAlarmArmMs) / 1000UL),
+                      (unsigned long)(ageMs / 1000UL),
                       (unsigned)g_intervalMin);
         g_rearmAlarmsPending = true;
       }
