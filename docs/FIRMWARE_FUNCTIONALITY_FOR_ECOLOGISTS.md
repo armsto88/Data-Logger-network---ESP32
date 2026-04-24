@@ -1,178 +1,388 @@
-# Firmware Functionality Overview for Ecologists
+# Firmware Functionality Overview — End-to-End Workflow
 
-Date: 2026-04-21
-Audience: Ecologists, field practitioners, and environmental monitoring teams
-Purpose: Explain what the firmware does in practical terms, how data moves through the system, and how field edge cases are handled.
+**Date:** 24 April 2026  
+**Audience:** Ecologists, field practitioners, and environmental monitoring teams  
+**Purpose:** Complete reference for how the system works from power-on through to CSV data download, including the web UI, node lifecycle, data flow, schedule control, and field edge cases.
 
-## 1. Why this firmware exists
+---
 
-This firmware is designed for ecological monitoring where sensors may be deployed in remote locations, run on limited power, and need to keep collecting data even when communications are intermittent.
+## Contents
 
-The system is built around two priorities:
+1. [System Overview](#1-system-overview)
+2. [First Access — Connecting to the Mothership](#2-first-access--connecting-to-the-mothership)
+3. [The Web UI — Page by Page](#3-the-web-ui--page-by-page)
+4. [Node Lifecycle — From Discovery to Deployment](#4-node-lifecycle--from-discovery-to-deployment)
+5. [Node Operating Behaviour When Deployed](#5-node-operating-behaviour-when-deployed)
+6. [Sync Windows — How Data Moves](#6-sync-windows--how-data-moves)
+7. [Data Logging — CSV Format and Storage](#7-data-logging--csv-format-and-storage)
+8. [Schedule Control](#8-schedule-control)
+9. [Edge Cases and Recovery](#9-edge-cases-and-recovery)
+10. [Removing a Node from Service](#10-removing-a-node-from-service)
+11. [Power and Battery Strategy](#11-power-and-battery-strategy)
+12. [Current Limits and Planned Work](#12-current-limits-and-planned-work)
+13. [Suggested Manuscript Framing](#13-suggested-manuscript-framing)
 
-1. Protect field data first.
-2. Use radio and power only when needed.
+---
 
-## 2. System at a glance
+## 1. System Overview
 
 The platform has two device roles:
 
-1. Node
-- A field sensor unit that wakes, measures, stores readings, and returns to low power.
-- It does not depend on constant network connectivity.
+**Node** — A field sensor unit. It wakes on a timer, reads sensors, stores readings in local memory, and goes back to sleep. It does not depend on the mothership being present at the time of measurement. Up to 24 samples can be queued before the oldest begin to be overwritten.
 
-2. Mothership
-- A collection and coordination unit.
-- It receives uploaded node data, writes records to storage, and manages schedules/configuration.
+**Mothership** — A collection and coordination unit. It runs a WiFi access point and a web server, receives uploaded node data, writes records to SD card CSV, and manages node schedules and configuration. Currently it runs continuously. A low-power scheduled-wake architecture is planned for field deployment.
 
-In practical terms, nodes do the measuring and buffering, while the mothership does the coordination and aggregation.
+**Core design principle:** nodes protect data first. Data is captured locally on the node and transferred to the mothership in bulk during scheduled sync windows. If the mothership is unavailable at sync time, the queue retains its data for the next window.
 
-## 3. Core behavior in normal operation
+---
 
-### 3.1 Node behavior
+## 2. First Access — Connecting to the Mothership
 
-At each scheduled wake:
+1. Power on the mothership.
+2. On your phone, tablet, or laptop, connect to the WiFi network named **`Logger001`** (or `Logger` + the configured device ID).
+3. No password is required.
+4. On most phones a captive portal page will open automatically. On a laptop, open a browser and navigate to **`http://192.168.4.1/`**.
 
-1. Wake from RTC alarm.
-2. Capture sensor readings.
-3. Store readings in local queue memory.
-4. Return to low power.
+The mothership serves its web interface on WiFi channel 11. Nodes communicate on the same channel. No internet connection is needed.
 
-At sync windows:
+---
 
-1. Wake and enable radio.
-2. Listen for mothership sync marker.
-3. If marker is seen, upload queued records.
-4. Re-arm alarms and sleep.
+## 3. The Web UI — Page by Page
 
-This queue-first design means the node can continue sampling even if the mothership is unavailable.
+### 3.1 Home Page (`/`)
 
-### 3.2 Mothership behavior
+The home page is the control centre. It shows:
 
-The mothership:
+**Top bar — Mothership time**
+The current RTC time read from the mothership's DS3231 clock. This is the time reference for all scheduling and logging. Can be corrected using the SET TIME panel.
 
-1. Broadcasts sync schedule and sync markers.
-2. Receives node uploads.
-3. Writes records to CSV storage.
-4. Tracks node status for the web UI.
-5. Pushes configuration updates when nodes check in.
+**Fleet summary chips**
+Three counts at a glance:
+- **Deployed** — nodes actively sampling and syncing.
+- **Paired** — nodes that have been paired but not yet deployed.
+- **Unpaired** — nodes seen but not yet paired.
 
-## 4. Data integrity approach
+**Action buttons**
+- **Discover Nodes** — sends a broadcast requesting all nearby powered nodes to announce themselves. New nodes appear in the fleet within seconds.
+- **Node Manager** — opens the full node list and configuration page.
+- **CSV** — downloads the current `datalog.csv` file directly to your device.
+- **INFO** — shows mothership device ID, firmware version, SSID, IP, and MAC address.
 
-The firmware prioritizes no-loss behavior under normal fault conditions.
+**Global Schedules section**
 
-1. Queue-first sampling
-- Data is collected locally first and uploaded later.
+Controls the timing shared across the whole fleet:
 
-2. Marker-gated uploads
-- Nodes upload only when sync marker conditions are met, reducing accidental out-of-window traffic.
+| Control | What it does |
+|---|---|
+| SET TIME | Manually set or correct the mothership DS3231 clock. Use the browser time button for convenience. |
+| Node interval | Default sampling interval applied to nodes on deploy or config update (1, 2, 5, 10, 15, 30, or 60 min). |
+| Sync mode | Switch between **Daily** (sync once per day at a fixed time) and **Interval** (sync every N minutes). |
+| Daily sync time | Time of day for daily sync (e.g. `06:00`). Shown when Daily mode is active. |
+| Sync interval | How often interval-mode syncs occur (5, 10, 15, 30, or 60 min). |
 
-3. Overflow policy
-- Queue uses controlled overwrite strategy (drop oldest) when full.
-- This protects latest observations in prolonged outage conditions.
+All schedule settings are persisted to NVS and survive a mothership reboot.
 
-4. Configuration handshakes
-- Config snapshots and acknowledgements are used to converge node settings safely.
+**Data status section**
+Shows SD card summary — record count and last logged timestamp.
 
-## 5. Power and battery strategy
+---
 
-The node is optimized for low duty cycle operation:
+### 3.2 Node Manager (`/nodes`)
 
-1. Radio mostly off between required communication windows.
-2. Sensor and communication tasks are brief and bounded.
-3. RTC alarms drive deterministic wake/sleep cycles.
+Lists every known node with one row per node. Refreshes automatically every 15 seconds.
 
-The mothership can support always-on bench operation now, with planned field mode where it powers on only for sync windows and user interaction.
+| Column | Meaning |
+|---|---|
+| ID / Name | User-assigned ID (e.g. `001`) and name (e.g. `River bank North`). Falls back to hardware-derived node ID if not yet assigned. |
+| Interval | The configured target wake interval for this node. |
+| Next wake | Estimated next wake time, computed from last contact time and configured interval. |
+| Queue | Number of samples buffered on the node since its last sync, as reported at last radio contact. |
+| Deploy chip | `Deployed`, `Paired`, or `Unpaired` — the node's lifecycle state. |
+| Config chip | `Config updated` (firmware acknowledged the latest config) or `Config pending` (a change is waiting for the node to confirm). |
 
-## 6. Typical field workflow
+Clicking a node row opens its individual configuration page.
 
-A practical deployment cycle looks like this:
+---
 
-1. Discover and pair node.
-2. Deploy with sampling and sync settings.
-3. Node collects data autonomously.
-4. Node uploads buffered data during sync windows.
-5. Mothership stores data and reports health in UI.
+### 3.3 Node Configuration Page (`/node-config?node_id=...`)
 
-When working correctly, operators can verify health through:
+**Information fields**
+- Firmware ID, hardware MAC address, last seen time, inferred wake cadence, queue depth.
 
-1. Recent node contact.
-2. Queue depth trends.
-3. Config status.
-4. Presence of fresh CSV records.
+**Configurable fields**
+- User-assigned ID and name (used in the CSV and UI).
+- Per-node wake interval (overrides global default when set).
+- Notes field.
 
-## 7. Edge cases and how firmware handles them
+**Actions**
+- **Deploy** — triggers the full deploy sequence with current settings.
+- **Unpair** — removes the node from the fleet. The UNPAIR command is sent at the next sync window.
+- **Pair only** — pair the node without deploying (useful for staging before committing schedules).
 
-### 7.1 Missed sync windows
+---
 
-If a node misses one or more sync opportunities, data remains in local queue and is retried in later windows.
+## 4. Node Lifecycle — From Discovery to Deployment
 
-### 7.2 Time drift or stale sync
+### 4.1 States
 
-Both sides support stale-sync recovery logic:
+| State | Meaning |
+|---|---|
+| **Unpaired** | Node is powered and broadcasting. Mothership knows it exists but has no association. |
+| **Paired** | Mothership has registered the node. The node knows the mothership's MAC. |
+| **Deployed** | Node is actively sampling, queuing, and syncing. RTC alarms are armed. |
 
-1. Node-side stale recovery
-- Node can request time and seek re-lock during bounded recovery windows.
+### 4.2 Step-by-Step Commissioning
 
-2. Mothership-side stale assist
-- Mothership infers stale behavior and can push schedule and time corrections.
+**Step 1 — Discover**
+Press **Discover Nodes** on the home page. The mothership broadcasts a discovery request. All powered unpaired nodes respond with their hardware ID, MAC address, and firmware type. New nodes appear in the Node Manager.
 
-### 7.3 Duplicate deploy commands
+**Step 2 — Configure**
+Click the node in the Node Manager. Assign a user ID and friendly name. Set the sampling interval if it differs from the global default.
 
-Duplicate deploy handling is hardened to prevent unintended extra immediate sampling cycles.
+**Step 3 — Deploy**
+Click **Deploy** in the node config page. The mothership:
+1. Sends a PAIR command if not already paired.
+2. Sends a DEPLOY command with: current RTC time, wake interval, sync interval, and the next fleet sync slot's Unix timestamp (the phase anchor — the actual next scheduled fleet sync time, not deploy time).
+3. Marks the node DEPLOYED locally and saves to NVS.
+4. Resets the sync slot guard (`gLastSyncIntervalSlot = -1`) so the next fleet sync fires cleanly from the new anchor.
 
-### 7.4 Boot alarm ambiguity
+The node:
+1. Sets its internal RTC from the deploy payload.
+2. Arms Alarm1 (A1) to `now + intervalMin` for the first data wake.
+3. Arms Alarm2 (A2) directly to the phase anchor (the next fleet sync slot).
+4. Sends DEPLOY_ACK back to the mothership.
+5. Runs an immediate first sample cycle, queues the data, then cuts power.
 
-Boot-time alarm flag handling preserves wake reason information so wake classification is not masked.
+**Step 4 — Verify**
+In the Node Manager: Deploy chip shows **Deployed** and Config chip shows **Config updated** after the node's next contact. Queue counter rises with each data wake.
 
-### 7.5 Recovery from difficult field state
+### 4.3 Configuration Handshake
 
-A 3-boot rescue mode is implemented for field recovery:
+Every sync wake, the node sends NODE_HELLO with its current config version and queue depth. If the mothership has a newer desired config, it pushes a CONFIG_SNAPSHOT. The node applies it and sends CONFIG_ACK, which flips the chip from **Config pending** to **Config updated**. If an ACK is dropped, the mothership infers convergence when the node's reported wake interval matches the desired setting.
 
-1. Trigger: three quick power cycles.
-2. Action: node resets to unpaired-safe state.
-3. Behavior: node stays awake, listens, and announces status.
-4. UI: mothership receives explicit node status updates and reflects unpaired state.
+---
 
-This gives teams a physical recovery path without needing extra wiring or deep technical intervention.
+## 5. Node Operating Behaviour When Deployed
 
-## 8. Operator-facing status meaning
+### 5.1 Data Wake (Alarm 1 — A1)
 
-To reduce confusion, the UI is designed to represent:
+Fires every N minutes. No radio activity.
 
-1. Intended interval (configured target) rather than only inferred runtime interval.
-2. Queue depth as pending samples reported by the node.
-3. Config pending versus config updated state.
-4. Node contact freshness (awake/asleep interpretation).
+1. Power-on (A1 alarm fires, gate powers the board).
+2. Load config from NVS.
+3. Read all sensors.
+4. Append readings to local queue.
+5. Re-arm A1 to `now + intervalMin`.
+6. Cut power.
 
-These indicators help users interpret whether a node is healthy, delayed, unsynced, or awaiting configuration actions.
+Boot to power-off: approximately 2–3 seconds. Radio stays entirely off.
 
-## 9. Current strengths and practical limits
+### 5.2 Sync Wake (Alarm 2 — A2)
 
-### Strengths
+Fires at the next scheduled fleet sync slot. This is when data is transmitted.
 
-1. Robust queue-first data capture.
-2. Strong low-power behavior for field nodes.
-3. Improved recovery from sync and deployment edge cases.
-4. Field-friendly rescue mode for hard recovery.
+1. Power-on (A2 alarm fires).
+2. Load config from NVS.
+3. Bring up WiFi + ESP-NOW radio.
+4. Send NODE_HELLO to mothership (unicast + broadcast for reliability).
+5. Wait up to 60 seconds for SYNC_WINDOW_OPEN marker from mothership.
+6. If marker received:
+   - Flush all queued records to the mothership.
+   - Each record is delivery-confirmed via ESP-NOW callback before being removed from the queue.
+   - Flush stops 2 seconds before the window deadline — any remaining records carry forward.
+7. If no marker in 60 seconds: queue is preserved, alarms re-armed, power cut.
+8. Re-arm A2 to next sync slot.
+9. Shut down radio and cut power.
 
-### Practical limits (current stage)
+### 5.3 Combined Wake (A1 + A2 align)
 
-1. Fleet-scale contention at larger node counts still needs tuning and profiling.
-2. Mothership full scheduled-power architecture is still evolving.
-3. Long-term validation across many-node deployments is ongoing.
+If both alarms fire at the same time, one combined cycle runs: sample → sync flush → re-arm both alarms → power down.
 
-## 10. Suggested wording for manuscript framing
+### 5.4 Queue Capacity and Overflow
 
-Suggested high-level framing:
+The queue holds 24 records. When full, the oldest record is dropped to make room. Dropped records are flagged with quality flag `QF = 0x0001` so the gap is visible in the CSV.
 
-The firmware architecture was designed for ecological field reliability under intermittent communications and constrained power budgets. Nodes prioritize local persistence and deferred transfer, while the mothership coordinates synchronization and collection windows. Recovery paths include automated stale-sync correction and an operator-triggered rescue mode to restore field recoverability without specialized hardware interfaces.
+---
 
-## 11. Next manuscript additions
+## 6. Sync Windows — How Data Moves
 
-Recommended follow-on sections for the manuscript:
+### 6.1 The Sync Anchor
 
-1. Validation summary table (single-node and multi-node test outcomes).
-2. Battery budget estimates for representative sampling intervals.
-3. Data completeness metrics across induced communication outages.
-4. Field protocol appendix for deployment, recovery, and troubleshooting.
+When a node is deployed, the mothership calculates the **next fleet sync slot** as the deploy anchor — the Unix timestamp of the next scheduled sync boundary. All deployed nodes share the same anchor and interval, so they all wake at the same moment fleet-wide.
+
+### 6.2 Mothership Sync Broadcast
+
+At the sync slot boundary + 5 seconds (5 s offset to allow node boot and radio-up time), the mothership sends:
+
+1. **SET_SYNC_SCHED** — 3 broadcasts, 200 ms apart. Carries the sync interval and phase anchor.
+2. **SYNC_WINDOW_OPEN** — 3 broadcasts, 200 ms apart. This is the marker that gates node queue flushing.
+
+All 6 transmissions use true ESP-NOW broadcast (`FF:FF:FF:FF:FF:FF`). Total radio time is fixed regardless of fleet size — a node count of 1 or 20 generates the same 6 packets.
+
+### 6.3 What the Node Does on Receiving the Marker
+
+The node receives the SYNC_WINDOW_OPEN marker and immediately begins transmitting queued records to the mothership. Each record is delivery-confirmed before removal from queue. Remaining records stay in queue for the next window.
+
+### 6.4 What the Mothership Does on Receiving Records
+
+Records arrive via ESP-NOW callback and are placed into a small in-RAM buffer, then drained to the SD card in the main loop. This decoupling means further incoming packets are not blocked during SD writes. Each record is appended to `/datalog.csv`.
+
+---
+
+## 7. Data Logging — CSV Format and Storage
+
+### 7.1 File
+
+Data is written to `/datalog.csv` on the mothership's SD card.
+
+On first boot (or after a firmware update that changes the header format), the file is created with the correct header. If an existing file has a mismatched header, it is automatically renamed to `/datalog_legacy.csv` and a new file is started — previous data is preserved.
+
+### 7.2 CSV Header
+
+```
+timestamp,node_id,node_name,mac,event_type,sensor_type,value,meta
+```
+
+| Field | Example | Meaning |
+|---|---|---|
+| `timestamp` | `11:02:05 24-04-2026` | Mothership RTC time at moment of logging (sync window time) |
+| `node_id` | `001` | User-assigned node ID |
+| `node_name` | `NODE 1` | User-assigned node name |
+| `mac` | `d4:e9:f4:94:5d:c4` | Node hardware MAC address |
+| `event_type` | `SENSOR` | Record type |
+| `sensor_type` | `SOIL1_VWC` | Sensor channel label |
+| `value` | `0.440` | Measured value |
+| `meta` | `FW_ID=ENV_945DC4;SENSOR_ID=2001;SENSOR_TYPE=SOIL_VWC;QF=0x0000;NODE_TS=1777028371` | Firmware ID, sensor ID, quality flags, and node measurement timestamp |
+
+**Key timing note:** `timestamp` is when the mothership received and logged the record. `NODE_TS` in meta is when the node actually measured the sample. The difference is the buffering delay — expected and correct. Use `NODE_TS` for ecological analysis of measurement timing.
+
+**Quality flag (`QF`):**
+- `0x0000` = clean measurement.
+- `0x0001` = this record was preceded by a queue overflow (a gap may exist before it in the data stream).
+
+### 7.3 Downloading Data
+
+From the home page, click the **CSV** button. The browser downloads `datalog.csv` directly from the mothership over the WiFi connection. Open in any spreadsheet or analysis tool.
+
+---
+
+## 8. Schedule Control
+
+### 8.1 Sync Modes
+
+**Interval mode** — mothership broadcasts a sync window every N minutes (5, 10, 15, 30, or 60). Best for bench testing and high-frequency monitoring.
+
+**Daily mode** — mothership broadcasts once per day at a fixed time (e.g. `06:00`). Best for long-term field deployments. Includes a 15-minute retry window to tolerate mothership boot timing.
+
+### 8.2 Changing the Schedule
+
+Changes made in the web UI apply immediately and persist to NVS. At the next sync, all deployed nodes receive `SET_SYNC_SCHED` with the new interval and phase anchor, and re-arm their A2 alarms accordingly.
+
+### 8.3 Setting the Time
+
+The mothership DS3231 is the time source for the whole fleet. Correct it via the SET TIME panel on the home page. Use **Use browser time** to pull the current time from the connected device automatically.
+
+After a correction, the mothership will include a fresh timestamp in the next sync broadcast payload and all nodes will re-sync their clocks.
+
+---
+
+## 9. Edge Cases and Recovery
+
+### 9.1 Node Misses a Sync Window
+
+The node waited 60 seconds, received no marker, re-armed its alarms, and cut power. All queued data is intact — it will retry at the next sync slot. No action required.
+
+### 9.2 Mothership Reboots Mid-Cycle
+
+The sync slot guard is persisted to NVS. After reboot, the mothership reloads it and will not re-fire a sync burst that already happened in the current slot. Nodes that were mid-flush when the mothership rebooted will complete their listen window, note the missing marker, and retry at the next slot.
+
+### 9.3 Node Clock Drift or Stale Sync
+
+If a node's last time-sync is more than 24 hours old, stale recovery activates during the next data wake:
+1. Node brings up radio briefly and sends NODE_HELLO + REQUEST_TIME.
+2. If mothership replies with TIME_SYNC, node updates its clock and re-arms alarms.
+3. If a SYNC_WINDOW_OPEN marker is also received, node flushes its queue.
+
+The mothership independently infers stale nodes from contact age and sends a unicast SET_SYNC_SCHED + TIME_SYNC as a proactive assist.
+
+### 9.4 3-Boot Rescue Mode
+
+If a node is stuck and unreachable through normal means:
+
+1. Power-cycle the node **three times** rapidly (within 20 seconds).
+2. On the third boot the node detects the pattern and enters rescue mode.
+3. Node config is wiped to UNPAIRED, radio stays on, and the node continuously broadcasts discovery beacons.
+4. The mothership sees the node as UNPAIRED in the Node Manager — re-pair and re-deploy normally.
+
+No serial connection or extra hardware required.
+
+### 9.5 Duplicate Deploy
+
+If a node already deployed receives a second deploy command (e.g. operator re-deploys to update config), the extra immediate sample cycle is suppressed. Config values are updated and alarms are re-armed from the new phase anchor if it is fresher than the stored one.
+
+---
+
+## 10. Removing a Node from Service
+
+When an operator clicks **Unpair** in the node config page:
+
+1. The mothership queues an UNPAIR command for that node.
+2. At the next sync window, the UNPAIR command is broadcast alongside the sync burst (3 transmissions).
+3. The node receives the UNPAIR during its sync wake, after completing any queue flush.
+4. The node clears all deployment state, wipes its queue, disables its RTC alarms, and powers off cleanly — it does not re-arm any alarms.
+5. The node will not wake again autonomously.
+
+The node returns to a factory-fresh state, ready to be rediscovered and re-deployed.
+
+**Idle timeout:** If a node sits in UNPAIRED or PAIRED state for 15 minutes with no deploy, it automatically cuts power. This prevents battery drain on un-commissioned or recently unpaired nodes left powered on. Cycling power restarts the discovery beacon so the node can be found again.
+
+---
+
+## 11. Power and Battery Strategy
+
+### 11.1 Node Power Model
+
+The node uses a hardware power gate (PWR_HOLD pin) for a complete power cut between wake cycles — not a microcontroller deep-sleep. The processor, RAM, and radio are fully off. On the next RTC alarm, the board powers up from cold.
+
+This means:
+- No RAM state survives between wakes. All config is reloaded from NVS on every boot.
+- The DS3231 RTC continues running on its own coin-cell battery.
+- Boot time (NVS load, sensor init, I2C scan) is approximately 2–2.5 seconds.
+
+### 11.2 Radio Duty Cycle
+
+A deployed node keeps radio fully off during data wakes. Radio is on only during:
+- Sync wakes — up to 60 seconds.
+- NODE_HELLO at sync wake start.
+- Stale-sync recovery windows (brief, on data wakes only when clock age exceeds 24 hours).
+
+For a 1-minute wake interval and 5-minute sync interval, radio is active at most 60 seconds out of every 5-minute period — approximately 20% radio duty cycle. For a 5-minute wake interval with daily sync, radio duty cycle drops to minutes per day.
+
+### 11.3 Mothership Power
+
+The mothership currently runs continuously (WiFi AP + web server + ESP-NOW always on). A scheduled field mode where it powers on only for sync windows is planned but not yet implemented.
+
+---
+
+## 12. Current Limits and Planned Work
+
+| Area | Status |
+|---|---|
+| Mothership always-on power model | Planned: field mode will use RTC to power mothership on for sync windows only. |
+| Fleet sync contention (>8 simultaneous nodes) | No per-node stagger offset yet. Profiling needed at bench scale before large deployment. |
+| Long-term multi-season durability | Not yet validated. Testing is currently bench and short-term field. |
+| Sensor calibration | Bring-up establishes functional readiness only. Formal metrological calibration is a separate activity. |
+| Mothership SD write (decoupled from receive) | Already implemented: SD writes are queued in RAM and drained in main loop, preventing receive-path blocking. |
+
+---
+
+## 13. Suggested Manuscript Framing
+
+> The firmware architecture was designed for ecological field reliability under intermittent communications and constrained power budgets. Sensor nodes employ a queue-first data capture strategy, accumulating measurements in local persistent memory and transmitting in batch to a central mothership during scheduled synchronisation windows. Nodes achieve low radio duty cycle through RTC-gated wake/sleep cycles governed by a hardware power gate rather than microcontroller deep-sleep, ensuring complete power removal between measurement events. Recovery mechanisms include automated stale-synchronisation correction initiated by both node and mothership, and an operator-triggered rescue mode permitting field recovery without specialised hardware interfaces. Removal of a node from the active fleet is handled gracefully at the next synchronisation window, after which the node powers down and does not consume further battery capacity.
+
+### Recommended follow-on sections for the manuscript
+
+1. Validation summary table — single-node and multi-node test pass/fail outcomes.
+2. Battery budget estimates — awake time, sleep current, and estimated runtime for representative sampling configurations.
+3. Data completeness metrics — records received vs expected across induced communication outage scenarios.
+4. Field protocol appendix — deployment procedure, time-setting, routine health checks, recovery steps, and CSV download workflow.

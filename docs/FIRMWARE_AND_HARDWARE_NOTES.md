@@ -1,7 +1,7 @@
 # Firmware & Hardware Engineering Notes
 
 Consolidated reference for PCB bring-up, flashing, firmware architecture, sync workflow, and robustness assessment.  
-Merged from: `PCB_BRINGUP_TROUBLESHOOTING.md`, `pcb_bringup_troubleshooting_record.md`, `ESP32-C3_UART_FLASHING_DEBUG_NOTES.md`, `ESP32-WROOM_NODE_HARDWARE_REVISION_CHECKLIST.md`, `FIRMWARE_BUILD_LOG.md`, `FIRMWARE_BRINGUP_LOG.md`, `NODE-FIRMWARE_NOTES.md`, `FIRMWARE_SYNC_WORKFLOW_AND_TESTING.md`, `19.4.26 fireware review_sonnet.md`, `ERS381_Bring_Up_Section.md`
+Merged from: `PCB_BRINGUP_TROUBLESHOOTING.md`, `pcb_bringup_troubleshooting_record.md`, `ESP32-WROOM_NODE_HARDWARE_REVISION_CHECKLIST.md`, `FIRMWARE_BUILD_LOG.md`, `FIRMWARE_BRINGUP_LOG.md`, `NODE-FIRMWARE_NOTES.md`, `FIRMWARE_SYNC_WORKFLOW_AND_TESTING.md`, `19.4.26 fireware review_sonnet.md`, `ERS381_Bring_Up_Section.md`
 
 ---
 
@@ -152,6 +152,14 @@ The primary bring-up failure was caused by D8 and D9, implemented as BAV99 dual 
 - Reference: DMM = 3.88 V; firmware output = 3.8828–3.8857 V
 - Result: PASS
 
+#### Run log: 2026-04-24 — SHT40 via PCA9548A mux validation
+
+- Firmware: `esp32wroom-sht40-as7343-mux`; SDA=18, SCL=19; mux at `0x71`, SHT40 at `0x44` on mux ch 0
+- AS7343 on mux ch 1 physically damaged — init skipped gracefully (`g_as7343_ok=false`)
+- Result: PASS — stable SHT40 readings confirmed:
+  - AIR_TEMP ≈ 18.44–18.47 °C, AIR_RH ≈ 44.4–45.0 %
+- Notes: 2 s sample interval; no queue, no ESP-NOW; pure sensor read loop
+
 #### Next session focus: noise-source isolation
 
 1. Baseline comparator noise with TX disabled — count edges in fixed listen window.
@@ -205,105 +213,7 @@ Use this section for each new board or power-rail configuration so results can b
 
 ## 2. Flashing Reference
 
-### 2.1 ESP32-C3 UART Flashing Debug Notes
-
-#### Board Overview
-
-Custom PCB:
-- **ESP32-C3**
-- **CH340C USB-to-UART bridge**
-- UART flashing via **CH340 → RX/TX**
-- Native ESP USB (GPIO18/GPIO19) routed to **header only**, not USB connector
-- BOOT button: **GPIO9**; RESET button: **EN**
-
-Initial goal: flash via USB → CH340 → UART → ESP32-C3.
-
-#### Initial Problem
-
-```
-Wrong boot mode detected (0x0)
-The chip needs to be in download mode
-```
-
-#### Diagnostic Steps
-
-**1. USB-UART Interface** — CH340 detected correctly (`USB-SERIAL CH340 (COM3)`); UART console working.
-
-**2. Boot messages on reset:**
-```
-invalid header: 0xffffffff
-```
-ESP32-C3 powered; UART TX working; chip attempting flash boot but flash is blank.
-
-**3. BOOT + RESET behaviour:**
-```
-ESP-ROM:esp32c3-api1-20210207
-rst:0x1 (POWERON),boot:0x0 (USB_BOOT)
-wait usb download
-```
-Chip enters **USB download mode** — waits for native USB, not UART CH340.
-
-**Auto-Reset Circuit Investigation**
-
-RTS/DTR transistor network controls BOOT (GPIO9) and EN (RESET). Temporarily removed R36 and R37 to disable RTS/DTR.
-
-Result after removing RTS/DTR:
-```
-Invalid head of packet (0x20)
-Possible serial noise or corruption
-```
-ESP responding on UART but not synchronising.
-
-**Boot Strap Investigation**
-
-| Pin | Function |
-|---|---|
-| GPIO9 | BOOT strap |
-| GPIO8 | boot configuration |
-| GPIO2 | boot configuration |
-
-GPIO8 and GPIO2 were **not connected** → floating.  
-Floating strap pins cause inconsistent boot mode selection.
-
-#### Behaviour Summary
-
-| Condition | Result |
-|---|---|
-| Normal reset | `invalid header 0xffffffff` |
-| BOOT + RESET | `USB_BOOT wait usb download` |
-| esptool attempt | `Invalid head of packet (0x20)` |
-| RTS/DTR removed | behaviour unchanged |
-
-**Root Cause:** Floating strap pins (GPIO8 and GPIO2) — ROM randomly selects USB/UART download or flash boot.
-
-#### Recommended Fix (Next PCB Revision)
-
-Add pull-ups:
-```
-GPIO8 → 10k → 3.3V
-GPIO2 → 10k → 3.3V
-```
-
-Existing (correct):
-```
-GPIO9 → 10k → 3.3V
-BOOT button → GND
-EN → 10k → 3.3V
-RESET button → GND
-```
-
-#### Recommended Auto-Reset Design
-
-Use standard Espressif circuit:
-```
-RTS → transistor → EN
-DTR → transistor → GPIO9
-```
-Avoid cross-coupled transistor networks.
-
----
-
-### 2.2 ESP32-WROOM Node Hardware Revision Checklist
+### 2.1 ESP32-WROOM Node Hardware Revision Checklist
 
 **Target board:** ESP32-WROOM-32D + CH340C USB-UART  
 **Purpose:** Ensure reliable UART flashing, reset behaviour, and deterministic boot configuration.
