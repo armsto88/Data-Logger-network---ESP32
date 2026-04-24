@@ -571,7 +571,7 @@ Key validation lines per node:
 
 **Mothership side:**
 1. Operator submits action `start` with interval.
-2. Mothership writes desired config: `wakeIntervalMin`, `syncIntervalMin`, `syncPhaseUnix` (next fleet slot), incremented `configVersion`.
+2. Mothership writes desired config: `wakeIntervalMin`, `syncIntervalMin` (auto-derived as `wakeIntervalMin × 18`), `syncPhaseUnix` (next fleet slot), incremented `configVersion`.
 3. If UNPAIRED: sends PAIR_NODE + PAIRING_RESPONSE.
 4. Sends DEPLOY_NODE with config + RTC timestamp embedded in payload (atomic — no separate CONFIG_SNAPSHOT race).
 5. Sets `gLastSyncIntervalSlot = -1`, persists to NVS (slot guard reset for clean anchor).
@@ -612,8 +612,8 @@ Key validation lines per node:
 ### 6.8 Practical Testing Strategy
 
 **Bench profile (fast feedback):**
-- Node interval: 1 min; sync interval: 5 min; post-wake window: 1500–3000 ms
-- Acceptance: queue depth increases between syncs; drains at sync slot; mothership CSV shows contiguous rows with expected node timestamps; power cut confirmed (gate drain voltage drop).
+- Node interval: 1 min; sync interval: auto-derived (wakeMin × 18 = **18 min**); post-wake window: 1500–3000 ms
+- Acceptance: queue depth increases between syncs (18 samples queued across 18 data wakes); drains at sync slot; mothership CSV shows contiguous rows with expected node timestamps; power cut confirmed (gate drain voltage drop).
 
 **Field profile:**
 - Node interval: agronomy cadence (e.g. 5 or 10 min); sync: daily or few-times-per-day.
@@ -639,7 +639,7 @@ Key validation lines per node:
 | Test | Steps | Pass Criteria |
 |---|---|---|
 | FN-1 Global sync alignment | Deploy 4 nodes, same interval/phase | All 4 A2 alarms armed to same HH:MM ±1 min |
-| FN-2 Sync interval change propagates | Change sync interval from UI | All 4 nodes receive SET_SYNC_SCHED; re-arm logged; configVersion incremented for all 4 |
+| FN-2 Wake interval change propagates sync | Change global wake interval from UI | `gSyncIntervalMin` recomputed to `wakeMin × 18`; all 4 nodes receive SET_SYNC_SCHED with new auto-derived syncMin; re-arm logged; configVersion incremented for all 4 |
 | FN-3 Fleet simultaneous flush | All 4 wake at same A2; mothership running | All 4 queues flush; no duplicates in CSV; total flush < SYNC_LISTEN_WINDOW_MS per node |
 | FN-4 One node out of sync | Power-cut one node mid-cycle; restore | Restored node requests TIME_SYNC; within 2 sync cycles A2 is phase-aligned with fleet |
 | FN-5 Unpair one node mid-fleet | Unpair node 2 via web UI | Node 2 receives UNPAIR; stops sending; other 3 unaffected; node 2 absent from subsequent CSV |
@@ -878,19 +878,20 @@ $$\text{syncMin} \leq \text{wakeMin} \times 22$$
 
 Equivalently, the minimum safe wake interval for a given sync period is $\lceil \text{syncMin} / 22 \rceil$ minutes.
 
-`clampSyncToQueueCapacity(syncMin, wakeMin, wasClamped)` was added to `mothership/src/main.cpp` and is called wherever intervals are applied.
+Rather than a runtime clamp, queue overflow risk is eliminated structurally via the **K=18 auto-derive rule**: `syncMin = wakeMin × 18`. This always lands at 82% of the theoretical 22-wake limit, giving a 4-wake soft headroom buffer and making a correctly-configured node incapable of overflowing its queue under normal operation.
+
+`computeAutoSyncMin(wakeMin)` in `mothership/src/main.cpp` returns `(wakeMin > 0) ? (wakeMin * kSyncFillK) : 0` where `kSyncFillK = 18`. This is called in:
+- `setup()` — immediately after `loadWakeIntervalFromNVS()`.
+- `handleSetWakeInterval()` — HTTP POST handler for the global wake interval control.
+- The `set_wake_interval` WebSocket command handler.
 
 #### UI Safety Enforcement
 
-**Global sync interval (`/set-sync-interval`):**
-- Server clamps `syncMin` downward before applying if it would violate the rule; notes the clamp in the AJAX response.
-- Form `<select>` shows a static hint: "max safe sync = N min for current wake = M min".
-- Options that would overflow the queue are labelled `⚠ queue overflow`.
-- Live JS warning banner appears when a dangerous option is selected.
+Sync interval is **never user-configurable**. The main page shows a read-only auto-sync info panel derived from the current wake interval (e.g. *"Sync every 90 min (auto: wake × 18 — ~75% queue fill, 4+ wakes headroom)"*). No form, no select, no manual entry.
 
-**Per-node config (`/node-config` GET/POST):**
-- `handleNodeConfigForm`: same static hint and per-option `⚠ queue overflow` labels. Live JS warning banner fires on page load if the current selection is already dangerous.
-- `handleNodeConfigSave`: after the allowed-interval clamp, checks `interval < ceil(gSyncIntervalMin / 22)`. If so, walks `kAllowedIntervals` and clamps `interval` upward to the nearest safe value; logs the adjustment to Serial. Gated on `SYNC_MODE_INTERVAL` — daily-sync mode is unaffected.
+The per-node config page (`/node-config`) similarly shows the derived sync interval as a read-only display alongside the fleet-global wake interval. There is no per-node sync interval override.
+
+Queue overflow is structurally impossible when using the standard scheduling path: at K=18, a node would need to miss 6 consecutive sync windows (accumulating 24+ wakes) before overflow could occur — safely outside the 22-wake hard limit.
 
 **Build status:** All changes compiled successfully (mothership `esp32s3` env + node `esp32wroom` env, 24 April 2026).
 

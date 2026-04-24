@@ -75,10 +75,8 @@ Controls the timing shared across the whole fleet:
 | Control | What it does |
 |---|---|
 | SET TIME | Manually set or correct the mothership DS3231 clock. Use the browser time button for convenience. |
-| Node interval | Default sampling interval applied to nodes on deploy or config update (1, 2, 5, 10, 15, 30, or 60 min). |
-| Sync mode | Switch between **Daily** (sync once per day at a fixed time) and **Interval** (sync every N minutes). |
-| Daily sync time | Time of day for daily sync (e.g. `06:00`). Shown when Daily mode is active. |
-| Sync interval | How often interval-mode syncs occur (5, 10, 15, 30, or 60 min). |
+| Node interval | Sampling interval shared across the whole fleet (1, 5, 10, 20, 30, or 60 min). This is the **only scheduling knob**. |
+| Auto-sync | Derived automatically from the wake interval: `syncMin = wakeMin × 18`. Shown as a read-only info panel. No manual setting — changing the wake interval updates sync automatically. |
 
 All schedule settings are persisted to NVS and survive a mothership reboot.
 
@@ -142,7 +140,7 @@ Click the node in the Node Manager. Assign a user ID and friendly name. Set the 
 **Step 3 — Deploy**
 Click **Deploy** in the node config page. The mothership:
 1. Sends a PAIR command if not already paired.
-2. Sends a DEPLOY command with: current RTC time, wake interval, sync interval, and the next fleet sync slot's Unix timestamp (the phase anchor — the actual next scheduled fleet sync time, not deploy time).
+2. Sends a DEPLOY command with: current RTC time, wake interval, sync interval (auto-derived as `wakeMin × 18`), and the next fleet sync slot's Unix timestamp (the phase anchor — the actual next scheduled fleet sync time, not deploy time).
 3. Marks the node DEPLOYED locally and saves to NVS.
 4. Resets the sync slot guard (`gLastSyncIntervalSlot = -1`) so the next fleet sync fires cleanly from the new anchor.
 
@@ -214,7 +212,7 @@ When a node is deployed, the mothership calculates the **next fleet sync slot** 
 
 At the sync slot boundary + 5 seconds (5 s offset to allow node boot and radio-up time), the mothership sends:
 
-1. **SET_SYNC_SCHED** — 3 broadcasts, 200 ms apart. Carries the sync interval and phase anchor.
+1. **SET_SYNC_SCHED** — 3 broadcasts, 200 ms apart. Carries the auto-derived sync interval and phase anchor.
 2. **SYNC_WINDOW_OPEN** — 3 broadcasts, 200 ms apart. This is the marker that gates node queue flushing.
 
 All 6 transmissions use true ESP-NOW broadcast (`FF:FF:FF:FF:FF:FF`). Total radio time is fixed regardless of fleet size — a node count of 1 or 20 generates the same 6 packets.
@@ -237,26 +235,41 @@ Data is written to `/datalog.csv` on the mothership's SD card.
 
 On first boot (or after a firmware update that changes the header format), the file is created with the correct header. If an existing file has a mismatched header, it is automatically renamed to `/datalog_legacy.csv` and a new file is started — previous data is preserved.
 
-### 7.2 CSV Header
+### 7.2 CSV Format
 
-```
-timestamp,node_id,node_name,mac,event_type,sensor_type,value,meta
-```
+The CSV uses a **wide format** — one row per node per wake cycle, all sensor channels in a single row. Sensors not fitted on a given node appear as `NaN` in the relevant columns.
 
-| Field | Example | Meaning |
+**Columns (30 total):**
+
+| Column | Example | Meaning |
 |---|---|---|
-| `timestamp` | `11:02:05 24-04-2026` | Mothership RTC time at moment of logging (sync window time) |
+| `ms_datetime` | `11:02:05 24-04-2026` | Mothership RTC time at moment of logging |
+| `ms_sync_unix` | `1777028400` | Mothership Unix timestamp of the sync window |
 | `node_id` | `001` | User-assigned node ID |
 | `node_name` | `NODE 1` | User-assigned node name |
-| `mac` | `d4:e9:f4:94:5d:c4` | Node hardware MAC address |
-| `event_type` | `SENSOR` | Record type |
-| `sensor_type` | `SOIL1_VWC` | Sensor channel label |
-| `value` | `0.440` | Measured value |
-| `meta` | `FW_ID=ENV_945DC4;SENSOR_ID=2001;SENSOR_TYPE=SOIL_VWC;QF=0x0000;NODE_TS=1777028371` | Firmware ID, sensor ID, quality flags, and node measurement timestamp |
+| `node_mac` | `d4:e9:f4:94:5d:c4` | Node hardware MAC address |
+| `fw_id` | `ENV_945DC4` | Firmware-derived node identifier |
+| `node_datetime` | `11:01:45 24-04-2026` | Node RTC time at moment of measurement |
+| `node_unix` | `1777028505` | Node Unix timestamp of measurement |
+| `bat_v` | `3.85` | Battery voltage (V), `NaN` if not fitted |
+| `air_temp_c` | `18.44` | Air temperature (°C), `NaN` if not fitted |
+| `air_hum_pct` | `44.8` | Relative humidity (%), `NaN` if not fitted |
+| `spectral_415nm`–`spectral_680nm` | `0.032` | Spectral irradiance channels ×8 (415, 445, 480, 515, 555, 590, 630, 680 nm), `NaN` if not fitted |
+| `wind_speed_ms` | `2.1` | Wind speed (m/s), `NaN` if not fitted |
+| `wind_dir_deg` | `247.0` | Wind direction (°), `NaN` if not fitted |
+| `soil1_vwc` | `0.440` | Soil 1 volumetric water content, `NaN` if not fitted |
+| `soil1_temp_c` | `14.2` | Soil 1 temperature (°C), `NaN` if not fitted |
+| `soil2_vwc` | `NaN` | Soil 2 VWC, `NaN` if not fitted |
+| `soil2_temp_c` | `NaN` | Soil 2 temperature, `NaN` if not fitted |
+| `aux1` | `NaN` | Auxiliary channel 1, `NaN` if not used |
+| `aux2` | `NaN` | Auxiliary channel 2, `NaN` if not used |
+| `sensor_present` | `0x0023` | Bitmask of sensors fitted on this node |
+| `quality_flags` | `0x0000` | Data quality flags (see below) |
+| `seq_num` | `42` | Queue sequence number since last deploy |
 
-**Key timing note:** `timestamp` is when the mothership received and logged the record. `NODE_TS` in meta is when the node actually measured the sample. The difference is the buffering delay — expected and correct. Use `NODE_TS` for ecological analysis of measurement timing.
+**Key timing note:** `ms_datetime` is when the mothership received and logged the record. `node_unix` is when the node actually measured the sample. The difference is the buffering delay — expected and correct. Use `node_unix` for ecological analysis of measurement timing.
 
-**Quality flag (`QF`):**
+**Quality flags (`quality_flags`):**
 - `0x0000` = clean measurement.
 - `0x0001` = this record was preceded by a queue overflow (a gap may exist before it in the data stream).
 
@@ -268,15 +281,27 @@ From the home page, click the **CSV** button. The browser downloads `datalog.csv
 
 ## 8. Schedule Control
 
-### 8.1 Sync Modes
+### 8.1 The Scheduling Model
 
-**Interval mode** — mothership broadcasts a sync window every N minutes (5, 10, 15, 30, or 60). Best for bench testing and high-frequency monitoring.
+There is a **single scheduling knob**: the global wake interval (1, 5, 10, 20, 30, or 60 minutes). The sync interval is derived automatically:
 
-**Daily mode** — mothership broadcasts once per day at a fixed time (e.g. `06:00`). Best for long-term field deployments. Includes a 15-minute retry window to tolerate mothership boot timing.
+$$\text{syncMin} = \text{wakeMin} \times 18$$
+
+This keeps the queue at approximately 75% fill between syncs, leaving a 4-wake soft headroom buffer before any overflow risk. The derived sync interval is shown as a read-only info panel on the home page.
+
+**Example configurations:**
+
+| Wake interval | Auto sync interval | Queue depth at sync | Headroom |
+|---|---|---|---|
+| 1 min | 18 min | 18/24 slots (75%) | 6 wakes |
+| 5 min | 90 min | 18/24 slots (75%) | 6 wakes |
+| 10 min | 3 h | 18/24 slots (75%) | 6 wakes |
+| 30 min | 9 h | 18/24 slots (75%) | 6 wakes |
+| 60 min | 18 h | 18/24 slots (75%) | 6 wakes |
 
 ### 8.2 Changing the Schedule
 
-Changes made in the web UI apply immediately and persist to NVS. At the next sync, all deployed nodes receive `SET_SYNC_SCHED` with the new interval and phase anchor, and re-arm their A2 alarms accordingly.
+Change the global wake interval on the home page. The new sync interval computes immediately. At the next sync window, all deployed nodes receive `SET_SYNC_SCHED` with the new derived `syncMin` and a fresh phase anchor, and re-arm their A2 alarms accordingly. No per-node action is required.
 
 ### 8.3 Setting the Time
 
@@ -356,7 +381,7 @@ A deployed node keeps radio fully off during data wakes. Radio is on only during
 - NODE_HELLO at sync wake start.
 - Stale-sync recovery windows (brief, on data wakes only when clock age exceeds 24 hours).
 
-For a 1-minute wake interval and 5-minute sync interval, radio is active at most 60 seconds out of every 5-minute period — approximately 20% radio duty cycle. For a 5-minute wake interval with daily sync, radio duty cycle drops to minutes per day.
+For a 1-minute wake interval, sync fires every 18 minutes — radio is active at most 60 seconds per 18-minute period, approximately 6% radio duty cycle. For a 10-minute wake interval, sync fires every 3 hours — radio duty cycle drops to under 1%.
 
 ### 11.3 Mothership Power
 
