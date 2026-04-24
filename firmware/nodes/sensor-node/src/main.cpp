@@ -1608,23 +1608,32 @@ static bool armDeploymentWakeAlarms(DateTime* nextDataOut, DateTime* nextSyncOut
 static void finalizeWakeAndSleep(const char* reason) {
   Serial.printf("⚙️ [FINALIZE] entry: %s\n", reason ? reason : "wake cycle complete");
 
-  DateTime nextData{};
-  DateTime nextSync{};
-  bool okBoth = false;
+  if (currentNodeState() == STATE_DEPLOYED && rtcSynced && hasMothershipMAC()) {
+    DateTime nextData{};
+    DateTime nextSync{};
+    bool okBoth = false;
 
-  // Retry alarm arm up to 3 times – I2C can fail transiently.
-  for (int attempt = 1; attempt <= 3 && !okBoth; attempt++) {
-    okBoth = armDeploymentWakeAlarms(&nextData, &nextSync);
-    if (!okBoth && attempt < 3) {
-      Serial.printf("⚠️ [FINALIZE] Alarm arm failed (attempt %d/3) – retrying\n", attempt);
-      delay(10);
+    // Retry alarm arm up to 3 times – I2C can fail transiently.
+    for (int attempt = 1; attempt <= 3 && !okBoth; attempt++) {
+      okBoth = armDeploymentWakeAlarms(&nextData, &nextSync);
+      if (!okBoth && attempt < 3) {
+        Serial.printf("⚠️ [FINALIZE] Alarm arm failed (attempt %d/3) – retrying\n", attempt);
+        delay(10);
+      }
     }
-  }
 
-  char dataStr[24]; formatTime(nextData, dataStr, sizeof(dataStr));
-  char syncStr[24]; formatTime(nextSync, syncStr, sizeof(syncStr));
-  Serial.printf("🔁 [FINALIZE] Alarms armed: data=%s sync=%s (%s)\n",
-                dataStr, syncStr, okBoth ? "OK" : "PARTIAL");
+    char dataStr[24]; formatTime(nextData, dataStr, sizeof(dataStr));
+    char syncStr[24]; formatTime(nextSync, syncStr, sizeof(syncStr));
+    Serial.printf("🔁 [FINALIZE] Alarms armed: data=%s sync=%s (%s)\n",
+                  dataStr, syncStr, okBoth ? "OK" : "PARTIAL");
+  } else {
+    // Node is no longer deployed (e.g. UNPAIR received mid-cycle).
+    // Ensure alarms are disabled and flags cleared so we don't wake again.
+    ds3231DisableAlarmInterrupt();
+    ds3231DisableAlarm2Interrupt();
+    clearDS3231_AlarmFlags();
+    Serial.println("🔁 [FINALIZE] Not deployed – alarms disabled, no re-arm");
+  }
 
   shutdownEspNow();
   schedulePowerCut(reason ? reason : "wake cycle complete");
@@ -2030,19 +2039,40 @@ if (nowMs - lastA1Check > 1000UL) {
 
 
   // Simple state machine logs (for bench)
-  if (st == STATE_UNPAIRED) {
-    if (nowMs - lastAction > 15000UL) {
-      debugState("loop");
-      Serial.println("🟡 Unpaired – idle, waiting for discovery scan…");
-      lastAction = nowMs;
+  // For UNPAIRED and PAIRED: track idle entry time and shut down after 15 minutes.
+  static uint32_t g_idleEntryMs = 0;
+  static NodeState g_lastIdleState = STATE_DEPLOYED; // non-idle sentinel
+  if (st == STATE_UNPAIRED || st == STATE_PAIRED) {
+    // Reset idle timer whenever we transition into this state.
+    if (g_lastIdleState == STATE_DEPLOYED) {
+      g_idleEntryMs = nowMs;
     }
-  } else if (st == STATE_PAIRED) {
-    if (nowMs - lastAction > 5000UL) {
-      debugState("loop");
-      Serial.println("🟡 Bound, waiting for DEPLOY command…");
-      lastAction = nowMs;
+    g_lastIdleState = st;
+
+    if (st == STATE_UNPAIRED) {
+      if (nowMs - lastAction > 15000UL) {
+        debugState("loop");
+        Serial.println("🟡 Unpaired – idle, waiting for discovery scan…");
+        lastAction = nowMs;
+      }
+    } else {
+      if (nowMs - lastAction > 5000UL) {
+        debugState("loop");
+        Serial.println("🟡 Bound, waiting for DEPLOY command…");
+        lastAction = nowMs;
+      }
+    }
+
+    // Shut down after 15 minutes in UNPAIRED or PAIRED to save power.
+    const uint32_t kIdleTimeoutMs = 15UL * 60UL * 1000UL;
+    if (nowMs - g_idleEntryMs >= kIdleTimeoutMs) {
+      Serial.printf("⏰ Idle timeout (%s) – powering off\n",
+                    st == STATE_UNPAIRED ? "unpaired" : "paired");
+      shutdownEspNow();
+      schedulePowerCut(st == STATE_UNPAIRED ? "unpaired idle timeout" : "paired idle timeout");
     }
   } else { // STATE_DEPLOYED
+    g_lastIdleState = STATE_DEPLOYED; // reset idle tracker
     if (nowMs - lastAction > 20000UL) {
       debugState("loop");
       Serial.println("🟢 Deployed — work happens on each DS3231 alarm.");
