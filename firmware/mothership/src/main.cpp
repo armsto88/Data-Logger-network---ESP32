@@ -204,7 +204,7 @@ static void loadSyncRuntimeGuardsFromNVS() {
   }
 }
 
-static void saveSyncRuntimeGuardsToNVS() {
+void saveSyncRuntimeGuardsToNVS() {
   if (gPrefs.begin("ui", false)) {
     gPrefs.putLong("sync_day", gLastSyncBroadcastEpochDay);
     gPrefs.putULong("sync_last_unix", gLastSyncBroadcastUnix);
@@ -2861,11 +2861,29 @@ void loop() {
       const long long slot = (nowUnix >= anchorUnix)
         ? (long long)((nowUnix - anchorUnix) / periodSec)
         : -1LL;
-      const bool spacedOk = (gLastSyncBroadcastMs == 0) || ((millis() - gLastSyncBroadcastMs) >= periodSec * 1000UL);
-      if ((gLastSyncIntervalSlot < 0 || slot > gLastSyncIntervalSlot) && spacedOk) {
-        const uint32_t currentSlotUnix = (slot >= 0)
+
+      // Recovery guard: persisted slot from older firmware may be in a different
+      // scale. Normalize so interval broadcasts can resume immediately.
+      if (slot >= 0 && gLastSyncIntervalSlot > (slot + 2LL)) {
+        Serial.printf("[SYNC] slot guard reset: stored=%lld runtime=%lld anchor=%lu\n",
+                      gLastSyncIntervalSlot,
+                      slot,
+                      (unsigned long)anchorUnix);
+        gLastSyncIntervalSlot = slot - 1LL;
+        saveSyncRuntimeGuardsToNVS();
+      }
+
+      // Fire 5 s into the slot so nodes have time to boot (~2.5 s) and bring
+      // their radio up before the burst lands.  The slot guard still prevents
+      // double-firing within the same slot.
+      static const uint32_t kSyncBurstOffsetSec = 5UL;
+      const uint32_t slotStartUnix = (slot >= 0)
           ? (anchorUnix + (uint32_t)slot * periodSec)
           : anchorUnix;
+      const bool offsetReached = (nowUnix >= slotStartUnix + kSyncBurstOffsetSec);
+
+      if ((slot >= 0) && (gLastSyncIntervalSlot < 0 || slot > gLastSyncIntervalSlot) && offsetReached) {
+        const uint32_t currentSlotUnix = slotStartUnix;
         const bool sent = broadcastSyncSchedule(gSyncIntervalMin, anchorUnix);
         const bool markerSent = broadcastSyncWindowOpen(currentSlotUnix);
         gLastSyncBroadcastMs = millis();

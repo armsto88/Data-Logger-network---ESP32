@@ -27,6 +27,9 @@ extern const char* DEVICE_ID;
 extern int gSyncMode;
 extern int gSyncDailyHour;
 extern int gSyncDailyMinute;
+extern unsigned long gLastSyncBroadcastUnix;
+extern long long     gLastSyncIntervalSlot;
+void saveSyncRuntimeGuardsToNVS();
 
 // Defined once in espnow_manager_globals.cpp
 extern const uint8_t KNOWN_SENSOR_NODES[][6];
@@ -1496,29 +1499,37 @@ bool broadcastSyncSchedule(int syncIntervalMinutes, unsigned long phaseUnix) {
     cmd.syncIntervalMinutes = (unsigned long)syncIntervalMinutes;
     cmd.phaseUnix = phaseUnix;
 
-    bool anyOk = false;
+    // Check at least one eligible node exists before sending.
     bool anyEligible = false;
-    const uint8_t burstCount = 3;
-    for (auto& n : registeredNodes) {
-        if (n.state != PAIRED && n.state != DEPLOYED) continue;
-        anyEligible = true;
-        ensurePeerOnChannel(n.mac, ESPNOW_CHANNEL);
-        esp_wifi_set_channel(ESPNOW_CHANNEL, WIFI_SECOND_CHAN_NONE);
-        for (uint8_t i = 0; i < burstCount; ++i) {
-            esp_err_t res = esp_now_send(n.mac, (uint8_t*)&cmd, sizeof(cmd));
-            if (res == ESP_OK) anyOk = true;
-            Serial.printf("📤 SET_SYNC_SCHED %s burst %u/%u %d min phase=%lu -> %s\n",
-                          n.nodeId.c_str(),
-                          (unsigned)(i + 1),
-                          (unsigned)burstCount,
-                          syncIntervalMinutes,
-                          phaseUnix,
-                          (res == ESP_OK) ? "OK" : esp_err_to_name(res));
-            if (i + 1 < burstCount) delay(200);
-        }
+    for (const auto& n : registeredNodes) {
+        if (n.state == PAIRED || n.state == DEPLOYED) { anyEligible = true; break; }
     }
     if (!anyEligible) {
         Serial.println("⚠️ SET_SYNC_SCHED skipped: no PAIRED/DEPLOYED nodes eligible");
+        return false;
+    }
+
+    // True ESP-NOW broadcast: one transmission reaches all nodes simultaneously.
+    // Repeat 3 times for reliability.  O(1) regardless of fleet size.
+    static const uint8_t bcast[6] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
+    ensurePeerOnChannel(bcast, ESPNOW_CHANNEL);
+    esp_wifi_set_channel(ESPNOW_CHANNEL, WIFI_SECOND_CHAN_NONE);
+
+    bool anyOk = false;
+    const uint8_t burstCount = 3;
+    for (uint8_t i = 0; i < burstCount; ++i) {
+        char nowTs[24];
+        getRTCTimeString(nowTs, sizeof(nowTs));
+        esp_err_t res = esp_now_send(bcast, (uint8_t*)&cmd, sizeof(cmd));
+        if (res == ESP_OK) anyOk = true;
+        Serial.printf("📤 [%s] SET_SYNC_SCHED BCAST burst %u/%u %d min phase=%lu -> %s\n",
+                      nowTs,
+                      (unsigned)(i + 1),
+                      (unsigned)burstCount,
+                      syncIntervalMinutes,
+                      phaseUnix,
+                      (res == ESP_OK) ? "OK" : esp_err_to_name(res));
+        if (i + 1 < burstCount) delay(200);
     }
     return anyOk;
 }
@@ -1531,25 +1542,30 @@ bool broadcastSyncWindowOpen(unsigned long phaseUnix) {
     cmd.syncIntervalMinutes = 0;
     cmd.phaseUnix = phaseUnix;
 
-    bool anyOk = false;
     bool anyEligible = false;
+    for (const auto& n : registeredNodes) {
+        if (n.state == PAIRED || n.state == DEPLOYED) { anyEligible = true; break; }
+    }
+
+    // True broadcast: all nodes hear one transmission simultaneously.
+    static const uint8_t bcast[6] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
+    ensurePeerOnChannel(bcast, ESPNOW_CHANNEL);
+    esp_wifi_set_channel(ESPNOW_CHANNEL, WIFI_SECOND_CHAN_NONE);
+
+    bool anyOk = false;
     const uint8_t burstCount = 3;
-    for (auto& n : registeredNodes) {
-        if (n.state != PAIRED && n.state != DEPLOYED) continue;
-        anyEligible = true;
-        ensurePeerOnChannel(n.mac, ESPNOW_CHANNEL);
-        esp_wifi_set_channel(ESPNOW_CHANNEL, WIFI_SECOND_CHAN_NONE);
-        for (uint8_t i = 0; i < burstCount; ++i) {
-            esp_err_t res = esp_now_send(n.mac, (uint8_t*)&cmd, sizeof(cmd));
-            if (res == ESP_OK) anyOk = true;
-            Serial.printf("📤 SYNC_WINDOW_OPEN %s burst %u/%u phase=%lu -> %s\n",
-                          n.nodeId.c_str(),
-                          (unsigned)(i + 1),
-                          (unsigned)burstCount,
-                          phaseUnix,
-                          (res == ESP_OK) ? "OK" : esp_err_to_name(res));
-            if (i + 1 < burstCount) delay(200);
-        }
+    for (uint8_t i = 0; i < burstCount; ++i) {
+        char nowTs[24];
+        getRTCTimeString(nowTs, sizeof(nowTs));
+        esp_err_t res = esp_now_send(bcast, (uint8_t*)&cmd, sizeof(cmd));
+        if (res == ESP_OK) anyOk = true;
+        Serial.printf("📤 [%s] SYNC_WINDOW_OPEN BCAST burst %u/%u phase=%lu -> %s\n",
+                      nowTs,
+                      (unsigned)(i + 1),
+                      (unsigned)burstCount,
+                      phaseUnix,
+                      (res == ESP_OK) ? "OK" : esp_err_to_name(res));
+        if (i + 1 < burstCount) delay(200);
     }
     if (!anyEligible) {
         Serial.println("⚠️ SYNC_WINDOW_OPEN skipped: no PAIRED/DEPLOYED nodes eligible");
@@ -1796,12 +1812,20 @@ bool deploySelectedNodes(const std::vector<String>& nodeIds) {
                             deployCmd.syncIntervalMin = 15;
                         }
 
-                        // Use mothership-managed GLOBAL phase anchor for fleet slot alignment.
-                        // Do not re-anchor phase at deploy time, otherwise each node drifts to
-                        // its own "deploy+interval" schedule.
-                        deployCmd.syncPhaseUnix = (desired.syncPhaseUnix > 0)
-                            ? desired.syncPhaseUnix
+                        // Phase = actual next fleet sync slot so the node's first A2 alarm
+                        // fires at the same minute boundary as the mothership's next broadcast.
+                        // After that sync completes the node receives a fresh SET_SYNC_SCHED
+                        // broadcast and rolls forward from the stable fleet anchor thereafter.
+                        const uint32_t deployPeriodSec = (uint32_t)max((int)deployCmd.syncIntervalMin, 1) * 60UL;
+                        const uint32_t deployAnchor = (gLastSyncBroadcastUnix > 0)
+                            ? (uint32_t)gLastSyncBroadcastUnix
                             : (nowUnix - (nowUnix % 60UL));
+                        if (deployAnchor > nowUnix) {
+                            deployCmd.syncPhaseUnix = deployAnchor; // anchor is itself still future
+                        } else {
+                            const uint32_t elapsed = nowUnix - deployAnchor;
+                            deployCmd.syncPhaseUnix = deployAnchor + (elapsed / deployPeriodSec + 1UL) * deployPeriodSec;
+                        }
                     }
 
                     Serial.printf("📤 DEPLOY payload for %s: cfgV=%u wakeMin=%u syncMin=%u phase=%lu\n",
@@ -1810,6 +1834,16 @@ bool deploySelectedNodes(const std::vector<String>& nodeIds) {
                                   (unsigned)deployCmd.wakeIntervalMin,
                                   (unsigned)deployCmd.syncIntervalMin,
                                   (unsigned long)deployCmd.syncPhaseUnix);
+
+                    // Seed the global fleet anchor so subsequent interval broadcasts
+                    // use the same phase that was sent to the node, not a stale NVS value.
+                    // Also reset the slot guard so the trigger fires at slot 0 of the
+                    // new anchor instead of seeing it as "already fired" from NVS.
+                    if (gSyncMode != kSyncModeDaily && deployCmd.syncPhaseUnix > 0) {
+                        gLastSyncBroadcastUnix = deployCmd.syncPhaseUnix;
+                        gLastSyncIntervalSlot  = -1LL;
+                        saveSyncRuntimeGuardsToNVS();
+                    }
 
                     esp_err_t result =
                         esp_now_send(node.mac,

@@ -409,8 +409,7 @@ static bool ds3231ArmSyncWake(uint16_t syncIntervalMin,
     nextSyncUnix = next.unixtime();
   } else {
     uint32_t periodSec = (uint32_t)syncIntervalMin * 60UL;
-    uint32_t phase = syncPhaseUnix;
-    if (phase == 0 || phase > nowUnix) phase = nowUnix;
+    uint32_t phase = (syncPhaseUnix > 0) ? syncPhaseUnix : nowUnix;
 
     // Alarm2 is minute-resolution. Keep phase minute-aligned so each sync slot
     // lands exactly on minute boundaries (e.g. 20:12:00, 20:17:00, ...).
@@ -422,8 +421,25 @@ static bool ds3231ArmSyncWake(uint16_t syncIntervalMin,
                     (unsigned long)phase);
     }
 
-    uint32_t slot = (nowUnix - phase) / periodSec;
-    nextSyncUnix = phase + (slot + 1UL) * periodSec;
+    if (phase > nowUnix) {
+      // syncPhaseUnix is the actual next fleet sync slot sent by the mothership
+      // at deploy time. Arm directly for it; subsequent syncs will roll forward
+      // from the anchor received in periodic SET_SYNC_SCHED broadcasts.
+      nextSyncUnix = phase;
+    } else {
+      uint32_t slot = (nowUnix - phase) / periodSec;
+      nextSyncUnix = phase + (slot + 1UL) * periodSec;
+    }
+
+    // Safety: DS3231 A2 is minute-resolution — if the computed slot boundary
+    // has already passed (e.g. data-wake ran a few seconds past :00), arming
+    // for that minute would miss it and not fire until the same time next day.
+    // Advance one period so the alarm always lands in the future.
+    if (nextSyncUnix <= nowUnix) {
+      nextSyncUnix += periodSec;
+      Serial.printf("[A2] sync slot already past, advancing one period -> %lu\n",
+                    (unsigned long)nextSyncUnix);
+    }
   }
   uint32_t wakeUnixRaw = (nextSyncUnix > preWakeSec) ? (nextSyncUnix - preWakeSec) : nextSyncUnix;
 
@@ -794,20 +810,18 @@ static uint32_t nextSyncSlotUnix(uint32_t nowUnix) {
   if (g_syncIntervalMin == 0) {
     DateTime now(nowUnix);
     DateTime phase((g_syncPhaseUnix > 0) ? g_syncPhaseUnix : nowUnix);
-    DateTime next(now.year(), now.month(), now.day(), phase.hour(), phase.minute(), 0);
-    if (now.unixtime() >= next.unixtime()) {
-      DateTime tomorrow(now.unixtime() + 24UL * 60UL * 60UL);
-      next = DateTime(tomorrow.year(), tomorrow.month(), tomorrow.day(), phase.hour(), phase.minute(), 0);
-    }
-    return next.unixtime();
+    DateTime target(now.year(), now.month(), now.day(), phase.hour(), phase.minute(), 0);
+    return target.unixtime();
   }
 
   const uint32_t periodSec = (uint32_t)g_syncIntervalMin * 60UL;
   uint32_t phase = g_syncPhaseUnix;
-  if (phase == 0 || phase > nowUnix) phase = nowUnix;
+  if (phase == 0) phase = nowUnix;
+  if (phase > nowUnix) return phase;
 
+  // For an A2-driven sync wake we want the current slot boundary, not the next one.
   const uint32_t slot = (nowUnix - phase) / periodSec;
-  return phase + (slot + 1UL) * periodSec;
+  return phase + slot * periodSec;
 }
 
 static void captureSensorsToQueue() {
@@ -1657,6 +1671,13 @@ static void handleRtcWakeEvents(bool dataWake, bool syncWake) {
         if (listenUntilUnix < targetPlusGraceUnix) {
           listenUntilUnix = targetPlusGraceUnix;
         }
+      }
+      const uint32_t hardCapUnix = nowUnix + baseListenSec + (uint32_t)SYNC_MARKER_GRACE_SEC;
+      if (listenUntilUnix > hardCapUnix) {
+        Serial.printf("[SYNC] listen window capped: target=%lu cap=%lu\n",
+                      (unsigned long)listenUntilUnix,
+                      (unsigned long)hardCapUnix);
+        listenUntilUnix = hardCapUnix;
       }
 
       char targetStr[24];
