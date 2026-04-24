@@ -14,7 +14,7 @@ uint16_t resolveSensorId(const char* label, const char* type) {
   if (label) {
     if (strcmp(label, "AIR_TEMP") == 0) return SENSOR_ID_AIR_TEMP;
     if (strcmp(label, "AIR_RH") == 0) return SENSOR_ID_AIR_RH;
-    if (strcmp(label, "PAR") == 0) return SENSOR_ID_PAR;
+    if (strcmp(label, "PAR") == 0) return SENSOR_ID_UNKNOWN;
     if (strcmp(label, "WIND_SPEED") == 0) return SENSOR_ID_WIND_SPEED;
     if (strcmp(label, "SOIL1_VWC") == 0) return SENSOR_ID_SOIL1_VWC;
     if (strcmp(label, "SOIL2_VWC") == 0) return SENSOR_ID_SOIL2_VWC;
@@ -27,7 +27,7 @@ uint16_t resolveSensorId(const char* label, const char* type) {
   if (type) {
     if (strcmp(type, SENSOR_TYPE_AIR_TEMP) == 0) return SENSOR_ID_AIR_TEMP;
     if (strcmp(type, SENSOR_TYPE_HUMIDITY) == 0) return SENSOR_ID_AIR_RH;
-    if (strcmp(type, SENSOR_TYPE_PAR) == 0) return SENSOR_ID_PAR;
+    if (strcmp(type, SENSOR_TYPE_PAR) == 0) return SENSOR_ID_UNKNOWN;
     if (strcmp(type, SENSOR_TYPE_WIND) == 0) return SENSOR_ID_WIND_SPEED;
     if (strcmp(type, SENSOR_TYPE_SOIL_VWC) == 0) return SENSOR_ID_SOIL1_VWC;
     if (strcmp(type, SENSOR_TYPE_SOIL_TEMP) == 0) return SENSOR_ID_SOIL1_TEMP;

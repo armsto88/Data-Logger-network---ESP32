@@ -92,11 +92,10 @@ Lists every known node with one row per node. Refreshes automatically every 15 s
 | Column | Meaning |
 |---|---|
 | ID / Name | User-assigned ID (e.g. `001`) and name (e.g. `River bank North`). Falls back to hardware-derived node ID if not yet assigned. |
-| Interval | The configured target wake interval for this node. |
+| Interval | The configured target wake interval for this node. Reflects the global wake interval immediately when changed — no redeploy required. |
 | Next wake | Estimated next wake time, computed from last contact time and configured interval. |
-| Queue | Number of samples buffered on the node since its last sync, as reported at last radio contact. |
 | Deploy chip | `Deployed`, `Paired`, or `Unpaired` — the node's lifecycle state. |
-| Config chip | `Config updated` (firmware acknowledged the latest config) or `Config pending` (a change is waiting for the node to confirm). |
+| Battery chip | Last measured battery voltage. Green ≥ 3.9 V, orange 3.5–3.9 V, red < 3.5 V, grey `n/a` before first data received. Persists across mothership reboots. |
 
 Clicking a node row opens its individual configuration page.
 
@@ -334,12 +333,12 @@ The mothership independently infers stale nodes from contact age and sends a uni
 
 If a node is stuck and unreachable through normal means:
 
-1. Power-cycle the node **three times** rapidly (within 20 seconds).
-2. On the third boot the node detects the pattern and enters rescue mode.
-3. Node config is wiped to UNPAIRED, radio stays on, and the node continuously broadcasts discovery beacons.
+1. Power-cycle the node **three times** rapidly (within 20 seconds). For example, remove and reinsert the battery three times.
+2. On the third boot the node detects the rapid-reboot pattern and enters rescue mode.
+3. Node config is wiped to UNPAIRED, the radio stays on, and the node continuously broadcasts discovery beacons every 5 seconds.
 4. The mothership sees the node as UNPAIRED in the Node Manager — re-pair and re-deploy normally.
 
-No serial connection or extra hardware required.
+No serial connection or programming hardware is required. The streak counter resets itself after a successful normal boot, so two rapid reboots during normal field work (e.g. reseating a battery connector) will not accidentally trigger rescue.
 
 ### 9.5 Duplicate Deploy
 
@@ -374,7 +373,35 @@ This means:
 - The DS3231 RTC continues running on its own coin-cell battery.
 - Boot time (NVS load, sensor init, I2C scan) is approximately 2–2.5 seconds.
 
-### 11.2 Radio Duty Cycle
+### 11.2 Battery Voltage Monitoring
+
+Every data wake, the node reads battery voltage via an ADC channel (GPIO35) connected through a resistor divider. The reading is included in every snapshot packet under the `bat_v` CSV column. A calibration scale factor (`BAT_DIVIDER_SCALE`, default 3.58) converts the ADC reading to volts; this was determined by DMM measurement against the actual battery voltage during commissioning.
+
+The Node Manager displays the last received battery voltage for each node as a colour-coded chip:
+- **Green** — ≥ 3.9 V (healthy)
+- **Orange** — 3.5–3.9 V (moderate, plan recharge)
+- **Red** — < 3.5 V (low — recharge or replace before next field period)
+- **Grey n/a** — no snapshot received yet since last mothership reboot
+
+Battery readings persist across mothership reboots. The last value is stored in NVS alongside node pairing state.
+
+**Note on accuracy:** The ESP32 ADC has ±5–10% inherent nonlinearity. Battery readings are accurate to approximately ±0.2 V relative to a DMM reference. This is sufficient for state-of-health monitoring and low-battery alerting but not for precise charge estimation.
+
+### 11.2 Battery Voltage Monitoring
+
+Every data wake, the node reads battery voltage via an ADC channel (GPIO35) connected through a resistor voltage divider on the PCB. The reading is included in every snapshot as `bat_v` in the CSV.
+
+The Node Manager displays the last received value as a colour-coded chip:
+- **Green** — ≥ 3.9 V (healthy)
+- **Orange** — 3.5–3.9 V (moderate, plan recharge)
+- **Red** — < 3.5 V (low — recharge or replace before next field period)
+- **Grey `n/a`** — no snapshot received yet since last mothership reboot
+
+This value persists across mothership reboots — you do not need to wait for the next sync window to see the last known battery state after cycling power on the mothership.
+
+**Note on accuracy:** The reading is calibrated against a DMM reference at commissioning (`BAT_DIVIDER_SCALE = 3.58`, 24 April 2026) but the ESP32 ADC has ±5–10% inherent nonlinearity. Readings are accurate to approximately ±0.2 V — sufficient for state-of-health monitoring and low-battery alerts, not for precise charge estimation.
+
+### 11.3 Radio Duty Cycle
 
 A deployed node keeps radio fully off during data wakes. Radio is on only during:
 - Sync wakes — up to 60 seconds.
@@ -398,6 +425,7 @@ The mothership currently runs continuously (WiFi AP + web server + ESP-NOW alway
 | Long-term multi-season durability | Not yet validated. Testing is currently bench and short-term field. |
 | Sensor calibration | Bring-up establishes functional readiness only. Formal metrological calibration is a separate activity. |
 | Mothership SD write (decoupled from receive) | Already implemented: SD writes are queued in RAM and drained in main loop, preventing receive-path blocking. |
+| Battery voltage accuracy | ±0.2 V vs DMM reference (ESP32 ADC nonlinearity). Suitable for health monitoring, not precision charge estimation. Per-board calibration constants would improve accuracy. |
 
 ---
 

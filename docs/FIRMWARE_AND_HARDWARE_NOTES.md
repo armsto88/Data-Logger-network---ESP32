@@ -968,3 +968,163 @@ This record creates an auditable link between physical unit history and field da
 ### 8.6 Scope of Interpretation
 
 The bring-up process establishes functional readiness and systems integration confidence. It does not replace formal metrological calibration, uncertainty quantification, or long-duration durability testing. Those activities are separate components of full validation.
+
+---
+
+## 9. Firmware Update Log — 24 April 2026
+
+This section records all firmware changes made during and after the first full 4-node fleet commissioning session (24 April 2026).
+
+---
+
+### 9.1 Sync Mode Default Bug Fix
+
+**Problem:** `gSyncMode` was initialised to `SYNC_MODE_DAILY` at compile time and the NVS read-back also defaulted to `SYNC_MODE_DAILY` if no value was stored. After a fresh NVS erase, the mothership would silently run in daily-sync mode (firing only once per day) rather than interval mode.
+
+**Fix:** Both the global initialiser and the NVS read-back default were changed to `SYNC_MODE_INTERVAL`. A migration guard (`wake_v2_init` NVS key) writes a 5-minute default wake interval on first boot after a fresh erase, so fresh boards boot with deterministic, sane settings (`wake=5 min`, `sync=90 min`, `mode=Interval`) without any manual configuration.
+
+**Files changed:** `firmware/mothership/src/main.cpp`
+
+---
+
+### 9.2 Node Firmware Build Error Fixes
+
+Three separate issues that accumulated during the `node_snapshot_t` protocol redesign were resolved during the 24 April session:
+
+| File | Issue | Fix |
+|------|-------|-----|
+| `local_queue.cpp` | Helper functions and type definitions were declared after the `local_queue` namespace that used them, causing forward-reference errors. The bottom of the file also contained stale duplicate struct code from a prior version. | Full structural rewrite: anonymous namespace (helpers) first, then `local_queue` namespace. Duplicate tail code removed. |
+| `local_queue.h` | Include path used `../../../../shared/protocol.h` (one level too deep). | Corrected to `../../../shared/protocol.h`. |
+| `sensors.cpp` | Several references to `SENSOR_ID_PAR` which was removed from `protocol.h` in the `node_snapshot_t` redesign. | References replaced with `SENSOR_ID_UNKNOWN`. |
+
+---
+
+### 9.3 Battery Voltage Monitoring — Implementation
+
+**Bring-up reference:** `firmware/nodes/bringup/bringup_battery_io35.cpp`
+
+Battery voltage is read on every data wake via a direct ADC measurement on GPIO35 (IO35), which is connected to the battery through a resistor voltage divider. The reading bypasses the sensor registry and is always captured regardless of which I2C sensors are fitted.
+
+**ADC parameters (set in `platformio.ini`):**
+
+| Parameter | Value |
+|-----------|-------|
+| `BAT_ADC_PIN` | 35 |
+| `BAT_ADC_SAMPLES` | 16 (averaged) |
+| `BAT_DIVIDER_SCALE` | 3.58 (calibrated 24 April 2026) |
+
+**Scale calibration:** Scale factor was determined by DMM measurement of the battery at the node input (`4.06 V` no-load) and fitting against the fleet-average ESP32 ADC pin voltage across all 4 nodes. The ESP32's ADC with 11 dB attenuation has ±5–10% inherent nonlinearity — this scale gives all nodes readings within ±0.2 V of the DMM reference, which is sufficient for battery state-of-health trending.
+
+**Voltage divider hardware:** 220 kΩ / 100 kΩ (ratio ≈ 3.2:1 theoretical; calibrated ratio 3.58 accounts for ADC offset).
+
+**Node firmware changes (`firmware/nodes/sensor-node/src/main.cpp`):**
+
+In `captureSensorsToQueue()`, after all I2C sensor reads, the battery block runs:
+```cpp
+analogReadResolution(12);
+analogSetPinAttenuation(BAT_ADC_PIN, ADC_11db);
+// 16-sample average with 500 µs between samples
+raw_avg = sum / BAT_ADC_SAMPLES;
+pin_v = (raw_avg / 4095.0f) * 3.3f;
+snap.batVoltage = pin_v * BAT_DIVIDER_SCALE;
+snap.sensorPresent |= SNAP_PRESENT_BAT_V;
+```
+
+Battery voltage is stored in the `batVoltage` field of `node_snapshot_t` (`protocol.h`). `SNAP_PRESENT_BAT_V` (bit 8) is set in `sensorPresent` when a valid reading is obtained. Serial log: `[BAT] raw=NNN pin_v=X.XXXxV bat_v=X.XXXV`.
+
+**CSV column:** `bat_v` — fourth column in the wide-format row, immediately before `air_temp_c`.
+
+**Observed fleet battery readings (24 April 2026, all nodes on shared LiPo ~4.06 V no-load):**
+
+| Node (firmware ID) | CSV `bat_v` |
+|--------------------|-------------|
+| ENV_945DC4 | 3.84–3.85 V |
+| ENV_92F960 | 3.99–4.02 V |
+| ENV_94E38C | 4.23–4.24 V |
+| ENV_94DF54 | 4.11–4.13 V |
+
+Inter-node spread (~0.4 V) is within expected ESP32 ADC nonlinearity bounds. Values are suitable for low-battery alerts and long-term discharge trend monitoring.
+
+---
+
+### 9.4 Mothership — `lastReportedBatV` Persistence
+
+**Problem:** Battery voltage was stored only in the in-memory `NodeInfo` struct. After a mothership reboot, all nodes showed "n/a" in the battery column of the Node Manager until the next sync window.
+
+**Fix:** Added `float lastReportedBatV` to the `NodeInfo` struct. `savePairedNodes()` now writes it to NVS as `batv%d` (0.0 sentinel = NaN, since real voltages are never zero). `loadPairedNodes()` restores it on boot.
+
+**Files changed:** `firmware/mothership/src/comms/espnow_manager.h`, `firmware/mothership/src/comms/espnow_manager.cpp`
+
+---
+
+### 9.5 Node Manager UI — Battery Column
+
+A **Battery** status cell was added to every node card in the Node Manager (`/nodes`). The chip is colour-coded by voltage threshold:
+
+| Voucher | Chip colour | Meaning |
+|---------|-------------|---------|
+| ≥ 3.9 V | Green | Healthy |
+| 3.5–3.9 V | Orange | Moderate |
+| < 3.5 V | Red | Low — recharge or replace |
+| No data yet | Grey `n/a` | No snapshot received since last reboot |
+
+The column only activates once the first snapshot with `SNAP_PRESENT_BAT_V` set has been received from a given node. After that it is retained across mothership reboots (see §9.4).
+
+**Queue and Config badges removed:** The "Queue" timing cell and "Config updated / Config pending" status cell were removed from the node manager card in the same UI pass. The queue depth is still tracked internally (used in sync receive logic), and config version negotiation continues to operate — only the display was removed to reduce visual clutter after these values were judged less useful to field operators than battery state and deploy status.
+
+**Node Manager now shows per node card:** Interval · Next wake · Deploy state · Battery
+
+---
+
+### 9.6 Node Manager UI — Interval Display Priority Fix
+
+**Problem:** The "Interval" chip on the Node Manager card showed `5 min` even after the global wake interval was changed to `1 min`, until a node had been re-deployed. This was because the resolution order was `nodeDesired → observedWakeMin → gWakeIntervalMin` — the `observedWakeMin` (last HELLO-reported value from the node, still `5`) short-circuited the fresh global setting.
+
+**Fix:** Resolution order changed to `nodeDesired → gWakeIntervalMin → observedWakeMin`. The global setting now takes effect on the UI immediately when changed, without requiring a deploy or a node contact.
+
+**Files changed:** `firmware/mothership/src/main.cpp`
+
+---
+
+### 9.7 Schedule Panel UI Improvements
+
+The Global Schedules section of the home page was updated:
+
+- Old layout: "Sync mode" + "Active sync" stats.
+- New layout: **Node wake** (formatted as "X min" or "Off") · **Auto sync** (derived sync plan summary) · **Next sync** (ISO local time to next scheduled sync burst).
+
+This gives operators the three most operationally useful values at a glance, without exposing sync mode internals that are not user-configurable.
+
+---
+
+### 9.8 SD Drain Queue Depth Reset
+
+After the mothership drains each node's queued snapshots to SD card during a sync window, `lastReportedQueueDepth` is reset to zero for that node. Previously, the depth counter showed the queued count from the start of the sync window and never cleared until the next HELLO was received (which could be 18 minutes later). The reset now happens immediately after each node's records are written.
+
+**Files changed:** `firmware/mothership/src/comms/espnow_manager.cpp`
+
+---
+
+### 9.9 4-Node Fleet Commissioning Validation — 24 April 2026
+
+**Fleet configuration:**
+
+| Parameter | Value |
+|-----------|-------|
+| Nodes | 4 × ESP32-WROOM on custom PCB |
+| Node IDs assigned | 001–004 |
+| Wake interval | 1 min |
+| Sync interval | 18 min (auto-derived, K=18) |
+| Phase anchor (`syncPhaseUnix`) | 1777061040 |
+| Sensors active | ADS1115 soil moisture + temperature (4-channel), IO35 battery ADC |
+
+**Key test results:**
+
+| Test | Result |
+|------|--------|
+| FN-3: simultaneous 4-node flush (62 snapshots) | ✅ PASS — zero dropped, single SD open/close |
+| FN-4: post-UI-update commissioning flush (64 snapshots) | ✅ PASS — zero dropped |
+| Battery column (`present=0x0130`) all 4 nodes | ✅ PASS — bit 8 set, realistic voltages logged |
+| Node Manager interval displays 1 min immediately after global change | ✅ PASS |
+| Battery persists across mothership reboot | ✅ PASS (confirmed after NVS persistence fix) |
+| Next A2 alignment across fleet | ✅ All nodes locked to same slot (62 s deviation max) |

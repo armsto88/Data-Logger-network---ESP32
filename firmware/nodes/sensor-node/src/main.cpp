@@ -855,6 +855,24 @@ static void captureSensorsToQueue() {
   snap.aux1       = NAN;
   snap.aux2       = NAN;
 
+  // Battery voltage — dedicated ADC read (bypasses sensor registry, runs every wake)
+#ifdef BAT_ADC_PIN
+  {
+    analogReadResolution(12);
+    analogSetPinAttenuation(BAT_ADC_PIN, ADC_11db);
+    uint32_t raw_sum = 0;
+    for (int i = 0; i < BAT_ADC_SAMPLES; ++i) {
+      raw_sum += analogRead(BAT_ADC_PIN);
+      delayMicroseconds(500);
+    }
+    const uint16_t raw_avg = (uint16_t)(raw_sum / BAT_ADC_SAMPLES);
+    const float pin_v      = (static_cast<float>(raw_avg) / 4095.0f) * 3.3f;
+    snap.batVoltage        = pin_v * BAT_DIVIDER_SCALE;
+    snap.sensorPresent    |= SNAP_PRESENT_BAT_V;
+    Serial.printf("[BAT] raw=%u pin_v=%.3fV bat_v=%.3fV\n", raw_avg, pin_v, snap.batVoltage);
+  }
+#endif
+
   if (g_numSensors == 0) {
     Serial.println("⚠️ No sensors configured (g_numSensors == 0)");
   }

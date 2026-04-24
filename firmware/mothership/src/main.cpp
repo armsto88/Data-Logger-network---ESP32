@@ -63,7 +63,7 @@ enum SyncMode {
   SYNC_MODE_DAILY = 0,
   SYNC_MODE_INTERVAL = 1,
 };
-int gSyncMode = SYNC_MODE_DAILY;
+int gSyncMode = SYNC_MODE_INTERVAL;
 unsigned long gLastSyncBroadcastMs = 0;
 unsigned long gLastSyncBroadcastUnix = 0;
 unsigned long gLastSyncAuditMs = 0;
@@ -111,9 +111,9 @@ static void sendCaptivePortalLanding() {
 static void loadWakeIntervalFromNVS() {
   bool migrated = false;
   if (gPrefs.begin("ui", false)) {
-    // One-time migration: force OFF as the new default for global interval trigger.
+    // One-time migration: set 5 min as the default wake interval on first boot.
     if (!gPrefs.getBool("wake_v2_init", false)) {
-      gPrefs.putInt("wake_min", 0);
+      gPrefs.putInt("wake_min", 5);
       gPrefs.putBool("wake_v2_init", true);
       migrated = true;
     }
@@ -128,7 +128,7 @@ static void loadWakeIntervalFromNVS() {
   }
 
   if (migrated) {
-    Serial.println("[UI] wake interval migration applied: defaulted global trigger to OFF");
+    Serial.println("[UI] wake interval migration applied: defaulted global trigger to 5 min");
   }
 }
 
@@ -150,7 +150,7 @@ static void saveSyncIntervalToNVS(int) {
 
 static void loadSyncModeFromNVS() {
   if (gPrefs.begin("ui", true)) {
-    int m = gPrefs.getInt("sync_mode", SYNC_MODE_DAILY);
+    int m = gPrefs.getInt("sync_mode", SYNC_MODE_INTERVAL);
     gPrefs.end();
     gSyncMode = (m == SYNC_MODE_INTERVAL) ? SYNC_MODE_INTERVAL : SYNC_MODE_DAILY;
   }
@@ -1185,6 +1185,9 @@ a{color:var(--primary);text-decoration:none}
 .chip--link-offline{border-color:#ffcdd2;background:#ffebee;color:#b71c1c}
 .chip--cfg-pending{border-color:#ffe0b2;background:#fff8e1;color:#8a4b00}
 .chip--cfg-ok{border-color:#c8e6c9;background:#f1f8e9;color:#256029}
+.chip--bat-ok{border-color:#bcd1bd;background:rgba(164,194,165,.28);color:#2f4f35}
+.chip--bat-med{border-color:#E1B17A;background:rgba(225,177,122,.28);color:#7a4b13}
+.chip--bat-low{border-color:#DB162F;background:rgba(219,22,47,.14);color:#7f1020}
 
 /* Forms */
 .label{display:block;margin:8px 0 6px;color:var(--sub);font-size:.95rem}
@@ -1635,15 +1638,18 @@ void handleRoot() {
             "</form>"
             "</div>"
             "<div class='stats' style='margin:0 0 12px 0'>"
-            "<div class='stat'><strong>Sync mode</strong><span class='num' style='font-size:16px'><span id='kpi-sync-mode'>");
-  html += syncModeLabel();
-  html += F("</span></span></div>"
-            "<div class='stat'><strong>Active sync</strong><span class='num' style='font-size:16px'>");
-  html += F("<span id='kpi-active-sync'>");
+            "<div class='stat'><strong>Node wake</strong><span class='num' style='font-size:16px'>");
+  if (gWakeIntervalMin > 0) {
+    html += String(gWakeIntervalMin);
+    html += F(" min");
+  } else {
+    html += F("Off");
+  }
+  html += F("</span></div>"
+            "<div class='stat'><strong>Auto sync</strong><span class='num' style='font-size:16px'><span id='kpi-active-sync'>");
   html += activeSyncPlan;
   html += F("</span></span></div>"
-            "<div class='stat'><strong>Next sync</strong><span class='num' style='font-size:16px'>");
-  html += F("<span id='kpi-next-sync'>");
+            "<div class='stat'><strong>Next sync</strong><span class='num' style='font-size:16px'><span id='kpi-next-sync'>");
   html += computeNextSyncIsoLocal();
   html += F("</span></span></div>"
             "</div>"
@@ -2334,8 +2340,7 @@ void handleNodesPage() {
   } else {
     html += F("<p class='muted' style='margin:0 0 10px 0'>"
           "Interval shows the configured target for each node. "
-          "Next wake uses last node contact cadence (est while asleep). "
-          "Queue is buffered samples reported by the node at wake start."
+          "Next wake uses last node contact cadence (est while asleep)."
           "</p>");
     html += F("<div class='list'>");
 
@@ -2346,38 +2351,16 @@ void handleNodesPage() {
       if (userId.isEmpty()) userId = getNodeUserId(node.nodeId);
       if (name.isEmpty())   name   = getNodeName(node.nodeId);
       NodeDesiredConfig nodeDesired = getDesiredConfig(node.nodeId.c_str());
-      uint16_t desiredCfgV = nodeDesired.configVersion;
-      uint16_t appliedCfgV = node.configVersionApplied;
-      bool cfgPending = (desiredCfgV > 0 && appliedCfgV < desiredCfgV);
       uint8_t observedWakeMin = (node.wakeIntervalMin > 0)
         ? node.wakeIntervalMin
         : node.inferredWakeIntervalMin;
       int nodeIntervalCurrentMin = (nodeDesired.wakeIntervalMin > 0)
         ? (int)nodeDesired.wakeIntervalMin
-        : ((observedWakeMin > 0)
-            ? (int)observedWakeMin
-            : (isAllowedInterval(gWakeIntervalMin) ? gWakeIntervalMin : 5));
-      const uint8_t nodeQueueDepth = node.lastReportedQueueDepth;
+        : ((isAllowedInterval(gWakeIntervalMin) && gWakeIntervalMin > 0)
+            ? gWakeIntervalMin
+            : ((observedWakeMin > 0) ? (int)observedWakeMin : 5));
       const String nextWake = computeNextWakeIsoLocal(nodeIntervalCurrentMin, node.lastSeen, node.isActive);
       const String nextWakeTime = (nextWake.length() >= 8) ? nextWake.substring(0, 8) : String("n/a");
-      if (cfgPending && node.state == DEPLOYED && !node.deployPending &&
-          nodeDesired.wakeIntervalMin > 0 && observedWakeMin > 0 &&
-          nodeDesired.wakeIntervalMin == observedWakeMin) {
-        // Treat HELLO-reported wake interval match as applied config evidence when ACK is missed.
-        cfgPending = false;
-      }
-
-      String deployState = "Unpaired";
-      if (node.state == DEPLOYED) deployState = "Deployed";
-      else if (node.state == PAIRED) deployState = "Paired";
-
-      String appliedLabel = "";
-      if (!node.stateChangePending && node.lastStateAppliedMs > 0) {
-        if (node.lastAppliedTargetState == PENDING_TO_PAIRED) appliedLabel = "Paired applied";
-        else if (node.lastAppliedTargetState == PENDING_TO_UNPAIRED) appliedLabel = "Unpaired applied";
-        else if (node.lastAppliedTargetState == PENDING_TO_DEPLOYED) appliedLabel = "";
-        else appliedLabel = "Applied";
-      }
 
       String displayId = userId.length() ? userId : node.nodeId;
 
@@ -2406,12 +2389,6 @@ void handleNodesPage() {
                 "<span class='node-timing-label'>Next wake</span>"
                 "<span class='chip node-timing-value'>");
       html += nextWakeTime;
-              html += F("</span>"
-                    "</div>"
-                    "<div class='node-timing-cell'>"
-                    "<span class='node-timing-label'>Queue</span>"
-                    "<span class='chip node-timing-value'>");
-              html += String((unsigned)nodeQueueDepth);
       html += F("</span>"
                 "</div>"
                 "</div>"
@@ -2422,18 +2399,27 @@ void handleNodesPage() {
       if (node.state == DEPLOYED) html += F("<span class='chip chip--state-deployed'>Deployed</span>");
       else if (node.state == PAIRED) html += F("<span class='chip chip--state-paired'>Paired</span>");
       else html += F("<span class='chip chip--state-unpaired'>Unpaired</span>");
-      if (appliedLabel.length()) {
-        html += F("<span class='chip chip--cfg-ok' style='margin-top:4px'>");
-        html += appliedLabel;
-        html += F("</span>");
-      }
 
       html += F("</div>"
                 "<div class='node-status-cell'>"
-                "<span class='node-timing-label'>Config</span>");
-
-      if (cfgPending) html += F("<span class='chip chip--cfg-pending'>Config pending</span>");
-      else html += F("<span class='chip chip--cfg-ok'>Config updated</span>");
+                "<span class='node-timing-label'>Battery</span>");
+      {
+        float batV = node.lastReportedBatV;
+        if (isnan(batV)) {
+          html += F("<span class='chip'>n/a</span>");
+        } else {
+          char batBuf[10];
+          snprintf(batBuf, sizeof(batBuf), "%.2fV", batV);
+          const char* batClass = (batV >= 3.9f) ? "chip--bat-ok"
+                               : (batV >= 3.5f) ? "chip--bat-med"
+                               : "chip--bat-low";
+          html += F("<span class='chip ");
+          html += batClass;
+          html += F("'>");
+          html += batBuf;
+          html += F("</span>");
+        }
+      }
 
       html += F("</div></div></div></a>");
     }

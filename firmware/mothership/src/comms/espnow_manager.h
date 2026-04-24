@@ -48,6 +48,8 @@ struct NodeInfo {
     uint8_t   wakeIntervalMin;
     // Last queue depth reported by NODE_HELLO at wake start.
     uint8_t   lastReportedQueueDepth;
+    // Last battery voltage seen in a NODE_SNAPSHOT from this node (NAN = unknown).
+    float     lastReportedBatV;
     // Wake interval inferred from nodeTimestamp cadence in sensor data (0 = unknown)
     uint8_t   inferredWakeIntervalMin;
     // Last seen nodeTimestamp used for cadence inference (unix seconds)

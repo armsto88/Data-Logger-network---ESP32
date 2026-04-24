@@ -286,6 +286,14 @@ static void drainCsvQueueToSd() {
         file.println(rowBuf);
         Serial.printf("Data logged: %s\n", rowBuf);
         written++;
+
+        // Reset queue depth badge for this node now its record is drained.
+        for (auto& n : registeredNodes) {
+            if (String(s.nodeId) == n.nodeId) {
+                n.lastReportedQueueDepth = 0;
+                break;
+            }
+        }
     }
 
     file.close();
@@ -788,6 +796,10 @@ static void OnDataRecv(const uint8_t * mac,
                     if (snap.configVersion > 0 && snap.configVersion > n.configVersionApplied) {
                         n.configVersionApplied = snap.configVersion;
                     }
+                    // Update battery voltage from snapshot.
+                    if ((snap.sensorPresent & SNAP_PRESENT_BAT_V) && !isnan(snap.batVoltage)) {
+                        n.lastReportedBatV = snap.batVoltage;
+                    }
                     break;
                 }
             }
@@ -1288,6 +1300,10 @@ void savePairedNodes() {
         snprintf(key, sizeof(key), "st%d", idx);
         prefs.putUChar(key, (uint8_t)n.state);
 
+        // Last reported battery voltage (NAN stored as 0 sentinel)
+        snprintf(key, sizeof(key), "batv%d", idx);
+        prefs.putFloat(key, isnan(n.lastReportedBatV) ? 0.0f : n.lastReportedBatV);
+
         idx++;
     }
 
@@ -1336,6 +1352,10 @@ void loadPairedNodes() {
         uint8_t stRaw = prefs.getUChar(key, (uint8_t)PAIRED);
         NodeState state = (stRaw <= DEPLOYED) ? (NodeState)stRaw : PAIRED;
 
+        // Last reported battery voltage (0.0 sentinel = NAN)
+        snprintf(key, sizeof(key), "batv%d", i);
+        float savedBatV = prefs.getFloat(key, 0.0f);
+
       NodeInfo newNode{};
         memcpy(newNode.mac, mac, 6);
         newNode.nodeId   = nid;
@@ -1349,6 +1369,7 @@ void loadPairedNodes() {
         newNode.lastTimeSyncMs       = 0;
         newNode.wakeIntervalMin      = 0;
         newNode.lastReportedQueueDepth = 0;
+        newNode.lastReportedBatV     = (savedBatV > 0.0f) ? savedBatV : NAN;
         newNode.inferredWakeIntervalMin = 0;
         newNode.lastNodeTimestamp    = 0;
         newNode.configVersionApplied = 0;
