@@ -5,9 +5,106 @@
 
 namespace {
 
-static constexpr uint32_t kMagic = 0x4E514D31;  // "NQM1"
-static constexpr uint16_t kVersion = 2;
-static constexpr uint16_t kCapacity = 24;       // Keep blob safely within NVS limits.
+// Bump magic/version so existing NVS blobs from the old per-sensor queue are
+// automatically invalidated and a fresh queue is started on first boot.
+static constexpr uint32_t kMagic    = 0x4E514D32;  // "NQM2" (was NQM1)
+static constexpr uint16_t kVersion  = 3;            // was 2
+static constexpr uint16_t kCapacity = 24;           // 24 snapshots * 124B = 2976B records
+                                                     // + 24B header + 4B checksum = 3004B < 4000B (NVS limit)
+
+struct QueueBlob {
+  uint32_t magic;
+  uint16_t version;
+  uint16_t capacity;
+  uint32_t nextSeq;
+  uint16_t head;
+  uint16_t tail;
+  uint16_t used;
+  uint16_t reserved;
+  node_snapshot_t records[kCapacity];
+  uint32_t checksum;
+};
+
+static_assert(sizeof(QueueBlob) < 4000, "Queue blob too large for NVS key");
+
+namespace local_queue {
+
+bool begin() {
+  if (load()) {
+    g_ready = true;
+    Serial.printf("[QUEUE] loaded: used=%u nextSeq=%lu\n", (unsigned)g_blob.used, (unsigned long)g_blob.nextSeq);
+    return true;
+  }
+
+  initDefault();
+  g_ready = persist();
+  Serial.printf("[QUEUE] initialized new queue: used=%u nextSeq=%lu\n", (unsigned)g_blob.used, (unsigned long)g_blob.nextSeq);
+  return g_ready;
+}
+
+bool enqueue(const node_snapshot_t& snap) {
+  if (!g_ready && !begin()) return false;
+
+  uint16_t effectiveQualityFlags = snap.qualityFlags;
+
+  if (g_blob.used >= kCapacity) {
+    Serial.printf("[QUEUE] full (%u/%u); dropping oldest (seq=%lu) DROP_OLDEST\n",
+                  (unsigned)g_blob.used, (unsigned)kCapacity,
+                  (unsigned long)g_blob.records[g_blob.tail].seqNum);
+    g_blob.tail = (uint16_t)((g_blob.tail + 1) % kCapacity);
+    g_blob.used--;
+    effectiveQualityFlags |= local_queue::QF_DROPPED;
+  }
+
+  node_snapshot_t rec = snap;
+  rec.seqNum       = g_blob.nextSeq;
+  rec.qualityFlags = effectiveQualityFlags;
+
+  g_blob.records[g_blob.head] = rec;
+  g_blob.head = (uint16_t)((g_blob.head + 1) % kCapacity);
+  g_blob.used++;
+  g_blob.nextSeq++;
+
+  return persist();
+}
+
+bool peek(node_snapshot_t& out) {
+  if (!g_ready && !begin()) return false;
+  if (g_blob.used == 0) return false;
+  out = g_blob.records[g_blob.tail];
+  return true;
+}
+
+bool pop() {
+  if (!g_ready && !begin()) return false;
+  if (g_blob.used == 0) return false;
+
+  g_blob.tail = (uint16_t)((g_blob.tail + 1) % kCapacity);
+  g_blob.used--;
+  return persist();
+}
+
+uint16_t count() {
+  if (!g_ready && !begin()) return 0;
+  return g_blob.used;
+}
+
+uint32_t nextSeq() {
+  if (!g_ready && !begin()) return 0;
+  return g_blob.nextSeq;
+}
+
+void clear() {
+  initDefault();
+  if (!persist()) {
+    Serial.println("[QUEUE] clear persist failed");
+    return;
+  }
+  g_ready = true;
+  Serial.println("[QUEUE] cleared");
+}
+
+}  // namespace local_queue
 
 struct QueueBlob {
   uint32_t magic;
@@ -92,105 +189,3 @@ bool load() {
 }
 
 }  // namespace
-
-namespace local_queue {
-
-bool begin() {
-  if (load()) {
-    g_ready = true;
-    Serial.printf("[QUEUE] loaded: used=%u nextSeq=%lu\n", (unsigned)g_blob.used, (unsigned long)g_blob.nextSeq);
-    return true;
-  }
-
-  initDefault();
-  g_ready = persist();
-  Serial.printf("[QUEUE] initialized new queue: used=%u nextSeq=%lu\n", (unsigned)g_blob.used, (unsigned long)g_blob.nextSeq);
-  return g_ready;
-}
-
-bool enqueue(uint32_t sampleUnix,
-             uint16_t sensorId,
-             const char* sensorType,
-             const char* sensorLabel,
-             float value,
-             uint16_t qualityFlags) {
-  if (!g_ready && !begin()) return false;
-
-  uint16_t effectiveQualityFlags = qualityFlags;
-
-  if (g_blob.used >= kCapacity) {
-    // DROP_OLDEST: overwrite the tail (oldest) entry to make room
-    Serial.printf("[QUEUE] full (%u/%u); dropping oldest (seq=%lu) for DROP_OLDEST policy\n",
-                  (unsigned)g_blob.used, (unsigned)kCapacity,
-                  (unsigned long)g_blob.records[g_blob.tail].sampleSeq);
-    g_blob.tail = (uint16_t)((g_blob.tail + 1) % kCapacity);
-    g_blob.used--;
-    effectiveQualityFlags |= local_queue::QF_DROPPED;
-  }
-
-  QueuedSample rec{};
-  rec.sampleSeq = g_blob.nextSeq;
-  rec.sampleUnix = sampleUnix;
-  rec.sensorId = sensorId;
-  rec.value = value;
-  rec.qualityFlags = effectiveQualityFlags;
-
-  if (sensorType && sensorType[0]) {
-    strncpy(rec.sensorType, sensorType, sizeof(rec.sensorType) - 1);
-  } else {
-    strncpy(rec.sensorType, "UNKNOWN", sizeof(rec.sensorType) - 1);
-  }
-  rec.sensorType[sizeof(rec.sensorType) - 1] = '\0';
-
-  if (sensorLabel && sensorLabel[0]) {
-    strncpy(rec.sensorLabel, sensorLabel, sizeof(rec.sensorLabel) - 1);
-  } else {
-    strncpy(rec.sensorLabel, "UNKNOWN", sizeof(rec.sensorLabel) - 1);
-  }
-  rec.sensorLabel[sizeof(rec.sensorLabel) - 1] = '\0';
-
-  g_blob.records[g_blob.head] = rec;
-  g_blob.head = (uint16_t)((g_blob.head + 1) % kCapacity);
-  g_blob.used++;
-  g_blob.nextSeq++;
-
-  return persist();
-}
-
-bool peek(QueuedSample& out) {
-  if (!g_ready && !begin()) return false;
-  if (g_blob.used == 0) return false;
-  out = g_blob.records[g_blob.tail];
-  return true;
-}
-
-bool pop() {
-  if (!g_ready && !begin()) return false;
-  if (g_blob.used == 0) return false;
-
-  g_blob.tail = (uint16_t)((g_blob.tail + 1) % kCapacity);
-  g_blob.used--;
-  return persist();
-}
-
-uint16_t count() {
-  if (!g_ready && !begin()) return 0;
-  return g_blob.used;
-}
-
-uint32_t nextSeq() {
-  if (!g_ready && !begin()) return 0;
-  return g_blob.nextSeq;
-}
-
-void clear() {
-  initDefault();
-  if (!persist()) {
-    Serial.println("[QUEUE] clear persist failed");
-    return;
-  }
-  g_ready = true;
-  Serial.println("[QUEUE] cleared");
-}
-
-}  // namespace local_queue

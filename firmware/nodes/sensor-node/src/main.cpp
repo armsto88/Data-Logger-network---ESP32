@@ -496,6 +496,11 @@ uint32_t  g_lastSyncSlot = 0xFFFFFFFFUL;
 static bool g_rescueModeActive = false;
 static uint32_t g_lastRescueBeaconMs = 0;
 
+// Set when UNPAIR_NODE is received during an active sync wake cycle.
+// Causes finalizeWakeAndSleep to skip the power cut so the UNPAIRED idle
+// loop can keep the radio on for 15 minutes before auto power-off.
+static bool g_postUnpairHold = false;
+
 #ifndef RESCUE_BOOT_THRESHOLD
 #define RESCUE_BOOT_THRESHOLD 3
 #endif
@@ -825,12 +830,35 @@ static uint32_t nextSyncSlotUnix(uint32_t nowUnix) {
 }
 
 static void captureSensorsToQueue() {
+  // Build one snapshot per wake cycle and enqueue it as a single NVS record.
+  // One snapshot = one NODE_SNAPSHOT ESP-NOW packet at flush time.
+  node_snapshot_t snap{};
+  strncpy(snap.command, "NODE_SNAPSHOT", sizeof(snap.command) - 1);
+  strncpy(snap.nodeId,  NODE_ID,        sizeof(snap.nodeId)  - 1);
+  snap.nodeTimestamp = rtc.now().unixtime();
+  snap.seqNum        = local_queue::nextSeq();
+  snap.sensorPresent = 0;
+  snap.qualityFlags  = 0;
+  snap.configVersion = 0; // filled by flush from NVS
+
+  // Initialise all float fields to NaN so missing sensors are obvious in CSV.
+  snap.batVoltage = NAN;
+  snap.airTemp    = NAN;
+  snap.airHumidity= NAN;
+  for (int i = 0; i < 8; i++) snap.spectral[i] = NAN;
+  snap.windSpeed  = NAN;
+  snap.windDir    = NAN;
+  snap.soil1Vwc   = NAN;
+  snap.soil1Temp  = NAN;
+  snap.soil2Vwc   = NAN;
+  snap.soil2Temp  = NAN;
+  snap.aux1       = NAN;
+  snap.aux2       = NAN;
+
   if (g_numSensors == 0) {
     Serial.println("⚠️ No sensors configured (g_numSensors == 0)");
-    return;
   }
 
-  uint32_t nowUnix = rtc.now().unixtime();
   for (size_t i = 0; i < g_numSensors; ++i) {
     float value = 0.0f;
     if (!readSensor(i, value)) {
@@ -838,18 +866,40 @@ static void captureSensorsToQueue() {
       continue;
     }
 
-    const char* labelStr = g_sensors[i].label ? g_sensors[i].label : "UNKNOWN";
-    const char* typeStr  = g_sensors[i].sensorType ? g_sensors[i].sensorType : "UNKNOWN";
     uint16_t sensorId = g_sensors[i].sensorId;
-    if (local_queue::enqueue(nowUnix, sensorId, typeStr, labelStr, value, 0)) {
-      Serial.printf("🧾 queued seq=%lu %s=%.4f (pending=%u)\n",
-                    (unsigned long)(local_queue::nextSeq() - 1),
-                    labelStr,
-                    value,
-                    (unsigned)local_queue::count());
-    } else {
-      Serial.printf("❌ queue append failed for %s\n", labelStr);
+    switch (sensorId) {
+      case SENSOR_ID_AIR_TEMP:                snap.airTemp     = value; snap.sensorPresent |= SNAP_PRESENT_AIR_TEMP; break;
+      case SENSOR_ID_AIR_RH:                  snap.airHumidity = value; snap.sensorPresent |= SNAP_PRESENT_AIR_RH;   break;
+      case SENSOR_ID_SPECTRAL_415: snap.spectral[0] = value; snap.sensorPresent |= SNAP_PRESENT_SPECTRAL;   break;
+      case SENSOR_ID_SPECTRAL_445: snap.spectral[1] = value; snap.sensorPresent |= SNAP_PRESENT_SPECTRAL;   break;
+      case SENSOR_ID_SPECTRAL_480: snap.spectral[2] = value; snap.sensorPresent |= SNAP_PRESENT_SPECTRAL;   break;
+      case SENSOR_ID_SPECTRAL_515: snap.spectral[3] = value; snap.sensorPresent |= SNAP_PRESENT_SPECTRAL;   break;
+      case SENSOR_ID_SPECTRAL_555: snap.spectral[4] = value; snap.sensorPresent |= SNAP_PRESENT_SPECTRAL;   break;
+      case SENSOR_ID_SPECTRAL_590: snap.spectral[5] = value; snap.sensorPresent |= SNAP_PRESENT_SPECTRAL;   break;
+      case SENSOR_ID_SPECTRAL_630: snap.spectral[6] = value; snap.sensorPresent |= SNAP_PRESENT_SPECTRAL;   break;
+      case SENSOR_ID_SPECTRAL_680: snap.spectral[7] = value; snap.sensorPresent |= SNAP_PRESENT_SPECTRAL;   break;
+      case SENSOR_ID_WIND_SPEED:              snap.windSpeed   = value; snap.sensorPresent |= SNAP_PRESENT_WIND;      break;
+      case SENSOR_ID_WIND_DIR:                snap.windDir     = value; snap.sensorPresent |= SNAP_PRESENT_WIND;      break;
+      case SENSOR_ID_SOIL1_VWC:               snap.soil1Vwc    = value; snap.sensorPresent |= SNAP_PRESENT_SOIL1;     break;
+      case SENSOR_ID_SOIL1_TEMP:              snap.soil1Temp   = value; snap.sensorPresent |= SNAP_PRESENT_SOIL1;     break;
+      case SENSOR_ID_SOIL2_VWC:               snap.soil2Vwc    = value; snap.sensorPresent |= SNAP_PRESENT_SOIL2;     break;
+      case SENSOR_ID_SOIL2_TEMP:              snap.soil2Temp   = value; snap.sensorPresent |= SNAP_PRESENT_SOIL2;     break;
+      case SENSOR_ID_BAT_V:                   snap.batVoltage  = value; snap.sensorPresent |= SNAP_PRESENT_BAT_V;     break;
+      case SENSOR_ID_AUX1:                    snap.aux1        = value; snap.sensorPresent |= SNAP_PRESENT_AUX1;      break;
+      case SENSOR_ID_AUX2:                    snap.aux2        = value; snap.sensorPresent |= SNAP_PRESENT_AUX2;      break;
+      default:
+        Serial.printf("⚠️ Unknown sensorId %u for slot %u — value not stored in snapshot\n", sensorId, (unsigned)i);
+        break;
     }
+  }
+
+  if (local_queue::enqueue(snap)) {
+    Serial.printf("🧾 snapshot queued seq=%lu present=0x%04X (pending=%u)\n",
+                  (unsigned long)snap.seqNum,
+                  (unsigned)snap.sensorPresent,
+                  (unsigned)local_queue::count());
+  } else {
+    Serial.println("❌ snapshot enqueue failed");
   }
 }
 
@@ -878,34 +928,26 @@ static void flushQueuedToMothership(uint32_t deadlineMs) {
       }
     }
 
-    local_queue::QueuedSample rec{};
-    if (!local_queue::peek(rec)) break;
+    node_snapshot_t snap{};
+    if (!local_queue::peek(snap)) break;
 
-    sensor_data_message_t msg{};
-    strcpy(msg.nodeId, NODE_ID);
-    strncpy(msg.sensorType, rec.sensorType, sizeof(msg.sensorType) - 1);
-    msg.sensorType[sizeof(msg.sensorType) - 1] = '\0';
-    strncpy(msg.sensorLabel, rec.sensorLabel, sizeof(msg.sensorLabel) - 1);
-    msg.sensorLabel[sizeof(msg.sensorLabel) - 1] = '\0';
-    msg.sensorId = rec.sensorId;
-    msg.value = rec.value;
-    msg.nodeTimestamp = rec.sampleUnix;
-    msg.qualityFlags = rec.qualityFlags;
+    // Tag with current config version at send time so mothership can track it.
+    snap.configVersion = (uint16_t)getNodeConfigVersion();
 
-    g_lastSendDone = false;
+    g_lastSendDone   = false;
     g_lastSendStatus = ESP_NOW_SEND_FAIL;
 
-    esp_err_t res = espnowSendWithRecover(mothershipMAC, (uint8_t*)&msg, sizeof(msg));
+    esp_err_t res = espnowSendWithRecover(mothershipMAC, (uint8_t*)&snap, sizeof(snap));
     if (res != ESP_OK) {
       Serial.printf("❌ queue flush send failed at seq=%lu: %s\n",
-                    (unsigned long)rec.sampleSeq,
+                    (unsigned long)snap.seqNum,
                     esp_err_to_name(res));
       break;
     }
 
     if (!waitForSendDelivery(200)) {
       Serial.printf("❌ queue flush delivery not confirmed at seq=%lu (status=%d)\n",
-                    (unsigned long)rec.sampleSeq,
+                    (unsigned long)snap.seqNum,
                     (int)g_lastSendStatus);
       break;
     }
@@ -1143,7 +1185,9 @@ static void onDataReceived(const uint8_t *mac, const uint8_t *incomingData, int 
       clearDS3231_AlarmFlags();
       persistNodeConfig();
       local_queue::clear();
+      g_postUnpairHold = true;
       Serial.println("💾 Node config persisted after UNPAIR");
+      Serial.println("📡 Post-unpair: radio hold requested (15 min idle before power-off)");
 
       debugState("after UNPAIR");
     }
@@ -1635,7 +1679,16 @@ static void finalizeWakeAndSleep(const char* reason) {
     Serial.println("🔁 [FINALIZE] Not deployed – alarms disabled, no re-arm");
   }
 
+  if (g_postUnpairHold) {
+    // UNPAIR was received during this sync wake. Keep PWR_HOLD asserted AND radio on;
+    // the UNPAIRED idle loop will listen for re-pair/commands for 15 minutes then power off.
+    g_postUnpairHold = false;
+    Serial.println("🔁 [FINALIZE] Post-unpair hold – radio stays on, deferring power cut to idle loop (15 min)");
+    return;
+  }
+
   shutdownEspNow();
+
   schedulePowerCut(reason ? reason : "wake cycle complete");
   Serial.printf("💤 [FINALIZE] Power cut scheduled – reason: %s\n",
                 reason ? reason : "wake cycle complete");
@@ -2050,9 +2103,13 @@ if (nowMs - lastA1Check > 1000UL) {
     g_lastIdleState = st;
 
     if (st == STATE_UNPAIRED) {
+      // Keep ESP-NOW alive so the mothership can re-pair or issue commands.
+      if (!g_espNowReady) {
+        bringupEspNow();
+      }
       if (nowMs - lastAction > 15000UL) {
         debugState("loop");
-        Serial.println("🟡 Unpaired – idle, waiting for discovery scan…");
+        Serial.println("🟡 Unpaired – radio on, listening for mothership…");
         lastAction = nowMs;
       }
     } else {

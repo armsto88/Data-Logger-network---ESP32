@@ -1,29 +1,18 @@
 #pragma once
 
 #include <Arduino.h>
+#include "../../../../shared/protocol.h"
 
 namespace local_queue {
 
 static constexpr uint16_t QF_DROPPED = 0x0001;
 
-struct QueuedSample {
-  uint32_t sampleSeq;
-  uint32_t sampleUnix;
-  uint16_t sensorId;
-  char sensorType[16];
-  char sensorLabel[24];
-  float value;
-  uint16_t qualityFlags;
-};
-
+// The queue now stores one node_snapshot_t per wake cycle rather than
+// individual sensor readings. This reduces ESP-NOW packet count from
+// N_sensors packets/node/wake to 1 packet/node/wake.
 bool begin();
-bool enqueue(uint32_t sampleUnix,
-             uint16_t sensorId,
-             const char* sensorType,
-             const char* sensorLabel,
-             float value,
-             uint16_t qualityFlags = 0);
-bool peek(QueuedSample& out);
+bool enqueue(const node_snapshot_t& snap);
+bool peek(node_snapshot_t& out);
 bool pop();
 uint16_t count();
 uint32_t nextSeq();

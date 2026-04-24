@@ -63,15 +63,28 @@ static const uint32_t STALE_ASSIST_LEAD_MS = 20000UL;
 static const uint32_t STALE_ASSIST_LAG_MS = 45000UL;
 static const uint32_t STALE_ASSIST_RETRY_MS = 10000UL;
 
+// Silence period after last sensor packet before UNPAIR is sent, allowing the
+// node to complete its flush before we wipe its state.
+static constexpr uint32_t kUnpairFlushSettleMs = 1500UL;
+
 struct SyncRxTracker {
     String nodeId;
     uint32_t helloMs;
     uint8_t expectedQueue;
     uint16_t receivedInWindow;
     uint32_t lastLogMs;
+    uint32_t lastPacketMs;   // millis() of most recent SENSOR packet from this node
     bool completionLogged;
 };
 static std::vector<SyncRxTracker> g_syncRxTrackers;
+
+// Find-only — returns nullptr if not present. Use when you must not create a tracker.
+static SyncRxTracker* findSyncRxTracker(const String& nodeId) {
+    for (auto& t : g_syncRxTrackers) {
+        if (t.nodeId == nodeId) return &t;
+    }
+    return nullptr;
+}
 
 static SyncRxTracker* getSyncRxTracker(const String& nodeId) {
     for (auto& t : g_syncRxTrackers) {
@@ -107,6 +120,7 @@ static void noteNodeSampleForSyncRx(const char* nodeId) {
 
     t->receivedInWindow++;
     const uint32_t nowMs = millis();
+    t->lastPacketMs = nowMs;
     const bool periodicLog = (t->lastLogMs == 0) || ((nowMs - t->lastLogMs) >= 5000UL);
     if (periodicLog) {
         Serial.printf("[SYNC_RX] %s received=%u", nodeId, (unsigned)t->receivedInWindow);
@@ -126,68 +140,157 @@ static void noteNodeSampleForSyncRx(const char* nodeId) {
     }
 }
 
-// CSV writes are buffered from ESP-NOW callback context and drained from the main loop.
-static constexpr uint8_t kCsvQueueCapacity = 32;
-static constexpr size_t kCsvRowMaxLen = 320;
-static portMUX_TYPE g_csvQueueMux = portMUX_INITIALIZER_UNLOCKED;
-static char g_csvRowQueue[kCsvQueueCapacity][kCsvRowMaxLen];
-static uint8_t g_csvQueueHead = 0;
-static uint8_t g_csvQueueTail = 0;
-static uint8_t g_csvQueueCount = 0;
-static uint32_t g_csvQueueDropped = 0;
-static uint32_t g_csvQueueDroppedReported = 0;
+// Snapshot queue: stores raw node_snapshot_t structs received in the ESP-NOW
+// callback, drained and written to SD in the main loop. Using raw structs
+// (124 bytes each) instead of pre-formatted strings (320 bytes each) reduces
+// RAM use by ~8x and allows single-open SD writes per drain cycle.
+static constexpr uint8_t kSnapQueueCapacity = 128;
+static portMUX_TYPE g_snapQueueMux = portMUX_INITIALIZER_UNLOCKED;
 
-static bool enqueueCsvRowFromCallback(const String& row) {
+struct SnapEntry {
+    node_snapshot_t snap;
+    char  macStr[18];   // "aa:bb:cc:dd:ee:ff\0"
+    char  csvId[16];    // node numeric id / userId
+    char  csvName[32];  // friendly name
+    char  msTimestamp[24]; // mothership wall-clock string at receipt
+    uint32_t msSyncUnix;   // mothership unix at receipt
+};
+
+static SnapEntry g_snapQueue[kSnapQueueCapacity];
+static uint8_t  g_snapQueueHead  = 0;
+static uint8_t  g_snapQueueTail  = 0;
+static uint8_t  g_snapQueueCount = 0;
+static uint32_t g_snapQueueDropped = 0;
+static uint32_t g_snapQueueDroppedReported = 0;
+
+static bool enqueueSnapshotFromCallback(const SnapEntry& entry) {
     bool queued = false;
-    portENTER_CRITICAL(&g_csvQueueMux);
-    if (g_csvQueueCount < kCsvQueueCapacity) {
-        const uint8_t idx = g_csvQueueHead;
-        strncpy(g_csvRowQueue[idx], row.c_str(), kCsvRowMaxLen - 1);
-        g_csvRowQueue[idx][kCsvRowMaxLen - 1] = '\0';
-        g_csvQueueHead = (uint8_t)((g_csvQueueHead + 1) % kCsvQueueCapacity);
-        g_csvQueueCount++;
+    portENTER_CRITICAL(&g_snapQueueMux);
+    if (g_snapQueueCount < kSnapQueueCapacity) {
+        g_snapQueue[g_snapQueueHead] = entry;
+        g_snapQueueHead = (uint8_t)((g_snapQueueHead + 1) % kSnapQueueCapacity);
+        g_snapQueueCount++;
         queued = true;
     } else {
-        g_csvQueueDropped++;
+        g_snapQueueDropped++;
     }
-    portEXIT_CRITICAL(&g_csvQueueMux);
+    portEXIT_CRITICAL(&g_snapQueueMux);
     return queued;
 }
 
-static bool dequeueCsvRowForSdWrite(char* outRow, size_t outLen) {
-    if (!outRow || outLen == 0) return false;
-
-    bool hadRow = false;
-    portENTER_CRITICAL(&g_csvQueueMux);
-    if (g_csvQueueCount > 0) {
-        const uint8_t idx = g_csvQueueTail;
-        strncpy(outRow, g_csvRowQueue[idx], outLen - 1);
-        outRow[outLen - 1] = '\0';
-        g_csvQueueTail = (uint8_t)((g_csvQueueTail + 1) % kCsvQueueCapacity);
-        g_csvQueueCount--;
-        hadRow = true;
+static bool dequeueSnapshot(SnapEntry& out) {
+    bool hadEntry = false;
+    portENTER_CRITICAL(&g_snapQueueMux);
+    if (g_snapQueueCount > 0) {
+        out = g_snapQueue[g_snapQueueTail];
+        g_snapQueueTail = (uint8_t)((g_snapQueueTail + 1) % kSnapQueueCapacity);
+        g_snapQueueCount--;
+        hadEntry = true;
     }
-    portEXIT_CRITICAL(&g_csvQueueMux);
-    return hadRow;
+    portEXIT_CRITICAL(&g_snapQueueMux);
+    return hadEntry;
 }
 
-static void drainCsvQueueToSd(uint8_t maxRowsPerLoop = 8) {
-    char rowBuf[kCsvRowMaxLen];
+// Format a float field: writes "NaN" if NaN, otherwise %.4f
+static int appendFloat(char* buf, size_t bufLen, size_t offset, float v) {
+    if (isnan(v)) {
+        return snprintf(buf + offset, bufLen - offset, "NaN");
+    }
+    return snprintf(buf + offset, bufLen - offset, "%.4f", v);
+}
+
+static void drainCsvQueueToSd() {
+    if (g_snapQueueCount == 0 && g_snapQueueDropped == g_snapQueueDroppedReported) return;
+
+    if (g_snapQueueDropped != g_snapQueueDroppedReported) {
+        const uint32_t delta = g_snapQueueDropped - g_snapQueueDroppedReported;
+        g_snapQueueDroppedReported = g_snapQueueDropped;
+        Serial.printf("⚠️ Snapshot queue overflow: dropped %lu (total=%lu)\n",
+                      (unsigned long)delta, (unsigned long)g_snapQueueDropped);
+    }
+
+    if (g_snapQueueCount == 0) return;
+
+    // Open file ONCE for the whole drain cycle.
+    File file = SD.open("/datalog.csv", FILE_APPEND);
+    if (!file) {
+        Serial.println("❌ drainCsvQueueToSd: failed to open datalog.csv");
+        return;
+    }
+
+    SnapEntry entry;
     uint8_t written = 0;
-    while (written < maxRowsPerLoop && dequeueCsvRowForSdWrite(rowBuf, sizeof(rowBuf))) {
-        if (!logCSVRow(String(rowBuf))) {
-            Serial.println("❌ Failed to log node data");
+    while (dequeueSnapshot(entry)) {
+        const node_snapshot_t& s = entry.snap;
+
+        // Wide-format CSV row — one row per node wake snapshot.
+        // Column order matches the CSV header written by sd_manager.
+        static char rowBuf[512];
+        size_t off = 0;
+
+        // ms_datetime, ms_sync_unix, node_id, node_name, node_mac, fw_id,
+        // node_datetime (from nodeTimestamp), node_unix
+        char nodeTs[24];
+        {
+            time_t t = (time_t)s.nodeTimestamp;
+            struct tm* tm = gmtime(&t);
+            snprintf(nodeTs, sizeof(nodeTs), "%04d-%02d-%02d %02d:%02d:%02d",
+                     tm->tm_year + 1900, tm->tm_mon + 1, tm->tm_mday,
+                     tm->tm_hour, tm->tm_min, tm->tm_sec);
         }
+
+        off += snprintf(rowBuf + off, sizeof(rowBuf) - off,
+            "%s,%lu,%s,%s,%s,%s,%s,%lu,",
+            entry.msTimestamp,
+            (unsigned long)entry.msSyncUnix,
+            entry.csvId,
+            entry.csvName,
+            entry.macStr,
+            s.nodeId,
+            nodeTs,
+            (unsigned long)s.nodeTimestamp);
+
+        // bat_v, air_temp_c, air_hum_pct
+        off += appendFloat(rowBuf, sizeof(rowBuf), off, s.batVoltage); rowBuf[off++] = ',';
+        off += appendFloat(rowBuf, sizeof(rowBuf), off, s.airTemp);     rowBuf[off++] = ',';
+        off += appendFloat(rowBuf, sizeof(rowBuf), off, s.airHumidity); rowBuf[off++] = ',';
+
+        // spectral_415..680 (8 channels)
+        for (int i = 0; i < 8; i++) {
+            off += appendFloat(rowBuf, sizeof(rowBuf), off, s.spectral[i]);
+            rowBuf[off++] = ',';
+        }
+
+        // wind_speed_ms, wind_dir_deg
+        off += appendFloat(rowBuf, sizeof(rowBuf), off, s.windSpeed); rowBuf[off++] = ',';
+        off += appendFloat(rowBuf, sizeof(rowBuf), off, s.windDir);   rowBuf[off++] = ',';
+
+        // soil1_vwc, soil1_temp_c, soil2_vwc, soil2_temp_c
+        off += appendFloat(rowBuf, sizeof(rowBuf), off, s.soil1Vwc);  rowBuf[off++] = ',';
+        off += appendFloat(rowBuf, sizeof(rowBuf), off, s.soil1Temp); rowBuf[off++] = ',';
+        off += appendFloat(rowBuf, sizeof(rowBuf), off, s.soil2Vwc);  rowBuf[off++] = ',';
+        off += appendFloat(rowBuf, sizeof(rowBuf), off, s.soil2Temp); rowBuf[off++] = ',';
+
+        // aux1, aux2
+        off += appendFloat(rowBuf, sizeof(rowBuf), off, s.aux1); rowBuf[off++] = ',';
+        off += appendFloat(rowBuf, sizeof(rowBuf), off, s.aux2); rowBuf[off++] = ',';
+
+        // sensor_present (hex), quality_flags (hex), seq_num
+        off += snprintf(rowBuf + off, sizeof(rowBuf) - off,
+            "0x%04X,0x%04X,%lu",
+            (unsigned)s.sensorPresent,
+            (unsigned)s.qualityFlags,
+            (unsigned long)s.seqNum);
+
+        rowBuf[off] = '\0';
+        file.println(rowBuf);
+        Serial.printf("Data logged: %s\n", rowBuf);
         written++;
     }
 
-    if (g_csvQueueDropped != g_csvQueueDroppedReported) {
-        const uint32_t droppedNow = g_csvQueueDropped;
-        const uint32_t delta = droppedNow - g_csvQueueDroppedReported;
-        g_csvQueueDroppedReported = droppedNow;
-        Serial.printf("⚠️ CSV callback queue overflow: dropped %lu row(s) (total=%lu)\n",
-                      (unsigned long)delta,
-                      (unsigned long)droppedNow);
+    file.close();
+    if (written > 0) {
+        Serial.printf("📝 SD drain: wrote %u snapshot(s) in one open/close\n", written);
     }
 }
 
@@ -237,6 +340,16 @@ static void processPendingStateCommand(NodeInfo& node, const char* reason) {
 
     bool sent = false;
     if (node.pendingTargetState == PENDING_TO_UNPAIRED) {
+        // Wait until the node's flush has settled before sending UNPAIR, so all
+        // queued data reaches the mothership first. If packets are still flowing
+        // (within kUnpairFlushSettleMs of the last one), suppress and let
+        // espnow_loop() dispatch once silence is detected.
+        SyncRxTracker* t = findSyncRxTracker(node.nodeId);
+        if (t && t->lastPacketMs > 0 && (nowMs - t->lastPacketMs) < kUnpairFlushSettleMs) {
+            // Flush in progress — do NOT update pendingLastAttemptMs so the
+            // 5 s throttle doesn't block loop-driven dispatch.
+            return;
+        }
         sent = sendUnpairToNode(node.nodeId);
     } else if (node.pendingTargetState == PENDING_TO_PAIRED) {
         sent = pairNode(node.nodeId);
@@ -615,208 +728,143 @@ static void OnDataRecv(const uint8_t * mac,
         return;
     }
 
-    // 1) Sensor data packets → mark DEPLOYED + log CSV
-    if (len == sizeof(sensor_data_message_t)) {
-        sensor_data_message_t incoming{};
-        memcpy(&incoming, incomingBytes, sizeof(incoming));
+    // 1) NODE_SNAPSHOT — one packet per node per wake cycle (replaces per-sensor packets)
+    if (len == sizeof(node_snapshot_t)) {
+        node_snapshot_t snap{};
+        memcpy(&snap, incomingBytes, sizeof(snap));
+        if (strcmp(snap.command, "NODE_SNAPSHOT") != 0) goto not_snapshot;
 
-        noteNodeSampleForSyncRx(incoming.nodeId);
+        noteNodeSampleForSyncRx(snap.nodeId);
 
-        if (g_sensorDataEventCb) {
-            g_sensorDataEventCb(incoming, mac);
-        }
-
-        // Honor local unpair authority: if this MAC is currently UNPAIRED in the registry,
-        // do not auto-promote to DEPLOYED from passive sensor contact.
-        NodeState observedState = UNPAIRED;
-        bool pendingBlocksAutoDeploy = false;
-        bool knownMac = false;
-        for (const auto& n : registeredNodes) {
-            if (memcmp(n.mac, mac, 6) == 0) {
-                observedState = n.state;
-                pendingBlocksAutoDeploy = n.stateChangePending &&
-                                          n.pendingTargetState != PENDING_TO_DEPLOYED;
-                knownMac = true;
-                break;
+        {
+            // Honor local unpair authority.
+            NodeState observedState = UNPAIRED;
+            bool pendingBlocksAutoDeploy = false;
+            bool knownMac = false;
+            for (const auto& n : registeredNodes) {
+                if (memcmp(n.mac, mac, 6) == 0) {
+                    observedState = n.state;
+                    pendingBlocksAutoDeploy = n.stateChangePending &&
+                                              n.pendingTargetState != PENDING_TO_DEPLOYED;
+                    knownMac = true;
+                    break;
+                }
             }
-        }
 
-        if (knownMac && (observedState == UNPAIRED || pendingBlocksAutoDeploy)) {
-            registerNode(mac, incoming.nodeId, incoming.sensorType, UNPAIRED);
-            Serial.printf("🛡️ Ignoring auto-deploy promotion from sensor data for %s (state=%s, pending=%d)\n",
-                          incoming.nodeId,
-                          stateToStr(observedState),
-                          pendingBlocksAutoDeploy ? 1 : 0);
-        } else {
-            registerNode(mac, incoming.nodeId, incoming.sensorType, DEPLOYED);
-        }
-        NodeInfo* nodeInfo = nullptr;
+            if (knownMac && (observedState == UNPAIRED || pendingBlocksAutoDeploy)) {
+                registerNode(mac, snap.nodeId, "MULTI_ENV", UNPAIRED);
+                Serial.printf("🛡️ Ignoring auto-deploy promotion from snapshot for %s (state=%s)\n",
+                              snap.nodeId, stateToStr(observedState));
+            } else {
+                registerNode(mac, snap.nodeId, "MULTI_ENV", DEPLOYED);
+            }
 
-        for (auto& n : registeredNodes) {
-            if (n.nodeId == String(incoming.nodeId)) {
-                nodeInfo = &n;
-                if (incoming.nodeTimestamp > 0) {
-                    if (n.lastNodeTimestamp > 0 && incoming.nodeTimestamp > n.lastNodeTimestamp) {
-                        const uint32_t deltaSec = incoming.nodeTimestamp - n.lastNodeTimestamp;
-                        // Infer cadence from node timestamps; tolerate small jitter.
-                        const uint8_t mins = (uint8_t)((deltaSec + 30UL) / 60UL);
-                        const uint32_t expectedSec = (uint32_t)mins * 60UL;
-                        const uint32_t absErr = (deltaSec > expectedSec)
-                            ? (deltaSec - expectedSec)
-                            : (expectedSec - deltaSec);
-                        if (isReasonableWakeInterval(mins) && absErr <= 10UL) {
-                            if (n.inferredWakeIntervalMin != mins) {
-                                Serial.printf("🧭 Inferred wake cadence for %s: ~%u min (delta=%lus)\n",
-                                              incoming.nodeId,
-                                              (unsigned)mins,
-                                              (unsigned long)deltaSec);
-                            }
-                            n.inferredWakeIntervalMin = mins;
-                            if (n.wakeIntervalMin == 0) {
-                                n.wakeIntervalMin = mins;
+            NodeInfo* nodeInfo = nullptr;
+            for (auto& n : registeredNodes) {
+                if (n.nodeId == String(snap.nodeId)) {
+                    nodeInfo = &n;
+                    // Cadence inference from consecutive snapshot timestamps.
+                    if (snap.nodeTimestamp > 0) {
+                        if (n.lastNodeTimestamp > 0 && snap.nodeTimestamp > n.lastNodeTimestamp) {
+                            const uint32_t deltaSec = snap.nodeTimestamp - n.lastNodeTimestamp;
+                            const uint8_t mins = (uint8_t)((deltaSec + 30UL) / 60UL);
+                            const uint32_t expectedSec = (uint32_t)mins * 60UL;
+                            const uint32_t absErr = (deltaSec > expectedSec)
+                                ? (deltaSec - expectedSec) : (expectedSec - deltaSec);
+                            if (isReasonableWakeInterval(mins) && absErr <= 10UL) {
+                                if (n.inferredWakeIntervalMin != mins) {
+                                    Serial.printf("🧭 Inferred wake cadence for %s: ~%u min (delta=%lus)\n",
+                                                  snap.nodeId, (unsigned)mins, (unsigned long)deltaSec);
+                                }
+                                n.inferredWakeIntervalMin = mins;
+                                if (n.wakeIntervalMin == 0) n.wakeIntervalMin = mins;
                             }
                         }
+                        if (snap.nodeTimestamp > n.lastNodeTimestamp) {
+                            n.lastNodeTimestamp = snap.nodeTimestamp;
+                        }
                     }
-                    if (incoming.nodeTimestamp > n.lastNodeTimestamp) {
-                        n.lastNodeTimestamp = incoming.nodeTimestamp;
+                    // Update applied config version from snapshot.
+                    if (snap.configVersion > 0 && snap.configVersion > n.configVersionApplied) {
+                        n.configVersionApplied = snap.configVersion;
+                    }
+                    break;
+                }
+            }
+
+            if (nodeInfo) {
+                processPendingStateCommand(*nodeInfo, "snapshot contact");
+            }
+
+            // Fallback config push if HELLO was missed.
+            if (nodeInfo) {
+                NodeDesiredConfig desired = getDesiredConfig(snap.nodeId);
+                const bool cfgPending = (desired.configVersion > 0) &&
+                                        (nodeInfo->configVersionApplied < desired.configVersion);
+                const uint32_t nowMs = millis();
+                const bool canRetry = (nodeInfo->lastConfigPushMs == 0) ||
+                                      (nowMs - nodeInfo->lastConfigPushMs >= 5000UL);
+                if (cfgPending && canRetry) {
+                    if (pushDesiredConfigSnapshot(mac, snap.nodeId, desired)) {
+                        nodeInfo->lastConfigPushMs = nowMs;
                     }
                 }
-                break;
             }
-        }
 
-        if (nodeInfo) {
-            processPendingStateCommand(*nodeInfo, "sensor contact");
-        }
-
-        // Fallback path: if HELLO is missed, still push pending config when sensor data proves contact.
-        if (nodeInfo) {
-            NodeDesiredConfig desired = getDesiredConfig(incoming.nodeId);
-            const bool cfgPending = (desired.configVersion > 0) &&
-                                    (nodeInfo->configVersionApplied < desired.configVersion);
-            const uint32_t nowMs = millis();
-            const bool canRetry = (nodeInfo->lastConfigPushMs == 0) ||
-                                  (nowMs - nodeInfo->lastConfigPushMs >= 5000UL);
-            if (cfgPending && canRetry) {
-                if (pushDesiredConfigSnapshot(mac, incoming.nodeId, desired)) {
-                    nodeInfo->lastConfigPushMs = nowMs;
+            // Deploy confirmation from sensor traffic.
+            for (auto& n : registeredNodes) {
+                if (n.nodeId == String(snap.nodeId)) {
+                    if (n.stateChangePending && n.pendingTargetState == PENDING_TO_DEPLOYED) {
+                        clearPendingState(n, "snapshot confirms deployed");
+                    }
+                    if (n.deployPending) {
+                        n.deployPending = false;
+                        Serial.printf("✅ Deploy pending cleared by snapshot from %s\n", snap.nodeId);
+                        savePairedNodes();
+                    }
+                    break;
                 }
             }
-        }
 
-        // If a deployed node is producing data, treat it as runtime deploy confirmation.
-        for (auto& n : registeredNodes) {
-            if (n.nodeId == String(incoming.nodeId)) {
-                if (n.stateChangePending && n.pendingTargetState == PENDING_TO_DEPLOYED) {
-                    clearPendingState(n, "SENSOR data confirms deployed runtime");
+            // Build and enqueue a SnapEntry for SD drain in the main loop.
+            SnapEntry entry{};
+            entry.snap = snap;
+            entry.msSyncUnix = 0;
+            {
+                // mothership wall-clock timestamp
+                getRTCTimeString(entry.msTimestamp, sizeof(entry.msTimestamp));
+                // mothership unix
+                entry.msSyncUnix = (uint32_t)getRTCTimeUnix();
+                // MAC string
+                snprintf(entry.macStr, sizeof(entry.macStr),
+                         "%02x:%02x:%02x:%02x:%02x:%02x",
+                         mac[0],mac[1],mac[2],mac[3],mac[4],mac[5]);
+                // CSV id / name
+                String fwId = String(snap.nodeId);
+                String csvId   = getCsvNodeId(fwId);
+                String csvName = getCsvNodeName(fwId);
+                for (auto& n : registeredNodes) {
+                    if (n.nodeId == fwId) {
+                        if (!n.userId.isEmpty()) csvId   = n.userId;
+                        if (!n.name.isEmpty())   csvName = n.name;
+                        break;
+                    }
                 }
-                if (n.deployPending) {
-                    n.deployPending = false;
-                    Serial.printf("✅ Deploy pending cleared by SENSOR data from %s\n", incoming.nodeId);
-                    savePairedNodes();
-                }
-                break;
+                strncpy(entry.csvId,   csvId.c_str(),   sizeof(entry.csvId)   - 1);
+                strncpy(entry.csvName, csvName.c_str(), sizeof(entry.csvName) - 1);
+            }
+
+            Serial.printf("📊 SNAPSHOT fw=%s seq=%lu present=0x%04X node_ts=%lu\n",
+                          snap.nodeId, (unsigned long)snap.seqNum,
+                          (unsigned)snap.sensorPresent, (unsigned long)snap.nodeTimestamp);
+
+            if (!enqueueSnapshotFromCallback(entry)) {
+                Serial.println("⚠️ Snapshot queue full — SD write dropped");
             }
         }
-
-        // MAC in lowercase colon format for CSV
-        String macStr;
-        for (int i = 0; i < 6; i++) {
-            if (i) macStr += ":";
-            char bb[3];
-            snprintf(bb, sizeof(bb), "%02x", mac[i]);
-            macStr += bb;
-        }
-
-        // Map firmware nodeId -> CSV node_id (numeric) + node_name (friendly)
-        String fwId    = String(incoming.nodeId);  // e.g. "TEMP_001"
-        String csvId   = getCsvNodeId(fwId);       // e.g. "001"
-        String csvName = getCsvNodeName(fwId);     // e.g. "North Hedge 01"
-
-        // If we have a NodeInfo with in-memory meta, prefer that
-        for (auto &n : registeredNodes) {
-            if (n.nodeId == fwId) {
-                if (!n.userId.isEmpty()) csvId   = n.userId;
-                if (!n.name.isEmpty())   csvName = n.name;
-                break;
-            }
-        }
-
-        // Serial log: include CSV id + friendly name so it matches the UI/CSV
-        char ts[24];
-        getRTCTimeString(ts, sizeof(ts));
-
-        // Keep packet logging concise in operator mode.
-    #if ENABLE_VERBOSE_SENSOR_PACKET_LOG
-        Serial.printf(
-          "📊 Data @ %s\n"
-          "   from FW=%s, MAC=%s\n"
-          "   CSV node_id=%s, name='%s'\n"
-          "   sensor_id=%u, sensor_type=%s, sensor_label=%s, value=%.3f, node_ts=%lu, qf=0x%04X\n",
-          ts,
-          incoming.nodeId,
-          macStr.c_str(),
-          csvId.c_str(),
-          csvName.c_str(),
-          (unsigned)incoming.sensorId,
-          incoming.sensorType,
-                    incoming.sensorLabel,
-          incoming.value,
-                    (unsigned long)incoming.nodeTimestamp,
-                    (unsigned)incoming.qualityFlags
-        );
-    #else
-        Serial.printf("📊 SENSOR fw=%s id=%u label=%s val=%.3f node_ts=%lu\n",
-                  incoming.nodeId,
-                  (unsigned)incoming.sensorId,
-                  incoming.sensorLabel,
-                  incoming.value,
-                  (unsigned long)incoming.nodeTimestamp);
-    #endif
-
-    // CSV row: timestamp,node_id,node_name,mac,event_type,sensor_type,value,meta
-        String row;
-        row.reserve(240);
-        row  = ts;               // timestamp (mothership RTC)
-        row += ",";
-        row += csvId;            // node_id (numeric, falls back to fwId if empty)
-        row += ",";
-        row += csvName;          // node_name (may be empty)
-        row += ",";
-        row += macStr;           // raw MAC
-        row += ",";
-        row += "SENSOR";         // event_type (more explicit than "DATA")
-        row += ",";
-        row += incoming.sensorLabel[0] ? incoming.sensorLabel : incoming.sensorType;
-        row += ",";
-        row += String(incoming.value, 3);   // value with 3 decimals
-        row += ",";
-
-        // --- meta: start using this for future stuff ---
-        // For now: firmware ID + node-side timestamp
-        String meta;
-        meta.reserve(80);
-        meta  = "FW_ID=";
-        meta += fwId; // e.g. "TEMP_001"
-        meta += ";SENSOR_ID=";
-        meta += String((unsigned)incoming.sensorId);
-        meta += ";SENSOR_TYPE=";
-        meta += incoming.sensorType;
-        meta += ";QF=0x";
-        char qfHex[5];
-        snprintf(qfHex, sizeof(qfHex), "%04X", (unsigned)incoming.qualityFlags);
-        meta += qfHex;
-        meta += ";NODE_TS=";
-        meta += String(incoming.nodeTimestamp);  // as sent by node (millis or unix)
-
-        row += meta;
-
-        if (!enqueueCsvRowFromCallback(row)) {
-            Serial.println("⚠️ Node data queued for SD write failed: callback queue full");
-        }
-
         return;
     }
+    not_snapshot:;
 
     // 2) Discovery from node
     if (len == sizeof(discovery_message_t)) {
@@ -1104,6 +1152,18 @@ void espnow_loop() {
 
     // Flush buffered SD writes outside ESP-NOW callback context.
     drainCsvQueueToSd();
+
+    // Deferred UNPAIR dispatch: send UNPAIR_NODE only after the node's flush has
+    // settled (kUnpairFlushSettleMs silence since last sensor packet). This ensures
+    // all queued node data reaches the CSV before the node wipes its state.
+    for (auto& n : registeredNodes) {
+        if (!n.stateChangePending || n.pendingTargetState != PENDING_TO_UNPAIRED) continue;
+        SyncRxTracker* t = findSyncRxTracker(n.nodeId);
+        if (!t || t->lastPacketMs == 0) continue; // not seen this window yet
+        if ((now - t->lastPacketMs) < kUnpairFlushSettleMs) continue; // still flushing
+        // Flush settled — dispatch now (respects existing 5 s retry throttle).
+        processPendingStateCommand(n, "post-flush UNPAIR");
+    }
 
     // Mark nodes not-awake shortly after contact so UI reflects real wake windows.
     for (auto& n : registeredNodes) {

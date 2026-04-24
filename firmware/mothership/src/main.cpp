@@ -49,7 +49,13 @@ const char* password = "logger123";
 
 Preferences gPrefs;
 int gWakeIntervalMin = 0;          // 0=OFF, >0 applies global wake interval to paired/deployed nodes
-int gSyncIntervalMin = 15;         // transport interval still used in sync schedule payload
+// Sync interval is derived automatically: syncMin = wakeMin * kSyncFillK.
+// Never set this directly — call computeAutoSyncMin() instead.
+static constexpr int kSyncFillK = 18; // target 75% queue fill; leaves 4 wakes of headroom
+static inline int computeAutoSyncMin(int wakeMin) {
+  return (wakeMin > 0) ? (wakeMin * kSyncFillK) : 0;
+}
+int gSyncIntervalMin = 0;          // derived from gWakeIntervalMin * kSyncFillK; never persisted
 int gSyncDailyHour = 6;            // local daily sync trigger time (HH)
 int gSyncDailyMinute = 0;          // local daily sync trigger time (MM)
 long gLastSyncBroadcastEpochDay = -1;
@@ -133,26 +139,13 @@ static void saveWakeIntervalToNVS(int mins) {
   }
 }
 
+// Sync interval is now derived automatically; no NVS load/save needed.
 static void loadSyncIntervalFromNVS() {
-  if (gPrefs.begin("ui", true)) {
-    int v = gPrefs.getInt("sync_min", gSyncIntervalMin);
-    gPrefs.end();
-    bool ok = false;
-    for (size_t i = 0; i < kAllowedCount; i++) {
-      if (v == kAllowedIntervals[i]) {
-        ok = true;
-        break;
-      }
-    }
-    gSyncIntervalMin = ok ? v : 15;
-  }
+  // No-op: gSyncIntervalMin is recomputed from gWakeIntervalMin after wake load.
 }
 
-static void saveSyncIntervalToNVS(int mins) {
-  if (gPrefs.begin("ui", false)) {
-    gPrefs.putInt("sync_min", mins);
-    gPrefs.end();
-  }
+static void saveSyncIntervalToNVS(int) {
+  // No-op: sync interval is derived, not persisted.
 }
 
 static void loadSyncModeFromNVS() {
@@ -903,6 +896,7 @@ static bool handleBleCommand(
 
     bool sent = broadcastWakeInterval(interval);
     gWakeIntervalMin = interval;
+    gSyncIntervalMin = computeAutoSyncMin(gWakeIntervalMin);
     saveWakeIntervalToNVS(interval);
 
     // Bump desired config version so CONFIG_SNAPSHOT is pushed on next NODE_HELLO
@@ -922,46 +916,6 @@ static bool handleBleCommand(
       + (sent ? "true" : "false")
       + "}";
     responseMessage = sent ? "Wake schedule broadcast sent" : "No eligible paired/deployed nodes";
-    return true;
-  }
-
-  if (cmd == "set_sync_interval") {
-    long iv = 0;
-    if (!extractJsonIntFieldLocal(payloadJson, "intervalMinutes", iv)) {
-      extractJsonIntFieldLocal(payloadJson, "syncIntervalMinutes", iv);
-    }
-    int interval = (int)iv;
-    if (!isAllowedInterval(interval)) {
-      errorCode = "INVALID_INTERVAL";
-      errorMessage = "Interval must be one of: 1, 5, 10, 20, 30, 60";
-      return false;
-    }
-
-    long phase = 0;
-    if (!extractJsonIntFieldLocal(payloadJson, "phaseUnix", phase) || phase <= 0) {
-      phase = (long)getRTCTimeUnix();
-    }
-    phase -= (phase % 60L);
-
-    bool sent = broadcastSyncSchedule(interval, (unsigned long)phase);
-    gSyncIntervalMin = interval;
-    gSyncMode = SYNC_MODE_INTERVAL;
-    gLastSyncBroadcastEpochDay = (long)(((unsigned long)phase) / 86400UL);
-    gLastSyncBroadcastUnix = (unsigned long)phase;
-    gLastSyncIntervalSlot = (long long)((unsigned long)phase / ((unsigned long)max(interval, 1) * 60UL));
-    saveSyncRuntimeGuardsToNVS();
-    saveSyncIntervalToNVS(interval);
-    saveSyncModeToNVS(gSyncMode);
-
-    responseType = "ack";
-    responseDataJson = String("{\"command\":\"set_sync_interval\",\"intervalMinutes\":")
-      + String(interval)
-      + ",\"phaseUnix\":"
-      + String((unsigned long)phase)
-      + ",\"broadcastSent\":"
-      + (sent ? "true" : "false")
-      + "}";
-    responseMessage = sent ? "Sync schedule broadcast sent" : "No eligible paired/deployed nodes";
     return true;
   }
 
@@ -1398,7 +1352,6 @@ function wireAsyncForms(){
 
         if (ok && form.action && (
             form.action.indexOf('/set-sync-mode') !== -1 ||
-            form.action.indexOf('/set-sync-interval') !== -1 ||
             form.action.indexOf('/set-sync-time') !== -1 ||
             form.action.indexOf('/set-wake-interval') !== -1)) {
           await refreshKpiCards();
@@ -1425,12 +1378,6 @@ function setCurrentTime(){
 }
 function toggleSettings(){
   const panel=document.getElementById('settings-panel');
-  if(!panel) return;
-  const showing=panel.style.display==='block';
-  panel.style.display = showing ? 'none' : 'block';
-}
-function toggleSyncSchedule(){
-  const panel=document.getElementById('sync-panel');
   if(!panel) return;
   const showing=panel.style.display==='block';
   panel.style.display = showing ? 'none' : 'block';
@@ -1540,7 +1487,6 @@ void handleNodeConfigForm();
 void handleNodeConfigSave();
 void handleNodesPage();
 void handleSetSyncMode();
-void handleSetSyncInterval();
 void handleSetSyncTime();
 
 // ---------- Routes / Handlers ----------
@@ -1663,12 +1609,9 @@ void handleRoot() {
 
   html += F("</div>"); // end overview section
 
-  int activeSyncIntervalMin = gSyncIntervalMin;
-  if (!isAllowedInterval(activeSyncIntervalMin)) activeSyncIntervalMin = 15;
-
   String activeSyncPlan =
     (gSyncMode == SYNC_MODE_INTERVAL)
-      ? (String("Every ") + String(activeSyncIntervalMin) + String(" min"))
+      ? (String("Every ") + String(gSyncIntervalMin) + String(" min"))
       : (String("Daily @ ") + formatSyncTimeHHMM(gSyncDailyHour, gSyncDailyMinute));
 
   // --- Schedule section ---
@@ -1737,61 +1680,22 @@ void handleRoot() {
 
   html += F("<div class='col'>");
 
-  html += F("<button id='sync-btn' class='btn btn--warn btn--action' type='button' onclick='toggleSyncSchedule()' style='margin-top:10px'>"
-            "<svg class='icon' viewBox='0 0 24 24' aria-hidden='true'><path d='M12 2C7 2 3 3.8 3 6v12c0 2.2 4 4 9 4s9-1.8 9-4V6c0-2.2-4-4-9-4zm0 2c4.4 0 7 .9 7 2s-2.6 2-7 2-7-.9-7-2 2.6-2 7-2zm0 16c-4.4 0-7-.9-7-2v-2c1.6 1.1 4.4 1.7 7 1.7s5.4-.6 7-1.7v2c0 1.1-2.6 2-7 2zm0-6c-4.4 0-7-.9-7-2v-2c1.6 1.1 4.4 1.7 7 1.7s5.4-.6 7-1.7v2c0 1.1-2.6 2-7 2z'/></svg> Data sync interval"
-            "</button>");
-
-  html += F("<div id='sync-panel' style='display:none;margin-top:10px;padding:10px;border:1px solid var(--border);border-radius:8px;background:#fafafa'>"
-            "<form class='async-form' action='/set-sync-mode' method='POST'>"
-            "<label class='label'><strong>Sync mode</strong></label>"
-            "<select class='input' name='mode'>"
-            "<option value='daily'");
-  if (gSyncMode == SYNC_MODE_DAILY) html += F(" selected");
-  html += F(">Daily (recommended)</option>"
-            "<option value='interval'");
-  if (gSyncMode == SYNC_MODE_INTERVAL) html += F(" selected");
-  html += F(">Interval</option>"
-            "</select>"
-            "<button type='submit' class='btn btn--warn' style='margin-top:8px'>"
-            "Save sync mode</button>"
-            "</form>");
-
-  if (gSyncMode == SYNC_MODE_DAILY) {
-    html += F("<form class='async-form' action='/set-sync-time' method='POST' style='margin-top:12px'>"
-              "<label class='label'><strong>Daily sync time</strong></label>"
-              "<input class='input' type='time' name='sync_time' value='");
-    html += formatSyncTimeHHMM(gSyncDailyHour, gSyncDailyMinute);
-    html += F("'>"
-              "<button type='submit' class='btn btn--warn' style='margin-top:8px'>"
-              "Set daily sync time</button>"
-              "</form>");
+  // Auto-sync info panel — read-only, derived from wake interval.
+  html += F("<div style='margin-top:10px;padding:10px;border:1px solid var(--border);border-radius:8px;background:#fafafa'>"
+            "<div style='font-size:13px;color:#555;margin-bottom:4px'><strong>Auto-sync</strong></div>");
+  if (gWakeIntervalMin > 0) {
+    html += F("<div style='font-size:13px'>Sync every <strong>");
+    html += String(gSyncIntervalMin);
+    html += F(" min</strong> &nbsp;<span style='font-size:12px;color:#888'>"
+              "(auto: wake &times; ");
+    html += String(kSyncFillK);
+    html += F(" &mdash; ~75% queue fill, 4+ wakes headroom)</span></div>");
   } else {
-    html += F("<form class='async-form' action='/set-sync-interval' method='POST' style='margin-top:12px'>"
-              "<div><strong>Current active:</strong> ");
-    html += String(activeSyncIntervalMin);
-    html += F(" min</div>"
-              "<label class='label'><strong>Sync every (minutes)</strong></label>"
-              "<select class='input' name='interval'>");
-
-    for (size_t i = 0; i < kAllowedCount; ++i) {
-      int v = kAllowedIntervals[i];
-      html += F("<option value='");
-      html += String(v);
-      html += F("'");
-      if (v == activeSyncIntervalMin) html += F(" selected");
-      html += F(">");
-      html += String(v);
-      html += F("</option>");
-    }
-
-    html += F("</select>"
-              "<button type='submit' class='btn btn--warn' style='margin-top:8px'>"
-              "Set sync interval</button>"
-              "</form>");
+    html += F("<div style='font-size:13px;color:#888'>Set a wake interval to enable auto-sync.</div>");
   }
+  html += F("</div>"); // end auto-sync panel
 
-  html += F("</div>"
-            "</div>" // end col
+  html += F("</div>" // end col
             "</div>" // end row
             "</div>"); // end schedule section
 
@@ -1880,6 +1784,7 @@ void handleSetWakeInterval() {
   if (!ok) interval = 0;
 
   gWakeIntervalMin = interval;
+  gSyncIntervalMin = computeAutoSyncMin(gWakeIntervalMin);
   saveWakeIntervalToNVS(interval);
 
   bool sent = false;
@@ -1978,77 +1883,7 @@ void handleSetSyncMode() {
   server.send(200, "text/html", html);
 }
 
-void handleSetSyncInterval() {
-  int interval = server.hasArg("interval") ? server.arg("interval").toInt() : 0;
-  bool ok = false;
-  for (size_t i = 0; i < kAllowedCount; ++i) {
-    if (interval == kAllowedIntervals[i]) {
-      ok = true;
-      break;
-    }
-  }
-  if (!ok) interval = 15;
 
-  unsigned long phaseUnix = getRTCTimeUnix();
-  phaseUnix -= (phaseUnix % 60UL);
-  bool sent = broadcastSyncSchedule(interval, phaseUnix);
-
-  gSyncIntervalMin = interval;
-  gSyncMode = SYNC_MODE_INTERVAL;
-  gLastSyncBroadcastEpochDay = (long)(phaseUnix / 86400UL);
-  gLastSyncBroadcastUnix = phaseUnix;
-  gLastSyncBroadcastMs = millis();
-  gLastSyncIntervalSlot = (long long)(phaseUnix / ((unsigned long)max(interval, 1) * 60UL));
-  saveSyncRuntimeGuardsToNVS();
-  saveSyncIntervalToNVS(interval);
-  saveSyncModeToNVS(gSyncMode);
-
-  // Keep all desired node snapshots aligned to the same global sync schedule.
-  for (const auto& node : registeredNodes) {
-    NodeDesiredConfig dc = getDesiredConfig(node.nodeId.c_str());
-    bool changed = false;
-    if (dc.syncIntervalMin != (uint16_t)interval) {
-      dc.syncIntervalMin = (uint16_t)interval;
-      changed = true;
-    }
-    if (dc.syncPhaseUnix != phaseUnix) {
-      dc.syncPhaseUnix = phaseUnix;
-      changed = true;
-    }
-    if (dc.configVersion == 0) {
-      dc.configVersion = 1;
-      changed = true;
-    } else if (changed) {
-      dc.configVersion = (dc.configVersion < 0xFFFFu) ? (dc.configVersion + 1u) : 1u;
-    }
-    if (changed) {
-      setDesiredConfig(node.nodeId.c_str(), dc);
-    }
-  }
-
-  Serial.printf("[UI] Sync interval set to %d min phase=%lu -> broadcast %s (mode=%s)\n",
-                interval,
-                phaseUnix,
-                sent ? "SENT" : "FAILED",
-                syncModeLabel());
-
-  if (isAjaxRequest()) {
-    sendAjaxResult(sent,
-      sent ? (String("Sync interval set to ") + String(interval) + " min")
-           : String("Sync broadcast failed"));
-    return;
-  }
-
-  String html = F("<!doctype html><meta name='viewport' content='width=device-width,initial-scale=1'>"
-                  "<body style='font-family:sans-serif;padding:20px;text-align:center'>"
-                  "<h3>📶 Sync Schedule</h3><p>Broadcasted sync schedule: ");
-  html += String(interval);
-  html += F(" min.</p><p style='color:#666'>");
-  html += sent ? F("Broadcast sent to fleet.") : F("Broadcast failed.");
-  html += F("</p><a href='/' style='display:inline-block;padding:10px 16px;"
-            "background:#2196F3;color:#fff;text-decoration:none;border-radius:6px'>Back</a></body>");
-  server.send(200, "text/html", html);
-}
 
 void handleSetSyncTime() {
   String hhmm = server.arg("sync_time");
@@ -2250,29 +2085,21 @@ void handleNodeConfigForm() {
               "</div>");
   }
 
-  html += F(
-
-            "<label class='label'>Interval (minutes)</label>"
-            "<select class='input' name='interval'>");
-
-  uint8_t intervalSel = isAllowedInterval(gWakeIntervalMin) ? (uint8_t)gWakeIntervalMin : (uint8_t)5;
-  NodeDesiredConfig desired = getDesiredConfig(target->nodeId.c_str());
-  if (desired.wakeIntervalMin > 0) intervalSel = desired.wakeIntervalMin;
-  else if (target->wakeIntervalMin > 0) intervalSel = target->wakeIntervalMin;
-
-  for (size_t i = 0; i < kAllowedCount; ++i) {
-    int v = kAllowedIntervals[i];
-    html += F("<option value='");
-    html += String(v);
-    html += F("'");
-    if (v == intervalSel) html += F(" selected");
-    html += F(">");
-    html += String(v);
-    html += F("</option>");
+  // Wake interval is fleet-global — show read-only, not a per-node select.
+  html += F("<div style='margin-bottom:12px'>"
+            "<label class='label'>Wake interval (minutes)</label>"
+            "<div style='font-size:14px;padding:6px 0'><strong>");
+  html += String(gWakeIntervalMin > 0 ? gWakeIntervalMin : 0);
+  html += F(" min</strong> &nbsp;<span style='font-size:12px;color:#888'>"
+            "(fleet-global &mdash; change via Node interval on main page)</span></div>");
+  if (gSyncIntervalMin > 0) {
+    html += F("<div style='font-size:12px;color:#555'>Auto-sync every ");
+    html += String(gSyncIntervalMin);
+    html += F(" min</div>");
   }
+  html += F("</div>");
 
-  html += F("</select>"
-            "<div class='action-choices'>"
+  html += F("<div class='action-choices'>"
               "<label class='action-choice action-choice--start'><input type='radio' name='action' value='start' checked><span>Start / deploy</span></label>"
               "<label class='action-choice action-choice--stop'><input type='radio' name='action' value='stop'><span>Stop / keep paired</span></label>"
               "<label class='action-choice action-choice--unpair'><input type='radio' name='action' value='unpair'><span>Unpair / forget</span></label>"
@@ -2296,18 +2123,9 @@ void handleNodeConfigSave() {
   bool editIdentityRequested = server.hasArg("edit_identity") && server.arg("edit_identity") == "1";
   bool editIdentityConfirmed = server.hasArg("edit_identity_confirm") && server.arg("edit_identity_confirm") == "yes";
   String action   = server.arg("action");
-  const int safeIntervalDefault = isAllowedInterval(gWakeIntervalMin) ? gWakeIntervalMin : 5;
-  int interval    = server.hasArg("interval") ? server.arg("interval").toInt() : safeIntervalDefault;
-
-  // --- 2) Clamp interval ---
-  bool intervalOk = false;
-  for (size_t i = 0; i < kAllowedCount; ++i) {
-    if (interval == kAllowedIntervals[i]) {
-      intervalOk = true;
-      break;
-    }
-  }
-  if (!intervalOk) interval = safeIntervalDefault;
+  // Interval is fleet-global — not submitted by the node config form.
+  // Use the current global wake interval directly.
+  int interval = (gWakeIntervalMin > 0) ? gWakeIntervalMin : 5;
 
   // --- 3) Find node entry ---
   NodeInfo* target = nullptr;
@@ -2346,7 +2164,7 @@ void handleNodeConfigSave() {
     dc.wakeIntervalMin = (uint8_t)interval;
     cfgChanged = true;
   }
-  const uint16_t desiredSyncMin = (gSyncMode == SYNC_MODE_DAILY) ? 0u : (uint16_t)gSyncIntervalMin;
+  const uint16_t desiredSyncMin = (gSyncMode == SYNC_MODE_DAILY) ? 0u : (uint16_t)computeAutoSyncMin(interval);
   if (dc.syncIntervalMin != desiredSyncMin) {
     dc.syncIntervalMin = desiredSyncMin;
     cfgChanged = true;
@@ -2707,12 +2525,12 @@ void setup() {
   Serial.print("Current RTC Time: "); Serial.println(timeStr);
 
   loadWakeIntervalFromNVS();
-  loadSyncIntervalFromNVS();
+  gSyncIntervalMin = computeAutoSyncMin(gWakeIntervalMin);
   loadSyncModeFromNVS();
   loadDailySyncTimeFromNVS();
   loadSyncRuntimeGuardsFromNVS();
   Serial.printf("Current wake interval (from NVS): %d min\n", gWakeIntervalMin);
-  Serial.printf("Current sync interval payload (from NVS): %d min\n", gSyncIntervalMin);
+  Serial.printf("Auto-derived sync interval: %d min\n", gSyncIntervalMin);
   Serial.printf("Current daily sync time (from NVS): %s\n", formatSyncTimeHHMM(gSyncDailyHour, gSyncDailyMinute).c_str());
   Serial.printf("Sync guards (from NVS): day=%ld lastUnix=%lu slot=%lld\n",
                 gLastSyncBroadcastEpochDay,
@@ -2764,7 +2582,6 @@ void setup() {
   server.on("/discover-nodes", HTTP_POST, handleDiscoverNodes);
   server.on("/set-wake-interval", HTTP_POST, handleSetWakeInterval);
   server.on("/set-sync-mode", HTTP_POST, handleSetSyncMode);
-  server.on("/set-sync-interval", HTTP_POST, handleSetSyncInterval);
   server.on("/set-sync-time", HTTP_POST, handleSetSyncTime);
   server.on("/ui-status", HTTP_GET, []() {
     server.send(200, "application/json", buildBleStatusDataJson());

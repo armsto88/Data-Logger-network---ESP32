@@ -813,6 +813,89 @@ Two bugs identified during live unpair testing were fixed in node firmware.
 
 ---
 
+### 7.12 FN-3 Test Results and CS-3 Architecture Fix (24 April 2026)
+
+#### FN-3 Test Execution
+
+FN-3 (fleet simultaneous flush, 4 nodes, wakeMin=1, syncMin=5) was run and **failed** — confirming the CS-3 scenario predicted in §7.8.
+
+**Observed behaviour across 3 sync cycles:**
+
+| Cycle | Rows expected | Rows in CSV | Dropped |
+|---|---|---|---|
+| 1 | 20 | 12 | 8 |
+| 2 | 20 | 11 | 9 |
+| 3 | 20 | 10 | ~10 |
+
+Approximately 27 rows lost across 3 cycles. Node `ENV_94E38C` showed a "Config updated" badge that never cleared — its `lastNodeTimestamp` was stale because enough of its packets were dropped that cadence inference failed. All dropped rows were from the simultaneous-flush burst phase, not the queue-fill phase, confirming the root cause was SD write latency inside `OnDataRecv`.
+
+#### Root Cause (CS-3 Confirmed)
+
+Calling `SD.open()` / write / `SD.close()` inside the ESP-NOW `OnDataRecv` callback takes 20–50 ms per row. With 4 nodes sending simultaneously, packets arriving during that blocked window were silently discarded by the ESP-NOW driver. Per-row open/close compounded the problem: a 4-node burst of 5 records each = 20 SD operations, each one blocking the receive path.
+
+#### Fix — NODE_SNAPSHOT Architecture
+
+The data path was redesigned end-to-end to eliminate the SD latency problem structurally.
+
+**Protocol change — `node_snapshot_t` (protocol.h):**
+- One 124-byte packed struct per node per wake cycle replaces N per-sensor packets.
+- All sensor fields as `float` (NaN for sensors not fitted on that node).
+- `sensorPresent` bitmask, `seqNum`, `qualityFlags`, `configVersion` included.
+- `static_assert(sizeof(node_snapshot_t) == 124)` enforced at compile time.
+- New sensor IDs added: `SPECTRAL_415`–`SPECTRAL_680` (×8), `WIND_DIR` (1202), `BAT_V` (4001), `AUX2` (3002).
+
+**Node firmware changes:**
+- `captureSensorsToQueue()`: builds one `node_snapshot_t` per wake, maps sensor ID → struct field via switch, NaN-initialises all floats, calls `local_queue::enqueue(snap)`.
+- `flushQueuedToMothership()`: peeks `node_snapshot_t`, tags `configVersion`, sends 124-byte packet via `espnowSendWithRecover`.
+
+**Node queue redesign (local_queue.h / local_queue.cpp):**
+- Queue now stores raw `node_snapshot_t` structs (124 B each) instead of pre-formatted strings (320 B each).
+- Capacity increased from 12 → **24 slots** (NVS blob ~3004 B, well under the 4000 B key limit).
+- kMagic = `0x4E514D32`, kVersion = 3.
+- `static_assert(sizeof(QueueBlob) < 4000)` enforced.
+
+**Mothership changes (espnow_manager.cpp):**
+- Old 10 KB pre-formatted string queue removed.
+- New `SnapEntry` ring buffer: `g_snapQueue[128]`, each entry holds 124-byte snapshot + MAC string + CSV ID/name + timestamps. Enqueue/dequeue protected by critical section.
+- `OnDataRecv` callback: enqueues `SnapEntry` in ~1 µs — no SD access, does not block the receive path.
+- `drainCsvQueueToSd()` (called from `loop()`): opens SD once → writes all queued entries → closes once. Eliminates per-row open/close overhead.
+- `appendFloat()` helper writes `"NaN"` for absent sensors.
+- Deferred UNPAIR dispatch: `kUnpairFlushSettleMs = 1500 ms`. UNPAIR suppressed while packets are flowing; dispatched from `espnow_loop` after 1.5 s packet silence.
+
+**Mothership CSV format (sd_manager.cpp):**
+New wide-format header — one row per wake event, 30 columns:
+`ms_datetime`, `ms_sync_unix`, `node_id`, `node_name`, `node_mac`, `fw_id`, `node_datetime`, `node_unix`, `bat_v`, `air_temp_c`, `air_hum_pct`, `spectral_415nm`–`spectral_680nm` (×8), `wind_speed_ms`, `wind_dir_deg`, `soil1_vwc`, `soil1_temp_c`, `soil2_vwc`, `soil2_temp_c`, `aux1`, `aux2`, `sensor_present`, `quality_flags`, `seq_num`.
+
+**Effective packet reduction:** 4 nodes × N sensors/wake → 4 nodes × 1 packet/wake. A 20-node fleet produces 20 packets per sync vs 250+ previously.
+
+#### Queue Safety Rule
+
+With a 24-slot queue and 2 slots held as headroom, the maximum safe number of snapshots between syncs is **22**.
+
+The enforced constraint is:
+
+$$\text{syncMin} \leq \text{wakeMin} \times 22$$
+
+Equivalently, the minimum safe wake interval for a given sync period is $\lceil \text{syncMin} / 22 \rceil$ minutes.
+
+`clampSyncToQueueCapacity(syncMin, wakeMin, wasClamped)` was added to `mothership/src/main.cpp` and is called wherever intervals are applied.
+
+#### UI Safety Enforcement
+
+**Global sync interval (`/set-sync-interval`):**
+- Server clamps `syncMin` downward before applying if it would violate the rule; notes the clamp in the AJAX response.
+- Form `<select>` shows a static hint: "max safe sync = N min for current wake = M min".
+- Options that would overflow the queue are labelled `⚠ queue overflow`.
+- Live JS warning banner appears when a dangerous option is selected.
+
+**Per-node config (`/node-config` GET/POST):**
+- `handleNodeConfigForm`: same static hint and per-option `⚠ queue overflow` labels. Live JS warning banner fires on page load if the current selection is already dangerous.
+- `handleNodeConfigSave`: after the allowed-interval clamp, checks `interval < ceil(gSyncIntervalMin / 22)`. If so, walks `kAllowedIntervals` and clamps `interval` upward to the nearest safe value; logs the adjustment to Serial. Gated on `SYNC_MODE_INTERVAL` — daily-sync mode is unaffected.
+
+**Build status:** All changes compiled successfully (mothership `esp32s3` env + node `esp32wroom` env, 24 April 2026).
+
+---
+
 ## 8. Field Commissioning Procedure
 
 *Adapted from methods documentation (Section 4.4 — Bring-Up and Commissioning Workflow)*

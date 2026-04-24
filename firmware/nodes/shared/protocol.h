@@ -171,13 +171,64 @@ typedef struct rnt_pairing_t {
 #define SENSOR_ID_UNKNOWN       0
 #define SENSOR_ID_AIR_TEMP      1001
 #define SENSOR_ID_AIR_RH        1002
-#define SENSOR_ID_PAR           1101
+#define SENSOR_ID_SPECTRAL_415  1101
+#define SENSOR_ID_SPECTRAL_445  1102
+#define SENSOR_ID_SPECTRAL_480  1103
+#define SENSOR_ID_SPECTRAL_515  1104
+#define SENSOR_ID_SPECTRAL_555  1105
+#define SENSOR_ID_SPECTRAL_590  1106
+#define SENSOR_ID_SPECTRAL_630  1107
+#define SENSOR_ID_SPECTRAL_680  1108
 #define SENSOR_ID_WIND_SPEED    1201
+#define SENSOR_ID_WIND_DIR      1202
 #define SENSOR_ID_SOIL1_VWC     2001
 #define SENSOR_ID_SOIL2_VWC     2002
 #define SENSOR_ID_SOIL1_TEMP    2003
 #define SENSOR_ID_SOIL2_TEMP    2004
+#define SENSOR_ID_BAT_V         4001
 #define SENSOR_ID_AUX1          3001
+#define SENSOR_ID_AUX2          3002
+
+// ===== Snapshot packet (node -> mothership, one per wake cycle) =====
+// Single packet containing all sensor values for one wake event.
+// Replaces multiple sensor_data_message_t packets.
+// Size: 124 bytes — well within the 250-byte ESP-NOW limit.
+
+// Bitmask for snapshot_t::sensorPresent — set bit = sensor had a valid read this cycle.
+#define SNAP_PRESENT_AIR_TEMP    (1u << 0)
+#define SNAP_PRESENT_AIR_RH      (1u << 1)
+#define SNAP_PRESENT_SPECTRAL    (1u << 2)  // all 8 channels as a group
+#define SNAP_PRESENT_WIND        (1u << 3)  // speed + direction together
+#define SNAP_PRESENT_SOIL1       (1u << 4)  // soil1 vwc + temp together
+#define SNAP_PRESENT_SOIL2       (1u << 5)  // soil2 vwc + temp together
+#define SNAP_PRESENT_AUX1        (1u << 6)
+#define SNAP_PRESENT_AUX2        (1u << 7)
+#define SNAP_PRESENT_BAT_V       (1u << 8)
+
+typedef struct __attribute__((packed)) node_snapshot {
+    char     command[16];       // "NODE_SNAPSHOT"              16
+    char     nodeId[16];        // e.g. "ENV_94E38C"            16
+    uint32_t nodeTimestamp;     // node RTC unix at capture      4
+    uint32_t seqNum;            // snapshot sequence number      4
+    uint16_t sensorPresent;     // bitmask of valid channels     2
+    uint16_t qualityFlags;      // QF_DROPPED etc.               2
+    uint16_t configVersion;     //                               2
+    uint8_t  _pad[2];           //                               2
+    float    batVoltage;        // V                             4
+    float    airTemp;           // °C                            4
+    float    airHumidity;       // % RH                          4
+    float    spectral[8];       // raw counts, 415–680 nm       32
+    float    windSpeed;         // m/s                           4
+    float    windDir;           // degrees 0–360                 4
+    float    soil1Vwc;          // m³/m³                         4
+    float    soil1Temp;         // °C                            4
+    float    soil2Vwc;          //                               4
+    float    soil2Temp;         //                               4
+    float    aux1;              //                               4
+    float    aux2;              //                               4
+} node_snapshot_t;
+// Total: 124 bytes
+static_assert(sizeof(node_snapshot_t) == 124, "node_snapshot_t size mismatch");
 #define SENSOR_ID_AUX2          3002
 
 #define ESPNOW_CHANNEL 11

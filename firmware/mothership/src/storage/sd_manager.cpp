@@ -1,10 +1,19 @@
 #include "sd_manager.h"
 #include "../system/config.h"
 
-// Desired CSV header matching espnow_manager:
-// Timestamp,Node_ID,Node_Name,MAC_Address,Sensor_Type,Value
+// Wide-format CSV header — one row per node wake snapshot.
+// Columns: mothership timestamp, mothership unix, node id, node name, mac,
+//          firmware id, node datetime (from RTC), node unix,
+//          all sensor channels (NaN when absent), presence bitmask, quality flags, seq.
 static const char* CSV_HEADER =
-    "timestamp,node_id,node_name,mac,event_type,sensor_type,value,meta";
+    "ms_datetime,ms_sync_unix,node_id,node_name,node_mac,fw_id,node_datetime,node_unix,"
+    "bat_v,air_temp_c,air_hum_pct,"
+    "spectral_415nm,spectral_445nm,spectral_480nm,spectral_515nm,"
+    "spectral_555nm,spectral_590nm,spectral_630nm,spectral_680nm,"
+    "wind_speed_ms,wind_dir_deg,"
+    "soil1_vwc,soil1_temp_c,soil2_vwc,soil2_temp_c,"
+    "aux1,aux2,"
+    "sensor_present,quality_flags,seq_num";
 
 // Forward decl for internal helper
 static bool ensureCSVHeader();
