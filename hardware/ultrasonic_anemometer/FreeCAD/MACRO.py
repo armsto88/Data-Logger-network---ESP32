@@ -20,7 +20,7 @@ from FreeCAD import Vector
 # ============================================================
 
 # ---------------- Exploded view (visual only) ----------------
-EXPLODED_VIEW = False
+EXPLODED_VIEW = True
 EXPLODE_LOWER_DZ = 0.0
 EXPLODE_ROOF_DZ  = 35.0
 EXPLODE_PAN_DZ   = -105.0
@@ -171,8 +171,8 @@ PLATE_BOLT_CB_DEPTH     = 2.5
 # ---------------- Wall ports ----------------
 CONNECTORS_ENABLE = True
 
-GX12_HOLE_D     = 11.0
-GX12_NUT_D      = 15.0
+GX12_HOLE_D     = 12.2
+GX12_NUT_D      = 17.2
 GX12_QTY = 4                    # legacy/reserved (current placement derives from row angles below)
 
 GX12_ROW_CENTER_ANGLE = 320.0
@@ -181,13 +181,89 @@ GX12_ROW_OFFSET_DEG   = -15.0
 GX12_Z_CENTER         = -25.0
 GX12_PAIR_SEPARATION_DEG = 210.0  # legacy/reserved (not currently used in gx12_angles build)
 
-PG7_HOLE_D    = 13.0
-PG7_NUT_D     = 17.9
+# GX12 bulkhead fittings are shorter-threaded than the original generic reinforced
+# port geometry allowed for, so they use a dedicated thinner mounting treatment.
+# Based on measured hardware: thread OD = 11.7 mm, thread length = 5.8 mm,
+# nut = 14.7 mm AF / 16.8 mm corners.
+GX12_OUTER_PAD_ENABLE   = False
+GX12_INNER_PAD_ENABLE   = True
+GX12_INNER_PAD_THK      = 0.8
+GX12_INNER_PAD_EXTRA_W  = 4.0
+GX12_INNER_PAD_EXTRA_H  = 4.0
+GX12_INNER_PAD_INSET    = 0.8
+GX12_OUTER_FLAT_ENABLE  = True
+GX12_OUTER_FLAT_DEPTH   = 3.0
+GX12_OUTER_FLAT_EXTRA_W = 4.0
+GX12_OUTER_FLAT_EXTRA_H = 4.0
+GX12_OUTER_FLAT_CHAMFER_Z   = 2.0
+GX12_OUTER_FLAT_CHAMFER_RUN = 2.0
+GX12_OUTER_FLAT_CHAMFER_Y   = 2.0
+GX12_OUTER_FLAT_CHAMFER_RUN_Y = 2.0
+GX12_HOLE_MOUTH_CHAMFER_ENABLE = True
+GX12_HOLE_OUTER_CHAMFER_L      = 1.2
+GX12_HOLE_OUTER_CHAMFER_RAD    = 0.8
+GX12_HOLE_INNER_CHAMFER_L      = 1.0
+GX12_HOLE_INNER_CHAMFER_RAD    = 0.8
+
+PG7_HOLE_D    = 12.7
+PG7_NUT_D     = 22.7
 PG7_ANGLE_DEG = 225.0
 
+# PG7 fitting also has a short thread, so it uses a dedicated thinner mount.
+# Based on measured hardware: thread OD = 12.2 mm, thread length = 6.0 mm,
+# nut = 20.1 mm AF / 22.3 mm corners.
+PG7_OUTER_PAD_ENABLE   = False
+PG7_INNER_PAD_ENABLE   = True
+PG7_INNER_PAD_THK      = 0.8
+PG7_INNER_PAD_EXTRA_W  = 4.0
+PG7_INNER_PAD_EXTRA_H  = 4.0
+PG7_INNER_PAD_INSET    = 0.8
+PG7_OUTER_FLAT_ENABLE  = True
+PG7_OUTER_FLAT_DEPTH   = 3.0
+PG7_OUTER_FLAT_EXTRA_W = 4.0
+PG7_OUTER_FLAT_EXTRA_H = 4.0
+PG7_OUTER_FLAT_CHAMFER_Z   = 2.0
+PG7_OUTER_FLAT_CHAMFER_RUN = 2.0
+PG7_OUTER_FLAT_CHAMFER_Y   = 2.0
+PG7_OUTER_FLAT_CHAMFER_RUN_Y = 2.0
+PG7_HOLE_MOUTH_CHAMFER_ENABLE = True
+PG7_HOLE_OUTER_CHAMFER_L      = 1.2
+PG7_HOLE_OUTER_CHAMFER_RAD    = 0.8
+PG7_HOLE_INNER_CHAMFER_L      = 1.0
+PG7_HOLE_INNER_CHAMFER_RAD    = 0.8
+
 SHT_HOLE_D    = 11.5
-SHT_NUT_D     = 15.0
+SHT_NUT_D     = 17.4
 SHT_ANGLE_DEG = 45.0
+
+# SHT bulkhead fitting is shorter-threaded than the GX12 connectors, so it uses
+# a dedicated thinner mounting treatment instead of the generic reinforced port pads.
+# Based on measured hardware: thread OD = 12.1 mm, nut = 15.6 mm AF / 17.0 mm corners.
+SHT_OUTER_PAD_ENABLE   = False
+SHT_INNER_PAD_ENABLE   = True
+SHT_INNER_PAD_THK      = 1.0
+SHT_INNER_PAD_EXTRA_W  = 4.0
+SHT_INNER_PAD_EXTRA_H  = 4.0
+SHT_INNER_PAD_INSET    = 0.8
+SHT_OUTER_FLAT_ENABLE  = True
+SHT_OUTER_FLAT_DEPTH   = 3.0
+SHT_OUTER_FLAT_EXTRA_W = 4.0
+SHT_OUTER_FLAT_EXTRA_H = 4.0
+SHT_OUTER_FLAT_CHAMFER_Z   = 2.0
+SHT_OUTER_FLAT_CHAMFER_RUN = 2.0
+SHT_OUTER_FLAT_CHAMFER_Y   = 2.0
+SHT_OUTER_FLAT_CHAMFER_RUN_Y = 2.0
+SHT_WALL_RELIEF_ENABLE = True
+SHT_WALL_RELIEF_D      = 18.0
+SHT_WALL_RELIEF_DEPTH  = 2.8
+SHT_HOLE_MOUTH_CHAMFER_ENABLE = True
+SHT_HOLE_OUTER_CHAMFER_L      = 1.2
+SHT_HOLE_OUTER_CHAMFER_RAD    = 0.8
+SHT_HOLE_INNER_CHAMFER_L      = 1.0
+SHT_HOLE_INNER_CHAMFER_RAD    = 0.8
+
+# FDM clearance on measured 12.1 mm thread OD.
+SHT_HOLE_D    = 12.6
 
 PORT_Z_CENTER        = -27.0
 PORT_CUT_EXTRA       = 2.0
@@ -399,6 +475,52 @@ def cut_radial_port(solid, hole_d, angle_deg, z_center,
     cutter.rotate(Vector(0, 0, 0), Vector(0, 0, 1), angle_deg)
     return solid.cut(cutter)
 
+def cut_radial_inner_relief(solid, relief_d, angle_deg, z_center,
+                            wall_inner_r, depth,
+                            start_backoff=0.2):
+    zc = clamp(z_center, -BELLY_WALL_H + 6.0, -6.0)
+    relief_depth = max(0.1, float(depth) + float(start_backoff))
+
+    cutter = Part.makeCylinder(
+        relief_d / 2.0,
+        relief_depth,
+        Vector(float(wall_inner_r) - float(start_backoff), 0, zc),
+        Vector(1, 0, 0)
+    )
+    cutter.rotate(Vector(0, 0, 0), Vector(0, 0, 1), angle_deg)
+    return solid.cut(cutter)
+
+def cut_radial_port_mouth_chamfers(solid, hole_d, angle_deg, z_center,
+                                   outer_face_x=None, outer_len=0.0, outer_rad=0.0,
+                                   inner_face_x=None, inner_len=0.0, inner_rad=0.0):
+    zc = clamp(z_center, -BELLY_WALL_H + 6.0, -6.0)
+    out = solid
+    hole_r = float(hole_d) / 2.0
+
+    if outer_face_x is not None and outer_len > 0 and outer_rad > 0:
+        outer = Part.makeCone(
+            hole_r,
+            hole_r + float(outer_rad),
+            float(outer_len),
+            Vector(float(outer_face_x) - float(outer_len), 0, zc),
+            Vector(1, 0, 0)
+        )
+        outer.rotate(Vector(0, 0, 0), Vector(0, 0, 1), angle_deg)
+        out = out.cut(outer)
+
+    if inner_face_x is not None and inner_len > 0 and inner_rad > 0:
+        inner = Part.makeCone(
+            hole_r + float(inner_rad),
+            hole_r,
+            float(inner_len),
+            Vector(float(inner_face_x), 0, zc),
+            Vector(1, 0, 0)
+        )
+        inner.rotate(Vector(0, 0, 0), Vector(0, 0, 1), angle_deg)
+        out = out.cut(inner)
+
+    return out.removeSplitter()
+
 def add_inner_port_pad(solid, angle_deg, zc, nut_d, wall_inner_r,
                        inner_thk=3.0, inset=0.8,
                        extra_w=8.0, extra_h=8.0,
@@ -481,6 +603,98 @@ def add_inner_port_pad(solid, angle_deg, zc, nut_d, wall_inner_r,
 
     pad.rotate(Vector(0, 0, 0), Vector(0, 0, 1), float(angle_deg))
     return solid.fuse(pad).removeSplitter()
+
+def add_flat_inner_port_land(solid, angle_deg, zc, nut_d, wall_inner_r,
+                             inner_thk=1.0, inset=0.8,
+                             extra_w=4.0, extra_h=4.0):
+    pad_w = float(nut_d) + 2.0 * float(extra_w)
+    pad_h = float(nut_d) + 2.0 * float(extra_h)
+
+    x0 = float(wall_inner_r) - float(inner_thk)
+    x_len = float(inner_thk) + float(inset)
+    y0 = -pad_w / 2.0
+    z0 = float(zc) - pad_h / 2.0
+
+    pad = Part.makeBox(x_len, pad_w, pad_h, Vector(x0, y0, z0))
+    pad.rotate(Vector(0, 0, 0), Vector(0, 0, 1), float(angle_deg))
+    return solid.fuse(pad).removeSplitter()
+
+def cut_flat_outer_port_land(solid, angle_deg, zc, nut_d, wall_outer_r,
+                             depth=1.6,
+                             extra_w=4.0, extra_h=4.0,
+                             start_extra=0.4,
+                             chamfer_z=0.0, chamfer_run=0.0,
+                             chamfer_y=0.0, chamfer_run_y=0.0):
+    pad_w = float(nut_d) + 2.0 * float(extra_w)
+    pad_h = float(nut_d) + 2.0 * float(extra_h)
+
+    x0 = float(wall_outer_r) - float(depth)
+    x_len = float(depth) + float(start_extra)
+    y0 = -pad_w / 2.0
+    z0 = float(zc) - pad_h / 2.0
+    y1 = y0 + pad_w
+    z1 = z0 + pad_h
+
+    cutter = Part.makeBox(x_len, pad_w, pad_h, Vector(x0, y0, z0))
+
+    x_in = x0
+    cz = max(0.0, float(chamfer_z))
+    cr = max(0.0, float(chamfer_run))
+    cy = max(0.0, float(chamfer_y))
+    cyr = max(0.0, float(chamfer_run_y))
+
+    if cz > 0.0 and cr > 0.0 and cz < pad_h:
+        tri_pts = [
+            Vector(x_in,       0, z0),
+            Vector(x_in,       0, z0 + cz),
+            Vector(x_in + cr,  0, z0),
+            Vector(x_in,       0, z0),
+        ]
+        tri = Part.makePolygon(tri_pts)
+        tri_face = Part.Face(tri)
+        bot = tri_face.extrude(Vector(0, pad_w, 0))
+        bot.translate(Vector(0, y0, 0))
+        cutter = cutter.cut(bot)
+
+        tri_pts2 = [
+            Vector(x_in,       0, z1),
+            Vector(x_in,       0, z1 - cz),
+            Vector(x_in + cr,  0, z1),
+            Vector(x_in,       0, z1),
+        ]
+        tri2 = Part.makePolygon(tri_pts2)
+        tri2_face = Part.Face(tri2)
+        top = tri2_face.extrude(Vector(0, pad_w, 0))
+        top.translate(Vector(0, y0, 0))
+        cutter = cutter.cut(top)
+
+    if cy > 0.0 and cyr > 0.0 and cy < pad_w:
+        triL = [
+            Vector(x_in,       y0, 0),
+            Vector(x_in,       y0 + cy, 0),
+            Vector(x_in + cyr, y0, 0),
+            Vector(x_in,       y0, 0),
+        ]
+        polyL = Part.makePolygon(triL)
+        faceL = Part.Face(polyL)
+        wedgeL = faceL.extrude(Vector(0, 0, pad_h))
+        wedgeL.translate(Vector(0, 0, z0))
+        cutter = cutter.cut(wedgeL)
+
+        triR = [
+            Vector(x_in,       y1, 0),
+            Vector(x_in,       y1 - cy, 0),
+            Vector(x_in + cyr, y1, 0),
+            Vector(x_in,       y1, 0),
+        ]
+        polyR = Part.makePolygon(triR)
+        faceR = Part.Face(polyR)
+        wedgeR = faceR.extrude(Vector(0, 0, pad_h))
+        wedgeR.translate(Vector(0, 0, z0))
+        cutter = cutter.cut(wedgeR)
+
+    cutter.rotate(Vector(0, 0, 0), Vector(0, 0, 1), float(angle_deg))
+    return solid.cut(cutter).removeSplitter()
 
 def fillet_body_outer_top_rim(shape, target_r, fillet_r, top_z, tol_r=1.5, tol_z=1.2):
     if fillet_r <= 0:
@@ -1488,7 +1702,22 @@ if BELLY_ENABLE:
         ]
 
         for ang in gx12_angles:
-            if outer_pads_on:
+            gx12_outer_pad_on = bool(outer_pads_on and GX12_OUTER_PAD_ENABLE)
+            gx12_inner_pad_on = bool(inner_pads_on and GX12_INNER_PAD_ENABLE)
+
+            if GX12_OUTER_FLAT_ENABLE and GX12_OUTER_FLAT_DEPTH > 0:
+                pan = cut_flat_outer_port_land(
+                    pan, ang, gx12_zc, GX12_NUT_D, wall_outer_r,
+                    depth=GX12_OUTER_FLAT_DEPTH,
+                    extra_w=GX12_OUTER_FLAT_EXTRA_W,
+                    extra_h=GX12_OUTER_FLAT_EXTRA_H,
+                    chamfer_z=GX12_OUTER_FLAT_CHAMFER_Z,
+                    chamfer_run=GX12_OUTER_FLAT_CHAMFER_RUN,
+                    chamfer_y=GX12_OUTER_FLAT_CHAMFER_Y,
+                    chamfer_run_y=GX12_OUTER_FLAT_CHAMFER_RUN_Y,
+                )
+
+            if gx12_outer_pad_on:
                 pan = add_port_pad(
                     pan, ang, gx12_zc, GX12_NUT_D, wall_outer_r,
                     pad_thk=PORT_PAD_THK, inset=PORT_PAD_INSET,
@@ -1496,25 +1725,51 @@ if BELLY_ENABLE:
                     chamfer_z=PORT_PAD_CHAMFER_Z, chamfer_run=PORT_PAD_CHAMFER_RUN,
                     chamfer_y=PORT_PAD_CHAMFER_Z, chamfer_run_y=PORT_PAD_CHAMFER_RUN
                 )
-            if inner_pads_on:
-                pan = add_inner_port_pad(
+            if gx12_inner_pad_on:
+                pan = add_flat_inner_port_land(
                     pan, ang, gx12_zc, GX12_NUT_D, wall_inner_r,
-                    inner_thk=PORT_PAD_THK, inset=PORT_PAD_INSET,
-                    extra_w=PORT_PAD_EXTRA_W, extra_h=PORT_PAD_EXTRA_H,
-                    chamfer_z=PORT_PAD_CHAMFER_Z, chamfer_run=PORT_PAD_CHAMFER_RUN,
-                    chamfer_y=PORT_PAD_CHAMFER_Z, chamfer_run_y=PORT_PAD_CHAMFER_RUN
+                    inner_thk=GX12_INNER_PAD_THK, inset=GX12_INNER_PAD_INSET,
+                    extra_w=GX12_INNER_PAD_EXTRA_W, extra_h=GX12_INNER_PAD_EXTRA_H
                 )
 
             pan = cut_radial_port(
                 pan, GX12_HOLE_D, ang, gx12_zc,
                 wall_inner_r, wall_outer_r,
-                extra=PORT_CUT_EXTRA + (float(PORT_PAD_THK) if outer_pads_on else 0.0),
-                outer_extra=(float(PORT_PAD_THK) if outer_pads_on else 0.0),
-                inner_extra=(float(PORT_PAD_THK) if inner_pads_on else 0.0),
+                extra=PORT_CUT_EXTRA + (float(PORT_PAD_THK) if gx12_outer_pad_on else 0.0),
+                outer_extra=(float(PORT_PAD_THK) if gx12_outer_pad_on else 0.0),
+                inner_extra=(float(GX12_INNER_PAD_THK) if gx12_inner_pad_on else 0.0),
             )
 
+            if GX12_HOLE_MOUTH_CHAMFER_ENABLE:
+                outer_face_x = float(wall_outer_r) - float(GX12_OUTER_FLAT_DEPTH if GX12_OUTER_FLAT_ENABLE else 0.0)
+                inner_face_x = float(wall_inner_r) - float(GX12_INNER_PAD_THK if gx12_inner_pad_on else 0.0)
+                pan = cut_radial_port_mouth_chamfers(
+                    pan, GX12_HOLE_D, ang, gx12_zc,
+                    outer_face_x=outer_face_x,
+                    outer_len=GX12_HOLE_OUTER_CHAMFER_L,
+                    outer_rad=GX12_HOLE_OUTER_CHAMFER_RAD,
+                    inner_face_x=inner_face_x,
+                    inner_len=GX12_HOLE_INNER_CHAMFER_L,
+                    inner_rad=GX12_HOLE_INNER_CHAMFER_RAD,
+                )
+
         if angle_ok(PG7_ANGLE_DEG):
-            if outer_pads_on:
+            pg7_outer_pad_on = bool(outer_pads_on and PG7_OUTER_PAD_ENABLE)
+            pg7_inner_pad_on = bool(inner_pads_on and PG7_INNER_PAD_ENABLE)
+
+            if PG7_OUTER_FLAT_ENABLE and PG7_OUTER_FLAT_DEPTH > 0:
+                pan = cut_flat_outer_port_land(
+                    pan, PG7_ANGLE_DEG, zc_ports, PG7_NUT_D, wall_outer_r,
+                    depth=PG7_OUTER_FLAT_DEPTH,
+                    extra_w=PG7_OUTER_FLAT_EXTRA_W,
+                    extra_h=PG7_OUTER_FLAT_EXTRA_H,
+                    chamfer_z=PG7_OUTER_FLAT_CHAMFER_Z,
+                    chamfer_run=PG7_OUTER_FLAT_CHAMFER_RUN,
+                    chamfer_y=PG7_OUTER_FLAT_CHAMFER_Y,
+                    chamfer_run_y=PG7_OUTER_FLAT_CHAMFER_RUN_Y,
+                )
+
+            if pg7_outer_pad_on:
                 pan = add_port_pad(
                     pan, PG7_ANGLE_DEG, zc_ports, PG7_NUT_D, wall_outer_r,
                     pad_thk=PORT_PAD_THK, inset=PORT_PAD_INSET,
@@ -1522,25 +1777,57 @@ if BELLY_ENABLE:
                     chamfer_z=PORT_PAD_CHAMFER_Z, chamfer_run=PORT_PAD_CHAMFER_RUN,
                     chamfer_y=PORT_PAD_CHAMFER_Z, chamfer_run_y=PORT_PAD_CHAMFER_RUN
                 )
-            if inner_pads_on:
-                pan = add_inner_port_pad(
+            if pg7_inner_pad_on:
+                pan = add_flat_inner_port_land(
                     pan, PG7_ANGLE_DEG, zc_ports, PG7_NUT_D, wall_inner_r,
-                    inner_thk=PORT_PAD_THK, inset=PORT_PAD_INSET,
-                    extra_w=PORT_PAD_EXTRA_W, extra_h=PORT_PAD_EXTRA_H,
-                    chamfer_z=PORT_PAD_CHAMFER_Z, chamfer_run=PORT_PAD_CHAMFER_RUN,
-                    chamfer_y=PORT_PAD_CHAMFER_Z, chamfer_run_y=PORT_PAD_CHAMFER_RUN
+                    inner_thk=PG7_INNER_PAD_THK, inset=PG7_INNER_PAD_INSET,
+                    extra_w=PG7_INNER_PAD_EXTRA_W, extra_h=PG7_INNER_PAD_EXTRA_H
                 )
 
             pan = cut_radial_port(
                 pan, PG7_HOLE_D, PG7_ANGLE_DEG, zc_ports,
                 wall_inner_r, wall_outer_r,
-                extra=PORT_CUT_EXTRA + (float(PORT_PAD_THK) if outer_pads_on else 0.0),
-                outer_extra=(float(PORT_PAD_THK) if outer_pads_on else 0.0),
-                inner_extra=(float(PORT_PAD_THK) if inner_pads_on else 0.0),
+                extra=PORT_CUT_EXTRA + (float(PORT_PAD_THK) if pg7_outer_pad_on else 0.0),
+                outer_extra=(float(PORT_PAD_THK) if pg7_outer_pad_on else 0.0),
+                inner_extra=(float(PG7_INNER_PAD_THK) if pg7_inner_pad_on else 0.0),
             )
 
+            if PG7_HOLE_MOUTH_CHAMFER_ENABLE:
+                outer_face_x = float(wall_outer_r) - float(PG7_OUTER_FLAT_DEPTH if PG7_OUTER_FLAT_ENABLE else 0.0)
+                inner_face_x = float(wall_inner_r) - float(PG7_INNER_PAD_THK if pg7_inner_pad_on else 0.0)
+                pan = cut_radial_port_mouth_chamfers(
+                    pan, PG7_HOLE_D, PG7_ANGLE_DEG, zc_ports,
+                    outer_face_x=outer_face_x,
+                    outer_len=PG7_HOLE_OUTER_CHAMFER_L,
+                    outer_rad=PG7_HOLE_OUTER_CHAMFER_RAD,
+                    inner_face_x=inner_face_x,
+                    inner_len=PG7_HOLE_INNER_CHAMFER_L,
+                    inner_rad=PG7_HOLE_INNER_CHAMFER_RAD,
+                )
+
         if angle_ok(SHT_ANGLE_DEG):
-            if outer_pads_on:
+            sht_outer_pad_on = bool(outer_pads_on and SHT_OUTER_PAD_ENABLE)
+            sht_inner_pad_on = bool(inner_pads_on and SHT_INNER_PAD_ENABLE)
+
+            if SHT_OUTER_FLAT_ENABLE and SHT_OUTER_FLAT_DEPTH > 0:
+                pan = cut_flat_outer_port_land(
+                    pan, SHT_ANGLE_DEG, zc_ports, SHT_NUT_D, wall_outer_r,
+                    depth=SHT_OUTER_FLAT_DEPTH,
+                    extra_w=SHT_OUTER_FLAT_EXTRA_W,
+                    extra_h=SHT_OUTER_FLAT_EXTRA_H,
+                    chamfer_z=SHT_OUTER_FLAT_CHAMFER_Z,
+                    chamfer_run=SHT_OUTER_FLAT_CHAMFER_RUN,
+                    chamfer_y=SHT_OUTER_FLAT_CHAMFER_Y,
+                    chamfer_run_y=SHT_OUTER_FLAT_CHAMFER_RUN_Y,
+                )
+
+            if SHT_WALL_RELIEF_ENABLE and SHT_WALL_RELIEF_DEPTH > 0:
+                pan = cut_radial_inner_relief(
+                    pan, SHT_WALL_RELIEF_D, SHT_ANGLE_DEG, zc_ports,
+                    wall_inner_r, SHT_WALL_RELIEF_DEPTH
+                )
+
+            if sht_outer_pad_on:
                 pan = add_port_pad(
                     pan, SHT_ANGLE_DEG, zc_ports, SHT_NUT_D, wall_outer_r,
                     pad_thk=PORT_PAD_THK, inset=PORT_PAD_INSET,
@@ -1548,22 +1835,33 @@ if BELLY_ENABLE:
                     chamfer_z=PORT_PAD_CHAMFER_Z, chamfer_run=PORT_PAD_CHAMFER_RUN,
                     chamfer_y=PORT_PAD_CHAMFER_Z, chamfer_run_y=PORT_PAD_CHAMFER_RUN
                 )
-            if inner_pads_on:
-                pan = add_inner_port_pad(
+            if sht_inner_pad_on:
+                pan = add_flat_inner_port_land(
                     pan, SHT_ANGLE_DEG, zc_ports, SHT_NUT_D, wall_inner_r,
-                    inner_thk=PORT_PAD_THK, inset=PORT_PAD_INSET,
-                    extra_w=PORT_PAD_EXTRA_W, extra_h=PORT_PAD_EXTRA_H,
-                    chamfer_z=PORT_PAD_CHAMFER_Z, chamfer_run=PORT_PAD_CHAMFER_RUN,
-                    chamfer_y=PORT_PAD_CHAMFER_Z, chamfer_run_y=PORT_PAD_CHAMFER_RUN
+                    inner_thk=SHT_INNER_PAD_THK, inset=SHT_INNER_PAD_INSET,
+                    extra_w=SHT_INNER_PAD_EXTRA_W, extra_h=SHT_INNER_PAD_EXTRA_H
                 )
 
             pan = cut_radial_port(
                 pan, SHT_HOLE_D, SHT_ANGLE_DEG, zc_ports,
                 wall_inner_r, wall_outer_r,
-                extra=PORT_CUT_EXTRA + (float(PORT_PAD_THK) if outer_pads_on else 0.0),
-                outer_extra=(float(PORT_PAD_THK) if outer_pads_on else 0.0),
-                inner_extra=(float(PORT_PAD_THK) if inner_pads_on else 0.0),
+                extra=PORT_CUT_EXTRA + (float(PORT_PAD_THK) if sht_outer_pad_on else 0.0),
+                outer_extra=(float(PORT_PAD_THK) if sht_outer_pad_on else 0.0),
+                inner_extra=(float(SHT_INNER_PAD_THK) if sht_inner_pad_on else 0.0),
             )
+
+            if SHT_HOLE_MOUTH_CHAMFER_ENABLE:
+                outer_face_x = float(wall_outer_r) - float(SHT_OUTER_FLAT_DEPTH if SHT_OUTER_FLAT_ENABLE else 0.0)
+                inner_face_x = float(wall_inner_r) - float(SHT_INNER_PAD_THK if sht_inner_pad_on else 0.0)
+                pan = cut_radial_port_mouth_chamfers(
+                    pan, SHT_HOLE_D, SHT_ANGLE_DEG, zc_ports,
+                    outer_face_x=outer_face_x,
+                    outer_len=SHT_HOLE_OUTER_CHAMFER_L,
+                    outer_rad=SHT_HOLE_OUTER_CHAMFER_RAD,
+                    inner_face_x=inner_face_x,
+                    inner_len=SHT_HOLE_INNER_CHAMFER_L,
+                    inner_rad=SHT_HOLE_INNER_CHAMFER_RAD,
+                )
 
         if SHT_RS_ENABLE and angle_ok(SHT_ANGLE_DEG):
             roof_shield = make_sht_canopy_roof(wall_outer_r=wall_outer_r, zc=SHT_Z, angle_deg=SHT_ANGLE_DEG)

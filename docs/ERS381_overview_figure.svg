@@ -1,0 +1,64 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1800" height="1100" viewBox="0 0 1800 1100">
+<style>
+    .title { font: 700 42px Arial, sans-serif; fill: rgb(36, 43, 48); }
+    .sub { font: 700 24px Arial, sans-serif; fill: rgb(36, 43, 48); }
+    .body { font: 22px Arial, sans-serif; fill: rgb(36, 43, 48); }
+    .small { font: 18px Arial, sans-serif; fill: rgb(87, 98, 107); }
+</style>
+<rect width="100%" height="100%" fill="rgb(250, 248, 244)"/>
+<text x="70" y="78" class="title">Figure X. Overview of the distributed microclimate monitoring system</text>
+<text x="72" y="128" class="body" fill="rgb(87, 98, 107)">Sensor nodes measure fine-scale microclimate variables in the field, store readings locally between sync windows, and transmit data wirelessly to a mothership hub for logging, configuration, and download.</text>
+<rect x="70" y="220" width="540" height="570" rx="28" fill="rgb(227, 242, 232)" stroke="rgb(82, 151, 110)" stroke-width="3"/>
+<rect x="680" y="220" width="500" height="570" rx="28" fill="rgb(226, 236, 255)" stroke="rgb(84, 126, 214)" stroke-width="3"/>
+<rect x="1250" y="220" width="480" height="570" rx="28" fill="rgb(251, 235, 217)" stroke="rgb(197, 130, 65)" stroke-width="3"/>
+<rect x="70" y="840" width="1660" height="190" rx="28" fill="rgb(255, 255, 255)" stroke="rgb(214, 219, 224)" stroke-width="3"/>
+<text x="98" y="270" class="sub">Field sensor nodes</text>
+<text x="98" y="312" class="body" fill="rgb(87, 98, 107)">Distributed ESP32-based nodes deployed at multiple field positions.</text>
+<text x="98" y="500" class="sub">Measured variables</text>
+<text x="98" y="548" class="body">• Air temperature and relative humidity</text>
+<text x="98" y="586" class="body">• Photosynthetically active radiation (PAR)</text>
+<text x="98" y="624" class="body">• Wind speed and direction (ultrasonic)</text>
+<text x="98" y="662" class="body">• Soil moisture and soil temperature</text>
+<text x="98" y="700" class="body">• Battery voltage / node health</text>
+<text x="98" y="748" class="body" fill="rgb(87, 98, 107)">Nodes follow a low-power wake, measure, buffer, and sync cycle.</text>
+<text x="708" y="270" class="sub">Mothership hub</text>
+<text x="708" y="312" class="body" fill="rgb(87, 98, 107)">On-site coordination, timekeeping, logging, and local configuration.</text>
+<text x="708" y="500" class="sub">Functions</text>
+<text x="708" y="548" class="body">• Receives wireless node data during sync windows</text>
+<text x="708" y="586" class="body">• Maintains reference time and deployment settings</text>
+<text x="708" y="624" class="body">• Writes records to local SD-card CSV storage</text>
+<text x="708" y="662" class="body">• Hosts a local Wi-Fi access point and web dashboard</text>
+<text x="708" y="730" class="body" fill="rgb(87, 98, 107)">No internet connection is required for configuration or download.</text>
+<text x="1278" y="270" class="sub">Field user interface</text>
+<text x="1278" y="312" class="body" fill="rgb(87, 98, 107)">Phone or laptop connected to the mothership local Wi-Fi network.</text>
+<text x="1278" y="500" class="sub">Typical actions</text>
+<text x="1278" y="548" class="body">• Discover nearby nodes</text>
+<text x="1278" y="586" class="body">• Assign node names and deploy them</text>
+<text x="1278" y="624" class="body">• Set sampling and sync schedules</text>
+<text x="1278" y="662" class="body">• Review status and battery voltage</text>
+<text x="1278" y="700" class="body">• Download CSV data for analysis</text>
+<line x1="610" y1="430" x2="680" y2="430" stroke="rgb(36, 43, 48)" stroke-width="5"/>
+<polygon points="680,430 664,422 664,438" fill="rgb(36, 43, 48)"/>
+<text x="620" y="392" class="small">Wireless sync</text>
+<text x="620" y="418" class="small">ESP-NOW / scheduled transfer</text>
+<line x1="1180" y1="430" x2="1250" y2="430" stroke="rgb(36, 43, 48)" stroke-width="5"/>
+<polygon points="1250,430 1234,422 1234,438" fill="rgb(36, 43, 48)"/>
+<text x="1190" y="392" class="small">Local access</text>
+<text x="1190" y="418" class="small">Wi-Fi AP + web dashboard</text>
+<text x="98" y="900" class="sub">Acquisition and data flow</text>
+<rect x="110" y="912" width="240" height="83" rx="18" fill="white" stroke="rgb(214, 219, 224)" stroke-width="2"/>
+<rect x="430" y="912" width="240" height="83" rx="18" fill="white" stroke="rgb(214, 219, 224)" stroke-width="2"/>
+<rect x="750" y="912" width="240" height="83" rx="18" fill="white" stroke="rgb(214, 219, 224)" stroke-width="2"/>
+<rect x="1070" y="912" width="240" height="83" rx="18" fill="white" stroke="rgb(214, 219, 224)" stroke-width="2"/>
+<rect x="1390" y="912" width="240" height="83" rx="18" fill="white" stroke="rgb(214, 219, 224)" stroke-width="2"/>
+<text x="126" y="942" class="small">1. Measure</text>
+<text x="126" y="968" class="small">Node wakes and samples sensors</text>
+<text x="446" y="942" class="small">2. Buffer</text>
+<text x="446" y="968" class="small">Readings retained on-node</text>
+<text x="766" y="942" class="small">3. Sync</text>
+<text x="766" y="968" class="small">Data transmitted on schedule</text>
+<text x="1086" y="942" class="small">4. Log</text>
+<text x="1086" y="968" class="small">CSV written to SD card</text>
+<text x="1406" y="942" class="small">5. Download</text>
+<text x="1406" y="968" class="small">User retrieves local data</text>
+</svg>
