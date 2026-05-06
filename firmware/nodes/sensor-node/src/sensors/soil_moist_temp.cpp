@@ -12,25 +12,30 @@ extern TwoWire WireRtc;
 
 namespace {
 
+  constexpr uint8_t CH_SOIL1_TEMP  = 0;
+  constexpr uint8_t CH_SOIL1_MOIST = 1;
+  constexpr uint8_t CH_SOIL2_MOIST = 2;
+  constexpr uint8_t CH_SOIL2_TEMP  = 3;
+
   // One global ADS instance on the root I2C bus
   static ADS1115 ads(WireRtc);
 
   // ---- Legacy thermistor divider + Steinhart–Hart (from older probe setup) ----
   constexpr float V_DIV_SUPPLY = 4.910f;
-  constexpr float R_FIXED_A2   = 9880.0f;   // A2 → soil1 NTC
+  constexpr float R_FIXED_A0   = 9880.0f;   // A0 → soil1 NTC
   constexpr float R_FIXED_A3   = 9970.0f;   // A3 → soil2 NTC
 
   // Fallback SH coefficients (from fit on your logs)
-  constexpr float A2_A = -0.0036485006f;
-  constexpr float A2_B =  0.00096359095f;
-  constexpr float A2_C = -2.4188805e-06f;
+  constexpr float A0_A = -0.0036485006f;
+  constexpr float A0_B =  0.00096359095f;
+  constexpr float A0_C = -2.4188805e-06f;
 
   constexpr float A3_A = -0.0047102991f;
   constexpr float A3_B =  0.00112009362f;
   constexpr float A3_C = -2.9164770e-06f;
 
-  constexpr float A2_TRIM_GAIN = 1.000f;
-  constexpr float A2_TRIM_OFF  = 0.0f;
+  constexpr float A0_TRIM_GAIN = 1.000f;
+  constexpr float A0_TRIM_OFF  = 0.0f;
   constexpr float A3_TRIM_GAIN = 1.000f;
   constexpr float A3_TRIM_OFF  = 0.0f;
 
@@ -66,10 +71,10 @@ namespace {
     int16_t raw0, raw1, raw2, raw3;
     float   mv0,  mv1,  mv2,  mv3;
 
-    bool ok0 = ads.readChannelMv(0, raw0, mv0); // SOIL1 moisture
-    bool ok1 = ads.readChannelMv(1, raw1, mv1); // SOIL2 moisture
-    bool ok2 = ads.readChannelMv(2, raw2, mv2); // SOIL1 thermistor
-    bool ok3 = ads.readChannelMv(3, raw3, mv3); // SOIL2 thermistor
+    bool ok0 = ads.readChannelMv(CH_SOIL1_TEMP,  raw0, mv0); // SOIL1 temperature
+    bool ok1 = ads.readChannelMv(CH_SOIL1_MOIST, raw1, mv1); // SOIL1 moisture
+    bool ok2 = ads.readChannelMv(CH_SOIL2_MOIST, raw2, mv2); // SOIL2 moisture
+    bool ok3 = ads.readChannelMv(CH_SOIL2_TEMP,  raw3, mv3); // SOIL2 temperature
 
     if (!ok0 || !ok1 || !ok2 || !ok3) {
       Serial.println(F("[SOIL] ADS1115 read failed on one or more channels"));
@@ -78,25 +83,25 @@ namespace {
     }
 
     #if SOIL_CWT_THA_MODE
-    // CWT TH-A (0-5V): A0/A1 moisture, A2/A3 temperature.
+    // CWT TH-A current wiring: SOIL1 A0=temp A1=moisture, SOIL2 A2=moisture A3=temp.
     // Convert ADS input volts -> sensor output volts using configured gain.
     float v0 = (mv0 / 1000.0f) * SOIL_ADC_INPUT_TO_SENSOR_VOLT_GAIN;
     float v1 = (mv1 / 1000.0f) * SOIL_ADC_INPUT_TO_SENSOR_VOLT_GAIN;
     float v2 = (mv2 / 1000.0f) * SOIL_ADC_INPUT_TO_SENSOR_VOLT_GAIN;
     float v3 = (mv3 / 1000.0f) * SOIL_ADC_INPUT_TO_SENSOR_VOLT_GAIN;
 
-    lastThetaV1 = cwt_tha_moisture_from_sensor_volts(v0);
-    lastThetaV2 = cwt_tha_moisture_from_sensor_volts(v1);
-    lastTemp1C  = cwt_tha_temp_c_from_sensor_volts(v2);
+    lastTemp1C  = cwt_tha_temp_c_from_sensor_volts(v0);
+    lastThetaV1 = cwt_tha_moisture_from_sensor_volts(v1);
+    lastThetaV2 = cwt_tha_moisture_from_sensor_volts(v2);
     lastTemp2C  = cwt_tha_temp_c_from_sensor_volts(v3);
     #else
     // Legacy moisture polynomial + thermistor model.
-    lastThetaV1 = theta_v_from_mv(mv0, SOIL1_A0, SOIL1_B0, SOIL1_C0);
-    lastThetaV2 = theta_v_from_mv(mv1, SOIL2_A1, SOIL2_B1, SOIL2_C1);
+    lastThetaV1 = theta_v_from_mv(mv1, SOIL1_A0, SOIL1_B0, SOIL1_C0);
+    lastThetaV2 = theta_v_from_mv(mv2, SOIL2_A1, SOIL2_B1, SOIL2_C1);
 
-    float r2 = r_from_vnode(mv2 / 1000.0f, V_DIV_SUPPLY, R_FIXED_A2);
-    float t2 = sh_temp_c(r2, A2_A, A2_B, A2_C);
-    lastTemp1C = A2_TRIM_GAIN * t2 + A2_TRIM_OFF;
+    float r0 = r_from_vnode(mv0 / 1000.0f, V_DIV_SUPPLY, R_FIXED_A0);
+    float t0 = sh_temp_c(r0, A0_A, A0_B, A0_C);
+    lastTemp1C = A0_TRIM_GAIN * t0 + A0_TRIM_OFF;
 
     float r3 = r_from_vnode(mv3 / 1000.0f, V_DIV_SUPPLY, R_FIXED_A3);
     float t3 = sh_temp_c(r3, A3_A, A3_B, A3_C);
@@ -104,9 +109,9 @@ namespace {
     #endif
 
     // Debug
-    Serial.printf("[SOIL] ch0 raw=%d mv=%.1f → θv1=%.4f\n", raw0, mv0, lastThetaV1);
-    Serial.printf("[SOIL] ch1 raw=%d mv=%.1f → θv2=%.4f\n", raw1, mv1, lastThetaV2);
-    Serial.printf("[SOIL] ch2 raw=%d mv=%.1f → Tsoil1=%.2f °C\n", raw2, mv2, lastTemp1C);
+    Serial.printf("[SOIL] ch0 raw=%d mv=%.1f → Tsoil1=%.2f °C\n", raw0, mv0, lastTemp1C);
+    Serial.printf("[SOIL] ch1 raw=%d mv=%.1f → θv1=%.4f\n", raw1, mv1, lastThetaV1);
+    Serial.printf("[SOIL] ch2 raw=%d mv=%.1f → θv2=%.4f\n", raw2, mv2, lastThetaV2);
     Serial.printf("[SOIL] ch3 raw=%d mv=%.1f → Tsoil2=%.2f °C\n", raw3, mv3, lastTemp2C);
 
     haveSample   = true;

@@ -1,6 +1,7 @@
 ﻿// bringup_sht40_as7343_mux.cpp
 //
-// Validates SHT40 (mux ch 0) and AS7343 (mux ch 1) on the PCA9548A I2C mux.
+// Validates SHT40 (mux ch 0) and AS7341/AS734x-family spectral sensor
+// (mux ch 1) on the PCA9548A I2C mux.
 // Prints all channel readings to serial every 2 seconds.
 // No logging, no queue, no power-cut -- pure diagnostic loop.
 //
@@ -8,22 +9,14 @@
 //   SDA = 18, SCL = 19
 //   Mux PCA9548A at MUX_ADDR (default 0x71)
 //   SHT40 at 0x44 on mux ch 0
-//   AS7343 at 0x39 on mux ch 1
+//   AS7341/AS734x sensor at 0x39 on mux ch 1
 //
 // Build: pio run -e esp32wroom-sht40-as7343-mux -t upload
-//
-// AS7343 channel map (18-ch AUTOSMUX):
-//   Cycle 1: FZ(450nm), FY(555nm), FXL(600nm), NIR(855nm), VIS1, FD1
-//   Cycle 2: F2(425nm), F3(475nm), F4(515nm), F6(640nm), VIS2, FD2
-//   Cycle 3: F1(405nm), F7(690nm), F8(745nm), F5(550nm), VIS3, FD3
-//
-// PAR proxy = sum of channels in 400-700nm: F1+F2+FZ+F3+F4+F5+FY+FXL+F6+F7
-// NDVI      = (NIR855 - F7_690) / (NIR855 + F7_690)
 
 #include <Arduino.h>
 #include <Wire.h>
 #include <Adafruit_SHT4x.h>
-#include <SparkFun_AS7343.h>
+#include <Adafruit_AS7341.h>
 
 // ------------------------------------------------------------------ pins / addresses
 #ifndef I2C_SDA_PIN
@@ -36,13 +29,13 @@
 #define MUX_ADDR 0x71
 #endif
 #define MUX_CH_SHT40   0
-#define MUX_CH_AS7343  1
+#define MUX_CH_AS734X  1
 
 // ------------------------------------------------------------------ drivers
 static Adafruit_SHT4x  g_sht4;
-static SfeAS7343ArdI2C g_as7343;
+static Adafruit_AS7341 g_as7341;
 static bool            g_sht40_ok  = false;
-static bool            g_as7343_ok = false;
+static bool            g_as734x_ok = false;
 
 // ------------------------------------------------------------------ mux helpers
 static bool mux_select(uint8_t ch) {
@@ -62,10 +55,53 @@ static void mux_disable_all() {
   Wire.endTransmission();
 }
 
+static void scan_selected_bus(const char* label) {
+  bool found = false;
+  Serial.printf("[%s] I2C scan:", label);
+  for (uint8_t addr = 0x08; addr <= 0x77; ++addr) {
+    Wire.beginTransmission(addr);
+    uint8_t err = Wire.endTransmission();
+    if (err == 0) {
+      Serial.printf(" 0x%02X", addr);
+      found = true;
+    }
+  }
+  if (!found) {
+    Serial.print(" none");
+  }
+  Serial.println();
+}
+
+static bool read_i2c_u8(uint8_t addr, uint8_t reg, uint8_t &value) {
+  Wire.beginTransmission(addr);
+  Wire.write(reg);
+  if (Wire.endTransmission(false) != 0) {
+    return false;
+  }
+
+  uint8_t count = Wire.requestFrom((int)addr, 1);
+  if (count != 1 || !Wire.available()) {
+    return false;
+  }
+
+  value = Wire.read();
+  return true;
+}
+
+static void print_as734x_device_id() {
+  uint8_t deviceId = 0;
+  if (read_i2c_u8(AS7341_I2CADDR_DEFAULT, AS7341_WHOAMI, deviceId)) {
+    Serial.printf("[AS734x] WHOAMI reg 0x%02X = 0x%02X\n", AS7341_WHOAMI, deviceId);
+  } else {
+    Serial.printf("[AS734x] WHOAMI read failed at reg 0x%02X\n", AS7341_WHOAMI);
+  }
+}
+
 // ------------------------------------------------------------------ SHT40 init
 static bool init_sht40() {
   if (!mux_select(MUX_CH_SHT40)) return false;
   delay(5);
+  scan_selected_bus("MUX ch0");
   if (!g_sht4.begin(&Wire)) {
     Serial.println("[SHT40] not found on mux ch 0");
     return false;
@@ -76,33 +112,37 @@ static bool init_sht40() {
   return true;
 }
 
-// ------------------------------------------------------------------ AS7343 init
-static bool init_as7343() {
-  if (!mux_select(MUX_CH_AS7343)) return false;
+// ------------------------------------------------------------------ AS7341/AS734x init
+static bool init_as734x() {
+  if (!mux_select(MUX_CH_AS734X)) return false;
   delay(5);
-  if (!g_as7343.begin(kAS7343Addr, Wire)) {
-    Serial.println("[AS7343] not found on mux ch 1");
+  scan_selected_bus("MUX ch1");
+  print_as734x_device_id();
+
+  if (!g_as7341.begin(AS7341_I2CADDR_DEFAULT, &Wire)) {
+    Serial.println("[AS734x] begin failed on mux ch 1");
     return false;
   }
-  if (!g_as7343.powerOn()) {
-    Serial.println("[AS7343] powerOn failed");
+
+  g_as7341.powerEnable(true);
+  if (!g_as7341.setATIME(29)) {
+    Serial.println("[AS734x] setATIME failed");
     return false;
   }
-  // AGAIN_16 = 16x gain. Good for indoor/diffuse outdoor.
-  // Reduce to AGAIN_4 or AGAIN_2 if readings saturate (65535) in direct sun.
-  if (!g_as7343.setAgain(AGAIN_16)) {
-    Serial.println("[AS7343] setAgain failed");
+  if (!g_as7341.setASTEP(599)) {
+    Serial.println("[AS734x] setASTEP failed");
     return false;
   }
-  if (!g_as7343.setAutoSmux(AUTOSMUX_18_CHANNELS)) {
-    Serial.println("[AS7343] setAutoSmux failed");
+  if (!g_as7341.setGain(AS7341_GAIN_4X)) {
+    Serial.println("[AS734x] setGain failed");
     return false;
   }
-  if (!g_as7343.enableSpectralMeasurement()) {
-    Serial.println("[AS7343] enableSpectralMeasurement failed");
+  if (!g_as7341.enableSpectralMeasurement(true)) {
+    Serial.println("[AS734x] enableSpectralMeasurement failed");
     return false;
   }
-  Serial.println("[AS7343] init OK  (GAIN=x16, AUTOSMUX=18ch)");
+
+  Serial.println("[AS734x] init OK  (GAIN=4X, ATIME=29, ASTEP=599)");
   return true;
 }
 
@@ -119,60 +159,50 @@ static void read_sht40() {
                 temp.temperature, humidity.relative_humidity);
 }
 
-// ------------------------------------------------------------------ read AS7343
-static void read_as7343() {
-  if (!mux_select(MUX_CH_AS7343)) return;
+// ------------------------------------------------------------------ read AS7341/AS734x
+static void read_as734x() {
+  if (!mux_select(MUX_CH_AS734X)) return;
   delay(2);
-  if (!g_as7343.readSpectraDataFromSensor()) {
-    Serial.println("[AS7343] read failed");
+  if (!g_as7341.readAllChannels()) {
+    Serial.println("[AS734x] read failed");
     return;
   }
 
-  // Raw counts per channel
-  uint16_t f1  = g_as7343.getChannelData(CH_PURPLE_F1_405NM);
-  uint16_t f2  = g_as7343.getChannelData(CH_DARK_BLUE_F2_425NM);
-  uint16_t fz  = g_as7343.getChannelData(CH_BLUE_FZ_450NM);
-  uint16_t f3  = g_as7343.getChannelData(CH_LIGHT_BLUE_F3_475NM);
-  uint16_t f4  = g_as7343.getChannelData(CH_BLUE_F4_515NM);
-  uint16_t f5  = g_as7343.getChannelData(CH_GREEN_F5_550NM);
-  uint16_t fy  = g_as7343.getChannelData(CH_GREEN_FY_555NM);
-  uint16_t fxl = g_as7343.getChannelData(CH_ORANGE_FXL_600NM);
-  uint16_t f6  = g_as7343.getChannelData(CH_BROWN_F6_640NM);
-  uint16_t f7  = g_as7343.getChannelData(CH_RED_F7_690NM);
-  uint16_t f8  = g_as7343.getChannelData(CH_DARK_RED_F8_745NM);
-  uint16_t nir = g_as7343.getChannelData(CH_NIR_855NM);
+  uint16_t f1    = g_as7341.getChannel(AS7341_CHANNEL_415nm_F1);
+  uint16_t f2    = g_as7341.getChannel(AS7341_CHANNEL_445nm_F2);
+  uint16_t f3    = g_as7341.getChannel(AS7341_CHANNEL_480nm_F3);
+  uint16_t f4    = g_as7341.getChannel(AS7341_CHANNEL_515nm_F4);
+  uint16_t clear0= g_as7341.getChannel(AS7341_CHANNEL_CLEAR_0);
+  uint16_t nir0  = g_as7341.getChannel(AS7341_CHANNEL_NIR_0);
+  uint16_t f5    = g_as7341.getChannel(AS7341_CHANNEL_555nm_F5);
+  uint16_t f6    = g_as7341.getChannel(AS7341_CHANNEL_590nm_F6);
+  uint16_t f7    = g_as7341.getChannel(AS7341_CHANNEL_630nm_F7);
+  uint16_t f8    = g_as7341.getChannel(AS7341_CHANNEL_680nm_F8);
+  uint16_t clear = g_as7341.getChannel(AS7341_CHANNEL_CLEAR);
+  uint16_t nir   = g_as7341.getChannel(AS7341_CHANNEL_NIR);
 
-  Serial.println("[AS7343] --- spectral channels (raw counts, GAIN=x16) ---");
-  Serial.printf("  F1  405nm (purple)       : %6u\n", f1);
-  Serial.printf("  F2  425nm (dark blue)    : %6u\n", f2);
-  Serial.printf("  FZ  450nm (blue)         : %6u\n", fz);
-  Serial.printf("  F3  475nm (light blue)   : %6u\n", f3);
-  Serial.printf("  F4  515nm (blue-green)   : %6u\n", f4);
-  Serial.printf("  F5  550nm (green narrow) : %6u\n", f5);
-  Serial.printf("  FY  555nm (green wide)   : %6u\n", fy);
-  Serial.printf("  FXL 600nm (orange)       : %6u\n", fxl);
-  Serial.printf("  F6  640nm (red-orange)   : %6u\n", f6);
-  Serial.printf("  F7  690nm (red)          : %6u\n", f7);
-  Serial.printf("  F8  745nm (deep red)     : %6u\n", f8);
-  Serial.printf("  NIR 855nm                : %6u\n", nir);
+  Serial.println("[AS734x] --- spectral channels (raw counts, GAIN=4X) ---");
+  Serial.printf("  F1   415nm            : %6u\n", f1);
+  Serial.printf("  F2   445nm            : %6u\n", f2);
+  Serial.printf("  F3   480nm            : %6u\n", f3);
+  Serial.printf("  F4   515nm            : %6u\n", f4);
+  Serial.printf("  CLEAR0                : %6u\n", clear0);
+  Serial.printf("  NIR0                  : %6u\n", nir0);
+  Serial.printf("  F5   555nm            : %6u\n", f5);
+  Serial.printf("  F6   590nm            : %6u\n", f6);
+  Serial.printf("  F7   630nm            : %6u\n", f7);
+  Serial.printf("  F8   680nm            : %6u\n", f8);
+  Serial.printf("  CLEAR                 : %6u\n", clear);
+  Serial.printf("  NIR                   : %6u\n", nir);
 
-  // Saturation check
-  bool sat = (f1==65535||f2==65535||fz==65535||f3==65535||f4==65535||
-              f5==65535||fy==65535||fxl==65535||f6==65535||f7==65535);
-  if (sat) Serial.println("  *** WARNING: channel(s) saturated -- reduce gain ***");
+  float par_proxy = (float)(f1 + f2 + f3 + f4 + f5 + f6 + f7 + f8);
+  Serial.printf("  PAR_PROXY (sum F1-F8) : %.0f\n", par_proxy);
 
-  // PAR proxy: equal-weight sum of the 10 channels in 400-700nm range.
-  // To convert to umol/m2/s: PAR_umol = PAR_PROXY * K  (K from regression vs reference sensor).
-  float par_proxy = (float)(f1 + f2 + fz + f3 + f4 + f5 + fy + fxl + f6 + f7);
-  Serial.printf("  PAR_PROXY (sum 400-700nm counts) : %.0f\n", par_proxy);
-
-  // NDVI = (NIR - red) / (NIR + red)  using F7 690nm as the red channel.
-  // Expected: vegetation ~0.3-0.8; bare soil / bench lighting ~-0.5 to 0.1
-  float denom = (float)nir + (float)f7;
+  float denom = (float)nir + (float)f8;
   if (denom > 0.0f)
-    Serial.printf("  NDVI (NIR-F7)/(NIR+F7) : %.4f\n", ((float)nir - (float)f7) / denom);
+    Serial.printf("  NDVI_PROXY (NIR-F8)/(NIR+F8) : %.4f\n", ((float)nir - (float)f8) / denom);
   else
-    Serial.println("  NDVI : invalid (zero denominator)");
+    Serial.println("  NDVI_PROXY : invalid (zero denominator)");
 
   Serial.println();
 }
@@ -181,11 +211,11 @@ static void read_as7343() {
 void setup() {
   Serial.begin(115200);
   delay(500);
-  Serial.println("\n=== SHT40 + AS7343 mux bringup ===");
+  Serial.println("\n=== SHT40 + AS734x mux bringup ===");
   Serial.printf("  I2C SDA=%d SCL=%d   MUX=0x%02X\n",
                 I2C_SDA_PIN, I2C_SCL_PIN, MUX_ADDR);
   Serial.printf("  SHT40  -> mux ch %d (I2C 0x44)\n", MUX_CH_SHT40);
-  Serial.printf("  AS7343 -> mux ch %d (I2C 0x39)\n\n", MUX_CH_AS7343);
+  Serial.printf("  AS734x -> mux ch %d (I2C 0x39)\n\n", MUX_CH_AS734X);
 
   Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
   Wire.setClock(100000);
@@ -195,19 +225,28 @@ void setup() {
 
   g_sht40_ok  = init_sht40();
   mux_disable_all();
-  g_as7343_ok = init_as7343();
+  g_as734x_ok = init_as734x();
   mux_disable_all();
 
-  Serial.printf("\nSHT40=%s   AS7343=%s\n\n",
+  Serial.printf("\nSHT40=%s   AS734x=%s\n\n",
                 g_sht40_ok  ? "OK" : "FAIL",
-                g_as7343_ok ? "OK" : "FAIL");
+                g_as734x_ok ? "OK" : "FAIL");
 }
 
 void loop() {
   Serial.println("---- sample ----");
   if (g_sht40_ok)  read_sht40();
   mux_disable_all();
-  if (g_as7343_ok) read_as7343();
+  if (!g_as734x_ok) {
+    Serial.println("[AS734x] retrying init...");
+    g_as734x_ok = init_as734x();
+    mux_disable_all();
+  }
+  if (g_as734x_ok) {
+    read_as734x();
+  } else {
+    Serial.println("[AS734x] unavailable on mux ch 1");
+  }
   mux_disable_all();
   delay(2000);
 }

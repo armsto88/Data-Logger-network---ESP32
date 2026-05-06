@@ -14,6 +14,14 @@ uint16_t resolveSensorId(const char* label, const char* type) {
   if (label) {
     if (strcmp(label, "AIR_TEMP") == 0) return SENSOR_ID_AIR_TEMP;
     if (strcmp(label, "AIR_RH") == 0) return SENSOR_ID_AIR_RH;
+    if (strcmp(label, "SPECTRAL_415") == 0) return SENSOR_ID_SPECTRAL_415;
+    if (strcmp(label, "SPECTRAL_445") == 0) return SENSOR_ID_SPECTRAL_445;
+    if (strcmp(label, "SPECTRAL_480") == 0) return SENSOR_ID_SPECTRAL_480;
+    if (strcmp(label, "SPECTRAL_515") == 0) return SENSOR_ID_SPECTRAL_515;
+    if (strcmp(label, "SPECTRAL_555") == 0) return SENSOR_ID_SPECTRAL_555;
+    if (strcmp(label, "SPECTRAL_590") == 0) return SENSOR_ID_SPECTRAL_590;
+    if (strcmp(label, "SPECTRAL_630") == 0) return SENSOR_ID_SPECTRAL_630;
+    if (strcmp(label, "SPECTRAL_680") == 0) return SENSOR_ID_SPECTRAL_680;
     if (strcmp(label, "PAR") == 0) return SENSOR_ID_UNKNOWN;
     if (strcmp(label, "WIND_SPEED") == 0) return SENSOR_ID_WIND_SPEED;
     if (strcmp(label, "SOIL1_VWC") == 0) return SENSOR_ID_SOIL1_VWC;
@@ -70,10 +78,10 @@ bool initSensors() {
     Serial.println(F("[SENS] SHT41 backend init FAILED"));
   }
 
-  // ----- PAR backend (AS7343) -----
+  // ----- Spectral backend (AS734x family) -----
   if (par_as7343_backend::init()) {
     size_t parCount = par_as7343_backend::count();
-    Serial.printf("[SENS] PAR backend reports %u sensor(s)\n",
+    Serial.printf("[SENS] spectral backend reports %u sensor(s)\n",
                   (unsigned)parCount);
 
     for (size_t i = 0; i < parCount && g_numSensors < MAX_SENSORS; ++i) {

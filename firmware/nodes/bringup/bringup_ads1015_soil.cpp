@@ -2,15 +2,18 @@
 //
 // Validates ADS1015IDGSR ADC and CWT TH-A soil moisture+temperature sensor.
 // Prints raw mV for all 4 channels, plus interpreted soil values for the
-// sensor connected on A0 (moisture) and A2 (temperature).
+// two probes on the current wiring:
+//   SOIL1: A0 = temperature, A1 = moisture
+//   SOIL2: A2 = moisture,   A3 = temperature
 //
 // Hardware:
 //   I2C:    SDA=18, SCL=19
 //   ADS1015 at 0x48 on main I2C bus (no mux)
-//   CWT TH-A sensor ch 1 connected:
-//     moisture output → A0
-//     temperature output → A2
-//   (A1, A3 printed as raw mV — may be floating/unconnected)
+//   CWT TH-A sensors connected:
+//     SOIL1 temperature output → A0
+//     SOIL1 moisture output    → A1
+//     SOIL2 moisture output    → A2
+//     SOIL2 temperature output → A3
 //
 // Gain: GAIN_TWO_THIRDS (±6.144 V full scale) to handle 0–5 V sensor outputs.
 // Important: ensure sensor supply voltage does not exceed ADS VDD + 0.3 V.
@@ -43,6 +46,11 @@ static constexpr float CWT_VOLT_FS    = 5.0f;
 static constexpr float CWT_MOIST_MAX  = 100.0f;  // %
 static constexpr float CWT_TEMP_MIN_C = -40.0f;
 static constexpr float CWT_TEMP_MAX_C =  80.0f;
+
+static constexpr uint8_t CH_SOIL1_TEMP  = 0;
+static constexpr uint8_t CH_SOIL1_MOIST = 1;
+static constexpr uint8_t CH_SOIL2_MOIST = 2;
+static constexpr uint8_t CH_SOIL2_TEMP  = 3;
 
 static Adafruit_ADS1015 g_ads;
 static bool g_ads_ok = false;
@@ -94,8 +102,7 @@ void setup() {
     g_ads.setGain(GAIN_TWOTHIRDS);
 
     Serial.println(F("ADS1015 OK  gain=TWOTHIRDS(±6.144V)"));
-    Serial.println(F("Sensor on: A0=moisture, A2=temperature (CWT TH-A 0-5V)"));
-    Serial.println(F("A1/A3 printed as raw mV only (unconnected channels expected ~0 V)"));
+    Serial.println(F("Wiring: SOIL1 A0=temp A1=moisture | SOIL2 A2=moisture A3=temp"));
     g_ads_ok = true;
 }
 
@@ -107,21 +114,26 @@ void loop() {
     float v2 = read_avg_volts(2);
     float v3 = read_avg_volts(3);
 
-    // CWT TH-A interpretation for sensor on A0/A2
-    float moisture = cwt_moisture(v0);
-    float tempC    = cwt_temp(v2);
+    float soil1TempC    = cwt_temp(v0);
+    float soil1Moisture = cwt_moisture(v1);
+    float soil2Moisture = cwt_moisture(v2);
+    float soil2TempC    = cwt_temp(v3);
 
     Serial.println(F("---- sample ----"));
     Serial.printf("[ADS] A0 = %6.0f mV   A1 = %6.0f mV   A2 = %6.0f mV   A3 = %6.0f mV\n",
                   v0 * 1000.0f, v1 * 1000.0f, v2 * 1000.0f, v3 * 1000.0f);
-    Serial.printf("[SOIL1] MOISTURE = %5.1f %%    TEMP = %5.2f C\n", moisture, tempC);
+    Serial.printf("[SOIL1] MOISTURE = %5.1f %%    TEMP = %5.2f C\n", soil1Moisture, soil1TempC);
+    Serial.printf("[SOIL2] MOISTURE = %5.1f %%    TEMP = %5.2f C\n", soil2Moisture, soil2TempC);
 
     // Sanity flags
-    if (v0 < 0.05f) {
-        Serial.println(F("  ⚠️  A0 near zero — sensor not connected or not powered?"));
+    if (v1 < 0.05f) {
+        Serial.println(F("  Warning: A1 near zero — SOIL1 moisture may be unpowered or disconnected."));
     }
-    if (v0 > CWT_VOLT_FS * 1.05f) {
-        Serial.println(F("  ⚠️  A0 above 5V — check gain/divider"));
+    if (v2 < 0.05f) {
+        Serial.println(F("  Warning: A2 near zero — SOIL2 moisture may be unpowered or disconnected."));
+    }
+    if (v1 > CWT_VOLT_FS * 1.05f || v2 > CWT_VOLT_FS * 1.05f) {
+        Serial.println(F("  Warning: moisture channel above 5V — check gain/divider."));
     }
 
     delay(2000);

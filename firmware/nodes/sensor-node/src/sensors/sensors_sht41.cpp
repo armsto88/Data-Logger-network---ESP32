@@ -5,8 +5,11 @@
 #include "sensors_sht41.h"
 
 extern TwoWire WireRtc;
+extern bool muxSelectChannel(uint8_t ch);
 
 namespace {
+
+constexpr uint8_t kMuxChSht40 = 0;
 
 Adafruit_SHT4x g_sht4;
 bool g_ready = false;
@@ -21,11 +24,18 @@ void sampleIfNeeded() {
     return;
   }
 
+  if (!muxSelectChannel(kMuxChSht40)) {
+    g_haveSample = false;
+    Serial.println(F("[SHT4X] mux select failed"));
+    return;
+  }
+  delay(2);
+
   sensors_event_t humidity;
   sensors_event_t temp;
   if (!g_sht4.getEvent(&humidity, &temp)) {
     g_haveSample = false;
-    Serial.println(F("[SHT41] read failed"));
+    Serial.println(F("[SHT4X] read failed"));
     return;
   }
 
@@ -34,7 +44,7 @@ void sampleIfNeeded() {
   g_lastSampleMs = now;
   g_haveSample = true;
 
-  Serial.printf("[SHT41] AIR_TEMP=%.2f C AIR_RH=%.2f %%\n", g_lastTempC, g_lastRh);
+  Serial.printf("[SHT4X] AIR_TEMP=%.2f C AIR_RH=%.2f %%\n", g_lastTempC, g_lastRh);
 }
 
 } // namespace
@@ -44,8 +54,14 @@ namespace sht41_backend {
 bool init() {
   if (g_ready) return true;
 
+  if (!muxSelectChannel(kMuxChSht40)) {
+    Serial.println(F("[SHT4X] mux ch0 not selectable"));
+    return false;
+  }
+  delay(5);
+
   if (!g_sht4.begin(&WireRtc)) {
-    Serial.println(F("[SHT41] not found on WireRtc"));
+    Serial.println(F("[SHT4X] not found on mux ch0 / WireRtc"));
     return false;
   }
 
@@ -54,7 +70,7 @@ bool init() {
 
   g_ready = true;
   g_haveSample = false;
-  Serial.println(F("[SHT41] ready"));
+  Serial.println(F("[SHT4X] ready on mux ch0"));
   return true;
 }
 

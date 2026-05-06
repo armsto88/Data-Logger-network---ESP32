@@ -1047,6 +1047,7 @@ static void onDataReceived(const uint8_t *mac, const uint8_t *incomingData, int 
       if (pr.isPaired) {
         Serial.println("📋 Pairing confirmed via PAIRING_RESPONSE");
         memcpy(mothershipMAC, mac, 6);
+        g_postUnpairHold = false;
         rtcSynced        = false;
         deployedFlag     = false;
         lastTimeSyncUnix = 0;
@@ -1078,6 +1079,7 @@ static void onDataReceived(const uint8_t *mac, const uint8_t *incomingData, int 
 
       memcpy(mothershipMAC, mac, 6);
 
+      g_postUnpairHold = false;
       rtcSynced        = false;
       deployedFlag     = false;
       lastTimeSyncUnix = 0;
@@ -1133,6 +1135,7 @@ static void onDataReceived(const uint8_t *mac, const uint8_t *incomingData, int 
           setNodeConfigVersion(dc.configVersion);
         }
       }
+      g_postUnpairHold = false;
       rtcSynced        = true;
       deployedFlag     = true;
       if (!wasAlreadyDeployed) {
