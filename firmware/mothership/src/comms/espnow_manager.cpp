@@ -1313,7 +1313,10 @@ void savePairedNodes() {
 
 void loadPairedNodes() {
     Preferences prefs;
-    if (!prefs.begin("paired_nodes", true)) {
+    // On a fresh device the namespace may not exist yet.
+    // Opening read-only can fail even though NVS itself is healthy,
+    // which creates a misleading boot error on first power-up.
+    if (!prefs.begin("paired_nodes", false)) {
         Serial.println("❌ Failed to open NVS for loading paired nodes");
         return;
     }
