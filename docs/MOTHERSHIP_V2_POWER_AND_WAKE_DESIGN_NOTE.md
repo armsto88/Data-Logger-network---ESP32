@@ -6,7 +6,7 @@ It is written for the next PCB pass, not as a claim that the breadboard or curre
 
 ## 1. Purpose
 
-The mothership currently works as an always-on ESP32-S3 hub with:
+The mothership currently works as an always-on hub with:
 
 - DS3231 wall-clock time
 - AP web UI
@@ -23,6 +23,10 @@ What it does not yet have as a complete hardware system is:
 
 The purpose of this note is to define that missing hardware architecture before PCB layout is finalized.
 
+Related V2 feature-planning note:
+
+- For the proposed LTE backhaul subsystem using `SIMCom A7670G`, see `MOTHERSHIP_V2_LTE_BACKHAUL_CONCEPT.md`.
+
 ## 2. Design Intent
 
 The mothership V2 should behave as a power-gated field hub rather than an always-on Wi-Fi device.
@@ -33,7 +37,7 @@ Target behavior:
 - The DS3231 alarm can wake the mothership for scheduled sync events.
 - A user can press one button to wake the mothership for local UI interaction.
 - USB can optionally force the mothership on for servicing, flashing, and diagnostics.
-- After boot, the ESP32-S3 asserts `PWR_HOLD` so the system stays alive long enough to complete its task.
+- After boot, the ESP32-WROOM asserts `PWR_HOLD` so the system stays alive long enough to complete its task.
 - When the task is complete, firmware releases `PWR_HOLD` and the system powers fully down.
 
 This matches the existing project direction that field mode should move away from an always-on mothership power model.
@@ -58,12 +62,51 @@ These three sources should be logically ORed into the latch-start path.
 
 The RTC and wake-start logic must live on an always-available domain.
 
-The ESP32-S3, Wi-Fi, SD subsystem, and the rest of the higher-current mothership electronics should live on the switched main domain.
+The ESP32-WROOM, Wi-Fi, SD subsystem, and the rest of the higher-current mothership electronics should live on the switched main domain.
 
 In other words:
 
 - always-on domain: RTC + wake logic + any minimum required pull-ups
-- switched domain: ESP32-S3 + radio + SD + UI-related peripherals + nonessential support rails
+- switched domain: ESP32-WROOM + radio + SD + UI-related peripherals + nonessential support rails
+
+### 3.4 Hard-Kill Switch Semantics
+
+`SW9` is a hard-kill slide switch with clear labeling.
+
+It is not part of normal operating logic and it is not a user interaction control.
+
+Its role is:
+
+- storage isolation
+- servicing isolation
+- true hard power cut
+
+It should be interpreted as a master hardware enable.
+
+Expected meaning:
+
+- `SW9 = RUN`: the always-on domain is allowed to exist, so RTC wake, config wake, service-force wake, and `PWR_HOLD` behavior can operate normally
+- `SW9 = KILL`: the board is intentionally dead; RTC wake, config wake, and normal soft wake behavior are not expected to operate
+
+### 3.5 Wake Behavior Table
+
+Use the following table as the intended behavior reference for schematic capture and bring-up.
+
+| Condition | SW9 | RTC alarm | Config button | USB / service force | PWR_HOLD | Expected result |
+|---|---|---|---|---|---|---|
+| Storage / hard-off state | KILL | ignored | ignored | optional, only if intentionally routed ahead of SW9 | low | board remains off |
+| Scheduled sync wake | RUN | asserted | not pressed | inactive | low at start, then high after boot | board powers on, firmware identifies RTC wake, performs sync work, re-arms RTC, powers down |
+| Manual UI wake | RUN | inactive | pressed momentarily | inactive | low at start, then high after boot | board powers on, firmware detects config wake, enters AP / UI mode, later powers down on timeout |
+| Service / debug force-on | RUN | inactive or ignored | not pressed | asserted | optional high after boot | board powers on for service, flashing, or diagnostics |
+| Normal active runtime | RUN | inactive | not pressed | inactive | high | board stays alive under firmware control |
+| Clean shutdown | RUN | inactive after re-arm | not pressed | inactive | low | main switched rail powers off |
+
+Design interpretation:
+
+- `SW9` is outside the normal wake-reason logic.
+- RTC alarm, config wake, and service-force are the soft wake-entry paths.
+- `PWR_HOLD` is the firmware hold path after boot.
+- The config latch is only for remembering wake reason, not for replacing the main power latch.
 
 ## 4. Required Hardware Blocks
 
@@ -85,7 +128,7 @@ Powered only when wake has occurred and the latch is being held.
 
 Recommended contents:
 
-- ESP32-S3
+- ESP32-WROOM
 - SD logging subsystem
 - Wi-Fi / AP runtime support
 - local UI peripherals
@@ -119,6 +162,11 @@ Why:
 
 The button must therefore participate in the latch-start path, not just MCU reset.
 
+Important behavioral note:
+
+- The manual wake button is the normal user-accessible wake input for AP / config mode.
+- `SW9` is not the normal user wake control.
+
 ## 5. Recommended Signal List
 
 The following named signals are recommended for the mothership V2 schematic.
@@ -133,6 +181,57 @@ The following named signals are recommended for the mothership V2 schematic.
 - `MS_EN` or similar if a dedicated regulator enable chain is used downstream
 
 If the design uses active-low naming, keep it consistent. The most important thing is to make OFF-default and wake-source polarity obvious on the schematic.
+
+## 5.1 Current WROOM Pin Plan
+
+The current mothership V2 PCB direction uses the following WROOM-native pin plan.
+
+| Signal | GPIO | Notes |
+|---|---:|---|
+| SD SCK | GPIO18 | SPI SD |
+| SD MISO | GPIO19 | SPI SD |
+| SD MOSI | GPIO23 | SPI SD |
+| SD CS | GPIO13 | SPI SD chip select; keep pulled high when idle |
+| RTC / I2C SDA | GPIO21 | DS3231 SDA |
+| RTC / I2C SCL | GPIO22 | DS3231 SCL |
+| CONFIG_WAKE_PIN | GPIO32 | Input from config wake-reason sense path |
+| CONFIG_CLEAR_PIN | GPIO25 | Output used to clear config wake latch |
+| PWR_HOLD | GPIO26 | Main firmware hold output |
+
+Important constraints:
+
+- Do not use GPIO6-GPIO11 on ESP32-WROOM; they are associated with internal flash.
+- Do not reuse the old ESP32-S3-side SD CS assumption of GPIO10.
+- Treat the SD mapping above as the current validated classic-ESP32 SPI plan.
+
+## 5.2 I2C Pull-Up Rule
+
+The DS3231 remains powered from `KEEP_ALIVE` so it can maintain time while the main rail is off.
+
+However, the I2C pull-ups should be tied to `MAIN_3V3`, not `KEEP_ALIVE`.
+
+Reason:
+
+- the ESP32-WROOM lives on the switched main 3.3 V rail
+- pulling SDA/SCL up to `KEEP_ALIVE` while the ESP32 is unpowered could back-power the MCU through its GPIO protection structures
+- pulling SDA/SCL up to `MAIN_3V3` keeps the bus inactive while the mothership is off, but allows normal I2C operation when the board is awake
+
+Current planned pull-ups:
+
+- SDA: `4.7k` to `MAIN_3V3`
+- SCL: `4.7k` to `MAIN_3V3`
+
+This means the DS3231 can stay alive on `KEEP_ALIVE` without forcing the I2C bus high into an unpowered ESP32 domain.
+
+## 5.3 SD Rail Rule
+
+The SD card should be powered from `MAIN_3V3`, not `KEEP_ALIVE`.
+
+Reason:
+
+- the SD subsystem belongs to the switched main domain
+- it should not remain powered while the board is hard-off between wake windows
+- this avoids unnecessary standby current and simplifies full-off behavior
 
 ## 6. RTC Alarm Behavior Requirements
 
@@ -197,6 +296,8 @@ Recommended prototype behavior:
 
 - one press from OFF wakes directly into full AP/UI mode
 
+This assumes `SW9` is already in `RUN`.
+
 This is simpler than trying to implement layered short/long/multi-press modes immediately.
 
 ### 7.3 USB service wake
@@ -209,6 +310,8 @@ Expected behavior:
 
 - if USB service force is present, the board can stay on independent of RTC schedule
 - useful during bring-up, firmware upload, SD diagnostics, and UI testing
+
+This path should not be treated as a config wake unless the logic explicitly chooses to do so.
 
 ## 8. Recommended User-Interaction Model
 
@@ -240,6 +343,7 @@ The firmware work implied by this PCB design is:
 - identify whether boot came from RTC alarm, manual wake, USB service, or generic reset
 - assert `PWR_HOLD` early in boot
 - clear RTC alarm only after hold is established
+- if using a config-wake latch, read and clear that latch without confusing it with service-force wake
 
 ### 9.3 Runtime state additions
 
@@ -287,6 +391,33 @@ The mothership V2 PCB should explicitly support the following.
 - reliable programming/debug path even when normal field power logic is in place
 - USB or equivalent service-force path clearly separated from normal RTC wake behavior
 - test points on key wake-control nets
+
+### 10.5 Candidate enclosure note
+
+Potential mothership housing candidate identified on 2026-05-17:
+
+- QWORK industrial enclosure
+- IP65 ABS plastic housing with transparent hinged PC lid
+- listed size: `150 x 100 x 70 mm`
+- measured internal usable footprint: `132 x 80 mm`
+- measured internal usable height: `53 mm`
+- two internal nutserts on the enclosure centerline with `100 mm` center-to-center spacing
+- Amazon.de link: `https://www.amazon.de/-/en/QWORK-Industrial-Waterproof-Transparent-Distribution/dp/B08XNMZF2V`
+
+Why it may fit this design direction:
+
+- transparent hinged lid could work well for field inspection without opening the full enclosure
+- the measured `132 x 80 x 53 mm` internal envelope looks plausible for a compact WROOM mothership PCB, battery/power wiring, and cable gland entry if the molded bosses do not consume too much area
+- the two centerline nutserts may provide a simple way to mount a carrier plate or directly pick up a long-axis PCB/bracket if the board outline is designed around the `100 mm` spacing
+- off-the-shelf industrial box format is aligned with the project's serviceable outdoor hub direction
+
+Before locking the PCB or panel layout to this housing, verify:
+
+- the `132 x 80 x 53 mm` internal envelope against the actual PCB outline, connector overhang, and wiring bend radius
+- whether the `100 mm` centerline nutsert spacing is better used for a dedicated mounting plate, an internal bracket, or direct PCB support
+- cable gland placement space for power, sensor, and any external antenna routing
+- whether the transparent lid and enclosure wall thickness interfere with Wi-Fi performance or suggest an external antenna option
+- whether the user button, service access, status visibility, and hard-kill switch placement are still practical in this form factor
 
 Suggested test points:
 

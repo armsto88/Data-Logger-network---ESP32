@@ -42,6 +42,14 @@ Important ultrasonic control signals:
 - `EN_22` (actual MT3608 enable node after the inverter stage)
 - Current reviewed V2 prototype assignments: `RX_EN_N -> GPIO4`, `TOF_EDGE -> GPIO34`, `TX_22V_EN_N -> GPIO5`, `PWR_HOLD -> GPIO23`
 
+Node V2 auxiliary wind fallback note:
+
+- `GPIO4` / `RX_EN_N` is also routed to connector `J52 / AUX WIND` through a solder jumper.
+- `J52` pinout is `Pin 3 = 3V3_SYS`, `Pin 2 = REED_SIG`, `Pin 1 = GND`.
+- The solder jumper is intended to remain open in normal ultrasonic operation.
+- When the jumper is closed, the same GPIO4 line can be reused as a reed-switch cup-anemometer input for fallback wind-speed measurement.
+- The two wind modes are therefore mutually exclusive on the board: ultrasonic mode or reed-switch mode.
+
 Assumption / To Be Verified:
 
 - Final GPIO mapping and active polarity of `DRV_N`, `REL_N`, `TX_BURST_PWM`, and `TX_22V_EN_N` on the latest PCB revision.
@@ -113,6 +121,8 @@ Mux control note:
 - `RX_EN_N LOW` = mux enabled.
 - `RX_EN_N HIGH` = mux disabled.
 - V2 derives `RX_WINDOW_EN = NOT RX_EN_N` for digital comparator-output blanking.
+- In fallback reed mode, the solder jumper ties `REED_SIG` onto this same node and firmware must stop using `GPIO4` as an ultrasonic control output.
+- The existing `RX_EN_N` pull-up is intentionally reused as the reed input pull-up in that mode.
 
 Assumption / To Be Verified:
 
@@ -133,6 +143,7 @@ Design rule:
 - 22 V stage should be active only for TX windows and disabled during RX capture windows.
 - In V2, the 22 V stage enable is intentionally independent from the burst PWM so the rail can be precharged before transmit.
 - The reviewed V2 prototype keeps the compact `22 uH` inductor for space reasons, with 22 V rail performance treated as a bring-up validation item rather than a resolved optimization.
+- In fallback reed mode, firmware must hold `TX_22V_EN_N` high so the ultrasonic boost rail stays off.
 
 ## Power and Mixed-Signal Integration
 

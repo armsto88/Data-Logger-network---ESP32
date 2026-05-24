@@ -100,10 +100,12 @@ Working checklist for the next node PCB revision. This combines known V1 bring-u
 
 - [ ] Reconfirm all sensor connector pinouts against the actual field wiring that worked in bring-up.
 - [ ] Clearly key and label all external connectors so soil probes, battery, PAR, ultrasonic, and auxiliary ports cannot be mixed up easily.
-- [ ] Expose a connector for a reed-switch style anemometer input.
+- [x] Expose a connector for a reed-switch style anemometer input using `J52 / AUX WIND`.
 - [ ] Expose a 1-Wire-capable connector.
-- [ ] Decide whether the reed-switch anemometer input and 1-Wire port are separate dedicated connectors or part of a configurable auxiliary connector scheme.
-- [ ] For the reed-switch anemometer input, add the required pull-up, input protection, debounce/filtering strategy, and clear voltage-domain definition.
+- [x] Decide that the reed-switch anemometer input is a dedicated fallback connector implemented separately from the 1-Wire path.
+- [x] Reuse the existing `RX_EN_N` pull-up as the reed input pull-up by routing `REED_SIG` to `GPIO4` through a normally-open solder jumper.
+- [x] Keep the reed input isolated from the ultrasonic control path by default; jumper open = ultrasonic mode, jumper closed = reed fallback mode.
+- [ ] Review whether additional input protection or debounce components are still needed beyond the existing pull-up and physical jumper isolation.
 - [ ] For the 1-Wire connector, define power pinout, pull-up strategy, cable length expectations, and ESD protection.
 - [ ] Add ESD protection on external sensor lines and any connector exposed to long cables.
 - [ ] Review whether sensor power rails should be switchable per port to reduce idle current and support warm-up sequencing.
@@ -154,10 +156,18 @@ If you want to keep V2 disciplined, the minimum high-value changes are:
 - [ ] Add a reset button.
 - [x] Keep recovery architecture based on RUN/KILL, force-on, and USB service force instead of adding an MCU service button.
 - [ ] Add a battery isolation method for storage and servicing.
-- [ ] Expose the external connector set you know V2 needs: reed-switch anemometer input and 1-Wire.
+- [ ] Finish the remaining external connector work: keep `J52 / AUX WIND` as the reed-switch fallback input and add the 1-Wire connector.
 - [ ] Rework the ultrasonic interface so it is robust, diagnosable, and fully integrated on-board.
 - [ ] Review LED behaviour so indicators are useful but not a battery drain.
 - [ ] Add connector labeling, ESD protection, and clearer service markings.
+
+### 10.1 AUX WIND Fallback Mode Note
+
+- `J52 / AUX WIND` is now part of the reviewed V2 connector set.
+- Pinout: `3V3_SYS`, `REED_SIG`, `GND`.
+- `REED_SIG` reaches `GPIO4 / RX_EN_N` only when the dedicated solder jumper is closed.
+- Default state is jumper open so ultrasonic timing and mux control stay isolated from any attached reed switch.
+- Reed mode is a fallback operating mode, not a simultaneous second wind sensor path.
 
 ## 11. Nice-To-Have Items
 

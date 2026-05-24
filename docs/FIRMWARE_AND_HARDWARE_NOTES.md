@@ -383,7 +383,12 @@ Allows emergency programming with external USB-UART if onboard bridge fails.
 
 ### 4.1 System Architecture Summary
 
-Firmware controls a bidirectional ultrasonic TOF measurement pipeline and computes axis wind components using reciprocal timing equations. The sequence coordinates direction control, boosted transmit energy, first-arrival edge capture, and robust filtering before producing wind outputs.
+Firmware supports two mutually exclusive node wind modes on V2:
+
+- ultrasonic mode: the normal bidirectional TOF measurement pipeline
+- reed fallback mode: a pulse-counted cup-anemometer input on `GPIO4`
+
+In ultrasonic mode, firmware controls a bidirectional ultrasonic TOF measurement pipeline and computes axis wind components using reciprocal timing equations. The sequence coordinates direction control, boosted transmit energy, first-arrival edge capture, and robust filtering before producing wind outputs.
 
 ### 4.2 Key Subsystems
 
@@ -391,8 +396,9 @@ Firmware controls a bidirectional ultrasonic TOF measurement pipeline and comput
 2. Ultrasonic receive timing: gate ring-down and capture first valid comparator edge.
 3. MCU scheduling logic: coordinate measurements with low jitter and deterministic timing.
 4. Power coordination: enable/disable ~22 V stage around each burst window.
-5. Sensor-hub behaviour: integrate ultrasonic reads with other node sensor tasks.
-6. Measurement algorithm: solve wind and speed-of-sound from bidirectional TOF pairs.
+5. Reed fallback input: count falling-edge pulses from a cup anemometer when the AUX WIND jumper is closed.
+6. Sensor-hub behaviour: integrate the selected wind mode with other node sensor tasks.
+7. Measurement algorithm: solve wind and speed-of-sound from bidirectional TOF pairs, or convert reed pulse rate using the selected cup calibration.
 
 ### 4.3 Measurement Cycle (Per Direction Pair)
 
@@ -406,6 +412,20 @@ Firmware controls a bidirectional ultrasonic TOF measurement pipeline and comput
 8. Repeat in opposite direction.
 
 Multiple cycles are collected and filtered before solving wind.
+
+### 4.3.1 Reed Fallback Measurement Cycle
+
+1. Select `wind_mode = reed` in configuration.
+2. Keep ultrasonic transmit disabled and hold `TX_22V_EN_N` high so the 22 V boost stays off.
+3. Leave `TX_PWM` disabled for the full sample window.
+4. Configure `GPIO4` as an input or interrupt source instead of driving `RX_EN_N`.
+5. Count reed falling edges over a fixed sample interval.
+6. Convert pulse frequency to wind speed using the deployed cup-anemometer calibration.
+
+Operational note:
+
+- Reed mode is a fallback pathway, not a parallel second wind measurement.
+- The board-level solder jumper must remain open in ultrasonic mode and closed only when the node is intentionally repurposed for reed input.
 
 ### 4.4 Sampling and Filtering
 

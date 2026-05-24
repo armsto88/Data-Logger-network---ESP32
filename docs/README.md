@@ -6,6 +6,8 @@ This folder contains project documentation that was previously in the repository
 
 - [concept_overview.md](concept_overview.md)
 - [FutureRoadMap.md](FutureRoadMap.md)
+- [MOTHERSHIP_V2_POWER_AND_WAKE_DESIGN_NOTE.md](MOTHERSHIP_V2_POWER_AND_WAKE_DESIGN_NOTE.md)
+- [MOTHERSHIP_V2_LTE_BACKHAUL_CONCEPT.md](MOTHERSHIP_V2_LTE_BACKHAUL_CONCEPT.md)
 
 ## Firmware and Hardware Notes
 
