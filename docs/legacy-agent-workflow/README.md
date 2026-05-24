@@ -11,5 +11,6 @@ The legacy Positron-era workflow reference files are archived in `docs/legacy-ag
 - `docs/legacy-agent-workflow/gitops.agent.md`
 - `docs/legacy-agent-workflow/designer.agent.md`
 - `docs/legacy-agent-workflow/ai-builder.agent.md`
+- `docs/legacy-agent-workflow/ORCHESTRATOR_WORK_PACKAGE.md`
 
 The active replacement for this repo lives under `.github/agents/` and `.github/skills/`.

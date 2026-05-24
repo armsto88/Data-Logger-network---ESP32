@@ -1,36 +1,34 @@
 # Documentation Index
 
-This folder contains project documentation that was previously in the repository root.
+This folder contains active project notes plus a small set of topic and archive folders.
 
 ## Agent Workflow Note
 
 - The active repo-scoped VS Code/Copilot agent stack lives under `.github/`.
 - The intended user-facing entrypoint is `orchestrator`.
 - See `.github/README.md` for the active workflow index.
-- See `docs/legacy-agent-workflow/README.md` for the archived older Positron-era reference files.
+- See `legacy-agent-workflow/README.md` for the archived older Positron-era reference files.
 
-## Core Project Docs
+## Active Top-Level Project Docs
 
 - [concept_overview.md](concept_overview.md)
 - [FutureRoadMap.md](FutureRoadMap.md)
+- [FIRMWARE_AND_HARDWARE_NOTES.md](FIRMWARE_AND_HARDWARE_NOTES.md)
+- [FIRMWARE_FUNCTIONALITY_FOR_ECOLOGISTS.md](FIRMWARE_FUNCTIONALITY_FOR_ECOLOGISTS.md)
 - [MOTHERSHIP_V2_POWER_AND_WAKE_DESIGN_NOTE.md](MOTHERSHIP_V2_POWER_AND_WAKE_DESIGN_NOTE.md)
 - [MOTHERSHIP_V2_LTE_BACKHAUL_CONCEPT.md](MOTHERSHIP_V2_LTE_BACKHAUL_CONCEPT.md)
-
-## Firmware and Hardware Notes
-
-- [NODE-FIRMWARE_NOTES.md](NODE-FIRMWARE_NOTES.md)
-- [FIRMWARE_SYNC_WORKFLOW_AND_TESTING.md](FIRMWARE_SYNC_WORKFLOW_AND_TESTING.md)
+- [NODE_HARDWARE_V2_CHECKLIST.md](NODE_HARDWARE_V2_CHECKLIST.md)
 - [NODE-PCB-OVERVIEW.md](NODE-PCB-OVERVIEW.md)
-- [ESP32-C3_UART_FLASHING_DEBUG_NOTES.md](ESP32-C3_UART_FLASHING_DEBUG_NOTES.md)
-- [ESP32-WROOM_NODE_HARDWARE_REVISION_CHECKLIST.md](ESP32-WROOM_NODE_HARDWARE_REVISION_CHECKLIST.md)
+- [NODE-LOCAL-STORAGE-CONTRACT-V1.md](NODE-LOCAL-STORAGE-CONTRACT-V1.md)
+- [NATIVE_APP_INTEGRATION_V2.md](NATIVE_APP_INTEGRATION_V2.md)
+- [NATIVE_APP_INTEGRATION_STATUS_2026-04-13.md](NATIVE_APP_INTEGRATION_STATUS_2026-04-13.md)
+- [NATIVE_APP_FULL_CONCEPT_AND_SCHEMAS.md](NATIVE_APP_FULL_CONCEPT_AND_SCHEMAS.md)
+- [MULTI_NODE_VALIDATION_2026-05-05.md](MULTI_NODE_VALIDATION_2026-05-05.md)
 
-## Related Domain Docs
+## Topic Folders
 
-- [../hardware/ultrasonic_anemometer/docs/MECHANICAL_DESIGN.md](../hardware/ultrasonic_anemometer/docs/MECHANICAL_DESIGN.md)
-- [../hardware/ultrasonic_anemometer/docs/OPENFOAM_QUICKSTART.md](../hardware/ultrasonic_anemometer/docs/OPENFOAM_QUICKSTART.md)
-- [../hardware/ultrasonic_anemometer/docs/TOF_WORKOUT_GUIDE.md](../hardware/ultrasonic_anemometer/docs/TOF_WORKOUT_GUIDE.md)
-
-## Visual Assets
-
-- [assets/ui/](assets/ui/) - dashboard and node-manager screenshots
-- [assets/reference/Freenove-ESP32-Wrover-CAM-pinout.png](assets/reference/Freenove-ESP32-Wrover-CAM-pinout.png) - board pinout reference
+- [legacy-agent-workflow/](legacy-agent-workflow/) - archived legacy workflow agents and work-package material
+- [ultrasonic/](ultrasonic/) - ultrasonic anemometer notes moved out of the docs root
+- [archive/manuscript/](archive/manuscript/) - manuscript drafts, figures, and supervisor update material
+- [archive/reference/](archive/reference/) - reference imports and miscellaneous supporting files
+- [assets/](assets/) - reference images and UI assets
