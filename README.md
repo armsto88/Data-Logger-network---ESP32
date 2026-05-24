@@ -13,6 +13,13 @@ A small **ESP-NOW**–based sensor network for environmental data logging, desig
 - [firmware/nodes/sensor-node/src/README.md](firmware/nodes/sensor-node/src/README.md) - node source layout and build target
 - [CONTRIBUTING.md](CONTRIBUTING.md) - repo organization and contribution rules
 
+## AI Workflow
+
+- The active repo-scoped VS Code/Copilot workflow lives under `.github/`.
+- The intended entrypoint is `orchestrator`.
+- The active flow is `orchestrator -> Planner -> Explore Repo / Implement Change / Review Changes`.
+- Older Positron-era workflow reference files are archived under `docs/legacy-agent-workflow/README.md`.
+
 ---
 
 ## System Overview

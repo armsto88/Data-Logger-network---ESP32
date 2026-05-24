@@ -22,6 +22,12 @@
 - Keep filenames descriptive and stable.
 - Avoid moving source files without updating references in docs.
 
+## Agent Workflow
+
+- The active repo-scoped AI workflow lives under `.github/`.
+- `orchestrator` is the intended user-facing coordinator.
+- If workflow docs change, update `.github/README.md`, `README.md`, and `docs/README.md` together.
+
 ## Before opening a PR
 
 - Build the target firmware (`mothership` or node) at least once.

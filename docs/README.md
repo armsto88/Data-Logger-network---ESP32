@@ -2,6 +2,13 @@
 
 This folder contains project documentation that was previously in the repository root.
 
+## Agent Workflow Note
+
+- The active repo-scoped VS Code/Copilot agent stack lives under `.github/`.
+- The intended user-facing entrypoint is `orchestrator`.
+- See `.github/README.md` for the active workflow index.
+- See `docs/legacy-agent-workflow/README.md` for the archived older Positron-era reference files.
+
 ## Core Project Docs
 
 - [concept_overview.md](concept_overview.md)
