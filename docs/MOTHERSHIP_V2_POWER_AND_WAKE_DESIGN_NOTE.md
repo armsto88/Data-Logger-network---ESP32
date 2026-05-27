@@ -182,29 +182,52 @@ The following named signals are recommended for the mothership V2 schematic.
 
 If the design uses active-low naming, keep it consistent. The most important thing is to make OFF-default and wake-source polarity obvious on the schematic.
 
-## 5.1 Current WROOM Pin Plan
+## 5.1 Current Working Pin Allocation (Schematic Target)
 
-The current mothership V2 PCB direction uses the following WROOM-native pin plan.
+The current mothership V2 PCB direction uses the following WROOM-native pin allocation as the working schematic target.
 
-| Signal | GPIO | Notes |
-|---|---:|---|
-| SD SCK | GPIO18 | SPI SD |
-| SD MISO | GPIO19 | SPI SD |
-| SD MOSI | GPIO23 | SPI SD |
-| SD CS | GPIO13 | SPI SD chip select; keep pulled high when idle |
-| RTC / I2C SDA | GPIO21 | DS3231 SDA |
-| RTC / I2C SCL | GPIO22 | DS3231 SCL |
-| CONFIG_WAKE_PIN | GPIO32 | Input from config wake-reason sense path |
-| CONFIG_CLEAR_PIN | GPIO25 | Output used to clear config wake latch |
-| PWR_HOLD | GPIO26 | Main firmware hold output |
+This table is a build-reference allocation, not a claim that all behaviors are bench-validated yet.
 
-Important constraints:
+| Signal | GPIO | Direction | Notes |
+|---|---:|---|---|
+| BATTERY_VSENSE | GPIO34 | Input (ADC) | Battery voltage divider sense; firmware ADC scaling required |
+| LTE_REG_PG | GPIO35 | Input | LTE regulator power-good; input-only pin |
+| CONFIG_WAKE_PIN | GPIO32 | Input | Config/manual wake-reason sense path |
+| LTE_REG_EN | GPIO33 | Output | Enable for LTE regulator; default intended OFF |
+| CONFIG_CLEAR_PIN | GPIO25 | Output | Clears config wake latch |
+| PWR_HOLD | GPIO26 | Output | Main firmware hold output for switched rail |
+| CONFIG_LED | GPIO27 | Output | Config/status LED drive |
+| LTE_PWRKEY | GPIO14 | Output | Modem PWRKEY control via NMOS stage |
+| SD CS | GPIO13 | Output | SPI SD chip select; keep pulled high when idle |
+| SD MOSI | GPIO23 | Output | SPI SD data out |
+| I2C SCL | GPIO22 | Bidirectional | DS3231 and related control bus clock |
+| I2C SDA | GPIO21 | Bidirectional | DS3231 and related control bus data |
+| SD MISO | GPIO19 | Input | SPI SD data in |
+| SD SCK | GPIO18 | Output | SPI SD clock |
+| LTE TX2 | GPIO17 | Output | UART2 TX from ESP32 to modem RXD via level shift |
+| LTE RX2 | GPIO16 | Input | UART2 RX to ESP32 from modem TXD via level shift |
+| LTE_STATUS | GPIO4 | Input | Modem status input via level shifter |
 
-- Do not use GPIO6-GPIO11 on ESP32-WROOM; they are associated with internal flash.
-- Do not reuse the old ESP32-S3-side SD CS assumption of GPIO10.
-- Treat the SD mapping above as the current validated classic-ESP32 SPI plan.
+## 5.2 Reserved/Avoided ESP32 Pins
 
-## 5.2 I2C Pull-Up Rule
+Keep the following pins reserved or avoided in mothership V2 unless a deliberate, reviewed exception is documented.
+
+| GPIO | Status | Reason |
+|---:|---|---|
+| GPIO0 | Avoid for general I/O | Boot strap sensitivity (download/boot mode interactions) |
+| GPIO1 | Reserved | Primary UART0 TX for boot logs/programming |
+| GPIO2 | Avoid for general I/O | Boot strap sensitivity |
+| GPIO3 | Reserved | Primary UART0 RX for programming/service |
+| GPIO5 | Avoid for general I/O | Strap/boot interaction risk in some startup states |
+| GPIO12 | Avoid | MTDI strap; wrong level can affect flash voltage behavior |
+| GPIO15 | Avoid | Strap behavior risk during reset/boot |
+| GPIO6-GPIO11 | Do not use | Connected to internal SPI flash on ESP32-WROOM |
+
+Design caution:
+
+- `GPIO4` is currently used for modem `STATUS` because the modem rail is intentionally default-OFF at boot, reducing strap-conflict risk during power-up.
+
+## 5.3 I2C Pull-Up Rule
 
 The DS3231 remains powered from `KEEP_ALIVE` so it can maintain time while the main rail is off.
 
@@ -223,7 +246,7 @@ Current planned pull-ups:
 
 This means the DS3231 can stay alive on `KEEP_ALIVE` without forcing the I2C bus high into an unpowered ESP32 domain.
 
-## 5.3 SD Rail Rule
+## 5.4 SD Rail Rule
 
 The SD card should be powered from `MAIN_3V3`, not `KEEP_ALIVE`.
 
@@ -232,6 +255,102 @@ Reason:
 - the SD subsystem belongs to the switched main domain
 - it should not remain powered while the board is hard-off between wake windows
 - this avoids unnecessary standby current and simplifies full-off behavior
+
+## 5.5 LTE Modem Subsystem Summary
+
+Current subsystem direction for mothership V2:
+
+- Selected modem: `SIMCom A7670G`
+- System workflow extension: existing ESP-NOW ingest to SD logging path is extended with scheduled, power-gated LTE upload windows
+- Control model: modem controlled over UART2 AT commands, with planned support for queued CSV transfer, MQTT/HTTPS transport options, and basic modem status/health reporting
+
+This section documents the current integration intent and working schematic allocation.
+
+## 5.6 LTE Digital Interface Mapping (Working)
+
+| Function | ESP32 pin | External endpoint | Interface detail |
+|---|---|---|---|
+| Modem rail enable | `GPIO33` | TPS63020 `EN` | `EN` has pulldown for default-OFF behavior |
+| Modem rail power-good | `GPIO35` | TPS63020 `PG` | External pull-up required; ESP32 pin is input-only |
+| Modem PWRKEY control | `GPIO14` | A7670G `PWRKEY` (via 2N7002) | NMOS pulldown stage for controlled key pulse |
+| Modem STATUS sense | `GPIO4` | A7670G `STATUS` (via level shifter) | 1.8 V domain translated to 3.3 V logic |
+| UART2 TX | `GPIO17` | A7670G `RXD` (via level shifter) | ESP32 command path to modem |
+| UART2 RX | `GPIO16` | A7670G `TXD` (via level shifter) | Modem response path to ESP32 |
+
+## 5.7 Modem Rail And VBAT Distribution (Working)
+
+Power chain intent:
+
+- `VSYS` -> TPS63020 -> `MODEM_VBAT_3V9` -> A7670G `VBAT`
+- Target modem rail: `3.9 V`
+- Planned sense divider: `680k / 100k` for modem/battery telemetry scaling in firmware
+- Control and readiness mapping: `GPIO33` (`EN`) and `GPIO35` (`PG`)
+
+Local protection and decoupling near modem VBAT entry:
+
+- `470 uF`
+- `10 uF`
+- `1 uF`
+- `100 nF`
+- `5 V` unidirectional TVS
+
+Routing rule:
+
+- route `MODEM_VBAT_3V9` to A7670G `VBAT` pins `55/56/57` using short, wide copper with local bulk close to the module pins.
+
+## 5.8 Level Shifting Strategy (Working)
+
+Use `SN74LVC1T45` for modem digital level translation where required.
+
+- `VCCA = M_1V8`
+- `VCCB = 3V3_SYS`
+- `M_1V8` source: A7670G `VDD_EXT` / `VDD_1V8` with local `100 nF` decoupling
+- treat `M_1V8` as a logic-reference rail only, not a general external load rail
+
+## 5.9 Level-Shifted Signal Directions And DIR Settings (Working)
+
+| Path | Intended data direction | DIR intent |
+|---|---|---|
+| `GPIO17 (TX2)` -> modem `RXD` | 3.3 V side to 1.8 V side | Set for B-to-A if B=3.3 V, A=1.8 V |
+| modem `TXD` -> `GPIO16 (RX2)` | 1.8 V side to 3.3 V side | Set for A-to-B if B=3.3 V, A=1.8 V |
+| modem `STATUS` -> `GPIO4` | 1.8 V side to 3.3 V side | Set for A-to-B if B=3.3 V, A=1.8 V |
+
+## 5.10 PWRKEY, RESET, And Recovery Access Notes
+
+PWRKEY control (working circuit intent):
+
+- `GPIO14` drives a `2N7002` gate through approximately `4.7k`
+- gate pulldown approximately `100k` keeps NMOS off during reset/boot
+- NMOS drain pulls modem `PWRKEY` low when activated
+- logic interpretation: transistor on = `PWRKEY` low (assert), transistor off = `PWRKEY` released high
+
+RESET note:
+
+- modem `RESET` remains unassigned in current working allocation
+- provide at least a test pad and optional DNI population path for future firmware/hardware recovery control.
+
+## 5.11 SIM Interface And ESD Notes
+
+- SIM holder signals should follow A7670G USIM reference guidance and keep trace lengths short/matched where practical
+- use ESD protection on SIM lines (target: `ESDA6V1W5` / `C48677`)
+- power SIM `VCC` only from modem `USIM1_VDD`.
+
+## 5.12 NETLIGHT Drive Note
+
+If exposing modem `NETLIGHT`, use a transistor driver stage:
+
+- `MMBT3904`
+- resistor set: `4.7k`, `47k`, `2.2k`
+
+This keeps modem-side signaling isolated from direct higher-current LED drive assumptions.
+
+## 5.13 LTE Antenna Path Note
+
+- keep modem RF net explicitly named (for example `LTE_RF`) and avoid ambiguous net aliases during layout/export
+- add RF ESD near antenna launch (target: `ESD9L5.0ST5G` / `C82326`)
+- route away from switching-noise nets and fast digital edges
+- internal FPC antenna placement should be verified against enclosure wall/lid geometry and ground-clearance requirements
+- preserve an optional external path (`u.FL` to SMA) for enclosure-dependent field deployments.
 
 ## 6. RTC Alarm Behavior Requirements
 
@@ -359,6 +478,23 @@ The firmware work implied by this PCB design is:
 - re-arm next RTC alarm
 - release `PWR_HOLD`
 
+### 9.5 Proposed LTE Upload Cycle (Unvalidated)
+
+This is the current proposed sequence for scheduled, power-gated LTE upload windows.
+
+1. Complete ESP-NOW ingest and local SD write path first.
+2. Assert `GPIO33` to enable modem regulator (`TPS63020 EN`).
+3. Wait for `GPIO35` power-good indication.
+4. Pulse modem `PWRKEY` through `GPIO14` (NMOS pulldown stage).
+5. Wait for modem `STATUS` on `GPIO4` to indicate ready state.
+6. Bring up UART2 on `GPIO16/GPIO17` and start AT session.
+7. Run SIM/reg/network checks, then perform queued upload (MQTT or HTTPS) from SD-backed queue.
+8. Log success/failure and queue state locally for retry accounting.
+9. Issue graceful modem shutdown commands and wait for status drop.
+10. Deassert `GPIO33` to hard-disable modem rail.
+
+This flow should be treated as design intent until validated during bring-up.
+
 ## 10. PCB Design Requirements
 
 The mothership V2 PCB should explicitly support the following.
@@ -392,7 +528,22 @@ The mothership V2 PCB should explicitly support the following.
 - USB or equivalent service-force path clearly separated from normal RTC wake behavior
 - test points on key wake-control nets
 
-### 10.5 Candidate enclosure note
+### 10.5 Pre-Fabrication Checks (LTE + Power/Wake Integration)
+
+Before releasing PCB fabrication outputs, confirm:
+
+- `GPIO4` boot-safety assumption remains valid because modem rail is default-OFF at boot
+- `GPIO35` has a valid external pull-up in the correct translated domain (ESP32 pin is input-only)
+- `GPIO34` ADC divider definition is explicitly documented and firmware scaling constants are aligned
+- `GPIO14` NMOS gate has a pulldown so modem `PWRKEY` is not spuriously asserted at reset
+- all modem ground pins are tied to solid local ground with low-impedance return
+- modem `VBAT` pins `55/56/57` have short/wide copper and local bulk decoupling
+- `M_1V8` is used only as logic reference for translators, not as a general supply rail
+- SIM `VCC` is sourced only from modem `USIM1_VDD`
+- RF routing is clean, short, and separated from switching/noisy nets
+- recovery/test pads exist for modem `RESET`, `USB_BOOT`, `USB_DP`, `USB_DM`, and `USB_VBUS`
+
+### 10.6 Candidate enclosure note
 
 Potential mothership housing candidate identified on 2026-05-17:
 

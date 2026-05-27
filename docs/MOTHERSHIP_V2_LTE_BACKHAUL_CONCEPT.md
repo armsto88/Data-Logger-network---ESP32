@@ -30,10 +30,11 @@ Confirmed project direction for this note:
 
 Open proposal items:
 
-- final modem footprint and module variant selection
+- final schematic and footprint review for the selected modem implementation
 - final power rail architecture for the modem
-- final upload protocol choice (`MQTT`, `HTTPS POST`, file upload, or another transport)
+- final long-term transport mix beyond the first file-upload pass
 - final power schedule and retry policy
+- final command/settings schema shared across web UI and later BLE/native surfaces
 - final enclosure antenna implementation
 
 ## 3. Preferred Modem Candidate
@@ -44,9 +45,9 @@ Current preferred modem:
 
 Current rationale:
 
-- global LTE Cat-1 class option
-- includes important LTE bands for Australia, especially `B28`
-- suitable for low-to-moderate telemetry and logger backhaul
+- global LTE Cat-1 modem suited to Australia, Europe, and wider multi-region deployments
+- includes useful LTE bands for Australia, Europe, and general global use, with `B28` particularly important for Australian regional coverage
+- suitable for low-to-moderate telemetry, queued status reporting, and scheduled CSV upload workloads
 - controllable by the ESP32 using UART `AT` commands
 - compatible with workflows such as `MQTT`, `HTTPS POST`, and periodic queued data upload
 
@@ -82,7 +83,7 @@ Design intent:
 
 Document the LTE subsystem as a distinct mothership V2 hardware block:
 
-`ESP32 mothership -> UART2 -> 3.3 V <-> 1.8 V level shifting -> SIMCom A7670G -> SIM holder + LTE antenna`
+`ESP32-WROOM mothership -> UART2 through level shifters -> A7670G modem -> SIM holder -> u.FL/IPEX antenna connector -> internal flexible LTE antenna or external antenna option`
 
 Key design rules:
 
@@ -100,7 +101,22 @@ Key design rules:
 - SIM connector domain
 - RF path from modem to external antenna connector
 
-### 5.2 Candidate modem-related signals
+### 5.2 Current assigned ESP32 modem pinout
+
+| Function | ESP32 pin | Notes |
+| --- | --- | --- |
+| UART RX | `GPIO16 / RX2` | receives modem `TXD` through level shifting |
+| UART TX | `GPIO17 / TX2` | drives modem `RXD` through level shifting |
+| Rail enable | `GPIO33` | drives `4V_EN` / `TPS63020 EN` |
+| Rail power-good | `GPIO35` | reads `LTE_REG_PGOOD` / `TPS63020 PG` |
+| `PWRKEY` control | `GPIO14` | drives NMOS pull-down stage |
+| `STATUS` input | `GPIO4` | reads modem `STATUS` through level shifting |
+
+Pin allocation note: this mapping follows the current working allocation in `MOTHERSHIP_V2_POWER_AND_WAKE_DESIGN_NOTE.md`, where `GPIO34` remains reserved for battery ADC sense (`BATTERY_VSENSE`) and is not reused for modem regulator power-good.
+
+`GPIO4` is acceptable for modem `STATUS` because the modem rail is intended to default `OFF` during ESP32 boot, so the status source should remain inactive until the rail is explicitly enabled.
+
+### 5.3 Current modem-related signals and control notes
 
 At minimum, document these signals in the mothership schematic plan:
 
@@ -115,11 +131,43 @@ At minimum, document these signals in the mothership schematic plan:
 Recommended control notes:
 
 - `PWRKEY` should be driven through a transistor or open-drain pull-down, not directly as a raw push-pull GPIO abstraction.
-- `RESET` should also be transistor-controlled and used primarily for recovery.
+- `RESET` is not currently assigned because of ESP32 pin limits and should at least be exposed as a test pad for recovery.
 - `STATUS` should be readable by the ESP32 so firmware can confirm the modem on/off state.
 - `DTR` may later be useful for modem sleep and wake handling.
 - `RI` may later be useful for modem event or wake behavior.
 - USB test pads for the modem should be considered for debugging or firmware recovery.
+
+### 5.4 `PWRKEY` pull-down implementation
+
+Current preferred `PWRKEY` control is an NMOS pull-down stage using `2N7002`:
+
+- `GPIO14 -> 100 ohm` gate resistor -> `2N7002` gate
+- `100k` gate pull-down to `GND`
+- source to `GND`
+- drain to modem `PWRKEY`
+
+Behavioral intent:
+
+- `GPIO14 HIGH` pulls `PWRKEY` low
+- `GPIO14 LOW` releases `PWRKEY`
+- `PWRKEY` is not level-shifted because the NMOS stage acts as the required pull-down interface
+
+### 5.5 `1.8 V` logic-domain translation
+
+Use `SN74LVC1T45` translators for the modem logic-domain crossings:
+
+- `VCCA = M_1V8`
+- `VCCB = 3V3_SYS`
+- `M_1V8` sourced from `A7670G VDD_EXT / VDD_1V8`
+- place `100 nF` from `M_1V8` to `GND` near the modem-side logic reference
+
+Current shifted lines and intended direction:
+
+- `ESP32 TX2 -> modem RXD`, `DIR` set from `3V3_SYS` side toward `M_1V8`
+- modem `TXD -> ESP32 RX2`, `DIR` set from `M_1V8` side toward `3V3_SYS`
+- modem `STATUS -> GPIO4`, `DIR` set from `M_1V8` side toward `3V3_SYS`
+
+Treat `M_1V8` as a modem-provided logic reference only, not as a general external load rail.
 
 ## 6. Proposed Power Architecture
 
@@ -127,28 +175,43 @@ The modem should have a dedicated high-current rail.
 
 Current target:
 
-- dedicated `3.8-4.0 V` modem rail
+- `VSYS -> TPS63020 buck-boost -> MODEM_VBAT_3V9 -> A7670G VBAT`
+- target `MODEM_VBAT_3V9` approximately `3.9 V`
 
 Candidate parts currently being considered:
 
 - regulator: `TPS63020DSJR`, `LCSC C15483`
 - inductor: `JIERR PCR0420-1R5-M`, `LCSC C53896855`
-- output target: `4.0 V` modem rail
+- feedback values: `Rtop 680k`, `Rbottom 100k`
+- output target: `3.9 V` modem rail
 
 Current power-rail requirements to document:
 
 - at least `2 A` peak current capability
 - preferably `3 A` design margin
-- `330-470 uF` bulk capacitance near modem `VBAT`
+- `470 uF` bulk capacitance near modem `VBAT` pins `55/56/57`
 - `10 uF`, `1 uF`, and `100 nF` ceramic capacitors close to modem `VBAT` pins
-- wide modem power routing
-- optional `TVS` protection on modem `VBAT`
+- `TVS` shunt to `GND` close to modem input power entry
+- wide, short `MODEM_VBAT_3V9` routing with local capacitor placement tight to the modem pins
 
 Important design rule:
 
 - the modem power path should be treated as a burst-current subsystem with its own layout and decoupling needs, not as a small accessory load hanging off the ESP32 rail.
 
-### 6.1 Modem power-control options to evaluate
+### 6.1 Current regulator control plan
+
+Current GPIO mapping around the regulator:
+
+- `GPIO33 -> 4V_EN -> TPS63020 EN`
+- `GPIO35 <- LTE_REG_PGOOD <- TPS63020 PG`
+
+Control intent:
+
+- the regulator should default `OFF`
+- add a pull-down on `EN` so the rail stays off through reset and boot
+- use `PGOOD` as the first firmware check that the modem rail actually came up before pulsing `PWRKEY`
+
+### 6.2 Modem power-control options to evaluate
 
 Open control options:
 
@@ -164,25 +227,99 @@ Current preferred direction for investigation:
 
 This combined approach is likely easier to reason about than relying on `PWRKEY` alone while leaving the modem rail energized indefinitely.
 
+### 6.3 Proposed modem control-state model
+
+Treat the following as a proposed firmware control sequence for implementation planning, not as validated modem behavior:
+
+- `Off`
+- `Rail Enabled`
+- `Rail Stable`
+- `Boot Requested`
+- `Status High`
+- `UART Ready`
+- `Registered`
+- `Transport Open`
+- `Upload Active`
+- `Graceful Shutdown`
+- `Rail Disabled`
+- `Recovery`
+
+Recommended interpretation:
+
+- the combined rail-enable plus `PWRKEY` model should be the default implementation direction for mothership V2
+- the state machine should explicitly separate rail presence, modem boot confirmation, network readiness, transport readiness, and active transfer
+- recovery should be able to branch either to a graceful retry path or to forced rail removal if the modem does not respond coherently
+
 ## 7. Antenna And RF Path Concept
 
 Current RF concept:
 
-- `A7670G RF_ANT -> pi matching network -> u.FL/IPEX connector -> external LTE antenna`
+- `A7670G RF_ANT pin 60 -> LTE_RF -> u.FL/IPEX centre pin`
+- u.FL/IPEX grounds tied directly to `GND`
+- `ESD9L5.0ST5G`, `LCSC C82326`, shunt from `LTE_RF` to `GND` close to the connector
+
+Recommended net naming:
+
+- use `LTE_RF` consistently from modem output to connector
 
 Preferred antenna approach:
 
-- external waterproof LTE antenna
-- `50 ohm` antenna system
-- wideband LTE coverage, approximately `700-2700 MHz`
-- `u.FL/IPEX` to `SMA` bulkhead pigtail for enclosure mounting
+- first-pass option: internal adhesive LTE `FPC` antenna
+- later option: `u.FL/IPEX` to `SMA` bulkhead external antenna
+- `50 ohm` antenna system with wideband LTE coverage, approximately `700-2700 MHz`
 
 Important PCB notes:
 
 - keep the RF path short and controlled
-- reserve the matching network footprint even if first-pass tuning is not complete yet
-- keep the modem RF section physically away from noisy digital and switched-power regions as much as the enclosure and board outline allow
-- verify that enclosure wall material, bulkhead position, and pigtail routing do not create an awkward or lossy antenna install
+- keep the modem RF section physically away from the battery, buck-boost inductor, ESP32 antenna, SD lines, high-current wiring, and any metal mounting plate as much as the enclosure and board outline allow
+- verify that enclosure wall material, adhesive antenna placement, bulkhead position, and pigtail routing do not create an awkward or lossy antenna install
+
+### 7.1 SIM holder integration
+
+Current SIM-holder plan:
+
+- direct `A7670G USIM1` wiring to the SIM holder
+- `22 ohm` series resistors on `DATA`, `CLK`, and `RST`
+- `USIM1_DET` routed to card-detect
+- `VPP` left `NC`
+- SIM shell tied to `GND`
+- `100 nF` on `USIM1_VDD`
+- `ESDA6V1W5`, `LCSC C48677`, shunt protection close to the holder on `VDD`, `DATA`, `CLK`, and `RST`
+
+### 7.2 `NETLIGHT` indicator concept
+
+Current indicator plan uses an `MMBT3904` (`LCSC C51953474`) NPN stage:
+
+- modem `NETLIGHT` drives the base through `4.7k`
+- `47k` base pull-down to `GND`
+- LED from `3V3_SYS` through `2.2k` to collector
+- emitter to `GND`
+
+### 7.3 Recommended test pads
+
+Recommended pads for bring-up and recovery:
+
+- `MODEM_VBAT_3V9`
+- `M_1V8`
+- `GND`
+- `4V_EN`
+- `LTE_REG_PGOOD`
+- `PWRKEY`
+- `A7670G RESET`
+- `A7670G STATUS`
+- `ESP_MODEM_TX / GPIO17`
+- `ESP_MODEM_RX / GPIO16`
+- `A7670G TXD`
+- `A7670G RXD`
+- `USB_DP`
+- `USB_DM`
+- `USB_VBUS`
+- `USB_BOOT`
+- `DTR`
+- `RI`
+- `LTE_RF` if layout allows
+
+USB pads are for debug, recovery, and factory-style testing rather than normal runtime operation.
 
 ## 8. Firmware Workflow Integration Feedback
 
@@ -205,23 +342,120 @@ This has several advantages:
 
 - node ingest and ESP-NOW handling
 - local record persistence and CSV management
-- upload queue or upload cursor management
-- modem power-state and AT-command manager
-- transport client (`MQTT`, `HTTPS`, or another chosen protocol)
-- upload result logging and retry scheduling
+- modem power/control manager
+- modem session manager
+- upload planner
+- streaming transfer engine
+- transmission status service
 
-### 8.2 Suggested upload record strategy
+Recommended responsibility boundaries:
 
-Prefer one of these models:
+- ESP-NOW ingest and SD persistence remain separate from LTE and remain the authoritative data path
+- the modem power/control manager owns rail enable, `PWRKEY`, `STATUS`, reset, and recovery transitions
+- the modem session manager owns attach, registration, PDP or data-session setup, and orderly teardown
+- the upload planner decides when upload is eligible based on schedule, power conditions, backlog, and retry policy
+- the streaming transfer engine reads persisted data and pushes it over the selected transport without redefining storage ownership
+- the transmission status service publishes modem state, backlog state, and last-transfer outcomes to the existing web UI and later BLE/native interfaces
 
-- append every record locally, then upload unsent records using a durable cursor
-- append every record locally, then periodically upload summaries plus a retained backlog when bandwidth allows
+### 8.2 First-pass upload workflow and storage strategy
+
+- Keep `datalog.csv` authoritative.
+- Add a durable upload cursor or manifest on local storage rather than relying on RAM-only progress.
+- Track at minimum: file identity, byte offset, last successful newline boundary, last success timestamp, last failure timestamp, and retry eligibility.
+- Upload should advance only after a server-accepted transfer boundary that can be resumed or retried deterministically.
+- File rotation can remain a later step if `datalog.csv` grows large enough that transfer windows or recovery become awkward.
 
 Avoid this first-pass architecture:
 
 - treating LTE upload success as a prerequisite for considering the data stored
+- keeping upload progress only in RAM
+- coupling modem session success to whether ESP-NOW ingest is allowed to continue
 
-The local SD record should remain authoritative.
+The local SD record should remain authoritative, and the upload cursor should be treated as derived metadata about remote-transfer progress.
+
+### 8.3 First-pass transport recommendation
+
+Recommended first pass:
+
+- prefer `HTTPS` file upload for the first implementation pass because the current workflow is file-centric and CSV-centric
+- keep `MQTT` as a later or alternative option for summaries, alerts, or compact state messages
+
+Reasoning:
+
+- the current mothership workflow already centers on `datalog.csv` export and persisted files
+- a file-oriented upload path aligns better with durable byte-offset tracking than a message-by-message transport in the first pass
+- `MQTT` may still be useful later once the base modem/session layer is proven and a summary or alert channel becomes valuable
+
+### 8.4 Proposed transmission UI and configuration surface
+
+Ground this in the existing web UI first, then mirror the same concepts into BLE/native once the shared command layer is stable.
+
+Recommended first-pass web UI additions:
+
+- Transmission or Backhaul status panel on the home page showing modem state, registration state, backlog size, last upload result, and next eligible upload window
+- settings or configuration panel for enabling backhaul, choosing transport, defining endpoint and auth mode, and setting upload policy constraints
+- exports or transfer queue panel showing `datalog.csv`, current upload cursor position, pending backlog estimate, last successful transfer, and manual upload action when allowed
+
+Alignment with current docs:
+
+- the current web UI already owns mothership summary, schedules, and CSV download, so it is the right first surface for transmission controls
+- the native app plan already treats web as the operational baseline and BLE or app parity as a later mirror of shared service behavior
+
+### 8.5 Proposed settings and status data model
+
+Treat these objects as first-pass planning shapes for shared web UI and later BLE or native parity work.
+
+Proposed transmission settings object:
+
+```json
+{
+	"enabled": true,
+	"transportType": "https_file",
+	"endpointUrl": "https://example.invalid/upload",
+	"authMode": "token",
+	"siteId": "site-001",
+	"deploymentId": "deploy-001",
+	"uploadPolicy": "scheduled_batch",
+	"uploadIntervalMin": 360,
+	"uploadPhaseUnix": 1767225600,
+	"minBatteryMv": 3700,
+	"maxBytesPerSession": 262144,
+	"maxRetriesPerWindow": 3,
+	"allowManualUpload": true
+}
+```
+
+Proposed modem status object:
+
+```json
+{
+	"powerState": "registered",
+	"railEnabled": true,
+	"statusPinHigh": true,
+	"networkRegistered": true,
+	"transportOpen": false,
+	"signalQuality": 18,
+	"operatorName": "example-carrier",
+	"lastAttachUnix": 1767229200,
+	"lastError": ""
+}
+```
+
+Proposed upload backlog object:
+
+```json
+{
+	"filePath": "/sd/datalog.csv",
+	"fileIdentity": "datalog.csv:1234567",
+	"nextByteOffset": 98304,
+	"lastSuccessfulNewlineOffset": 98112,
+	"pendingBytes": 24576,
+	"lastSuccessUnix": 1767229205,
+	"lastFailureUnix": 0,
+	"retryEligible": true,
+	"lastResult": "ok"
+}
+```
 
 ## 9. Scheduling And Power Questions
 
@@ -253,63 +487,95 @@ Reasoning:
 
 ## 10. Recommended Modem Upload Power Sequence
 
-Document the following proposed upload cycle:
+Document the following proposed upload cycle as an implementation direction, not as bench-validated behavior:
 
-1. Enable modem regulator or load switch.
-2. Wait for modem `VBAT` to stabilize.
-3. Pull `PWRKEY` low using an ESP32-controlled transistor.
-4. Wait for `STATUS` to indicate modem on.
-5. Wait for UART readiness.
-6. Send `AT` commands to check `SIM`, signal, and network registration.
-7. Open `MQTT` or `HTTPS` session.
-8. Upload queued data.
-9. Save upload result locally.
+1. Assert `GPIO33` to enable `4V_EN` and bring up `TPS63020`.
+2. Wait for `GPIO35` / `LTE_REG_PGOOD` and allow `MODEM_VBAT_3V9` to settle.
+3. Pulse `GPIO14` so the `2N7002` stage pulls modem `PWRKEY` low for boot request timing.
+4. Wait for modem `STATUS` on `GPIO4` to indicate the modem is up.
+5. Start `UART2` on `GPIO16 / GPIO17` and confirm basic `AT` responsiveness.
+6. Check `SIM`, signal, and network registration.
+7. Open `MQTT` or `HTTPS` session, with `HTTPS` still the preferred first-pass file upload path.
+8. Upload queued CSV or summary data.
+9. Log the upload result locally on SD.
 10. Gracefully shut down the modem using an `AT` command or `PWRKEY` shutdown sequence.
-11. Wait for `STATUS` off.
-12. Disable the modem regulator or load switch to remove standby drain.
+11. Wait for `GPIO4` `STATUS` to drop.
+12. Deassert `GPIO33` to disable the rail and remove standby drain.
 
 Recommended implementation note:
 
 - firmware should time-bound each stage and classify failures clearly, for example: rail enable failure, modem not booting, SIM absent, registration timeout, transport connect failure, upload reject, or clean shutdown failure.
+- the control implementation should explicitly map transitions through the proposed states in Section 6.2 so logs and UI status do not collapse multiple failure modes into a generic modem error
+- a combined rail-enable plus `PWRKEY` model should be the baseline assumption for firmware planning unless modem bench testing disproves it
 
 ## 11. Open Questions And Risks
 
-### 11.1 Power-system risk
+### 11.1 Pre-fabrication checks
+
+Check these items before releasing a board revision:
+
+- confirm all required modem `GND` pins are tied into a low-impedance ground system
+- confirm the `2N7002` symbol and footprint pin mapping matches the intended gate, drain, and source wiring
+- confirm the `MMBT3904` symbol and footprint pin mapping matches the intended base, collector, and emitter wiring
+- confirm each `SN74LVC1T45` `DIR` pin is oriented correctly for `TX2 -> RXD`, `TXD -> RX2`, and `STATUS -> GPIO4`
+- confirm `M_1V8` is only used as a logic reference and decoupled locally, not treated as an external supply rail
+- confirm intended SIM-detect behavior from `USIM1_DET`
+- confirm SIM `VPP` remains `NC`
+- confirm the SIM shell is tied to `GND`
+- confirm RF routing, connector grounding, and `LTE_RF` keep-out around noisy structures
+- confirm regulator `EN` has a pull-down so the modem rail defaults `OFF`
+- confirm `GPIO4` modem `STATUS` remains boot-safe because the rail is off until explicitly enabled
+
+### 11.2 Power-system risk
 
 - modem current bursts may upset the rest of the system if rail sizing, grounding, and bulk capacitance are inadequate
 
-### 11.2 Sleep-state ambiguity
+### 11.3 Sleep-state ambiguity
 
 - if the modem is not truly power-removed between sessions, standby drain may be much worse than expected
 
-### 11.3 Firmware complexity risk
+### 11.4 Firmware complexity risk
 
 - adding LTE can create a fragile coupled system if ingest, local storage, modem control, and upload retry are not separated cleanly
 
-### 11.4 RF and enclosure risk
+### 11.5 RF and enclosure risk
 
 - bulkhead placement, antenna quality, cable losses, and enclosure geometry may dominate real-world link quality more than the modem choice itself
 
-### 11.5 Carrier and regional risk
+### 11.6 Carrier and regional risk
 
 - even with `B28` support, actual deployment suitability still depends on local carrier behavior, antenna selection, and regional certification assumptions
 
-### 11.6 Recovery and service risk
+### 11.7 Recovery and service risk
 
 - if modem debug access is omitted, bring-up and field diagnosis may be unnecessarily slow
 
-## 12. Recommended Next Steps Before PCB Finalisation
+## 12. Recommended Implementation And Validation Order
 
-1. Confirm the exact `A7670G` module variant, footprint, and required power-on timing from the modem datasheet.
-2. Confirm which ESP32 UART pins are available and defensible for a dedicated modem port without colliding with SD, RTC, boot, or service functions.
-3. Decide whether the modem rail will use regulator enable, load switch, or both.
-4. Validate the candidate `4.0 V` rail design against modem burst current expectations and capacitor ESR behavior.
-5. Reserve schematic and layout space for the RF matching network, `u.FL/IPEX`, SIM holder, and modem USB test pads.
-6. Decide the first upload protocol to support in firmware so the control-state design is not completely transport-agnostic forever.
-7. Define a first-pass upload queue model and local metadata needed to mark records as pending, uploaded, failed, or deferred.
-8. Decide the initial battery-threshold policy for skipping LTE upload when energy is limited.
-9. Review the mothership power-state model to determine whether LTE upload should be a dedicated scheduled wake reason.
-10. Bench-validate modem start-up, registration time, and burst-current behavior before locking PCB placement or copper width assumptions.
+### 12.1 Staged implementation order
+
+Recommended sequence:
+
+1. Define the shared transmission command and settings schema first so web UI and later BLE or native parity do not invent different models.
+2. Extract or formalise a reusable export or storage service around `datalog.csv` access rather than letting modem code read ad hoc from unrelated paths.
+3. Add the durable upload cursor or manifest so transfer progress survives reset, brownout, and modem failure.
+4. Add the modem power and session subsystem around the combined rail-enable plus `PWRKEY` model.
+5. Add the scheduler decision layer that determines when upload is eligible based on backlog, interval, phase, battery threshold, and retry windows.
+6. Implement `HTTPS` file upload as the first transport path.
+7. Add web UI controls and status panels for transmission settings, backlog visibility, and manual actions.
+8. Mirror the same commands and status into BLE or native once the web-backed service surface is stable.
+9. Consider richer transport or storage options later, such as `MQTT` summaries, rotated upload files, or more advanced manifesting.
+
+### 12.2 Validation sequence
+
+Recommended validation order:
+
+1. Storage validation first: confirm the upload cursor or manifest advances correctly, survives reset, and never makes `datalog.csv` non-authoritative.
+2. Modem bench validation: confirm rail enable, `PWRKEY`, `STATUS`, boot timing, registration timing, and clean shutdown behavior on hardware.
+3. Transport validation: confirm `HTTPS` upload success, server error handling, resume behavior, and authenticated failure handling.
+4. Combined wake validation: confirm mothership scheduling, power budget checks, modem session duration, and post-upload shutdown all behave coherently in one cycle.
+5. UI parity validation: confirm the web UI can inspect and control transmission settings first, then verify BLE or native surfaces expose the same fields and state names.
+6. Failure-path validation: confirm behavior for no SIM, poor signal, registration timeout, transport reject, partial upload, and forced recovery or power removal.
 
 ## 13. Bottom Line
 
