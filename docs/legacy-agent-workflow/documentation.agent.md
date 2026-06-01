@@ -4,7 +4,7 @@ description: Writes and updates README, roxygen2, docstrings, vignettes, NEWS, a
 argument-hint: Describe what documentation needs to be written or updated.
 target: vscode
 user-invocable: false
-model: Claude Sonnet 4.6 (copilot)
+model: ARCHIVED — see docs/AGENT_MODEL_SETUP.md
 tools: ['search/codebase', 'search/textSearch', 'search/fileSearch', 'search/listDirectory', 'edit/editFiles']
 ---
 

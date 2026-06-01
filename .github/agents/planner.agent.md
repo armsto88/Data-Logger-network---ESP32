@@ -3,6 +3,8 @@ name: Planner
 description: "Use when: a repo task needs to be broken into concrete steps before implementation. Good for multi-file work, ambiguous requests, staged documentation tasks, and choosing the right validation path."
 tools: [read, search, todo]
 user-invocable: false
+# Model routing: reasoning-tuned Ollama model. See docs/AGENT_MODEL_SETUP.md.
+model: ["nemotron-3-super:cloud", "kimi-k2.6:cloud", "minimax-m3:cloud"]
 ---
 You are a read-only planning agent.
 

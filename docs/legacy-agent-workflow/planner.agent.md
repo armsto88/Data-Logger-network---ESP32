@@ -3,7 +3,7 @@ name: planner
 description: Researches codebase, verifies APIs, identifies edge cases, outputs ordered implementation steps. Never writes code.
 argument-hint: Describe what needs to be planned or investigated.
 target: vscode
-model: Claude Sonnet 4.6 (copilot)
+model: ARCHIVED — see docs/AGENT_MODEL_SETUP.md
 user-invocable: false
 tools: ['search/codebase', 'search/textSearch', 'search/fileSearch', 'search/listDirectory', 'runCommands']
 ---

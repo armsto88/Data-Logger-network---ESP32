@@ -4,7 +4,7 @@ description: Implements features from approved plans. Edits code, runs tests, in
 argument-hint: Describe what to implement, or paste the approved plan.
 target: vscode
 user-invocable: false
-model: Claude Opus 4.6 (copilot)
+model: ARCHIVED — see docs/AGENT_MODEL_SETUP.md
 tools: ['execute', 'read', 'agent', 'edit/editFiles', 'execute', 'read', 'search/codebase', 'search/fileSearch', 'search/listDirectory', 'search/textSearch', 'executeCode', 'ms-python.python/installPythonPackage', 'positron.positron-r/listPackageHelpTopics', 'positron.positron-r/listAvailableVignettes', 'positron.positron-r/getPackageVignette', 'positron.positron-r/getRHelpPage']
 agents: ['reviewer']
 ---

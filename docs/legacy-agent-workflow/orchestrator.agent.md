@@ -3,7 +3,7 @@ name: orchestrator
 description: Coordinates work across specialist agents, enforces approval gates, never implements directly.
 argument-hint: Describe the task, paste a GitHub issue URL, or state what you need done.
 target: vscode
-model: Claude Sonnet 4.6 (copilot)
+model: ARCHIVED — see docs/AGENT_MODEL_SETUP.md
 tools: ['edit', 'runNotebooks', 'search', 'new', 'runCommands', 'runTasks', 'executeCode', 'inspectVariables', 'getPlot', 'getTableSummary', 'projectTree', 'directoryStructure', 'changes', 'installPythonPackage', 'runNotebookCells', 'editNotebookCells', 'getNotebookCells', 'github.copilot-chat/usages', 'github.copilot-chat/vscodeAPI', 'github.copilot-chat/problems', 'github.copilot-chat/changes', 'github.copilot-chat/testFailure', 'github.copilot-chat/openSimpleBrowser', 'github.copilot-chat/fetch', 'github.copilot-chat/githubRepo', 'positron.positron-r/listPackageHelpTopics', 'positron.positron-r/listAvailableVignettes', 'positron.positron-r/getPackageVignette', 'positron.positron-r/getRHelpPage', 'extensions', 'todos', 'runSubagent', 'runTests']
 agents: ['planner', 'designer', 'coder', 'fast-coder', 'documentation', 'gitops']
 ---

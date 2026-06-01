@@ -4,7 +4,7 @@ description: Handles simple single-file tasks and quick fixes. Invokes reviewer 
 argument-hint: Describe the single-file fix or small change needed.
 target: vscode
 user-invocable: false
-model: Claude Sonnet 4.6 (copilot)
+model: ARCHIVED — see docs/AGENT_MODEL_SETUP.md
 tools: ['execute', 'read', 'agent', 'edit/editFiles', 'read', 'search/codebase', 'search/fileSearch', 'search/listDirectory', 'search/textSearch', 'executeCode', 'positron.positron-r/listPackageHelpTopics', 'positron.positron-r/listAvailableVignettes', 'positron.positron-r/getPackageVignette', 'positron.positron-r/getRHelpPage']
 agents: ['reviewer']
 ---

@@ -4,7 +4,7 @@ description: Builds and maintains the global local-only R/Python agent system fo
 argument-hint: Describe the agents, skills, prompts, or workflow you want to create or revise.
 target: vscode
 user-invocable: true
-model: Claude Sonnet 4.6 (copilot)
+model: ARCHIVED — see docs/AGENT_MODEL_SETUP.md
 tools: ['search/codebase', 'edit/editFiles', 'runCommands']
 handoffs:
   - label: Approve strategy and start coding

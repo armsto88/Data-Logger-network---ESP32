@@ -4,7 +4,7 @@ description: Designs architecture, APIs, Shiny UI/reactivity, and package struct
 argument-hint: Describe what needs to be designed or architected.
 target: vscode
 user-invocable: false
-model: Claude Sonnet 4.6 (copilot)
+model: ARCHIVED — see docs/AGENT_MODEL_SETUP.md
 tools: ['search/codebase', 'search/textSearch', 'search/fileSearch', 'search/listDirectory']
 ---
 

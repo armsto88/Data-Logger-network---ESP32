@@ -4,7 +4,7 @@ description: Read-only review gate. Checks implementation against plan and conve
 argument-hint: Describe what was implemented, or say "review recent changes".
 target: vscode
 user-invocable: false
-model: GPT-5.3 Codex (copilot)
+model: ARCHIVED — see docs/AGENT_MODEL_SETUP.md
 tools: ['search/codebase', 'search/textSearch', 'search/fileSearch', 'search/listDirectory', 'read', 'execute/getTerminalOutput', 'read/terminalLastCommand', 'read/terminalSelection', 'executeCode', 'inspectVariables', 'getTableSummary']
 ---
 

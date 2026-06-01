@@ -4,7 +4,7 @@ description: Handles git operations — branch creation, commits, pushes, and PR
 argument-hint: Describe the Git action needed (branch, commit, PR, release notes).
 target: vscode
 user-invocable: false
-model: Claude Sonnet 4.6 (copilot)
+model: ARCHIVED — see docs/AGENT_MODEL_SETUP.md
 tools: ['runCommands', 'edit/editFiles']
 ---
 

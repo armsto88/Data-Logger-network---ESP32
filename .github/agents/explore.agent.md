@@ -3,6 +3,8 @@ name: Explore Repo
 description: "Use when: locating the controlling code path, pin assignment, relevant design note, nearby test, enclosure measurement, part reference, or current implementation surface before making changes. Read-only exploration with short structured summaries."
 tools: [read, search]
 user-invocable: false
+# Model routing: fast instruction-following Ollama model. See docs/AGENT_MODEL_SETUP.md.
+model: ["qwen3.5:cloud", "minimax-m3:cloud"]
 ---
 You are a read-only repo exploration agent.
 

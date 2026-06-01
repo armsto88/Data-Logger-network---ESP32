@@ -5,6 +5,10 @@ argument-hint: "Describe the repo task and the orchestrator will plan and assign
 tools: [read, search, agent, todo]
 agents: [Planner, Explore Repo, Implement Change, Review Changes]
 user-invocable: true
+# Model routing: prefer a long-context generalist via Ollama. The :cloud tags
+# require either the Ollama VS Code extension, Continue, or copilot-ollama-proxy
+# to actually serve traffic. See docs/AGENT_MODEL_SETUP.md.
+model: ["kimi-k2.6:cloud", "nemotron-3-super:cloud", "minimax-m3:cloud"]
 ---
 You are the repo orchestrator.
 

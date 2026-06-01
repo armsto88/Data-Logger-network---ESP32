@@ -3,6 +3,8 @@ name: Review Changes
 description: "Use when: reviewing a change for bugs, regressions, missing tests, risky assumptions, workflow gaps, or documentation inconsistencies. Findings-first, read-only review agent."
 tools: [read, search]
 user-invocable: false
+# Model routing: read-only review, no edit pressure. See docs/AGENT_MODEL_SETUP.md.
+model: ["gemma4:31b-cloud", "nemotron-3-super:cloud", "minimax-m3:cloud"]
 ---
 You are a read-only review agent.
 
