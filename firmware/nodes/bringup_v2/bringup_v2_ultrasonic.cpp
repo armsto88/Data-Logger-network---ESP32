@@ -13,6 +13,15 @@
 
 #include <Arduino.h>
 
+#ifdef DISABLE_BROWNOUT
+#include "soc/rtc_cntl_reg.h"  // brownout disable
+#endif
+
+#include <esp_sleep.h>
+
+// RTC memory persists across brownout/power-on resets
+RTC_DATA_ATTR static bool g_boostWarmFlag = false;
+
 // ---------------------------------------------------------------------------
 // Pin definitions (all with #ifndef guards, V2 defaults)
 // ---------------------------------------------------------------------------
@@ -195,6 +204,40 @@ static void enableBoost() {
 
 static void disableBoost() {
   digitalWrite(PIN_TX_22V_EN_N, HIGH);  // HIGH = boost OFF (safe default)
+}
+
+static void softStartBoost() {
+  // Gradually charge the 22V output capacitor with microsecond enable pulses.
+  // 100us ON is short enough that the 470uF VSYS cap sustains the ESP32
+  // even when the MT3608 draws peak inrush at higher output voltages.
+  // 100ms OFF gives the battery maximum recovery time between pulses.
+  // Total soft-start time: ~5s before the final hard enable.
+  const int PULSE_ON_US  = 100;
+  const int PULSE_OFF_MS = 100;
+  const int PULSES = 50;
+  Serial.print("Soft-start: ");
+  Serial.print(PULSES);
+  Serial.print(" pulses, ");
+  Serial.print(PULSE_ON_US);
+  Serial.print("us ON / ");
+  Serial.print(PULSE_OFF_MS);
+  Serial.println("ms OFF");
+  for (int i = 0; i < PULSES; i++) {
+    digitalWrite(PIN_TX_22V_EN_N, LOW);   // boost ON
+    delayMicroseconds(PULSE_ON_US);
+    digitalWrite(PIN_TX_22V_EN_N, HIGH);  // boost OFF
+    delay(PULSE_OFF_MS);
+    if (i % 10 == 9) {
+      Serial.print("  pulse ");
+      Serial.print(i + 1);
+      Serial.println(" done");
+    }
+  }
+  // Final hard enable + precharge
+  Serial.println("  final enable + precharge");
+  digitalWrite(PIN_TX_22V_EN_N, LOW);
+  delay(g_boostPrechargeMs);
+  Serial.println("  boost ready");
 }
 
 // ---------------------------------------------------------------------------
@@ -852,13 +895,19 @@ void testSplitTxIndependence() {
   Serial.println("==== SPLIT-TX INDEPENDENCE TEST START ====");
   Serial.println("Verify TX_BURST_PWM and TX_22V_EN_N are independent");
 
-  // Phase A: Boost ON, no burst. Count TOF_EDGE edges for 500ms.
-  // Should be 0 (boost alone doesn't create false triggers).
-  Serial.println("-- Phase A: Boost ON, no burst --");
+  // Check if boost is already warm (enabled via 'b' key before this test)
+  if (!g_boostWarmFlag) {
+    Serial.println("ERROR: Boost not warm. Press 'b' first to enable boost,");
+    Serial.println("       accept reboot, then run test 3.");
+    Serial.println("---- SPLIT-TX INDEPENDENCE TEST DONE ----");
+    return;
+  }
+
+  // Phase A: Boost ON, no burst — count edges while boost is actively switching.
+  // MT3608 switching noise WILL create edges — this is expected.
+  Serial.println("-- Phase A: Boost ON, no burst (switching noise check) --");
   clearTxSelects();
   disableRxPath();
-  enableBoost();
-  delay(g_boostPrechargeMs);
 
   g_captureArmed = false;
   resetEdgeCapture();
@@ -873,18 +922,70 @@ void testSplitTxIndependence() {
   const uint32_t phaseAEdges = g_edgeCount;
 
   disableRxPath();
-  disableBoost();
 
   Serial.print("PHASE_A EDGES=");
   Serial.print(phaseAEdges);
-  Serial.print(" EXPECTED=0 -- ");
-  Serial.println(phaseAEdges == 0 ? "PASS" : "FAIL");
+  Serial.println(" (switching noise, expected >0) -- INFO");
+
+  // Phase A2: Disable boost, wait for switching to stop, then count edges.
+  // This measures the ambient noise floor of the RX chain with no active
+  // switching. Expect ~500-1000 edges/sec (same as Test 1 RX-enabled baseline).
+  // The purpose is to confirm that disabling boost doesn't create ADDITIONAL
+  // noise beyond the ambient baseline.
+  Serial.println("-- Phase A2: Boost OFF, no burst (ambient noise floor) --");
+  disableBoost();
+  delay(200);  // let MT3608 switching fully stop
+
+  g_captureArmed = false;
+  resetEdgeCapture();
+  enableRxPath();
+  delayMicroseconds(20);
+  g_captureArmed = true;
+
+  const uint32_t t0a2 = micros();
+  while ((micros() - t0a2) < 500000UL) {
+  }
+  g_captureArmed = false;
+  const uint32_t phaseA2Edges = g_edgeCount;
+
+  disableRxPath();
+
+  Serial.print("PHASE_A2 EDGES=");
+  Serial.print(phaseA2Edges);
+  Serial.print(" (ambient noise floor, expect ~500-1000) -- ");
+  if (phaseA2Edges < phaseAEdges) {
+    Serial.println("OK (less than Phase A switching noise)");
+  } else {
+    Serial.println("UNUSUAL (equal or more than Phase A — check for interference)");
+  }
 
   delay(200);
 
-  // Phase B: Burst ON, boost OFF. Fire 10 bursts with TX_22V_EN_N=HIGH.
-  // Should be 0% detection (no 22V = no acoustic output).
-  Serial.println("-- Phase B: Burst ON, boost OFF --");
+  // Phase B: Burst ON, boost OFF.
+  // The 22V cap (100uF) has no significant discharge path when driver relays
+  // are off (leakage ~1uA, time constant ~2200s). We must actively drain it
+  // by firing many bursts through the transducer.
+  Serial.println("-- Phase B: Burst ON, boost OFF (draining 22V cap) --");
+  disableBoost();
+  Serial.println("  Draining 22V cap with 100 bursts (no boost recharge)...");
+
+  // Fire 100 bursts with TX direction selected to drain the 22V cap.
+  // Each burst draws ~50mA for ~300us from the cap.
+  // 100 bursts × 50mA × 300us ≈ 1500uC, cap has ~2200uC total.
+  // After 100 bursts, cap should be at ~7V or less.
+  setRxDirection('S');
+  disableRxPath();
+  for (int drain = 0; drain < 100; ++drain) {
+    setTxCombo('N', true, true);
+    sendBurst40kHz(BURST_CYCLES);
+    clearTxSelects();
+    delay(10);  // short delay between drain bursts
+  }
+  Serial.println("  Cap drained, waiting 2s for residual to settle...");
+  delay(2000);
+
+  // Now fire 10 test bursts with boost OFF and 22V cap drained.
+  Serial.println("  Starting test bursts (22V cap should be near 0V)...");
   int phaseBDetected = 0;
 
   for (int shot = 0; shot < 10; ++shot) {
@@ -895,7 +996,6 @@ void testSplitTxIndependence() {
     delay(2);
 
     // Boost stays OFF
-    disableBoost();
 
     resetEdgeCapture();
     sendBurst40kHz(BURST_CYCLES);
@@ -949,7 +1049,20 @@ void testSplitTxIndependence() {
 
   // Phase C: Both ON (normal). Fire 10 bursts with boost + burst.
   // Should be >0% detection.
+  // The 22V cap is now drained from Phase B, so re-enabling boost
+  // will cause full inrush. Accept brownout — if it happens, press
+  // 'b' then '3' again. The Phase C result from the successful run
+  // is the one that matters.
   Serial.println("-- Phase C: Boost ON + Burst ON (normal) --");
+  Serial.println("Re-enabling boost (22V cap drained, may brownout)...");
+  Serial.println("  If brownout: press 'b' then '3' — Phase C will run with warm boost");
+  Serial.flush();
+  delay(10);
+  enableBoost();
+  delay(g_boostPrechargeMs);
+  delay(50);   // extra settling
+  Serial.println("Boost re-enabled");
+
   int phaseCDetected = 0;
 
   for (int shot = 0; shot < 10; ++shot) {
@@ -959,8 +1072,7 @@ void testSplitTxIndependence() {
     g_captureArmed = false;
     delay(2);
 
-    enableBoost();
-    delay(g_boostPrechargeMs);
+    // Boost already ON — no per-shot enable/disable cycle
 
     resetEdgeCapture();
     sendBurst40kHz(BURST_CYCLES);
@@ -1002,9 +1114,12 @@ void testSplitTxIndependence() {
 
     clearTxSelects();
     disableRxPath();
-    disableBoost();
+    // Boost stays ON — no disableBoost() here
     delay(INTER_SHOT_MS);
   }
+
+  disableBoost();  // disable boost once after all shots complete
+  g_boostWarmFlag = false;
 
   Serial.print("PHASE_C DETECTED=");
   Serial.print(phaseCDetected);
@@ -1643,6 +1758,9 @@ char toUpperAscii(char c) {
 // setup()
 // ===========================================================================
 void setup() {
+#ifdef DISABLE_BROWNOUT
+  WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);  // disable brownout detector
+#endif
   Serial.begin(115200);
   delay(800);
 
@@ -1685,6 +1803,17 @@ void setup() {
   pinMode(PIN_TX_22V_EN_N, OUTPUT);
   digitalWrite(PIN_TX_22V_EN_N, HIGH);  // safe default = boost OFF
 
+  // If boost was enabled before reboot, re-enable immediately.
+  // The 22V output cap is partially charged from the brief period before
+  // the GPIO reset, so the second inrush is much smaller.
+  if (g_boostWarmFlag) {
+    Serial.println("BOOST WARM: re-enabling boost (cap pre-charged from previous attempt)");
+    enableBoost();
+    delay(g_boostPrechargeMs);
+    delay(50);  // extra settling
+    Serial.println("BOOST WARM: boost ready — press '3' to run split-TX test");
+  }
+
   // Attach interrupt on PIN_TOF_EDGE RISING
   attachInterrupt(digitalPinToInterrupt(PIN_TOF_EDGE), onTofEdge, RISING);
 
@@ -1709,9 +1838,17 @@ void loop() {
       // Toggle boost ON/OFF (manual probe)
       g_manualBoostOn = !g_manualBoostOn;
       if (g_manualBoostOn) {
-        enableBoost();
-        Serial.println("BOOST: ON (TX_22V_EN_N=LOW) -- probe 22V_SYS with DMM");
+        g_boostWarmFlag = true;
+        Serial.println("BOOST: hard enable (may brownout and reboot)...");
+        Serial.println("  After reboot, boost will auto-resume from RTC flag");
+        Serial.flush();
+        delay(10);
+        enableBoost();  // GPIO5 LOW = boost ON — may cause brownout
+        // If we get here without brownout, boost is on
+        delay(g_boostPrechargeMs);
+        Serial.println("BOOST: ON (no brownout)");
       } else {
+        g_boostWarmFlag = false;
         disableBoost();
         Serial.println("BOOST: OFF (TX_22V_EN_N=HIGH) -- safe default");
       }

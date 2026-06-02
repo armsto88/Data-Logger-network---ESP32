@@ -12,17 +12,25 @@
 ## Summary
 
 **Date:** 2026-06-02  
-**Overall status:** Main systems PASS. Ultrasonic pending.  
+**Overall status:** Main systems PASS. Ultrasonic partially tested — AND-gate blanking PASS, ultrasonic pipeline functional, MT3608 brownout and regulation issues open.  
 **Key findings:**
 - V2 board boots and runs production sensor-node firmware correctly
 - All I2C devices detected and functional (mux, SHT40, AS7343, ADS1015, DS3231)
 - Power gating works: PWR_HOLD, RUN/KILL switch, split TX control (TX_BURST_PWM + TX_22V_EN_N)
-- AND gate blanking verified: TOF_EDGE blocked when RX_EN_N=HIGH
+- AND gate blanking verified: TOF_EDGE blocked when RX_EN_N=HIGH (zero feedthrough)
 - BAV99 RX clamp orientation fix confirmed — no hack needed on V2
 - Full wake → collect → store → sync cycle working with mothership
 - LEDs function correctly
+- Ultrasonic TOF pipeline functional: 10/10 detection with boost + burst (Phase C)
+- MT3608 22V boost converter causes ESP32 brownout on battery power (4.1V) when enabled from cold start
+- MT3608 output voltage fluctuates 14-20V with no load (possible burst-mode regulation issue)
 - Off-state leakage: pending DMM measurement
-- Ultrasonic: pending separate bringup
+
+**Open issues (ultrasonic):**
+1. MT3608 brownout on cold enable — ESP32 POWERON_RESET when boost enabled from ~0V output cap on battery power. Deep-sleep workaround works but is clunky. Needs hardware or firmware design decision for production.
+2. MT3608 output regulation — 22V rail fluctuates 14-20V with no load. May be normal pulse-skip behavior, or may indicate feedback divider / minimum load issue. Needs investigation with load applied and/or scope.
+3. Phase B (burst without boost) shows 10/10 detection even after 100 drain bursts — 22V cap may not be discharging through driver circuit as expected, or electrical coupling is creating false detections. Test 6 (coupling round with RX unplugged) needed to distinguish.
+4. Production ultrasonic firmware stub has no 22V boost control — brownout issue must be solved before real driver is written.
 
 ---
 
@@ -45,7 +53,7 @@
 | 13 | DS3231 RTC alarm | `esp32wroom-ds3231-alarm-10s` | No V2 changes | ✅ |
 | 14 | RUN/KILL switch (NEW) | `esp32wroom-run-kill-switch` | NEW sketch needed. Monitors VSYS while toggling RUN/KILL. | ✅ |
 | 15 | Off-state leakage (NEW) | `esp32wroom-off-current` | NEW sketch or DMM procedure. Measure quiescent current in KILL state. | ⬜ |
-| 16 | Ultrasonic TOF pipeline | `esp32wroom-ultrasonic-first-test` | MUST UPDATE for V2 pins: add TX_22V_EN_N=5, change RX_EN to RX_EN_N=4 (active-low), add AND-gate awareness. | ⬜ |
+| 16 | Ultrasonic TOF pipeline | `esp32wroom-v2-ultrasonic-bringup` | V2 pins: TX_22V_EN_N=5, RX_EN_N=4 (active-low), AND-gate. MT3608 brownout + regulation issues open. | ⚠️ |
 | 17 | WiFi integrity | `esp32wroom-wifi-integrity` | No V2 changes | ✅ |
 | 18 | ESP-NOW range TX | `esp32wroom-espnow-range-tx` | No V2 changes | ✅ |
 | 19 | ESP-NOW range RX | `esp32wrover-espnow-range-rx` | No V2 changes | ✅ |
@@ -362,14 +370,14 @@
 
 | Field | Value |
 |---|---|
-| Date | |
+| Date | 2026-06-02 |
 | Board serial | |
-| Flash method | |
+| Flash method | USB |
 
 | Check | Expected | Actual | Pass? |
 |-------|----------|--------|-------|
 | TX_22V_EN_N=5 controls boost | 22 V boost enables/disables correctly | | ⬜ |
-| RX_EN_N=4 gates RX path | AND-gate allows/blocks TOF_EDGE correctly | | ⬜ |
+| RX_EN_N=4 gates RX path | AND-gate allows/blocks TOF_EDGE correctly | 0 edges when disabled, ~1040 when enabled | ✅ |
 | TX burst fires | Ultrasonic burst transmitted | | ⬜ |
 | RX echo detected | TOF_EDGE captures echo edge | | ⬜ |
 | TOF measurement valid | Time-of-flight value in expected range | | ⬜ |
@@ -504,16 +512,16 @@ This is a separate sketch from the main-systems bringup because the ultrasonic s
 
 #### Test 1: AND-gate blanking verification
 
-**Date:**
+**Date:** 2026-06-02
 **Board serial:**
 
 | Check | Expected | Actual | Pass? |
 |---|---|---|---|
-| RX_EN_N=HIGH → TOF_EDGE edges = 0 | 0 edges in 1000 ms | | ⬜ |
-| RX_EN_N=LOW → TOF_EDGE edges ≥ 0 | May show noise edges | | ⬜ |
-| Consistent over 5 repeats | Same result each time | | ⬜ |
+| RX_EN_N=HIGH → TOF_EDGE edges = 0 | 0 edges in 1000 ms | 0 edges in all 5 trials (0/0/0/0/0) | ✅ |
+| RX_EN_N=LOW → TOF_EDGE edges ≥ 0 | May show noise edges | 1044/1036/1034/1042/1047 edges | ✅ |
+| Consistent over 5 repeats | Same result each time | 5/5 PASS | ✅ |
 
-**Notes:** V2 AND gate should block all COMP_RAW edges when RX_EN_N=HIGH. V1 showed feedthrough edges in this state. If this test fails, check U50 (inverter) and U51 (AND gate) soldering.
+**Notes:** AND gate blocks all edges when RX disabled. V2 hardware blanking works perfectly. Zero feedthrough leakage. RX enabled shows ~1040 edges/trial (noise/ambient).
 
 ---
 
@@ -541,16 +549,35 @@ This is a separate sketch from the main-systems bringup because the ultrasonic s
 
 #### Test 3: Split-TX independence test
 
-**Date:**
+**Date:** 2026-06-02
 **Board serial:**
 
 | Phase | Condition | Expected | Actual | Pass? |
 |---|---|---|---|---|
-| A | Boost ON, no burst | 0 TOF_EDGE edges in 500 ms | | ⬜ |
-| B | Burst ON, boost OFF | 0% detection (no 22V = no acoustic output) | | ⬜ |
-| C | Both ON (normal) | >0% detection | | ⬜ |
+| A | Boost ON, no burst (switching noise) | >0 edges (INFO) | 573-599 edges in 500ms | ℹ️ |
+| A2 | Boost OFF, no burst (ambient noise) | ~500-1000 edges (ambient baseline) | 537-539 edges in 500ms | ℹ️ |
+| B | Burst ON, boost OFF (after 100 drain bursts + 5s wait) | 0% detection | 10/10 detection | ❌ |
+| C | Both ON (normal) | >0% detection | 10/10 detection | ✅ |
 
-**Notes:** Phase A verifies the boost rail alone doesn't create false triggers. Phase B verifies the burst PWM without 22V doesn't produce measurable acoustic output. Phase C confirms normal operation works.
+**Notes:**
+- Phase A: MT3608 switching noise creates ~580 edges in 500ms. This is expected — the boost converter's ~1.5MHz switching couples into the RX chain. In production firmware, the blanking window filters this out.
+- Phase A2: Ambient noise floor is ~540 edges in 500ms (~1080 edges/sec), consistent with Test 1 RX-enabled baseline (~1040 edges/sec). Disabling boost does NOT increase noise — it slightly reduces it (switching noise removed).
+- Phase B: 10/10 detection even after 100 drain bursts + 5s wait. Two possible causes: (a) 22V cap not actually discharging through driver circuit, or (b) electrical coupling from burst PWM creating false detections. Test 6 (coupling round with RX unplugged) needed to distinguish.
+- Phase C: 10/10 detection confirms the full ultrasonic pipeline works: boost → burst → acoustic path → comparator → AND gate → TOF_EDGE → detection.
+
+**MT3608 brownout issue:**
+- Enabling the MT3608 boost from a cold start (22V output cap at ~0V) causes ESP32 POWERON_RESET on battery power at 4.1V
+- Inrush current (~1-2A) + ESP32 current (~100mA) exceeds battery's current capability
+- VSYS drops below ESP32 minimum operating voltage (~2.7V), causing complete power loss
+- Software soft-start attempts (1ms, 500µs, 200µs, 100µs pulses) all failed — even 100µs pulses cause brownout after ~40 pulses as the cap charges and inrush increases
+- Deep-sleep workaround (ESP32 sleeps 2-3s, MT3608 gets all battery current) works but causes serial disconnect
+- Accept-brownout + RTC-flag auto-resume also works but adds ~5s reboot time
+- This is a hardware limitation that needs a design decision for production firmware
+
+**MT3608 regulation issue:**
+- With boost continuously enabled and no load, 22V_SYS fluctuates between 14-20V on DMM
+- Likely cause: MT3608 pulse-skip / burst mode with no minimum load
+- Needs investigation: (a) add 10kΩ minimum load across 22V_SYS, (b) check feedback divider values on schematic, (c) measure with scope to distinguish ripple from burst-mode oscillation
 
 ---
 
@@ -624,16 +651,16 @@ This is a separate sketch from the main-systems bringup because the ultrasonic s
 
 #### Test 8: RX-disabled noise baseline
 
-**Date:**
+**Date:** 2026-06-02
 **Board serial:**
 
 | Duration (s) | TOF_EDGE edges | Notes |
 |---|---|---|
-| 1 | | |
-| 2 | | |
-| 5 | | |
+| 1 | 0 | 12 repeats, all zero |
+| 2 | 0 | 12 repeats, all zero |
+| 5 | 0 | 12 repeats, all zero |
 
-**Notes:** No burst, no boost, RX disabled. On V2 with AND gate, this should be exactly 0. If not, the AND gate is not blocking properly.
+**Notes:** 12/12 repeats show 0 edges. AND gate blocks all noise when RX disabled. V2 hardware blanking fully effective. Mean=0.00, Median=0. Window=2500µs. Consistent with Test 1 AND-gate blanking results.
 
 ---
 
