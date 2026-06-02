@@ -404,7 +404,7 @@ static void printTime(const char *prefix, const DateTime &t) {
   Serial.println(buf);
 }
 
-static bool armNextAlarm(const DateTime &fromNow) {
+static bool armNextAlarm(DateTime fromNow) {
   DateTime next = fromNow + TimeSpan(0, 0, 0, ALARM_INTERVAL_S);
   if (!writeAlarm1Exact(next)) return false;
   printTime("[A1] armed for ", next);

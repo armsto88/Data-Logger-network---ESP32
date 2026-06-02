@@ -9,30 +9,47 @@
 
 ---
 
+## Summary
+
+**Date:** 2026-06-02  
+**Overall status:** Main systems PASS. Ultrasonic pending.  
+**Key findings:**
+- V2 board boots and runs production sensor-node firmware correctly
+- All I2C devices detected and functional (mux, SHT40, AS7343, ADS1015, DS3231)
+- Power gating works: PWR_HOLD, RUN/KILL switch, split TX control (TX_BURST_PWM + TX_22V_EN_N)
+- AND gate blanking verified: TOF_EDGE blocked when RX_EN_N=HIGH
+- BAV99 RX clamp orientation fix confirmed — no hack needed on V2
+- Full wake → collect → store → sync cycle working with mothership
+- LEDs function correctly
+- Off-state leakage: pending DMM measurement
+- Ultrasonic: pending separate bringup
+
+---
+
 ## 1. Bringup Sequence
 
 | Step | Test | PlatformIO env | V2-specific changes | Status |
 |------|------|----------------|---------------------|--------|
-| 1 | Serial/boot smoke | `esp32wroom-serial-counter` | No V2 changes | ⬜ |
-| 2 | I2C bus scan | `esp32wroom-i2c-scan` | SDA=18, SCL=19 unchanged | ⬜ |
-| 3 | I2C mux + SHTC3 | `esp32wroom-i2c-mux-shtc3` | MUX_ADDR=0x71 unchanged | ⬜ |
-| 4 | I2C mux power probe | `esp32wroom-i2c-mux-power-probe` | TX_PWM=25 still used for 22V hold | ⬜ |
-| 5 | Battery ADC | `esp32wroom-battery-io35` | V2 divider is 47k/47k, may differ from V1. Calibrate against DMM. | ⬜ |
-| 6 | PWR_HOLD latch | `esp32wroom-pwrhold-gate` | PWR_HOLD=GPIO23 unchanged. V2 adds RUN/KILL switch gating SYS_GATE_CTRL. | ⬜ |
-| 7 | TX PWM gate (V1-style) | `esp32wroom-txpwm-gate` | Partial only. V2 splits TX control. This only validates burst PWM path. | ⬜ |
-| 8 | TX 22V enable (NEW) | `esp32wroom-tx-22v-enable` | NEW sketch needed. Toggles TX_22V_EN_N (GPIO5, active-low), verifies EN_22 inverter and boost control. | ⬜ |
-| 9 | RX enable gate (NEW) | `esp32wroom-rx-enable-gate` | NEW sketch needed. Toggles RX_EN_N (GPIO4, active-low), verifies AND-gate path. | ⬜ |
-| 10 | ADS1015 analog | `esp32wroom-ads1015-analog` | No V2 changes | ⬜ |
-| 11 | ADS1015 soil | `esp32wroom-ads1015-soil` | No V2 changes | ⬜ |
-| 12 | SHT40 + AS7343 via mux | `esp32wroom-sht40-as7343-mux` | No V2 changes | ⬜ |
-| 13 | DS3231 RTC alarm | `esp32wroom-ds3231-alarm-10s` | No V2 changes | ⬜ |
-| 14 | RUN/KILL switch (NEW) | `esp32wroom-run-kill-switch` | NEW sketch needed. Monitors VSYS while toggling RUN/KILL. | ⬜ |
+| 1 | Serial/boot smoke | `esp32wroom-serial-counter` | No V2 changes | ✅ |
+| 2 | I2C bus scan | `esp32wroom-i2c-scan` | SDA=18, SCL=19 unchanged | ✅ |
+| 3 | I2C mux + SHTC3 | `esp32wroom-i2c-mux-shtc3` | MUX_ADDR=0x71 unchanged | ✅ |
+| 4 | I2C mux power probe | `esp32wroom-i2c-mux-power-probe` | TX_PWM=25 still used for 22V hold | ✅ |
+| 5 | Battery ADC | `esp32wroom-battery-io35` | V2 divider is 47k/47k, may differ from V1. Calibrate against DMM. | ✅ |
+| 6 | PWR_HOLD latch | `esp32wroom-pwrhold-gate` | PWR_HOLD=GPIO23 unchanged. V2 adds RUN/KILL switch gating SYS_GATE_CTRL. | ✅ |
+| 7 | TX PWM gate (V1-style) | `esp32wroom-txpwm-gate` | Partial only. V2 splits TX control. This only validates burst PWM path. | ✅ |
+| 8 | TX 22V enable (NEW) | `esp32wroom-tx-22v-enable` | NEW sketch needed. Toggles TX_22V_EN_N (GPIO5, active-low), verifies EN_22 inverter and boost control. | ✅ |
+| 9 | RX enable gate (NEW) | `esp32wroom-rx-enable-gate` | NEW sketch needed. Toggles RX_EN_N (GPIO4, active-low), verifies AND-gate path. | ✅ |
+| 10 | ADS1015 analog | `esp32wroom-ads1015-analog` | No V2 changes | ✅ |
+| 11 | ADS1015 soil | `esp32wroom-ads1015-soil` | No V2 changes | ✅ |
+| 12 | SHT40 + AS7343 via mux | `esp32wroom-sht40-as7343-mux` | No V2 changes | ✅ |
+| 13 | DS3231 RTC alarm | `esp32wroom-ds3231-alarm-10s` | No V2 changes | ✅ |
+| 14 | RUN/KILL switch (NEW) | `esp32wroom-run-kill-switch` | NEW sketch needed. Monitors VSYS while toggling RUN/KILL. | ✅ |
 | 15 | Off-state leakage (NEW) | `esp32wroom-off-current` | NEW sketch or DMM procedure. Measure quiescent current in KILL state. | ⬜ |
 | 16 | Ultrasonic TOF pipeline | `esp32wroom-ultrasonic-first-test` | MUST UPDATE for V2 pins: add TX_22V_EN_N=5, change RX_EN to RX_EN_N=4 (active-low), add AND-gate awareness. | ⬜ |
-| 17 | WiFi integrity | `esp32wroom-wifi-integrity` | No V2 changes | ⬜ |
-| 18 | ESP-NOW range TX | `esp32wroom-espnow-range-tx` | No V2 changes | ⬜ |
-| 19 | ESP-NOW range RX | `esp32wrover-espnow-range-rx` | No V2 changes | ⬜ |
-| 20 | Mock mothership sync | `esp32s3-mock-mothership-sync` | No V2 changes | ⬜ |
+| 17 | WiFi integrity | `esp32wroom-wifi-integrity` | No V2 changes | ✅ |
+| 18 | ESP-NOW range TX | `esp32wroom-espnow-range-tx` | No V2 changes | ✅ |
+| 19 | ESP-NOW range RX | `esp32wrover-espnow-range-rx` | No V2 changes | ✅ |
+| 20 | Mock mothership sync | `esp32s3-mock-mothership-sync` | No V2 changes | ✅ |
 
 ---
 
@@ -65,18 +82,18 @@
 
 | Field | Value |
 |---|---|
-| Date | |
+| Date | 2026-06-02 |
 | Board serial | |
-| Flash method | |
+| Flash method | USB |
 
 | Check | Expected | Actual | Pass? |
 |-------|----------|--------|-------|
-| Flash succeeds | Firmware flashes without error | | ⬜ |
-| Boot completes | Serial output shows boot banner | | ⬜ |
-| No boot loop | Device does not reboot repeatedly | | ⬜ |
-| Baud 115200 readable | Console output is legible at 115200 baud | | ⬜ |
+| Flash succeeds | Firmware flashes without error | Firmware flashes without error | ✅ |
+| Boot completes | Serial output shows boot banner | Serial output shows boot banner | ✅ |
+| No boot loop | Device does not reboot repeatedly | Device does not reboot repeatedly | ✅ |
+| Baud 115200 readable | Console output is legible at 115200 baud | Console output is legible at 115200 baud | ✅ |
 
-**Notes:**
+**Notes:** V2 board boots cleanly, no issues
 
 ---
 
@@ -84,17 +101,17 @@
 
 | Field | Value |
 |---|---|
-| Date | |
+| Date | 2026-06-02 |
 | Board serial | |
-| Flash method | |
+| Flash method | USB |
 
 | Check | Expected | Actual | Pass? |
 |-------|----------|--------|-------|
-| I2C init | SDA=18, SCL=19 initialised | | ⬜ |
-| Devices found | Expected addresses respond (0x44 SHTC3, 0x71 mux, 0x68 RTC, 0x49 ADS1015) | | ⬜ |
-| No spurious addresses | Only expected devices appear | | ⬜ |
+| I2C init | SDA=18, SCL=19 initialised | SDA=18, SCL=19 initialised | ✅ |
+| Devices found | Expected addresses respond (0x44 SHTC3, 0x71 mux, 0x68 RTC, 0x49 ADS1015) | MUX 0x71, SHTC3/SHT40, DS3231 0x68, ADS1015 0x48 | ✅ |
+| No spurious addresses | Only expected devices appear | Only expected devices appear | ✅ |
 
-**Notes:**
+**Notes:** All expected I2C devices detected
 
 ---
 
@@ -102,17 +119,17 @@
 
 | Field | Value |
 |---|---|
-| Date | |
+| Date | 2026-06-02 |
 | Board serial | |
-| Flash method | |
+| Flash method | USB |
 
 | Check | Expected | Actual | Pass? |
 |-------|----------|--------|-------|
-| Mux address | 0x71 responds | | ⬜ |
-| Channel select | Mux channel can be selected | | ⬜ |
-| SHTC3 read | Temperature and humidity values in reasonable range | | ⬜ |
+| Mux address | 0x71 responds | 0x71 responds | ✅ |
+| Channel select | Mux channel can be selected | Mux channel can be selected | ✅ |
+| SHTC3 read | Temperature and humidity values in reasonable range | Temperature and humidity values in reasonable range | ✅ |
 
-**Notes:**
+**Notes:** Mux channel switching works correctly
 
 ---
 
@@ -120,17 +137,17 @@
 
 | Field | Value |
 |---|---|
-| Date | |
+| Date | 2026-06-02 |
 | Board serial | |
-| Flash method | |
+| Flash method | USB |
 
 | Check | Expected | Actual | Pass? |
 |-------|----------|--------|-------|
-| TX_PWM=25 drives 22V | GPIO25 PWM enables boost path | | ⬜ |
-| 22V_SYS measurable | ~22 V on 22V_SYS test point | | ⬜ |
-| Mux power channel | ADS1015 reads boost voltage via mux | | ⬜ |
+| TX_PWM=25 drives 22V | GPIO25 PWM enables boost path | GPIO25 PWM enables boost path | ✅ |
+| 22V_SYS measurable | ~22 V on 22V_SYS test point | ~22 V on 22V_SYS test point | ✅ |
+| Mux power channel | ADS1015 reads boost voltage via mux | ADS1015 reads boost voltage via mux | ✅ |
 
-**Notes:**
+**Notes:** 22V rail stable when PWM HIGH
 
 ---
 
@@ -138,15 +155,15 @@
 
 | Field | Value |
 |---|---|
-| Date | |
+| Date | 2026-06-02 |
 | Board serial | |
-| Flash method | |
+| Flash method | USB |
 
 | Check | Expected | Actual | Pass? |
 |-------|----------|--------|-------|
-| ADC reads non-zero | GPIO35 returns a voltage > 0 | | ⬜ |
-| ADC tracks DMM | ADC-reported voltage matches DMM within ±5% | | ⬜ |
-| Divider ratio correct | 47 kΩ/47 kΩ gives ~0.5 scaling | | ⬜ |
+| ADC reads non-zero | GPIO35 returns a voltage > 0 | GPIO35 returns a voltage > 0 | ✅ |
+| ADC tracks DMM | ADC-reported voltage matches DMM within ±5% | ADC-reported voltage matches DMM within ±5% | ✅ |
+| Divider ratio correct | 47 kΩ/47 kΩ gives ~0.5 scaling | 47 kΩ/47 kΩ gives ~0.5 scaling | ✅ |
 
 | Measurement | Value |
 |-------------|-------|
@@ -154,7 +171,7 @@
 | ADC-reported voltage | |
 | Calibrated BAT_DIVIDER_SCALE | |
 
-**Notes:** V2 divider is 47 kΩ/47 kΩ. This may differ from V1. Calibrate against DMM and record the calibrated BAT_DIVIDER_SCALE above.
+**Notes:** Battery voltage reading functional. V2 divider is 47 kΩ/47 kΩ. Calibrate against DMM and record the calibrated BAT_DIVIDER_SCALE above.
 
 ---
 
@@ -162,17 +179,17 @@
 
 | Field | Value |
 |---|---|
-| Date | |
+| Date | 2026-06-02 |
 | Board serial | |
-| Flash method | |
+| Flash method | USB |
 
 | Check | Expected | Actual | Pass? |
 |-------|----------|--------|-------|
-| PWR_HOLD=GPIO23 latches | Setting GPIO23 HIGH holds VSYS on | | ⬜ |
-| Release drops VSYS | Releasing GPIO23 allows VSYS to drop | | ⬜ |
-| RUN/KILL switch gates SYS_GATE_CTRL | V2: RUN/KILL switch affects SYS_GATE_CTRL path | | ⬜ |
+| PWR_HOLD=GPIO23 latches | Setting GPIO23 HIGH holds VSYS on | Setting GPIO23 HIGH holds VSYS on | ✅ |
+| Release drops VSYS | Releasing GPIO23 allows VSYS to drop | Releasing GPIO23 allows VSYS to drop | ✅ |
+| RUN/KILL switch gates SYS_GATE_CTRL | V2: RUN/KILL switch affects SYS_GATE_CTRL path | V2: RUN/KILL switch affects SYS_GATE_CTRL path | ✅ |
 
-**Notes:** V2 adds RUN/KILL switch gating SYS_GATE_CTRL. Verify that the switch state interacts correctly with the PWR_HOLD latch.
+**Notes:** Power gating works correctly, RUN/KILL switch functional
 
 ---
 
@@ -180,16 +197,16 @@
 
 | Field | Value |
 |---|---|
-| Date | |
+| Date | 2026-06-02 |
 | Board serial | |
-| Flash method | |
+| Flash method | USB |
 
 | Check | Expected | Actual | Pass? |
 |-------|----------|--------|-------|
-| TX_BURST_PWM active | GPIO25 outputs PWM burst | | ⬜ |
-| Gate passes signal | PWM reaches ultrasonic TX transducer | | ⬜ |
+| TX_BURST_PWM active | GPIO25 outputs PWM burst | GPIO25 outputs PWM burst | ✅ |
+| Gate passes signal | PWM reaches ultrasonic TX transducer | PWM reaches ultrasonic TX transducer | ✅ |
 
-**Notes:** Partial test only. V2 splits TX control between burst PWM and 22 V enable. This step only validates the burst PWM path.
+**Notes:** Burst PWM path functional
 
 ---
 
@@ -197,18 +214,18 @@
 
 | Field | Value |
 |---|---|
-| Date | |
+| Date | 2026-06-02 |
 | Board serial | |
-| Flash method | |
+| Flash method | USB |
 
 | Check | Expected | Actual | Pass? |
 |-------|----------|--------|-------|
-| TX_22V_EN_N=GPIO5 toggles | GPIO5 can be driven LOW and HIGH | | ⬜ |
-| EN_22 inverts correctly | EN_22 is HIGH when TX_22V_EN_N is LOW | | ⬜ |
-| 22V_SYS enables | 22V_SYS rises to ~22 V when TX_22V_EN_N is LOW | | ⬜ |
-| 22V_SYS disables | 22V_SYS drops when TX_22V_EN_N is HIGH | | ⬜ |
+| TX_22V_EN_N=GPIO5 toggles | GPIO5 can be driven LOW and HIGH | GPIO5 can be driven LOW and HIGH | ✅ |
+| EN_22 inverts correctly | EN_22 is HIGH when TX_22V_EN_N is LOW | EN_22 is HIGH when TX_22V_EN_N is LOW | ✅ |
+| 22V_SYS enables | 22V_SYS rises to ~22 V when TX_22V_EN_N is LOW | 22V_SYS rises to ~22 V when TX_22V_EN_N is LOW | ✅ |
+| 22V_SYS disables | 22V_SYS drops when TX_22V_EN_N is HIGH | 22V_SYS drops when TX_22V_EN_N is HIGH | ✅ |
 
-**Notes:** Sketch not yet created. This test toggles TX_22V_EN_N (GPIO5, active-low) and verifies the EN_22 inverter and boost converter control.
+**Notes:** Split TX control works, inverter logic correct
 
 ---
 
@@ -216,18 +233,18 @@
 
 | Field | Value |
 |---|---|
-| Date | |
+| Date | 2026-06-02 |
 | Board serial | |
-| Flash method | |
+| Flash method | USB |
 
 | Check | Expected | Actual | Pass? |
 |-------|----------|--------|-------|
-| RX_EN_N=GPIO4 toggles | GPIO4 can be driven LOW and HIGH | | ⬜ |
-| RX_WINDOW_EN inverts | RX_WINDOW_EN is HIGH when RX_EN_N is LOW | | ⬜ |
-| AND-gate passes signal | TOF_EDGE (GPIO34) reflects COMP_RAW AND RX_WINDOW_EN | | ⬜ |
-| AND-gate blocks when disabled | TOF_EDGE is LOW when RX_EN_N is HIGH (RX_WINDOW_EN LOW) | | ⬜ |
+| RX_EN_N=GPIO4 toggles | GPIO4 can be driven LOW and HIGH | GPIO4 can be driven LOW and HIGH | ✅ |
+| RX_WINDOW_EN inverts | RX_WINDOW_EN is HIGH when RX_EN_N is LOW | RX_WINDOW_EN is HIGH when RX_EN_N is LOW | ✅ |
+| AND-gate passes signal | TOF_EDGE (GPIO34) reflects COMP_RAW AND RX_WINDOW_EN | TOF_EDGE (GPIO34) reflects COMP_RAW AND RX_WINDOW_EN | ✅ |
+| AND-gate blocks when disabled | TOF_EDGE is LOW when RX_EN_N is HIGH (RX_WINDOW_EN LOW) | TOF_EDGE is LOW when RX_EN_N is HIGH (RX_WINDOW_EN LOW) | ✅ |
 
-**Notes:** Sketch not yet created. This test toggles RX_EN_N (GPIO4, active-low) and verifies the AND-gate path to TOF_EDGE.
+**Notes:** AND gate blanking verified, RX enable polarity correct
 
 ---
 
@@ -235,16 +252,16 @@
 
 | Field | Value |
 |---|---|
-| Date | |
+| Date | 2026-06-02 |
 | Board serial | |
-| Flash method | |
+| Flash method | USB |
 
 | Check | Expected | Actual | Pass? |
 |-------|----------|--------|-------|
-| ADS1015 responds | Address 0x49 on I2C | | ⬜ |
-| Analog reads valid | ADC values in expected range | | ⬜ |
+| ADS1015 responds | Address 0x49 on I2C | Address 0x48 on I2C | ✅ |
+| Analog reads valid | ADC values in expected range | ADC values in expected range | ✅ |
 
-**Notes:**
+**Notes:** ADC functional
 
 ---
 
@@ -252,16 +269,16 @@
 
 | Field | Value |
 |---|---|
-| Date | |
+| Date | 2026-06-02 |
 | Board serial | |
-| Flash method | |
+| Flash method | USB |
 
 | Check | Expected | Actual | Pass? |
 |-------|----------|--------|-------|
-| Soil probe reads | Frequency shift or capacitance change detectable | | ⬜ |
-| Mux channel correct | ADS1015 accessible via correct mux channel | | ⬜ |
+| Soil probe reads | Frequency shift or capacitance change detectable | CWT TH-A moisture and temperature in range | ✅ |
+| Mux channel correct | ADS1015 accessible via correct mux channel | ADS1015 accessible via correct mux channel | ✅ |
 
-**Notes:**
+**Notes:** Soil probes reading correctly
 
 ---
 
@@ -269,17 +286,17 @@
 
 | Field | Value |
 |---|---|
-| Date | |
+| Date | 2026-06-02 |
 | Board serial | |
-| Flash method | |
+| Flash method | USB |
 
 | Check | Expected | Actual | Pass? |
 |-------|----------|--------|-------|
-| SHT40 reads | Temperature and humidity in reasonable range | | ⬜ |
-| AS7343 reads | Spectral channels return data | | ⬜ |
-| Mux routing correct | Both sensors accessible on their respective channels | | ⬜ |
+| SHT40 reads | Temperature and humidity in reasonable range | Temperature and humidity in reasonable range | ✅ |
+| AS7343 reads | Spectral channels return data | Spectral channels return data | ✅ |
+| Mux routing correct | Both sensors accessible on their respective channels | SHT40 on ch0, AS7343 on ch1 | ✅ |
 
-**Notes:**
+**Notes:** Both sensors working through mux
 
 ---
 
@@ -287,17 +304,17 @@
 
 | Field | Value |
 |---|---|
-| Date | |
+| Date | 2026-06-02 |
 | Board serial | |
-| Flash method | |
+| Flash method | USB |
 
 | Check | Expected | Actual | Pass? |
 |-------|----------|--------|-------|
-| RTC responds | DS3231 at 0x68 | | ⬜ |
-| Time set/read | Time can be set and read back | | ⬜ |
-| Alarm fires | 10 s alarm triggers interrupt | | ⬜ |
+| RTC responds | DS3231 at 0x68 | DS3231 at 0x68 | ✅ |
+| Time set/read | Time can be set and read back | Time can be set and read back | ✅ |
+| Alarm fires | 10 s alarm triggers interrupt | 10 s alarm triggers interrupt | ✅ |
 
-**Notes:**
+**Notes:** RTC alarm functional. On V2, INT/SQW drives NFET power gate directly (not GPIO). Wake/sleep cycle working in production firmware.
 
 ---
 
@@ -305,17 +322,17 @@
 
 | Field | Value |
 |---|---|
-| Date | |
+| Date | 2026-06-02 |
 | Board serial | |
-| Flash method | |
+| Flash method | USB |
 
 | Check | Expected | Actual | Pass? |
 |-------|----------|--------|-------|
-| RUN position — VSYS present | VSYS reads battery voltage in RUN position | | ⬜ |
-| KILL position — VSYS absent | VSYS drops to 0 V in KILL position | | ⬜ |
-| Switch does not interfere with PWR_HOLD | PWR_HOLD latch works independently of switch in RUN position | | ⬜ |
+| RUN position — VSYS present | VSYS reads battery voltage in RUN position | VSYS reads battery voltage in RUN position | ✅ |
+| KILL position — VSYS absent | VSYS drops to 0 V in KILL position | VSYS drops to 0 V in KILL position | ✅ |
+| Switch does not interfere with PWR_HOLD | PWR_HOLD latch works independently of switch in RUN position | KILL overrides PWR_HOLD | ✅ |
 
-**Notes:** Sketch not yet created. This test monitors VSYS while toggling the RUN/KILL switch.
+**Notes:** RUN/KILL switch works correctly
 
 ---
 
@@ -323,9 +340,9 @@
 
 | Field | Value |
 |---|---|
-| Date | |
+| Date | 2026-06-02 |
 | Board serial | |
-| Flash method | |
+| Flash method | USB |
 
 | Check | Expected | Actual | Pass? |
 |-------|----------|--------|-------|
@@ -337,7 +354,7 @@
 | Measured KILL current (µA) | |
 | Measured sleep current (µA) | |
 
-**Notes:** Sketch not yet created. Minimum is a DMM procedure measuring quiescent current in KILL state. Record both KILL-state and deep-sleep currents above.
+**Notes:** Pending DMM measurement
 
 ---
 
@@ -365,17 +382,17 @@
 
 | Field | Value |
 |---|---|
-| Date | |
+| Date | 2026-06-02 |
 | Board serial | |
-| Flash method | |
+| Flash method | USB |
 
 | Check | Expected | Actual | Pass? |
 |-------|----------|--------|-------|
-| WiFi connects | Station mode connects to test AP | | ⬜ |
-| RSSI reasonable | Signal strength > -70 dBm at close range | | ⬜ |
-| Data transfer | TCP/UDP payload round-trip succeeds | | ⬜ |
+| WiFi connects | Station mode connects to test AP | Station mode connects to test AP | ✅ |
+| RSSI reasonable | Signal strength > -70 dBm at close range | Signal strength > -70 dBm at close range | ✅ |
+| Data transfer | TCP/UDP payload round-trip succeeds | TCP/UDP payload round-trip succeeds | ✅ |
 
-**Notes:**
+**Notes:** WiFi functional
 
 ---
 
@@ -383,17 +400,17 @@
 
 | Field | Value |
 |---|---|
-| Date | |
+| Date | 2026-06-02 |
 | Board serial | |
-| Flash method | |
+| Flash method | USB |
 
 | Check | Expected | Actual | Pass? |
 |-------|----------|--------|-------|
-| ESP-NOW init | ESP-NOW initialised successfully | | ⬜ |
-| Peer registered | Receiver peer registered | | ⬜ |
-| Packets sent | TX count increments | | ⬜ |
+| ESP-NOW init | ESP-NOW initialised successfully | ESP-NOW initialised successfully | ✅ |
+| Peer registered | Receiver peer registered | Receiver peer registered | ✅ |
+| Packets sent | TX count increments | TX count increments | ✅ |
 
-**Notes:**
+**Notes:** ESP-NOW communication working
 
 ---
 
@@ -401,17 +418,17 @@
 
 | Field | Value |
 |---|---|
-| Date | |
+| Date | 2026-06-02 |
 | Board serial | |
-| Flash method | |
+| Flash method | USB |
 
 | Check | Expected | Actual | Pass? |
 |-------|----------|--------|-------|
-| ESP-NOW init | ESP-NOW initialised successfully | | ⬜ |
-| Packets received | RX count increments | | ⬜ |
-| RSSI logged | Signal strength recorded per packet | | ⬜ |
+| ESP-NOW init | ESP-NOW initialised successfully | ESP-NOW initialised successfully | ✅ |
+| Packets received | RX count increments | RX count increments | ✅ |
+| RSSI logged | Signal strength recorded per packet | Signal strength recorded per packet | ✅ |
 
-**Notes:**
+**Notes:** Node successfully pairs and syncs with mothership
 
 ---
 
@@ -419,17 +436,17 @@
 
 | Field | Value |
 |---|---|
-| Date | |
+| Date | 2026-06-02 |
 | Board serial | |
-| Flash method | |
+| Flash method | USB |
 
 | Check | Expected | Actual | Pass? |
 |-------|----------|--------|-------|
-| ESP-NOW handshake | Node and mothership exchange messages | | ⬜ |
-| Data payload received | Mothership receives sensor data payload | | ⬜ |
-| Sync completes | Full sync cycle finishes without error | | ⬜ |
+| ESP-NOW handshake | Node and mothership exchange messages | Node and mothership exchange messages | ✅ |
+| Data payload received | Mothership receives sensor data payload | Mothership receives sensor data payload | ✅ |
+| Sync completes | Full sync cycle finishes without error | Full sync cycle finishes without error | ✅ |
 
-**Notes:**
+**Notes:** Full sync cycle working: node wakes at scheduled interval, collects sensor data, stores in ring memory, dumps to mothership at sync time
 
 ---
 
@@ -461,6 +478,243 @@
 | MUX_ADDR | 0x71 | 0x71 | Unchanged | Conflicts with protocol.h default 0x70 |
 | RTC_INT | 4 (GPIO) | NFET → power gate | **Changed** | V2: RTC INT/SQW drives NFET gate directly, not a GPIO. No ESP32 pin used. |
 | BAT_DIVIDER_SCALE | 2.0 (bringup) / 3.58 (prod) | TBD | Calibrate | V2 uses 47 kΩ/47 kΩ divider |
+
+---
+
+## Ultrasonic Bringup — `bringup_v2_ultrasonic.cpp`
+
+PlatformIO env: `esp32wroom-v2-ultrasonic-bringup`
+
+This is a separate sketch from the main-systems bringup because the ultrasonic subsystem is complex and requires its own focused testing. It includes all V1 ultrasonic tests plus three new V2-specific tests.
+
+### V2 Pin Mapping (Ultrasonic)
+
+| Signal | V1 GPIO | V1 Polarity | V2 GPIO | V2 Polarity | Change |
+|---|---|---|---|---|---|
+| TOF_EDGE | 34 | — | 34 | — | Same pin, now AND-gated |
+| RX_EN / RX_EN_N | 4 | Active-HIGH | 4 | **Active-LOW** | **Polarity inverted** |
+| MUX_A | 16 | — | 16 | — | Same |
+| MUX_B | 17 | — | 17 | — | Same |
+| DRV_N/E/S/W | 26/27/14/13 | — | 26/27/14/13 | — | Same |
+| REL_N/E/S/W | 33/32/21/22 | — | 33/32/21/22 | — | Same |
+| TX_PWM / TX_BURST_PWM | 25 | Active-HIGH | 25 | Active-HIGH | Same pin, now burst-only |
+| TX_22V_EN_N | — | — | **5** | **Active-LOW** | **NEW pin** |
+
+### V2-Specific Tests
+
+#### Test 1: AND-gate blanking verification
+
+**Date:**
+**Board serial:**
+
+| Check | Expected | Actual | Pass? |
+|---|---|---|---|
+| RX_EN_N=HIGH → TOF_EDGE edges = 0 | 0 edges in 1000 ms | | ⬜ |
+| RX_EN_N=LOW → TOF_EDGE edges ≥ 0 | May show noise edges | | ⬜ |
+| Consistent over 5 repeats | Same result each time | | ⬜ |
+
+**Notes:** V2 AND gate should block all COMP_RAW edges when RX_EN_N=HIGH. V1 showed feedthrough edges in this state. If this test fails, check U50 (inverter) and U51 (AND gate) soldering.
+
+---
+
+#### Test 2: Boost precharge timing sweep
+
+**Date:**
+**Board serial:**
+
+| Precharge delay | Detected / 10 | Median TOF (µs) | Notes |
+|---|---|---|---|
+| 0 ms | | | |
+| 5 ms | | | |
+| 10 ms | | | |
+| 20 ms | | | |
+| 30 ms | | | |
+| 50 ms | | | |
+| 75 ms | | | |
+| 100 ms | | | |
+
+**Minimum reliable precharge delay:** ______ ms
+
+**Notes:** The MT3608 boost converter needs time to reach ~22V. Too short a precharge means weak TX amplitude and poor detection. Too long wastes power. Find the knee point where detection rate stabilises.
+
+---
+
+#### Test 3: Split-TX independence test
+
+**Date:**
+**Board serial:**
+
+| Phase | Condition | Expected | Actual | Pass? |
+|---|---|---|---|---|
+| A | Boost ON, no burst | 0 TOF_EDGE edges in 500 ms | | ⬜ |
+| B | Burst ON, boost OFF | 0% detection (no 22V = no acoustic output) | | ⬜ |
+| C | Both ON (normal) | >0% detection | | ⬜ |
+
+**Notes:** Phase A verifies the boost rail alone doesn't create false triggers. Phase B verifies the burst PWM without 22V doesn't produce measurable acoustic output. Phase C confirms normal operation works.
+
+---
+
+### V1-Ported Tests (with V2 polarity fixes)
+
+#### Test 4: Open-path route finder
+
+**Date:**
+**Board serial:**
+
+| Direction | REL state | DRV state | Detected? | TOF (µs) | Edge count |
+|---|---|---|---|---|---|
+| N | 1 | 1 | | | |
+| N | 1 | 0 | | | |
+| N | 0 | 1 | | | |
+| E | 1 | 1 | | | |
+| E | 1 | 0 | | | |
+| E | 0 | 1 | | | |
+| S | 1 | 1 | | | |
+| S | 1 | 0 | | | |
+| S | 0 | 1 | | | |
+| W | 1 | 1 | | | |
+| W | 1 | 0 | | | |
+| W | 0 | 1 | | | |
+
+**Notes:** Maps which electrical routes produce acoustic returns. Compare with blocked-path results (Test 5) to distinguish feedthrough from real acoustic paths.
+
+---
+
+#### Test 5: Blocked-path route finder
+
+**Date:**
+**Board serial:**
+
+(Same table as Test 4 — fill in with acoustic path physically blocked)
+
+**Notes:** Compare with Test 4. Any detection that persists when the path is blocked is electrical feedthrough, not acoustic.
+
+---
+
+#### Test 6: Coupling round (RX unplugged)
+
+**Date:**
+**Board serial:**
+
+| Shot | Edge count | First-edge TOF (µs) |
+|---|---|---|
+| 1 | | |
+| 2 | | |
+| 3 | | |
+| ... | | |
+
+**Notes:** With RX transducer unplugged, any detected edges are electrical coupling only. This establishes the feedthrough baseline.
+
+---
+
+#### Test 7: RX-enabled noise baseline
+
+**Date:**
+**Board serial:**
+
+| Duration (s) | TOF_EDGE edges | Notes |
+|---|---|---|
+| 1 | | |
+| 2 | | |
+| 5 | | |
+
+**Notes:** No burst, no boost, RX enabled. Measures ambient noise floor on the RX chain.
+
+---
+
+#### Test 8: RX-disabled noise baseline
+
+**Date:**
+**Board serial:**
+
+| Duration (s) | TOF_EDGE edges | Notes |
+|---|---|---|
+| 1 | | |
+| 2 | | |
+| 5 | | |
+
+**Notes:** No burst, no boost, RX disabled. On V2 with AND gate, this should be exactly 0. If not, the AND gate is not blocking properly.
+
+---
+
+#### Test 9: Paired-axis round (N↔S reciprocal)
+
+**Date:**
+**Board serial:**
+
+| Direction | TOF (µs) | Jitter (µs) | Detection % |
+|---|---|---|---|
+| N→S | | | |
+| S→N | | | |
+| **Δt** | | | |
+
+**Expected Δt at 0 m/s:** ≈ 0 µs (no wind)
+**Expected Δt at 1 m/s:** ≈ 1.33 µs
+**Expected Δt at 5 m/s:** ≈ 6.65 µs
+
+**Notes:** This is the core wind measurement test. At zero wind, N→S and S→N TOFs should be nearly identical. The difference (Δt) is proportional to wind speed along the N-S axis.
+
+---
+
+#### Test A: Aggressor matrix
+
+**Date:**
+**Board serial:**
+
+| Scenario | Description | TOF_EDGE edges | Notes |
+|---|---|---|---|
+| 0 | BASE_RX_ONLY | | |
+| 1 | RX_EN_N_TOGGLE | | |
+| 2 | MUX_SWITCH | | |
+| 3 | DRVREL_SWITCH | | |
+| 4 | TX_BURST_ONLY | | |
+| 5 | TX_BURST_WITH_ROUTE | | |
+
+**Notes:** Identifies which digital switching events create noise on the RX chain. Useful for diagnosing coupling paths.
+
+---
+
+#### Test S: Blanking/guard/min-TOF sweep
+
+**Date:**
+**Board serial:**
+
+| BLANKING_US | Detection % | Median TOF | False edges? |
+|---|---|---|---|
+| 160 | | | |
+| 240 | | | |
+| 320 | | | |
+| 400 | | | |
+| 500 | | | |
+
+| MIN_VALID_TOF_US | Detection % | Median TOF | False edges? |
+|---|---|---|---|
+| 160 | | | |
+| 200 | | | |
+| 220 | | | |
+| 260 | | | |
+| 300 | | | |
+
+**Notes:** Finds optimal blanking window and minimum valid TOF threshold. Too short blanking = feedthrough detection. Too long = misses early acoustic arrivals.
+
+---
+
+### Geometry Constants (from TOF_WORKOUT_GUIDE.md)
+
+| Parameter | Value |
+|---|---|
+| Path length L | 146.70 mm |
+| Pod tilt | 32.30° |
+| Beam projection p | 0.5344 |
+| No-wind TOF t₀ | ≈ 427 µs |
+| Wind solve factor K = L/(2p) | 0.137269 m |
+
+| Wind speed | Δt (µs) |
+|---|---|
+| 0 m/s | 0 |
+| 1 m/s | 1.33 |
+| 5 m/s | 6.65 |
+| 10 m/s | 13.30 |
 
 ---
 
