@@ -1,0 +1,1 @@
+See `firmware/nodes/bringup_v2/NODE_V2_BRINGUP_RESULTS.md`.
