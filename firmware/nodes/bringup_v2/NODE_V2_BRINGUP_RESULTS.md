@@ -24,11 +24,13 @@
 - Ultrasonic TOF pipeline functional: 10/10 detection with boost + burst (Phase C)
 - MT3608 22V boost converter causes ESP32 brownout on battery power (4.1V) when enabled from cold start
 - MT3608 output voltage fluctuates 14-20V with no load (possible burst-mode regulation issue)
+- MT3608 inductor (SMMS0420-220M, 22µH, 1.5A saturation) is likely the primary root cause — inductor saturates at MT3608's 2A switch current limit, causing VSYS collapse, 3V3_SYS ripple, and EN_22 oscillation
+- U49 inverter bypass (R173 removed, GPIO5→EN_22 direct) did NOT fix the problem — 3V3_SYS ripple feeds through GPIO5 output, creating the same feedback loop
 - Off-state leakage: pending DMM measurement
 
 **Open issues (ultrasonic):**
-1. MT3608 brownout on cold enable — ESP32 POWERON_RESET when boost enabled from ~0V output cap on battery power. Deep-sleep workaround works but is clunky. Needs hardware or firmware design decision for production.
-2. MT3608 output regulation — 22V rail fluctuates 14-20V with no load. May be normal pulse-skip behavior, or may indicate feedback divider / minimum load issue. Needs investigation with load applied and/or scope.
+1. **MT3608 inductor saturation** — SMMS0420-220M (22µH, 1.5A Isat) saturates at the MT3608's 2A switch current limit. This is the primary root cause of brownout, 22V regulation instability, and 3V3_SYS ripple. Inductor must be replaced with ≥2.5A saturation part (e.g., Würth 7440455220, TDK SLC7649, Sunlord SWPA4018S). V1 did not exhibit this problem because the TX enable diode was reversed, so the boost converter was never properly enabled.
+2. **EN_22 feedback loop** — Even with U49 inverter bypassed (GPIO5→EN_22 direct), 3V3_SYS ripple couples through GPIO5's output level back to EN_22, creating the same oscillation. Fix requires either: (a) Schottky diode + 10µF cap on EN_22 to isolate GPIO5 from EN_22, or (b) sufficient input capacitance to prevent VSYS/3V3_SYS dips, or (c) inductor replacement to eliminate the root cause of the dips.
 3. Phase B (burst without boost) shows 10/10 detection even after 100 drain bursts — 22V cap may not be discharging through driver circuit as expected, or electrical coupling is creating false detections. Test 6 (coupling round with RX unplugged) needed to distinguish.
 4. Production ultrasonic firmware stub has no 22V boost control — brownout issue must be solved before real driver is written.
 
@@ -235,6 +237,8 @@
 
 **Notes:** Split TX control works, inverter logic correct
 
+**Hardware mod (2026-06-03):** R173 (1kΩ between U49 output and EN_22) removed. GPIO5 connected directly to EN_22 via bodge wire. 10µF cap on EN_22 to GND retained. This bypasses the U49 inverter entirely. Logic is now inverted: GPIO5 HIGH = boost ON, GPIO5 LOW = boost OFF. **This mod did NOT fix the 22V regulation problem** — 3V3_SYS ripple still couples through GPIO5's output level to EN_22, causing the same feedback loop. The root cause is the inductor saturating and causing VSYS/3V3_SYS dips.
+
 ---
 
 ### Step 9 — RX enable gate (NEW)
@@ -384,6 +388,8 @@
 
 **Notes:** MUST UPDATE sketch for V2 pins: add TX_22V_EN_N=5, change RX_EN to RX_EN_N=4 (active-low), add AND-gate awareness.
 
+**Hardware mod (2026-06-03):** U49 inverter bypassed (R173 removed, GPIO5→EN_22 direct). Boost logic inverted: GPIO5 HIGH = boost ON. Inductor identified as primary root cause of brownout and regulation issues — SMMS0420-220M saturates at 1.5A, below MT3608's 2A switch limit. V1 never had this problem because the TX enable diode was reversed, so the boost was never properly enabled.
+
 ---
 
 ### Step 17 — WiFi integrity
@@ -467,7 +473,7 @@
 | `bringup_run_kill_switch.cpp` | RUN/KILL toggle, monitor VSYS | PWR_HOLD=23, VSYS | High |
 | `bringup_off_current.cpp` | Quiescent current in KILL state | BAT_ADC=35, VSYS | Medium |
 | `bringup_analog_chain_dc.cpp` | VREF, RX_AMP, COMP_RAW DC levels | VREF, RX_AMP, COMP_RAW | Medium |
-| `bringup_reed_wind.cpp` | Reed-switch edge count on GPIO4 (shares RX_EN_N via solder jumper) | REED_SIG=GPIO4 | Low |
+| `bringup_reed_wind.cpp` | Reed-switch edge count on GPIO4 (WH-SP-WS01 cup anemometer via J52 AUX WIND) | REED_SIG=GPIO4 | In Progress |
 
 ---
 
@@ -572,12 +578,16 @@ This is a separate sketch from the main-systems bringup because the ultrasonic s
 - Software soft-start attempts (1ms, 500µs, 200µs, 100µs pulses) all failed — even 100µs pulses cause brownout after ~40 pulses as the cap charges and inrush increases
 - Deep-sleep workaround (ESP32 sleeps 2-3s, MT3608 gets all battery current) works but causes serial disconnect
 - Accept-brownout + RTC-flag auto-resume also works but adds ~5s reboot time
-- This is a hardware limitation that needs a design decision for production firmware
+- This is a hardware limitation that needs a design decision for production
+
+**Update (2026-06-03):** Root cause identified as inductor saturation. The SMMS0420-220M (22µH, 1.5A Isat) saturates at the MT3608's 2A switch current limit. When the inductor saturates: (1) it loses inductance and becomes a wire, (2) current spikes uncontrollably, (3) VSYS collapses, (4) 3V3_SYS collapses through the LDO, (5) ESP32 browns out. This also explains the 22V regulation instability — saturated inductor can't maintain proper boost regulation. V1 did not exhibit this problem because the TX enable diode was reversed, so the boost converter was never properly enabled.
 
 **MT3608 regulation issue:**
 - With boost continuously enabled and no load, 22V_SYS fluctuates between 14-20V on DMM
 - Likely cause: MT3608 pulse-skip / burst mode with no minimum load
 - Needs investigation: (a) add 10kΩ minimum load across 22V_SYS, (b) check feedback divider values on schematic, (c) measure with scope to distinguish ripple from burst-mode oscillation
+
+**Update (2026-06-03):** The 14-20V fluctuation persists even with U49 inverter bypassed (GPIO5→EN_22 direct). EN_22 and 3V3_SYS both fluctuate because the saturated inductor causes VSYS dips that propagate through the entire power chain. Replacing the inductor with a ≥2.5A saturation part is expected to resolve both the brownout and regulation issues.
 
 ---
 
@@ -726,6 +736,43 @@ This is a separate sketch from the main-systems bringup because the ultrasonic s
 
 ---
 
+#### Test R: AUX WIND Reed-Switch Anemometer (WH-SP-WS01)
+
+**Date:**
+**Board serial:**
+**PlatformIO env:** `esp32wroom-v2-reed-wind`
+**Anemometer:** WH-SP-WS01 cup anemometer (reed switch, 2-wire, 1 pulse/rev)
+
+**Hardware setup:**
+- Close solder jumper on J52 AUX WIND to connect REED_SIG to GPIO4
+- Connect WH-SP-WS01 to J52: Pin 1=GND, Pin 2=REED_SIG (signal), Pin 3=3V3_SYS (not used for 2-wire)
+- GPIO4 pull-up serves as reed pull-up (reuses RX_EN_N pull-up)
+- TX_22V_EN_N (GPIO5) held HIGH (boost OFF), TX_BURST_PWM (GPIO25) held LOW (no burst)
+
+**Calibration formula:** V = 0.085 × f + 0.1 (m/s, f in Hz)
+
+| Check | Expected | Actual | Pass? |
+|---|---|---|---|
+| Solder jumper closed | REED_SIG connected to GPIO4 | | ⬜ |
+| Reed edges detected | Falling-edge count increments when anemometer rotates | | ⬜ |
+| No false edges | Edge count is 0 when anemometer is still | | ⬜ |
+| Frequency vs wind speed | Reported speed matches handheld anemometer within ±20% | | ⬜ |
+| Continuous mode | Serial output updates every 1 second | | ⬜ |
+| Timed sample | 5-second sample produces stable frequency reading | | ⬜ |
+
+| Measurement | Value |
+|---|---|
+| Zero-wind edge rate (edges/sec) | |
+| Zero-wind reported speed (m/s) | |
+| Low wind speed (m/s) | |
+| Moderate wind speed (m/s) | |
+| Maximum observed frequency (Hz) | |
+| Battery voltage (V) | |
+
+**Notes:** WH-SP-WS01 is a reed-switch cup anemometer with ~0.5-0.8 m/s starting threshold. Two-wire connection: signal to REED_SIG, ground to GND. The 3V3_SYS pin on J52 is available for anemometers that need power but is not used by the WH-SP-WS01.
+
+---
+
 ### Geometry Constants (from TOF_WORKOUT_GUIDE.md)
 
 | Parameter | Value |
@@ -758,3 +805,49 @@ This is a separate sketch from the main-systems bringup because the ultrasonic s
 5. **Off-state leakage** — No bringup sketch exists yet. A DMM procedure is the minimum requirement. A sketch that logs BAT_ADC while entering deep sleep would be useful but is not blocking.
 
 6. **V2 bring-up sheet** — Checklist §7 calls for a formal test-point-to-expected-voltage mapping. This document partially addresses it with the Test Point Reference table in Section 2. A complete mapping should be validated against the V2 schematic.
+7. **Inductor replacement** — The SMMS0420-220M (22µH, 1.5A Isat) must be replaced with a ≥2.5A saturation part. This is the primary root cause of brownout, regulation instability, and EN_22 oscillation. V1 did not exhibit this problem because the TX enable diode was reversed, so the boost converter was never properly enabled.
+
+---
+
+## 7. Hardware Modifications
+
+### Mod 1: U49 Inverter Bypass (2026-06-03)
+
+**Status:** Applied, but did NOT fix the problem
+
+| Change | Details |
+|---|---|
+| R173 removed | 1kΩ resistor between U49 output and EN_22 |
+| GPIO5→EN_22 bodge wire | GPIO5 connected directly to EN_22 pad |
+| 10µF cap on EN_22 | Retained from previous debug attempt |
+| Logic inversion | GPIO5 HIGH = boost ON (was: GPIO5 LOW = boost ON via inverter) |
+
+**Rationale:** U49 inverter (SN74LVC1G04DRLR) was oscillating because MT3608 switching noise coupled into 3V3_SYS, which powers U49. Bypassing U49 eliminates the inverter oscillation path.
+
+**Result:** 22V_SYS still fluctuates 14-20V. EN_22 still fluctuates because GPIO5's output level tracks 3V3_SYS, which dips when the inductor saturates. The feedback loop persists through a different path (GPIO5 → EN_22 instead of U49 → EN_22).
+
+**Root cause identified:** The SMMS0420-220M inductor (22µH, 1.5A Isat) saturates at the MT3608's 2A switch current limit. Inductor saturation causes VSYS collapse → 3V3_SYS ripple → EN_22 instability → MT3608 regulation failure. This is the primary root cause of ALL observed issues (brownout, regulation instability, overheating).
+
+### Proposed Mod 2: Inductor Replacement
+
+**Status:** Not yet applied
+
+| Change | Details |
+|---|---|
+| Replace L4 (22V boost inductor) | SMMS0420-220M → 22µH, ≥2.5A Isat part |
+| Candidate parts | Würth 7440455220 (2.8A), TDK SLC7649 (3A), Sunlord SWPA4018S (2.6A) |
+| Minimum Isat | 2.5A (MT3608 switch limit is 2A, need margin) |
+
+**Rationale:** The current inductor saturates at 1.5A, below the MT3608's 2A switch current limit. A 2.5A+ saturation inductor should eliminate VSYS collapse, 3V3_SYS ripple, and EN_22 instability.
+
+### Proposed Mod 3: Schottky Diode Isolation on EN_22
+
+**Status:** Not yet applied
+
+| Change | Details |
+|---|---|
+| Schottky diode (BAT54 or 1N5817) | Anode on GPIO5, cathode on EN_22 |
+| 100kΩ pulldown on EN_22 | EN_22 to GND, for turn-off |
+| 10µF cap on EN_22 | Retained (already on board) |
+
+**Rationale:** Breaks the feedback loop by isolating EN_22 from GPIO5 voltage dips. When 3V3_SYS dips, the diode becomes reverse-biased and the 10µF cap holds EN_22 HIGH. This is a defense-in-depth measure even after inductor replacement.
