@@ -11,8 +11,8 @@
 
 ## Summary
 
-**Date:** 2026-06-02  
-**Overall status:** Main systems PASS. Ultrasonic partially tested — AND-gate blanking PASS, ultrasonic pipeline functional, MT3608 brownout and regulation issues open.  
+**Date:** 2026-06-04  
+**Overall status:** Main systems PASS. Ultrasonic partially tested — AND-gate blanking PASS, ultrasonic pipeline functional, MT3608 22V boost blocked by inductor saturation issue. AUX WIND reed input PASS.  
 **Key findings:**
 - V2 board boots and runs production sensor-node firmware correctly
 - All I2C devices detected and functional (mux, SHT40, AS7343, ADS1015, DS3231)
@@ -22,17 +22,42 @@
 - Full wake → collect → store → sync cycle working with mothership
 - LEDs function correctly
 - Ultrasonic TOF pipeline functional: 10/10 detection with boost + burst (Phase C)
-- MT3608 22V boost converter causes ESP32 brownout on battery power (4.1V) when enabled from cold start
-- MT3608 output voltage fluctuates 14-20V with no load (possible burst-mode regulation issue)
-- MT3608 inductor (SMMS0420-220M, 22µH, 1.5A saturation) is likely the primary root cause — inductor saturates at MT3608's 2A switch current limit, causing VSYS collapse, 3V3_SYS ripple, and EN_22 oscillation
+- WH-SP-WS01 reed anemometer on J52 AUX WIND input: working, edges detected 1-43 Hz, zero false edges, calibration formula V=0.085×f+0.1 produces reasonable values
+- MT3608 22V boost converter blocked by inductor saturation — SMMS0420-220M (22µH, 1.5A Isat) saturates at MT3608's 2A switch current limit
 - U49 inverter bypass (R173 removed, GPIO5→EN_22 direct) did NOT fix the problem — 3V3_SYS ripple feeds through GPIO5 output, creating the same feedback loop
 - Off-state leakage: pending DMM measurement
 
-**Open issues (ultrasonic):**
-1. **MT3608 inductor saturation** — SMMS0420-220M (22µH, 1.5A Isat) saturates at the MT3608's 2A switch current limit. This is the primary root cause of brownout, 22V regulation instability, and 3V3_SYS ripple. Inductor must be replaced with ≥2.5A saturation part (e.g., Würth 7440455220, TDK SLC7649, Sunlord SWPA4018S). V1 did not exhibit this problem because the TX enable diode was reversed, so the boost converter was never properly enabled.
-2. **EN_22 feedback loop** — Even with U49 inverter bypassed (GPIO5→EN_22 direct), 3V3_SYS ripple couples through GPIO5's output level back to EN_22, creating the same oscillation. Fix requires either: (a) Schottky diode + 10µF cap on EN_22 to isolate GPIO5 from EN_22, or (b) sufficient input capacitance to prevent VSYS/3V3_SYS dips, or (c) inductor replacement to eliminate the root cause of the dips.
-3. Phase B (burst without boost) shows 10/10 detection even after 100 drain bursts — 22V cap may not be discharging through driver circuit as expected, or electrical coupling is creating false detections. Test 6 (coupling round with RX unplugged) needed to distinguish.
-4. Production ultrasonic firmware stub has no 22V boost control — brownout issue must be solved before real driver is written.
+**Bringup status by subsystem:**
+| Subsystem | Status | Notes |
+|---|---|---|
+| Boot / serial | ✅ PASS | Clean boot, no issues |
+| I2C bus | ✅ PASS | All devices detected |
+| I2C mux + sensors | ✅ PASS | SHT40, AS7343, ADS1015 via mux |
+| Battery ADC | ✅ PASS | 47k/47k divider, calibrated |
+| PWR_HOLD / RUN-KILL | ✅ PASS | Latch and switch working |
+| TX PWM gate | ✅ PASS | Burst PWM path functional |
+| TX 22V enable | ✅ PASS | Inverter logic correct (before bypass) |
+| RX enable gate | ✅ PASS | AND-gate blanking verified |
+| ADS1015 analog | ✅ PASS | ADC functional |
+| ADS1015 soil | ✅ PASS | Soil probes reading |
+| SHT40 + AS7343 | ✅ PASS | Both sensors via mux |
+| DS3231 RTC alarm | ✅ PASS | Alarm triggers, wake/sleep working |
+| RUN/KILL switch | ✅ PASS | VSYS on/off, KILL overrides PWR_HOLD |
+| WiFi | ✅ PASS | Connects, RSSI good |
+| ESP-NOW TX/RX | ✅ PASS | Packets sent and received |
+| Mock mothership sync | ✅ PASS | Full sync cycle working |
+| Ultrasonic AND-gate | ✅ PASS | Zero feedthrough when RX disabled |
+| Ultrasonic TOF pipeline | ✅ PASS | 10/10 detection with boost + burst |
+| Ultrasonic 22V boost | ❌ BLOCKED | Inductor saturation — needs ≥2.5A Isat replacement |
+| AUX WIND reed input | ✅ PASS | WH-SP-WS01 working, 1-43 Hz, zero false edges |
+| Off-state leakage | ⬜ PENDING | Needs DMM measurement |
+
+**Open issues:**
+1. **MT3608 inductor saturation** — SMMS0420-220M (22µH, 1.5A Isat) saturates at the MT3608's 2A switch current limit. This is the primary root cause of brownout, 22V regulation instability, and 3V3_SYS ripple. Inductor must be replaced with ≥2.5A saturation part. V1 did not exhibit this problem because the TX enable diode was reversed, so the boost converter was never properly enabled. See `docs/MT3608_BROWNOUT_DESIGN_NOTE.md` for V3 hardware recommendations.
+2. **EN_22 feedback loop** — Even with U49 inverter bypassed (GPIO5→EN_22 direct), 3V3_SYS ripple couples through GPIO5's output level back to EN_22. Fix requires Schottky diode isolation on EN_22 or inductor replacement. See V3 recommendations R2 and R3 in the design note.
+3. **Remaining ultrasonic tests** (4, 5, 6, 7, 9, A, S) require a stable 22V rail, which is blocked by the inductor issue. These can be completed after inductor replacement.
+4. **Off-state leakage** — Needs DMM measurement in KILL state.
+5. **WH-SP-WS01 calibration verification** — Pending comparison with reference anemometer.
 
 ---
 
@@ -473,7 +498,7 @@
 | `bringup_run_kill_switch.cpp` | RUN/KILL toggle, monitor VSYS | PWR_HOLD=23, VSYS | High |
 | `bringup_off_current.cpp` | Quiescent current in KILL state | BAT_ADC=35, VSYS | Medium |
 | `bringup_analog_chain_dc.cpp` | VREF, RX_AMP, COMP_RAW DC levels | VREF, RX_AMP, COMP_RAW | Medium |
-| `bringup_reed_wind.cpp` | Reed-switch edge count on GPIO4 (WH-SP-WS01 cup anemometer via J52 AUX WIND) | REED_SIG=GPIO4 | In Progress |
+| `bringup_reed_wind.cpp` | Reed-switch edge count on GPIO4 (WH-SP-WS01 cup anemometer via J52 AUX WIND) | REED_SIG=GPIO4 | ✅ (partial — timed sample pending) |
 
 ---
 
@@ -738,7 +763,7 @@ This is a separate sketch from the main-systems bringup because the ultrasonic s
 
 #### Test R: AUX WIND Reed-Switch Anemometer (WH-SP-WS01)
 
-**Date:**
+**Date:** 2026-06-04
 **Board serial:**
 **PlatformIO env:** `esp32wroom-v2-reed-wind`
 **Anemometer:** WH-SP-WS01 cup anemometer (reed switch, 2-wire, 1 pulse/rev)
@@ -753,23 +778,23 @@ This is a separate sketch from the main-systems bringup because the ultrasonic s
 
 | Check | Expected | Actual | Pass? |
 |---|---|---|---|
-| Solder jumper closed | REED_SIG connected to GPIO4 | | ⬜ |
-| Reed edges detected | Falling-edge count increments when anemometer rotates | | ⬜ |
-| No false edges | Edge count is 0 when anemometer is still | | ⬜ |
-| Frequency vs wind speed | Reported speed matches handheld anemometer within ±20% | | ⬜ |
-| Continuous mode | Serial output updates every 1 second | | ⬜ |
-| Timed sample | 5-second sample produces stable frequency reading | | ⬜ |
+| Solder jumper closed | REED_SIG connected to GPIO4 | Initially open — bad solder joint on J52 through-hole pins. Re-soldered and confirmed connection. | ✅ |
+| Reed edges detected | Falling-edge count increments when anemometer rotates | Edges detected at 1-43 Hz range, clean 1:1 mapping | ✅ |
+| No false edges | Edge count is 0 when anemometer is still | 0 edges when still, no false triggers | ✅ |
+| Frequency vs wind speed | Reported speed matches handheld anemometer within ±20% | Calibration formula V=0.085×f+0.1 produces reasonable values (0.19-3.76 m/s for 1-43 Hz). Pending comparison with reference anemometer. | ⬜ |
+| Continuous mode | Serial output updates every 1 second | Updates every 1 second, clean output | ✅ |
+| Timed sample | 5-second sample produces stable frequency reading | Not yet tested | ⬜ |
 
 | Measurement | Value |
 |---|---|
-| Zero-wind edge rate (edges/sec) | |
-| Zero-wind reported speed (m/s) | |
-| Low wind speed (m/s) | |
-| Moderate wind speed (m/s) | |
-| Maximum observed frequency (Hz) | |
-| Battery voltage (V) | |
+| Zero-wind edge rate (edges/sec) | 0 (no false edges when still) |
+| Zero-wind reported speed (m/s) | 0.10 (offset only) |
+| Low wind speed (m/s) | 0.19-0.44 m/s (1-4 Hz) |
+| Moderate wind speed (m/s) | 0.52-1.03 m/s (5-11 Hz) |
+| Maximum observed frequency (Hz) | 43 Hz (hand-spun) = 3.76 m/s |
+| Battery voltage (V) | (not measured during this test) |
 
-**Notes:** WH-SP-WS01 is a reed-switch cup anemometer with ~0.5-0.8 m/s starting threshold. Two-wire connection: signal to REED_SIG, ground to GND. The 3V3_SYS pin on J52 is available for anemometers that need power but is not used by the WH-SP-WS01.
+**Notes:** WH-SP-WS01 is a reed-switch cup anemometer with ~0.5-0.8 m/s starting threshold. Two-wire connection: signal to REED_SIG, ground to GND. The 3V3_SYS pin on J52 is available for anemometers that need power but is not used by the WH-SP-WS01. Initial bringup successful. Signal path confirmed: WH-SP-WS01 → J52 Pin2 → solder jumper → GPIO4. Bad solder joint on J52 through-hole pins was the initial issue — re-soldered and working. Debounce at 5ms working correctly, no false edges when still. Calibration formula V=0.085×f+0.1 produces reasonable values for desk testing. Pending: comparison with reference anemometer for calibration verification, timed sample test.
 
 ---
 

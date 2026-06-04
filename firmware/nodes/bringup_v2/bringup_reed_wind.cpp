@@ -25,7 +25,7 @@
  *   reed pull-up. GPIO4 is pulled HIGH by default and pulled LOW
  *   when the reed switch closes.
  *
- * Polarity: Falling edge = reed switch closes (magnet passes).
+ * Polarity: Falling edge = reed switch closes (magnet passes).d
  *   One falling edge per revolution.
  *
  * Safety constraints (reed mode):
@@ -266,8 +266,10 @@ static void timedSample(unsigned long seconds) {
 static void gpioDiagnostic() {
   Serial.println("GPIO Diagnostic — reading GPIO4 state every 100ms.");
   Serial.println("  Watch for state changes when you spin the anemometer.");
-  Serial.println("  If state never changes, the solder jumper is likely OPEN.");
+  Serial.println("  If state never changes, the signal may not be reaching GPIO4.");
+  Serial.println("  Try shorting J52 Pin2 (REED_SIG) to J52 Pin1 (GND).");
   Serial.println("  Press any key to stop.");
+  Serial.printf("  Initial GPIO4 state: %d (expect 1=HIGH)\n", digitalRead(REED_SIG_PIN));
   Serial.println();
   Serial.println("  Time(ms)   GPIO4   Edges");
   Serial.println("  --------   -----   ------");
@@ -313,7 +315,11 @@ void setup() {
   digitalWrite(TX_BURST_PWM_PIN, LOW);    // LOW = no burst
 
   // Configure reed input with interrupt
-  pinMode(REED_SIG_PIN, INPUT);
+  // Use INPUT_PULLUP to ensure a defined HIGH state even if the external
+  // pull-up is weak or disconnected. The 15k external pull-up on RX_EN_N
+  // provides the primary pull-up; the internal ~45k pull-up adds redundancy.
+  // The WH-SP-WS01 reed switch pulls LOW when closed.
+  pinMode(REED_SIG_PIN, INPUT_PULLUP);
   attachInterrupt(digitalPinToInterrupt(REED_SIG_PIN), onReedFalling, FALLING);
 
   Serial.println();
