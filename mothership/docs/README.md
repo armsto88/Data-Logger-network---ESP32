@@ -1,6 +1,6 @@
 # Mothership Documentation
 
-Design notes and review documents for the ESP32-S3 mothership hub.
+Design notes and review documents for the ESP32-WROOM mothership hub.
 
 ## PCB and Power
 

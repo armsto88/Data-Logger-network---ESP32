@@ -7,11 +7,11 @@ An **ESP-NOW**�based environmental sensor network: field-deployed nodes collec
 ## Repository Structure
 
 ```
-mothership/           Mothership hub (ESP32-S3)
+mothership/           Mothership hub (ESP32-WROOM)
   docs/                 Power, wake, LTE, PCB design notes
   firmware/src/         Production firmware (main, BLE, ESP-NOW, SD, RTC)
 
-node/                 Sensor nodes (ESP32-C3 Mini)
+node/                 Sensor nodes (ESP32-WROOM)
   docs/                 Hardware, sensors, ultrasonic design notes
   firmware/
     src/                Production firmware (main, drivers, sensors, storage, RTC)
@@ -45,23 +45,28 @@ CONTRIBUTING.md      Repo organization and contribution rules
 
 ## System Overview
 
-### Mothership (ESP32-S3)
+### Mothership (ESP32-WROOM)
 
 - Runs a Wi-Fi access point with a web UI dashboard
 - Receives sensor data from nodes via ESP-NOW
 - Logs all data to CSV on a microSD card
 - Keeps time via a DS3231 RTC (the network time authority)
 - Manages node discovery, pairing, deployment, and scheduling
-- Power-gated design: RTC alarm or config button wakes the board; ESP32 latches power via `PWR_HOLD`
-- Optional LTE backhaul (A7670G) for scheduled cloud upload
+- Power-gated design: DS3231 alarm or config button wakes the board; ESP32 latches power via `PWR_HOLD`
+- Two power domains: `KEEP_ALIVE` (always-on, RTC + config latch) and `3V3_SYS` (switched, ESP32 + SD + logic)
+- Optional LTE backhaul via SIMCom A7670G modem (UART2 + level shifters)
+- CH340C USB-UART for programming and serial console
 
-### Sensor Nodes (ESP32-C3 Mini)
+### Sensor Nodes (ESP32-WROOM)
 
 - Sleep between measurement intervals (DS3231 Alarm 1 + FET power gate)
-- Measure temperature, soil moisture, and other environmental variables
+- Environmental sensors: SHT40 (temp/humidity), AS7343 (light spectrum), ADS1015 (soil probes)
+- Ultrasonic anemometer subsystem: 40 kHz transducers, MT3608 22 V boost, TC4427 driver, TLV9062IDR RX amplifier
+- I2C sensor mux via PCA9548A
 - Transmit readings to the mothership via ESP-NOW
 - Automatically request time sync when needed
 - Resume operation after power cuts (NVS state + RTC coin cell)
+- RUN/KILL hard switch for full power cut
 
 ### Communication
 
@@ -79,12 +84,13 @@ The root `platformio.ini` defines all build targets. Build from the repo root:
 # Mothership
 pio run -e esp32s3
 
-# Node sensor firmware
-pio run -e sensor-node
+# Node main systems bring-up
+pio run -e esp32wroom-v2-main-systems
 
 # Individual bring-up tests
 pio run -e esp32wroom-i2c-scan
 pio run -e esp32wroom-ds3231-alarm-10s
+pio run -e esp32wroom-sht40-as7343-mux
 # ... see platformio.ini for all environments
 ```
 

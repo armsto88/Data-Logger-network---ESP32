@@ -1,6 +1,6 @@
 # Node Documentation
 
-Design notes, hardware checklists, and sensor implementation docs for the ESP32-C3 sensor nodes.
+Design notes, hardware checklists, and sensor implementation docs for the ESP32-WROOM sensor nodes.
 
 ## Hardware
 
