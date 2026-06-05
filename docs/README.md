@@ -9,21 +9,21 @@ This folder contains shared/cross-system project notes. Mothership-specific and 
 
 - The active repo-scoped VS Code/Copilot agent stack lives under `.github/`.
 - The intended user-facing entrypoint is `orchestrator`.
-- See `.github/README.md` for the active workflow index.
 - See `legacy-agent-workflow/README.md` for the archived older Positron-era reference files.
 
 ## Shared Project Docs
 
-- [concept_overview.md](concept_overview.md)
-- [FutureRoadMap.md](FutureRoadMap.md)
-- [FIRMWARE_AND_HARDWARE_NOTES.md](FIRMWARE_AND_HARDWARE_NOTES.md)
-- [FIRMWARE_FUNCTIONALITY_FOR_ECOLOGISTS.md](FIRMWARE_FUNCTIONALITY_FOR_ECOLOGISTS.md)
-- [NATIVE_APP_INTEGRATION_V2.md](NATIVE_APP_INTEGRATION_V2.md)
-- [NATIVE_APP_INTEGRATION_STATUS_2026-04-13.md](NATIVE_APP_INTEGRATION_STATUS_2026-04-13.md)
-- [NATIVE_APP_FULL_CONCEPT_AND_SCHEMAS.md](NATIVE_APP_FULL_CONCEPT_AND_SCHEMAS.md)
-- [MULTI_NODE_VALIDATION_2026-05-05.md](MULTI_NODE_VALIDATION_2026-05-05.md)
-- [SONNET_HANDOFF_NODE_COMM_WORKFLOW.md](SONNET_HANDOFF_NODE_COMM_WORKFLOW.md)
-- [PHASE_C_APP_INTEGRATION_CHECKLIST.md](PHASE_C_APP_INTEGRATION_CHECKLIST.md)
+- [concept_overview.md](concept_overview.md) — system architecture and ESP-NOW messaging
+- [FutureRoadMap.md](FutureRoadMap.md) — project roadmap
+- [FIRMWARE_AND_HARDWARE_NOTES.md](FIRMWARE_AND_HARDWARE_NOTES.md) — integration notes
+- [FIRMWARE_FUNCTIONALITY_FOR_ECOLOGISTS.md](FIRMWARE_FUNCTIONALITY_FOR_ECOLOGISTS.md) — non-technical firmware overview
+- [NATIVE_APP_INTEGRATION_V2.md](NATIVE_APP_INTEGRATION_V2.md) — app integration and data schemas
+- [NATIVE_APP_INTEGRATION_STATUS_2026-04-13.md](NATIVE_APP_INTEGRATION_STATUS_2026-04-13.md) — app integration status
+- [NATIVE_APP_FULL_CONCEPT_AND_SCHEMAS.md](NATIVE_APP_FULL_CONCEPT_AND_SCHEMAS.md) — full app concept and data schemas
+- [MULTI_NODE_VALIDATION_2026-05-05.md](MULTI_NODE_VALIDATION_2026-05-05.md) — deployment validation
+- [SONNET_HANDOFF_NODE_COMM_WORKFLOW.md](SONNET_HANDOFF_NODE_COMM_WORKFLOW.md) — node communication workflow
+- [PHASE_C_APP_INTEGRATION_CHECKLIST.md](PHASE_C_APP_INTEGRATION_CHECKLIST.md) — app integration checklist
+- [AGENT_MODEL_SETUP.md](AGENT_MODEL_SETUP.md) — AI model routing setup
 
 ## Topic Folders
 

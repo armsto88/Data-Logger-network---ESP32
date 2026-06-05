@@ -9,23 +9,22 @@ Shared interfaces are in `../shared/` (for example `protocol.h` and `sensors.h`)
 
 ## Build Target
 
-- Project file: `firmware/nodes/sensor-node/platformio.ini`
-- Environment: `esp32wroom`
-- Board: `esp32dev`
+- Project file: `platformio.ini` (repo root)
+- Environment: `esp32wroom-v2-main-systems`
+- Board: `esp32dev` (ESP32-WROOM)
 
 ## Build From Repo Root
 
 ```powershell
-& "$env:USERPROFILE\.platformio\penv\Scripts\platformio.exe" run -d .\firmware\nodes\sensor-node -e esp32wroom
+pio run -e esp32wroom-v2-main-systems
 ```
 
-## Upload + Monitor
+## Individual Bring-up Tests
 
-`firmware/nodes/sensor-node/platformio.ini` currently pins:
-- `upload_port = COM3`
-- `monitor_port = COM3`
+See `platformio.ini` for all `esp32wroom-*` environments. Common ones:
 
 ```powershell
-& "$env:USERPROFILE\.platformio\penv\Scripts\platformio.exe" run -d .\firmware\nodes\sensor-node -e esp32wroom -t upload
-& "$env:USERPROFILE\.platformio\penv\Scripts\platformio.exe" device monitor -d .\firmware\nodes\sensor-node -e esp32wroom
+pio run -e esp32wroom-i2c-scan
+pio run -e esp32wroom-ds3231-alarm-10s
+pio run -e esp32wroom-sht40-as7343-mux
 ```

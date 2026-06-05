@@ -14,6 +14,8 @@ This structure keeps transport, persistence, and timing concerns separated.
 - Environment: `esp32s3`
 - Board: `esp32-s3-devkitc-1`
 
+> **Note:** The env name and board definition reference the ESP32-S3, but the production PCB uses an ESP32-WROOM module. The S3 board definition is used for development/testing; the pin allocation in the design notes targets ESP32-WROOM.
+
 ## Build From Repo Root
 
 ```powershell

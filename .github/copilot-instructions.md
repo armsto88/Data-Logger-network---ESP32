@@ -9,7 +9,6 @@
 - `node/` contains node firmware, tests, shared headers, and design docs.
 - `docs/` contains shared/cross-system design notes, roadmap, and workflow docs.
 - `hardware/` contains PCB, CAD, and simulation assets.
-- `include/` contains shared headers (if used).
 
 ## Working Conventions
 - Put new mothership-specific design notes in `mothership/docs/`.

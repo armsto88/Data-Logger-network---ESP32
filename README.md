@@ -14,7 +14,7 @@ mothership/           Mothership hub (ESP32-WROOM)
 node/                 Sensor nodes (ESP32-WROOM)
   docs/                 Hardware, sensors, ultrasonic design notes
   firmware/
-    src/                Production firmware (main, drivers, sensors, storage, RTC)
+    src/                Production firmware (main, drivers, sensors, storage, time)
     shared/             Shared protocol headers (protocol.h, sensors.h)
     tests/              Bring-up and validation sketches
 
