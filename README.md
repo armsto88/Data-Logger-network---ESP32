@@ -1,6 +1,6 @@
-# ESP32 Sensor Network – Mothership + Nodes
+# ESP32 Sensor Network ï¿½ Mothership + Nodes
 
-An **ESP-NOW**–based environmental sensor network: field-deployed nodes collect data, a mothership hub aggregates and logs it, and an optional LTE backhaul uploads to the cloud.
+An **ESP-NOW**ï¿½based environmental sensor network: field-deployed nodes collect data, a mothership hub aggregates and logs it, and an optional LTE backhaul uploads to the cloud.
 
 ---
 
@@ -102,13 +102,3 @@ pio run -e esp32wroom-ds3231-alarm-10s
 | Local Storage Contract | [node/docs/NODE-LOCAL-STORAGE-CONTRACT-V1.md](node/docs/NODE-LOCAL-STORAGE-CONTRACT-V1.md) | Queue storage and data format specification |
 | Concept Overview | [docs/concept_overview.md](docs/concept_overview.md) | High-level system architecture |
 
----
-
-## AI Workflow
-
-The repo uses VS Code Copilot agents for structured development:
-
-- **Entrypoint:** `orchestrator` — breaks work into steps, delegates to specialist agents
-- **Flow:** orchestrator -> Planner -> Explore Repo / Implement Change / Review Changes
-- **Config:** `.github/` contains agent definitions and domain skills
-- **Archived:** `docs/legacy-agent-workflow/` has older Positron-era reference files
