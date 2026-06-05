@@ -13,8 +13,8 @@ Scope: Replace web-first operations with native app operations while keeping web
 ## 2. Current Workflow Baseline (Web)
 
 Current runtime and routes are implemented in:
-- firmware/mothership/src/main.cpp
-- firmware/mothership/src/comms/espnow_manager.cpp
+- mothership/firmware/src/main.cpp
+- mothership/firmware/src/comms/espnow_manager.cpp
 
 Current web capabilities include:
 - Dashboard and device status
@@ -61,7 +61,7 @@ This allows both web and app to call the same internal operations.
 ### 4.1 Dashboard
 
 Web source:
-- handleRoot in firmware/mothership/src/main.cpp
+- handleRoot in mothership/firmware/src/main.cpp
 
 Native app equivalents:
 - Mothership summary card
@@ -227,8 +227,8 @@ App can be considered parity-ready when it can:
 ## 10. Implementation References
 
 Current web and command flow references:
-- firmware/mothership/src/main.cpp
-- firmware/mothership/src/comms/espnow_manager.cpp
-- firmware/nodes/shared/protocol.h
+- mothership/firmware/src/main.cpp
+- mothership/firmware/src/comms/espnow_manager.cpp
+- node/firmware/shared/protocol.h
 
 This document is a V2 planning artifact and should be updated as command schemas and app screens are finalized.

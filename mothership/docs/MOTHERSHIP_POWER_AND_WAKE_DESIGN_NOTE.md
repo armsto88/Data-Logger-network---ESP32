@@ -1,12 +1,12 @@
-# Mothership V2 Power And Wake Design Note
+# Mothership Power And Wake Design Note
 
-This note defines the intended mothership V2 power and wake architecture for PCB design.
+This note defines the intended mothership power and wake architecture for PCB design.
 
-It is written for the next PCB pass, not as a claim that the breadboard or current firmware already implements all of this behavior.
+It is written for the PCB design, not as a claim that the breadboard or current firmware already implements all of this behavior.
 
-**V1 schematic review:** See `MOTHERSHIP_V1_PCB_REVIEW_INPUT_POWER_CONFIG_LATCH.md` for the
-reviewed schematic sections and `MOTHERSHIP_V1_V2_RECONCILIATION.md` for a cross-reference
-between V1 schematic signal names and this design note.
+**PCB schematic review:** See `MOTHERSHIP_PCB_SCHEMATIC_REVIEW_2026-06-05.md` for the
+reviewed schematic sections and `MOTHERSHIP_PCB_SCHEMATIC_RECONCILIATION.md` for a cross-reference
+between schematic signal names and this design note.
 
 ## 1. Purpose
 
@@ -27,13 +27,13 @@ What it does not yet have as a complete hardware system is:
 
 The purpose of this note is to define that missing hardware architecture before PCB layout is finalized.
 
-Related V2 feature-planning note:
+Related feature-planning note:
 
-- For the proposed LTE backhaul subsystem using `SIMCom A7670G`, see `MOTHERSHIP_V2_LTE_BACKHAUL_CONCEPT.md`.
+- For the LTE backhaul subsystem using `SIMCom A7670G`, see `MOTHERSHIP_LTE_BACKHAUL_CONCEPT.md`.
 
 ## 2. Design Intent
 
-The mothership V2 should behave as a power-gated field hub rather than an always-on Wi-Fi device.
+The mothership should behave as a power-gated field hub rather than an always-on Wi-Fi device.
 
 Target behavior:
 
@@ -173,7 +173,7 @@ Important behavioral note:
 
 ## 5. Recommended Signal List
 
-The following named signals are recommended for the mothership V2 schematic.
+The following named signals are recommended for the mothership schematic.
 
 - `RAW_BAT` or equivalent unswitched input supply
 - `VSYS_SW` or equivalent switched main system rail
@@ -186,18 +186,18 @@ The following named signals are recommended for the mothership V2 schematic.
 
 If the design uses active-low naming, keep it consistent. The most important thing is to make OFF-default and wake-source polarity obvious on the schematic.
 
-### 5.0.1 V1 Schematic Signal Name Mapping
+### 5.0.1 Schematic Signal Name Mapping
 
-The V1 PCB schematic uses some different signal names from this design note.
+The PCB schematic uses some different signal names from this design note.
 The following table reconciles the two naming schemes. Where they differ,
-the V1 schematic name should be treated as an alias for the design-intent name.
+the schematic name should be treated as an alias for the design-intent name.
 
-| V1 Schematic Name | Design Note Name | Notes |
+| Schematic Name | Design Note Name | Notes |
 |---|---|---|
 | `LOGIC` | `WAKE_START` | Combined wake/hold node |
 | `INT_RTC` | `RTC_INT_N` | DS3231 alarm output (active-low) |
 | `VBUS_USB` | `USB_FORCE_ON` | USB presence wake path |
-| `FORCE_POWER` | (new) | Manual service/debug override; not in original V2 list |
+| `FORCE_POWER` | (new) | Manual service/debug override; not in original design note list |
 | `CONFIG_SET_N` | (new) | Config latch preset line; add to signal list |
 | `CONFIG_CLEAR_N` | (new) | Config latch clear line (active-low net side) |
 | `VSYS` | `VSYS_SW` | Switched system rail |
@@ -206,9 +206,9 @@ the V1 schematic name should be treated as an alias for the design-intent name.
 | `BAT_BUS` | (new) | Pre-fuse battery bus |
 | `RAW_BAT` | (new) | Post-fuse battery rail |
 
-### 5.0.2 V1 Schematic Component Additions
+### 5.0.2 Schematic Component Additions
 
-The V1 schematic introduces hardware not previously documented in this design note:
+The schematic introduces hardware not previously documented in this design note:
 
 | Ref | Part | Purpose |
 |---|---|---|
@@ -220,9 +220,9 @@ The V1 schematic introduces hardware not previously documented in this design no
 | D1 | Schottky diode | Isolates `CONFIG_SET_N` from `WAKE_START`; anode to `WAKE_START`, cathode to `CONFIG_SET_N` |
 | R12 | 100 Ω | Gate current-limiting resistor in main switch control path |
 
-### 5.0.3 V1 Schematic Regulator and SD Additions
+### 5.0.3 Schematic Regulator and SD Additions
 
-The V1 schematic specifies regulators and the SD card reader not previously
+The schematic specifies regulators and the SD card reader not previously
 documented at the component level in this design note:
 
 | Ref | Part | Purpose |
@@ -236,9 +236,9 @@ documented at the component level in this design note:
 | CH340C | USB-to-UART bridge for programming and serial debug |
 | SD socket | microSD | SPI SD card reader on GPIO18/19/23/13 |
 
-### 5.0.4 V1 Schematic USB / CH340C / ADC Additions
+### 5.0.4 Schematic USB / CH340C / ADC Additions
 
-The V1 schematic specifies the USB programming interface and ADC filter not
+The schematic specifies the USB programming interface and ADC filter not
 previously documented at the component level in this design note:
 
 | Ref | Part | Purpose |
@@ -282,7 +282,7 @@ Regulator capacitor summary:
 
 ## 5.1 Current Working Pin Allocation (Schematic Target)
 
-The current mothership V2 PCB direction uses the following WROOM-native pin allocation as the working schematic target.
+The current mothership PCB direction uses the following WROOM-native pin allocation as the working schematic target.
 
 This table is a build-reference allocation, not a claim that all behaviors are bench-validated yet.
 
@@ -308,7 +308,7 @@ This table is a build-reference allocation, not a claim that all behaviors are b
 
 ## 5.2 Reserved/Avoided ESP32 Pins
 
-Keep the following pins reserved or avoided in mothership V2 unless a deliberate, reviewed exception is documented.
+Keep the following pins reserved or avoided in the mothership unless a deliberate, reviewed exception is documented.
 
 | GPIO | Status | Reason |
 |---:|---|---|
@@ -354,7 +354,7 @@ Reason:
 - it should not remain powered while the board is hard-off between wake windows
 - this avoids unnecessary standby current and simplifies full-off behavior
 
-## 5.4.1 SD Card Pin Mapping (Confirmed from V1 Schematic)
+## 5.4.1 SD Card Pin Mapping (Confirmed from Schematic Review)
 
 | SD function | Net | ESP32 GPIO | Notes |
 |---|---|---:|---|
@@ -365,7 +365,7 @@ Reason:
 
 SD card powered from `3V3_SYS` with local 100 nF + 10 µF decoupling.
 
-## 5.4.2 Solar Charging (Confirmed from V1 Schematic)
+## 5.4.2 Solar Charging (Confirmed from Schematic Review)
 
 The mothership uses a CN3163 solar Li-ion charger.
 
@@ -397,7 +397,7 @@ Design rules:
 
 ## 5.5 LTE Modem Subsystem Summary
 
-Current subsystem direction for mothership V2:
+Current subsystem direction for the mothership:
 
 - Selected modem: `SIMCom A7670G`
 - System workflow extension: existing ESP-NOW ingest to SD logging path is extended with scheduled, power-gated LTE upload windows
@@ -573,7 +573,7 @@ This path should not be treated as a config wake unless the logic explicitly cho
 
 ## 8. Recommended User-Interaction Model
 
-For V2, keep the user interaction model simple.
+For the PCB, keep the user interaction model simple.
 
 Recommended behavior:
 
@@ -636,7 +636,7 @@ This flow should be treated as design intent until validated during bring-up.
 
 ## 10. PCB Design Requirements
 
-The mothership V2 PCB should explicitly support the following.
+The mothership PCB should explicitly support the following.
 
 ### 10.1 Power-gate requirements
 
@@ -769,7 +769,7 @@ Those should be chosen during schematic capture, PCB review, and later bench val
 
 ## 14. Bottom Line
 
-The mothership V2 should not be designed as an always-on Wi-Fi device with an RTC attached. It should be designed as a power-gated hub with three explicit wake sources:
+The mothership should not be designed as an always-on Wi-Fi device with an RTC attached. It should be designed as a power-gated hub with three explicit wake sources:
 
 - RTC alarm for scheduled sync operation
 - user button for manual UI access

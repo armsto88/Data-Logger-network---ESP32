@@ -2,11 +2,11 @@
 
 ## Repository layout
 
-- `firmware/mothership/src/` - mothership firmware source
-- `firmware/nodes/` - sensor node firmware projects and bring-up scripts
+- `mothership/` - mothership firmware source and docs
+- `node/` - sensor node firmware, tests, and docs
 - `include/` - shared headers for mothership firmware
 - `hardware/` - PCB, CAD, and simulation assets
-- `docs/` - high-level design, roadmap, and debug notes
+- `docs/` - shared/cross-system design, roadmap, and debug notes
 - `data/` - collected or example datasets
 
 ## Organization rules

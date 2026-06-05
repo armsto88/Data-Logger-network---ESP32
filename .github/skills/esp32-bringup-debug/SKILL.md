@@ -14,8 +14,8 @@ argument-hint: 'Describe the bring-up symptom, board area, or boot/debug issue'
 
 ## Repo Context
 - Consolidated bring-up and validation history lives in `docs/FIRMWARE_AND_HARDWARE_NOTES.md`.
-- Mothership power and RTC wake assumptions live in `docs/MOTHERSHIP_V2_POWER_AND_WAKE_DESIGN_NOTE.md`.
-- Node bring-up targets live in `firmware/nodes/bringup/`.
+- Mothership power and RTC wake assumptions live in `mothership/docs/MOTHERSHIP_POWER_AND_WAKE_DESIGN_NOTE.md`.
+- Node bring-up targets live in `node/firmware/tests/`.
 
 ## Procedure
 1. Start from the concrete failing surface:

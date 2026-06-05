@@ -5,14 +5,16 @@
 - Keep repo-specific behavior here; do not add a root `AGENTS.md` alongside this file.
 
 ## Layout
-- `firmware/mothership/src/` contains mothership firmware.
-- `firmware/nodes/` contains node firmware projects and bring-up targets.
-- `docs/` contains design notes, roadmap items, workflow notes, and hardware planning docs.
+- `mothership/` contains mothership firmware source and design docs.
+- `node/` contains node firmware, tests, shared headers, and design docs.
+- `docs/` contains shared/cross-system design notes, roadmap, and workflow docs.
 - `hardware/` contains PCB, CAD, and simulation assets.
-- `include/` contains shared headers.
+- `include/` contains shared headers (if used).
 
 ## Working Conventions
-- Put new general markdown design notes in `docs/` unless they are tightly coupled to a hardware asset folder.
+- Put new mothership-specific design notes in `mothership/docs/`.
+- Put new node-specific design notes in `node/docs/`.
+- Put new shared/cross-system design notes in `docs/` unless they are tightly coupled to a hardware asset folder.
 - Preserve the repo's existing documentation tone: separate confirmed decisions from open questions and proposed work.
 - Prefer small, focused updates over broad rewrites.
 - Do not create duplicate planning docs when an existing mothership or node design note already owns the topic.
@@ -23,8 +25,8 @@
 - If a change affects workflow or repo structure, update documentation accordingly.
 
 ## Common Repo Tasks
-- Mothership work usually touches `docs/`, `firmware/mothership/src/`, and shared scheduling or storage notes.
-- Node hardware work usually touches `docs/NODE_*`, `docs/FIRMWARE_AND_HARDWARE_NOTES.md`, and `hardware/` assets.
+- Mothership work usually touches `mothership/docs/`, `mothership/firmware/src/`, and shared scheduling or storage notes.
+- Node hardware work usually touches `node/docs/`, `node/firmware/`, and `hardware/` assets.
 - PCB and enclosure planning should keep manufacturability, serviceability, and field power constraints explicit.
 
 ## References

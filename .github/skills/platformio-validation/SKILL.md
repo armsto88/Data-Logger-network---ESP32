@@ -14,14 +14,14 @@ argument-hint: 'Describe the firmware area or target environment to validate'
 
 ## Repo Context
 - `platformio.ini` at repo root contains shared or top-level environments.
-- `firmware/nodes/sensor-node/platformio.ini` may contain node-specific target setup.
-- `firmware/nodes/bringup/` contains narrow bring-up firmware used for bench validation.
+- `node/firmware/platformio.ini` may contain node-specific target setup.
+- `node/firmware/tests/` contains narrow bring-up firmware used for bench validation.
 
 ## Procedure
 1. Identify the touched slice:
-   - `firmware/mothership/src/` -> prefer a mothership-scoped build
-   - `firmware/nodes/sensor-node/src/` -> prefer the sensor-node environment
-   - `firmware/nodes/bringup/` -> prefer the specific bring-up environment
+   - `mothership/firmware/src/` -> prefer a mothership-scoped build
+   - `node/firmware/src/` -> prefer the sensor-node environment
+   - `node/firmware/tests/` -> prefer the specific bring-up environment
 2. Run the narrowest build that can falsify the change.
 3. If the first narrow build passes but the change touches shared headers, consider one adjacent build only if justified.
 4. Report the exact environment built and whether validation was build-only or also behavior-scoped.

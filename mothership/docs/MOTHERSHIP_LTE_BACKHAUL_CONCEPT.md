@@ -1,6 +1,6 @@
-# Mothership V2 LTE Backhaul Concept
+# Mothership LTE Backhaul Concept
 
-This note documents a proposed LTE backhaul subsystem for mothership V2.
+This note documents the LTE backhaul subsystem for the mothership.
 
 It is a planning and PCB-review document, not a claim that the modem, power rail, antenna path, or firmware upload workflow has already been validated on hardware.
 
@@ -24,7 +24,7 @@ Important boundary:
 
 Confirmed project direction for this note:
 
-- treat LTE as an optional proposed mothership V2 subsystem
+- treat LTE as an optional mothership subsystem
 - keep SD card logging as the primary local record
 - separate confirmed current workflow from unvalidated LTE design work
 
@@ -81,7 +81,7 @@ Design intent:
 
 ## 5. Proposed Hardware Integration
 
-Document the LTE subsystem as a distinct mothership V2 hardware block:
+Document the LTE subsystem as a distinct mothership hardware block:
 
 `ESP32-WROOM mothership -> UART2 through level shifters -> A7670G modem -> SIM holder -> u.FL/IPEX antenna connector -> internal flexible LTE antenna or external antenna option`
 
@@ -112,7 +112,7 @@ Key design rules:
 | `PWRKEY` control | `GPIO14` | drives NMOS pull-down stage |
 | `STATUS` input | `GPIO4` | reads modem `STATUS` through level shifting |
 
-Pin allocation note: this mapping follows the current working allocation in `MOTHERSHIP_V2_POWER_AND_WAKE_DESIGN_NOTE.md`, where `GPIO34` remains reserved for battery ADC sense (`BATTERY_VSENSE`) and is not reused for modem regulator power-good.
+Pin allocation note: this mapping follows the current working allocation in `MOTHERSHIP_POWER_AND_WAKE_DESIGN_NOTE.md`, where `GPIO34` remains reserved for battery ADC sense (`BATTERY_VSENSE`) and is not reused for modem regulator power-good.
 
 `GPIO4` is acceptable for modem `STATUS` because the modem rail is intended to default `OFF` during ESP32 boot, so the status source should remain inactive until the rail is explicitly enabled.
 
@@ -185,7 +185,7 @@ Candidate parts currently being considered:
 - feedback values: `Rtop 680k`, `Rbottom 100k`
 - output target: `3.9 V` modem rail
 
-**V1 schematic review confirmation (2026-06-05):**
+**PCB schematic review confirmation (2026-06-05):**
 
 - Feedback divider confirmed: `680 kΩ / 100 kΩ` gives ~3.9 V output
 - `PG` and `PS/SYNC` are **not** tied together — earlier screenshot review was misleading due to route proximity
@@ -253,7 +253,7 @@ Treat the following as a proposed firmware control sequence for implementation p
 
 Recommended interpretation:
 
-- the combined rail-enable plus `PWRKEY` model should be the default implementation direction for mothership V2
+- the combined rail-enable plus `PWRKEY` model should be the default implementation direction for the mothership
 - the state machine should explicitly separate rail presence, modem boot confirmation, network readiness, transport readiness, and active transfer
 - recovery should be able to branch either to a graceful retry path or to forced rail removal if the modem does not respond coherently
 
@@ -293,7 +293,7 @@ Current SIM-holder plan:
 - `100 nF` on `USIM1_VDD`
 - `ESDA6V1W5`, `LCSC C48677`, shunt protection close to the holder on `VDD`, `DATA`, `CLK`, and `RST`
 
-**V1 schematic review additions (2026-06-05):**
+**PCB schematic review additions (2026-06-05):**
 
 - SIM series resistors should be placed **near the modem SIM pins**, not near the SIM socket
   - Rationale: modem is the driving source for SIM_CLK, SIM_RST, SIM_DATA; resistors damp edges at the source
@@ -595,7 +595,7 @@ Recommended validation order:
 
 ## 13. Bottom Line
 
-The `SIMCom A7670G` is a plausible mothership V2 LTE backhaul candidate for scheduled remote upload, but it should be treated as a distinct, high-current, still-unvalidated subsystem.
+The `SIMCom A7670G` is a plausible mothership LTE backhaul candidate for scheduled remote upload, but it should be treated as a distinct, high-current, still-unvalidated subsystem.
 
 The safest architectural direction is:
 

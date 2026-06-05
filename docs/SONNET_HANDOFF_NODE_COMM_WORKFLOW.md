@@ -133,13 +133,13 @@ Benefits:
 ## 9) Concrete Code Areas To Inspect
 
 Mothership:
-- firmware/mothership/src/comms/espnow_manager.cpp
-- firmware/mothership/src/comms/espnow_manager.h
-- firmware/mothership/src/main.cpp
+- mothership/firmware/src/comms/espnow_manager.cpp
+- mothership/firmware/src/comms/espnow_manager.h
+- mothership/firmware/src/main.cpp
 
 Node:
-- firmware/nodes/sensor-node/src/main.cpp
-- firmware/nodes/shared/protocol.h
+- node/firmware/src/main.cpp
+- node/firmware/shared/protocol.h
 
 ## 10) Sonnet Task Prompt (copy/paste)
 

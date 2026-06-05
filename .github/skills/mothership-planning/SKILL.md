@@ -1,13 +1,13 @@
 ---
 name: mothership-planning
-description: 'Use for mothership V2 planning tasks: power and wake architecture, enclosure fit, LTE backhaul notes, PCB feature proposals, design-note updates, and separating confirmed decisions from open questions.'
+description: 'Use for mothership planning tasks: power and wake architecture, enclosure fit, LTE backhaul notes, PCB feature proposals, design-note updates, and separating confirmed decisions from open questions.'
 argument-hint: 'Describe the mothership planning or documentation task'
 ---
 
 # Mothership Planning
 
 ## When to Use
-- Updating mothership V2 design notes
+- Updating mothership design notes
 - Adding new proposed mothership subsystems such as LTE, power, wake, storage, or enclosure changes
 - Turning rough hardware ideas into structured repo documentation
 - Comparing confirmed current behavior against proposed future behavior
