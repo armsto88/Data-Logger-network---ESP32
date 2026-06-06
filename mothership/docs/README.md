@@ -12,3 +12,4 @@ Design notes and review documents for the ESP32-WROOM mothership hub.
 ## LTE Backhaul
 
 - [MOTHERSHIP_LTE_BACKHAUL_CONCEPT.md](MOTHERSHIP_LTE_BACKHAUL_CONCEPT.md) — LTE modem integration and backhaul strategy
+- [MOTHERSHIP_A7670G_MODEM_BRINGUP_NOTES.md](MOTHERSHIP_A7670G_MODEM_BRINGUP_NOTES.md) — A7670G hardware bring-up: power, PWRKEY, UART level shifting, SIM, RF, ESD, firmware checklist

@@ -17,7 +17,7 @@
 | `VOLT` | `BATTERY_VSENSE` | Battery voltage divider midpoint |
 | `BAT_BUS` | — | Pre-fuse battery/solar bus |
 | `RAW_BAT` | — | Post-fuse protected battery rail |
-| `FORCE_POWER` | — | Manual service/debug override |
+| `FORCE_POWER` | — | **Removed from design.** SW10 + USB covers service/debug; no separate FORCE_POWER switch needed |
 | `CONFIG_SET_N` | — | Config latch preset (active low) |
 | `CONFIG_CLEAR_N` | — | Config latch clear (active low) |
 | `VBUS_USB` | `USB_FORCE_ON` | USB service wake/power rail |
@@ -95,12 +95,12 @@ The shared control node is `LOGIC`. Wake sources:
 | `INT_RTC` | RTC scheduled wake |
 | `PWR_HOLD` | ESP32 firmware hold (GPIO26) |
 | `VBUS_USB` | USB/service wake |
-| `FORCE_POWER` | Manual service override |
+| `FORCE_POWER` | **Removed** — SW10 + USB covers this use case |
 | `CONFIG button via D1` | Config-mode wake |
 
 `PWR_HOLD` must be asserted very early in firmware boot.
 
-`FORCE_POWER` pulls `LOGIC` active but does **not** set the config latch — correct for service/debug without triggering config mode.
+> **Design decision (2026-06-05):** FORCE_POWER (SW11) has been removed. SW10 + USB (VBUS_USB) covers the service/debug use case. The config button provides the momentary wake trigger for user interaction.
 
 ---
 
@@ -469,6 +469,6 @@ if (configWake) {
 - [ ] Solar input connector polarity and silkscreen confirmed
 - [ ] SW9 does not leave main FET gate floating when open
 - [ ] `VBUS_USB` path does not charge or backfeed the battery
-- [ ] `FORCE_POWER` does not connect to `CONFIG_SET_N`
+- [x] ~~`FORCE_POWER` does not connect to `CONFIG_SET_N`~~ — FORCE_POWER removed from design (SW11 removed)
 - [ ] ADC calibration in firmware matches actual divider resistor values
 - [ ] ADC trace routed away from noisy switching nodes

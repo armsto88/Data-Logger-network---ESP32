@@ -27,7 +27,7 @@ and firmware development.
 | `CONFIG_CLEAR_PIN` | `CONFIG_CLEAR_PIN` | ✅ Matches (GPIO25). |
 | `PWR_HOLD` | `PWR_HOLD` | ✅ Matches (GPIO26). |
 | `VBUS_USB` | `USB_FORCE_ON` | The design note §3.1 uses `USB_FORCE_ON`. The schematic uses `VBUS_USB`. These may be different signals — see §2 below. |
-| `FORCE_POWER` | (not in design note) | New signal — the design note mentions "force power" conceptually but doesn't name a discrete signal. The schematic introduces `FORCE_POWER` as a separate service/debug override. |
+| `FORCE_POWER` | (removed) | **Removed from design (2026-06-05).** SW10 + USB (VBUS_USB) covers the service/debug use case. No separate FORCE_POWER switch is needed. |
 
 ---
 
@@ -41,20 +41,17 @@ sources that can pull `LOGIC` active.
 
 - Is `VBUS_USB` literally the USB VBUS rail (5 V from USB connector)?
 - Or is it a derived signal (e.g., VBUS through a voltage divider or comparator)?
-- Does `VBUS_USB` serve **both** wake and power purposes, or is there a separate
-  `FORCE_POWER` signal for the service/debug override?
+- ~~Does `VBUS_USB` serve **both** wake and power purposes, or is there a separate `FORCE_POWER` signal for the service/debug override?~~ **Resolved:** FORCE_POWER removed; VBUS_USB is the sole service/debug wake path.
 
 The design note separates these into two concepts:
 1. `USB_FORCE_ON` — automatic wake when USB is plugged in
-2. A separate force-on path for service/debug
+2. ~~A separate force-on path for service/debug~~ **Removed (2026-06-05):** SW11 (FORCE_POWER) has been removed from the design. SW10 + USB covers the service/debug use case.
 
-The schematic lists both `VBUS_USB` and `FORCE_POWER` as separate sources
-on the `LOGIC` node, which aligns with the design intent. But the naming
-discrepancy should be resolved.
+The schematic previously listed both `VBUS_USB` and `FORCE_POWER` as separate sources
+on the `LOGIC` node. With FORCE_POWER removed, only `VBUS_USB` serves the service path.
 
-**Recommendation:** Use `VBUS_USB` for the raw USB presence detect and
-`FORCE_POWER` for the manual service override. Update the design note to include
-both signal names.
+**Recommendation:** Use `VBUS_USB` for the USB presence detect / service wake path.
+`FORCE_POWER` should be removed from the schematic (SW11 removed).
 
 ---
 
@@ -168,7 +165,7 @@ before the PCB order:
    `RAW_BAT` for main switch).
 
 2. **D1 orientation** — anode to `LOGIC`, cathode to `CONFIG_SET_N`. If
-   reversed, RTC/PWR_HOLD/FORCE_POWER wake events would falsely set the
+   reversed, RTC/PWR_HOLD/VBUS_USB wake events would falsely set the
    config latch.
 
 3. **Q41/Q42 2N7002 pin mapping** — SOT-23 pinout varies between manufacturers.
@@ -185,8 +182,7 @@ before the PCB order:
 6. **R12 = 100 Ω** — confirm this is intentional (current-limiting in the
    gate control path) and not a placeholder.
 
-7. **`VBUS_USB` vs `FORCE_POWER`** — confirm these are separate signals
-   on the `LOGIC` node and that `VBUS_USB` does not backfeed the battery.
+7. **`VBUS_USB`** — confirm `VBUS_USB` does not backfeed the battery and that it is the sole service/debug wake path (FORCE_POWER/SW11 removed from design).
 
 8. **`/Q` output of U52** — confirm it's left unconnected or on a test pad
    only, not driving any other circuit.
@@ -215,7 +211,7 @@ before the PCB order:
 - [ ] `BAT_BUS` and `RAW_BAT` rail definitions
 - [ ] Reconcile `VSYS` vs `VSYS_SW` naming
 - [ ] Reconcile `3V3_SYS` vs `MAIN_3V3` naming
-- [ ] Add `FORCE_POWER` and `VBUS_USB` signal definitions
+- [x] ~~Add `FORCE_POWER` and `VBUS_USB` signal definitions~~ — FORCE_POWER removed from design; VBUS_USB already defined
 - [ ] Add `CONFIG_SET_N` and `CONFIG_CLEAR_N` net names
 
 ### New from 3V3/KEEP_ALIVE/RTC/SD review
@@ -295,5 +291,4 @@ before the PCB order:
 - [ ] Confirm `PWR_HOLD` (GPIO26) is asserted as first action in `setup()`
 - [ ] Confirm `CONFIG_WAKE_PIN` (GPIO32) read logic: LOW = config wake requested
 - [ ] Confirm `CONFIG_CLEAR_PIN` (GPIO25) pulse sequence: HIGH 20ms, then LOW
-- [ ] Add `FORCE_POWER` and `VBUS_USB` wake-reason detection to firmware if
-      those signals are routed to ESP32 inputs (currently not in pin table)
+- [x] ~~Add `FORCE_POWER` and `VBUS_USB` wake-reason detection to firmware~~ — FORCE_POWER removed; VBUS_USB wake detection already in firmware plan

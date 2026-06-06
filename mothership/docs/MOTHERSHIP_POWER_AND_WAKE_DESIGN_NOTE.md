@@ -40,7 +40,7 @@ Target behavior:
 - The board remains fully off between scheduled sync windows.
 - The DS3231 alarm can wake the mothership for scheduled sync events.
 - A user can press one button to wake the mothership for local UI interaction.
-- USB can optionally force the mothership on for servicing, flashing, and diagnostics.
+- SW10 + USB can force the mothership on for servicing, flashing, and diagnostics (no separate FORCE_POWER switch needed).
 - After boot, the ESP32-WROOM asserts `PWR_HOLD` so the system stays alive long enough to complete its task.
 - When the task is complete, firmware releases `PWR_HOLD` and the system powers fully down.
 
@@ -48,15 +48,15 @@ This matches the existing project direction that field mode should move away fro
 
 ## 3. Recommended High-Level Architecture
 
-Use a hard power-latch architecture with three wake-entry sources.
+Use a hard power-latch architecture with two soft wake-entry sources plus a service path.
 
 ### 3.1 Wake-entry sources
 
 - `RTC_WAKE`: DS3231 `INT/SQW` alarm output
-- `USER_WAKE`: manual momentary button for UI access
-- `USB_FORCE`: optional service/debug force-on path when USB is present
+- `USER_WAKE`: manual momentary button for UI access (config button via SN74LVC2G74 latch)
+- `SW10 + USB`: service/debug path — sliding SW10 to the programming position and connecting USB holds LOGIC high via VBUS_USB
 
-These three sources should be logically ORed into the latch-start path.
+These two soft sources are logically ORed into the latch-start path. SW10 + USB is a separate service path, not a third soft wake source.
 
 ### 3.2 Hold path
 
@@ -89,28 +89,31 @@ It should be interpreted as a master hardware enable.
 
 Expected meaning:
 
-- `SW9 = RUN`: the always-on domain is allowed to exist, so RTC wake, config wake, service-force wake, and `PWR_HOLD` behavior can operate normally
+- `SW9 = RUN`: the always-on domain is allowed to exist, so RTC wake, config wake, SW10+USB service path, and `PWR_HOLD` behavior can operate normally
 - `SW9 = KILL`: the board is intentionally dead; RTC wake, config wake, and normal soft wake behavior are not expected to operate
 
 ### 3.5 Wake Behavior Table
 
 Use the following table as the intended behavior reference for schematic capture and bring-up.
 
-| Condition | SW9 | RTC alarm | Config button | USB / service force | PWR_HOLD | Expected result |
+| Condition | SW9 | RTC alarm | Config button | SW10 + USB | PWR_HOLD | Expected result |
 |---|---|---|---|---|---|---|
-| Storage / hard-off state | KILL | ignored | ignored | optional, only if intentionally routed ahead of SW9 | low | board remains off |
+| Storage / hard-off state | KILL | ignored | ignored | ignored | low | board remains off |
 | Scheduled sync wake | RUN | asserted | not pressed | inactive | low at start, then high after boot | board powers on, firmware identifies RTC wake, performs sync work, re-arms RTC, powers down |
 | Manual UI wake | RUN | inactive | pressed momentarily | inactive | low at start, then high after boot | board powers on, firmware detects config wake, enters AP / UI mode, later powers down on timeout |
-| Service / debug force-on | RUN | inactive or ignored | not pressed | asserted | optional high after boot | board powers on for service, flashing, or diagnostics |
+| Service / debug (SW10 + USB) | RUN | inactive or ignored | not pressed | SW10 slid + USB present | optional high after boot | board powers on for service, flashing, or diagnostics; stays on while USB connected |
 | Normal active runtime | RUN | inactive | not pressed | inactive | high | board stays alive under firmware control |
 | Clean shutdown | RUN | inactive after re-arm | not pressed | inactive | low | main switched rail powers off |
 
 Design interpretation:
 
 - `SW9` is outside the normal wake-reason logic.
-- RTC alarm, config wake, and service-force are the soft wake-entry paths.
+- RTC alarm and config wake are the soft wake-entry paths.
+- SW10 + USB provides the service/debug path (no separate FORCE_POWER switch needed).
 - `PWR_HOLD` is the firmware hold path after boot.
 - The config latch is only for remembering wake reason, not for replacing the main power latch.
+
+> **Design decision (2026-06-05):** SW11 (FORCE_POWER) has been removed from the design. The service/debug use case is fully covered by SW10 + USB (VBUS_USB holds LOGIC high while USB is connected and SW10 is in the programming position). The config button provides the momentary wake trigger for user interaction. This simplifies the LOGIC OR network and removes a redundant wake path.
 
 ## 4. Required Hardware Blocks
 
@@ -197,7 +200,7 @@ the schematic name should be treated as an alias for the design-intent name.
 | `LOGIC` | `WAKE_START` | Combined wake/hold node |
 | `INT_RTC` | `RTC_INT_N` | DS3231 alarm output (active-low) |
 | `VBUS_USB` | `USB_FORCE_ON` | USB presence wake path |
-| `FORCE_POWER` | (new) | Manual service/debug override; not in original design note list |
+| `FORCE_POWER` | (removed) | **Removed from design.** SW10 + VBUS_USB covers the service/debug use case. The config button provides the momentary wake trigger for user interaction. No separate FORCE_POWER switch is needed. |
 | `CONFIG_SET_N` | (new) | Config latch preset line; add to signal list |
 | `CONFIG_CLEAR_N` | (new) | Config latch clear line (active-low net side) |
 | `VSYS` | `VSYS_SW` | Switched system rail |

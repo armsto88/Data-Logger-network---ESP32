@@ -87,6 +87,6 @@ Work through each checkbox on the PCB layout and schematic before submitting the
 - [x] Solar input connector polarity and silkscreen confirmed
 - [x] SW9 does not leave main FET gate floating when open
 - [x] `VBUS_USB` path does not charge or backfeed the battery
-- [x] `FORCE_POWER` does not connect to `CONFIG_SET_N`
+- [x] ~~`FORCE_POWER` does not connect to `CONFIG_SET_N`~~ — FORCE_POWER/SW11 removed from design
 - [x] ADC calibration in firmware matches actual divider resistor values
 - [x] ADC trace routed away from noisy switching nodes
