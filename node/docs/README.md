@@ -7,6 +7,7 @@ Design notes, hardware checklists, and sensor implementation docs for the ESP32-
 - [NODE_HARDWARE_V2_CHECKLIST.md](NODE_HARDWARE_V2_CHECKLIST.md) — V2 hardware bring-up and validation checklist
 - [NODE-PCB-OVERVIEW.md](NODE-PCB-OVERVIEW.md) — node PCB design summary and pin mapping
 - [NODE_V2_BRINGUP_RESULTS.md](NODE_V2_BRINGUP_RESULTS.md) — V2 hardware bring-up test results
+- [NODE_V3_22V_BOOST_UPDATE.md](NODE_V3_22V_BOOST_UPDATE.md) — V3 22 V boost circuit update: inductor upgrade, U49 retained, decoupling improved
 
 ## Storage
 

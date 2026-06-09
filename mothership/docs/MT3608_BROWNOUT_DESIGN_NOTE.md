@@ -1,8 +1,9 @@
 # MT3608 22V Boost Converter — Brownout & Regulation Design Note
 
 **Date:** 2026-06-02  
-**Status:** Open — needs design decision before production ultrasonic firmware  
-**Affected:** Node V2 PCB, all future boards using MT3608 for 22V ultrasonic TX rail
+**Updated:** 2026-06-06 — inductor and input cap replaced  
+**Status:** In progress — hardware fix applied, re-test pending  
+**Affected:** Node V2/V3 PCB, all future boards using MT3608 for 22V ultrasonic TX rail
 
 ---
 
@@ -162,11 +163,13 @@ The transducer only draws current during bursts (~50mA for ~300µs), so the rail
 
 Based on V2 bringup findings, the following changes are recommended for the next PCB revision. Each change is classified as **Required** (must-fix for reliable operation), **Recommended** (defense-in-depth, strongly advised), or **Optional** (nice-to-have for robustness).
 
-### R1. Replace 22V Boost Inductor — **Required**
+### R1. Replace 22V Boost Inductor — **Required** ✅ **APPLIED**
 
 **Problem:** SMMS0420-220M (22µH, 1.5A Isat) saturates at the MT3608's 2A switch current limit, causing VSYS collapse, 3V3_SYS ripple, EN_22 oscillation, brownout, and 22V regulation failure.
 
-**Change:** Replace L4 with a 22µH inductor rated ≥2.5A saturation current. Minimum Isat should be 2.5A; 3A preferred for margin.
+**Change applied (2026-06-06):** Replaced L4 with a 22µH 2.5A I_sat 5.6×5.2mm molded inductor. Also upgraded MT3608 input cap from 22µF to 1210 100µF 6.3V X5R ceramic for improved cold-start energy reserve.
+
+**Status:** Hardware change applied. Re-test needed to confirm brownout is resolved and 22V rail is stable.
 
 | Candidate | Isat | DCR | Size | LCSC | Notes |
 |---|---|---|---|---|---|
@@ -220,13 +223,13 @@ Enable source ──►|── EN_22 ── 10µF ── GND
 
 ---
 
-### R4. Add Input Bulk Capacitance on VSYS — **Recommended**
+### R4. Add Input Bulk Capacitance on VSYS — **Recommended** ✅ **PARTIALLY APPLIED**
 
 **Problem:** The MT3608 draws 1-2A inrush when charging the 22V output cap from 0V. Even with a higher-Isat inductor, the battery's internal resistance can cause VSYS to dip under heavy transient loads.
 
-**Change:** Add a footprint for a 470µF–1000µF electrolytic or polymer capacitor across VSYS/GND, near the MT3608 input. Populate with 470µF as default; can increase to 1000µF if needed.
+**Change applied (2026-06-06):** MT3608 input cap upgraded from 22µF to 1210 100µF 6.3V X5R ceramic. This provides ~5× more local energy storage at the IC pins.
 
-**Why near MT3608:** The input cap must be as close as possible to the MT3608's VIN and GND pins to minimise loop inductance. The current 22µF (C126) + 100nF (C81) are insufficient for the inrush transient.
+**Remaining recommendation:** Consider adding a footprint for a 470µF–1000µF electrolytic or polymer capacitor across VSYS/GND as additional bulk energy storage. The 100µF ceramic is a significant improvement but may still benefit from additional bulk capacitance for cold-start scenarios.
 
 **BOM impact:** +1 electrolytic/polymer cap (470µF, 6.3V or 10V). May need a small layout area increase.
 
@@ -289,6 +292,20 @@ For V2 bringup with the current hardware, the recommended path is:
 5. **Test 22V_SYS stability** after inductor replacement — if stable, proceed with ultrasonic bringup
 
 If inductor replacement alone resolves the brownout and regulation issues, the Schottky diode is still recommended as defense in depth.
+
+## V3 Design Decision (2026-06-09)
+
+**See also:** `node/docs/NODE_V3_22V_BOOST_UPDATE.md` — full V3 22 V boost circuit update note.
+
+After review, the V3 design decision is to **retain U49** rather than remove it. This changes the status of R2 and R3:
+
+- **R2 (Schottky diode isolation on EN_22):** ❌ **Not applied in V3.** Deferred. If EN_22 instability persists after inductor upgrade and U49 decoupling, this can be reconsidered.
+- **R3 (Remove U49 from EN_22 path):** ❌ **Not applied in V3.** U49 is retained because it provides boot-safe behaviour (GPIO5 defaults HIGH at boot → U49 inverts → EN_22 LOW → boost OFF). Removing U49 would require a firmware polarity change and creates a boot-time risk where the boost converter starts immediately.
+- **R6 (U49 decoupling):** ✅ **Applied in V3.** A 1 µF ceramic capacitor has been added on U49 VCC, placed close to the supply pins. This replaces the original R6 recommendation of 100 nF + 1 µF.
+
+The rationale is that the **primary root cause** was inductor saturation (R1), not the U49 feedback loop. The feedback loop was a secondary effect that only manifested because VSYS was already collapsing. By fixing the inductor and adding U49 decoupling, the feedback loop should be eliminated or reduced to negligible levels, without changing the enable logic or firmware polarity.
+
+This approach minimises the number of simultaneous variables changed between V2 and V3.
 
 ## V3 BOM Change Summary
 

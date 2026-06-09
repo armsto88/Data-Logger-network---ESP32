@@ -18,7 +18,7 @@ Working checklist for the next node PCB revision. This combines known V1 bring-u
 - [x] Remove EN/programming capacitor selection pads; fixed `1 uF` retained because flashing and boot behaviour were stable during V1 bring-up.
 - [x] Re-check ESP32 strapping pins so none can float or be driven into invalid states at boot.
 - [x] Keep an emergency programming/debug header on the board: `GND`, `3V3`, `TX`, `RX`, `EN`, `BOOT`.
-- [ ] Review decoupling and local bulk capacitance placement around the ESP32, charger, regulators, RTC, mux, ADC, and ultrasonic power stage.
+- [ ] Review decoupling and local bulk capacitance placement around the ESP32, charger, regulators, RTC, mux, ADC, and ultrasonic power stage. **MT3608 input cap upgraded to 1210 100µF 6.3V + 100 nF ceramic HF decoupling on VSYS; U49 VCC decoupling upgraded with 1 µF ceramic; remaining decoupling review still needed. See `NODE_V3_22V_BOOST_UPDATE.md`.**
 
 ## 2. Power Architecture
 
@@ -26,7 +26,8 @@ Working checklist for the next node PCB revision. This combines known V1 bring-u
 - [ ] Add a true battery isolation method for storage, shipping, and safe servicing.
 - [ ] Treat the isolation switch as a service or storage disconnect, not as the normal user on/off control.
 - [x] Keep the existing main rail structure for the V2 prototype: `3V3_SYS`, `5V_SYS`, and `22V_SYS` all reviewed as acceptable for bring-up.
-- [x] Keep the compact `22 uH` inductor in the 22 V stage for V2 prototype space reasons, with 22 V performance treated as a bring-up validation item.
+- [x] ~~Keep the compact `22 uH` inductor in the 22 V stage for V2 prototype space reasons, with 22 V performance treated as a bring-up validation item.~~ **V3 update:** Replaced SMMS0420-220M (1.5A I_sat) with 22µH ≥2.5A I_sat 5.6×5.2mm molded inductor (LCSC C41406986) to fix saturation brownout. See `NODE_V3_22V_BOOST_UPDATE.md`.
+- [x] Upgrade MT3608 input cap from 22µF to 1210 100µF 6.3V X5R ceramic for improved cold-start energy reserve.
 - [x] Use a RUN/KILL latch-control disconnect slide switch as the current V2 hard-kill approach.
 - [x] Keep the USB service-force path, but place it under RUN/KILL authority so it only works when the node is in RUN.
 - [x] Standardize all four PCB slide switches to the same lower-cost `MST-12D18G2`-style SMD SPDT slide switch family.

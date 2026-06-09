@@ -48,12 +48,12 @@
 | Mock mothership sync | ✅ PASS | Full sync cycle working |
 | Ultrasonic AND-gate | ✅ PASS | Zero feedthrough when RX disabled |
 | Ultrasonic TOF pipeline | ✅ PASS | 10/10 detection with boost + burst |
-| Ultrasonic 22V boost | ❌ BLOCKED | Inductor saturation — needs ≥2.5A Isat replacement |
+| Ultrasonic 22V boost | 🔄 IN PROGRESS | Inductor replaced with 22µH 2.5A I_sat 5.6×5.2mm molded part; MT3608 input cap upgraded to 1210 100µF 6.3V X5R; re-test pending |
 | AUX WIND reed input | ✅ PASS | WH-SP-WS01 working, 1-43 Hz, zero false edges |
 | Off-state leakage | ⬜ PENDING | Needs DMM measurement |
 
 **Open issues:**
-1. **MT3608 inductor saturation** — SMMS0420-220M (22µH, 1.5A Isat) saturates at the MT3608's 2A switch current limit. This is the primary root cause of brownout, 22V regulation instability, and 3V3_SYS ripple. Inductor must be replaced with ≥2.5A saturation part. V1 did not exhibit this problem because the TX enable diode was reversed, so the boost converter was never properly enabled. See `docs/MT3608_BROWNOUT_DESIGN_NOTE.md` for V3 hardware recommendations.
+1. **MT3608 inductor saturation** — ~~SMMS0420-220M (22µH, 1.5A Isat) saturates at the MT3608's 2A switch current limit.~~ **V3 fix applied:** Replaced with 22µH 2.5A I_sat 5.6×5.2mm molded inductor. MT3608 input cap also upgraded from 22µF to 1210 100µF 6.3V X5R ceramic. Re-test needed to confirm brownout is resolved and 22V rail is stable.
 2. **EN_22 feedback loop** — Even with U49 inverter bypassed (GPIO5→EN_22 direct), 3V3_SYS ripple couples through GPIO5's output level back to EN_22. Fix requires Schottky diode isolation on EN_22 or inductor replacement. See V3 recommendations R2 and R3 in the design note.
 3. **Remaining ultrasonic tests** (4, 5, 6, 7, 9, A, S) require a stable 22V rail, which is blocked by the inductor issue. These can be completed after inductor replacement.
 4. **Off-state leakage** — Needs DMM measurement in KILL state.
