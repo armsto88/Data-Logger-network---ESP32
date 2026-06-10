@@ -143,6 +143,113 @@ Reason:
 
 If `EN_22` still glitches during testing, an EN_22 hold/filter capacitor can be reconsidered later.
 
+### 6. 22V_SYS Bleed / Minimum Load Resistor Not Added — ❌ NOT ADDED
+
+A permanent 22V_SYS bleed/minimum-load resistor (R5 in the MT3608 design note) has **not** been added to V3.
+
+Reason:
+
+- The 22 V rail is only required during ultrasonic measurement windows. Adding a permanent bleed load would waste power whenever the 22 V boost is enabled.
+- The upgraded L4 inductor and improved MT3608 input capacitance should be tested first before adding a minimum-load component.
+- If light-load regulation remains unstable, a temporary 22 kΩ or 10 kΩ resistor can be bodged from 22V_SYS to GND during bring-up to test whether a minimum load improves stability.
+
+**Important:** The ultrasonic transducer should not be used as a direct DC load on 22V_SYS. It should remain driven only through the intended TX driver/burst circuit. The transducer is primarily a piezo/capacitive load and only loads the 22 V rail meaningfully during TX bursts, not as a steady idle load.
+
+Status:
+
+- R_22V_BLEED not added for V3.
+- Reconsider only if bring-up shows 22V_SYS instability at idle or during measurement startup.
+
+### 7. Comparator Supply Filtering Applied — ✅ APPLIED
+
+The comparator 3.3 V supply has been locally filtered to reduce TX-induced supply noise reaching the comparator.
+
+**Applied change:**
+- Added 4.7 Ω series resistor between 3V3_SYS and the comparator VCC supply node
+- Added local 100 nF decoupling capacitor on the comparator side of the resistor
+- Added local 1 µF ceramic capacitor on the comparator side of the resistor
+- The filtered comparator supply node should be treated as a local clean supply island: **3V3_COMP**
+
+**Purpose:**
+- Reduce fast 3V3_SYS disturbances caused by TX burst / 22 V boost activity
+- Improve comparator supply stability
+- Reduce false COMP_RAW transitions caused by supply noise
+
+| Property | Value |
+|---|---|
+| Series resistor | 4.7 Ω (0402 or 0603) |
+| Decoupling cap (HF) | 100 nF ceramic ≥6.3 V (0402 or 0603) |
+| Decoupling cap (bulk) | 1 µF ceramic ≥6.3 V (0402 or 0603) |
+| Filtered supply net | 3V3_COMP |
+| Source supply | 3V3_SYS through 4.7 Ω resistor |
+
+**Layout requirements:**
+- 100 nF and 1 µF capacitors must be placed close to comparator VCC/GND pins
+- The capacitors must be on the comparator side of the 4.7 Ω resistor
+- No noisy digital loads should be connected to the filtered comparator supply node (3V3_COMP)
+
+**Bring-up check:**
+Probe 3V3_SYS, 3V3_COMP, COMP_RAW, and TOF_EDGE during TX burst and RX blanking tests.
+
+### 8. TLV9062 RX Amplifier Supply Filtering Applied — ✅ APPLIED
+
+Added local supply filtering for the TLV9062 RX amplifier.
+
+**Applied change:**
+- Added 4.7 Ω series resistor between 3V3_SYS and TLV9062 VCC
+- Created local filtered node: **3V3_RXAMP**
+- Added local 100 nF and 1 µF decoupling capacitors from 3V3_RXAMP to GND
+- Capacitors are placed on the TLV9062 side of the resistor and close to the IC supply pins
+
+**Purpose:**
+- Reduce TX/boost-induced 3V3_SYS disturbance reaching the RX amplifier
+- Reduce analog feedthrough, amplifier recovery artifacts, and false downstream comparator triggering
+- Create a small local analog supply island without needing a full separate 3V3_A rail
+
+| Property | Value |
+|---|---|
+| Series resistor | 4.7 Ω (0402 or 0603) |
+| Decoupling cap (HF) | 100 nF ceramic ≥6.3 V (0402 or 0603) |
+| Decoupling cap (bulk) | 1 µF ceramic ≥6.3 V (0402 or 0603) |
+| Filtered supply net | 3V3_RXAMP |
+| Source supply | 3V3_SYS through 4.7 Ω resistor |
+
+**Layout requirements:**
+- 100 nF and 1 µF capacitors must be placed close to TLV9062 VCC/GND pins
+- The capacitors must be on the TLV9062 side of the 4.7 Ω resistor
+- No noisy digital loads should be connected to the filtered amplifier supply node (3V3_RXAMP)
+
+**Bring-up check:**
+Probe 3V3_SYS, 3V3_RXAMP, RX_AMP, COMP_RAW, and TOF_EDGE during TX burst and receive-window tests.
+
+### 9. VREF Filtering Applied — ✅ APPLIED
+
+The ultrasonic mid-rail reference has been improved.
+
+**Applied change:**
+- Added 220 Ω series resistor from 3V3_SYS into the VREF divider supply path
+- Retained 47 kΩ / 47 kΩ divider
+- Retained 100 nF and 1 µF VREF filtering
+- Added 4.7 µF ceramic bulk capacitance from VREF to GND
+
+**Result:**
+- VREF remains approximately mid-rail at ~1.65 V
+- The added capacitance improves reference stability during TX burst and boost switching events
+- The 220 Ω resistor provides an additional supply-side isolation/tuning point
+
+| Property | Value |
+|---|---|
+| Series resistor | 220 Ω (0402 or 0603) |
+| Divider | 47 kΩ / 47 kΩ from filtered supply to GND |
+| Filtering | 100 nF + 1 µF + 4.7 µF ceramic from VREF to GND |
+| VREF target | ~1.65 V (mid-rail) |
+
+**Optional future improvement:**
+- Add 100 nF from the node between the 220 Ω resistor and the upper 47 kΩ divider resistor to GND if space allows
+
+**Bring-up check:**
+Probe 3V3_SYS and VREF during TX burst. VREF should remain stable and should not show visible TX-correlated spikes or steps.
+
 ---
 
 ## Firmware Impact
@@ -222,6 +329,7 @@ If the inductor upgrade and U49 decoupling do not fully resolve the brownout or 
 2. **Add Schottky diode isolation** — BAT54S from GPIO5 to EN_22 with 100 kΩ pulldown, as per R2. This can be applied with U49 still in circuit (Schottky between U49 output and EN_22).
 3. **Remove U49 and switch to direct Schottky drive** — As per R2+R3, but requires firmware polarity change.
 4. **Add VSYS bulk capacitor** — 470–1000 µF electrolytic/polymer across VSYS/GND, as per R4.
+5. **Add 22V_SYS minimum load resistor** — 10 kΩ or 22 kΩ from 22V_SYS to GND, as per R5. Test with a bodge first; only add to the PCB if the minimum load is confirmed necessary.
 
 ---
 
@@ -233,12 +341,20 @@ If the inductor upgrade and U49 decoupling do not fully resolve the brownout or 
 | Change | MT3608 input cap (bulk) | 1210 100 µF 6.3 V X5R | 1210 | Upgraded from 22 µF, VSYS input |
 | Add | MT3608 input cap (HF decoupling) | 100 nF ceramic ≥6.3 V | 0402/0603 | VSYS input high-frequency decoupling |
 | Add | C_new | 1 µF ceramic ≥6.3 V | 0402/0603 | U49 VCC decoupling, placed close to U49 |
+| Add | R_comp_filt | 4.7 Ω | 0402/0603 | Comparator VCC supply filter resistor (3V3_SYS → 3V3_COMP) |
+| Add | C_comp_hf | 100 nF ceramic ≥6.3 V | 0402/0603 | Comparator VCC HF decoupling on 3V3_COMP |
+| Add | C_comp_bulk | 1 µF ceramic ≥6.3 V | 0402/0603 | Comparator VCC bulk decoupling on 3V3_COMP |
+| Add | R_rxamp_filt | 4.7 Ω | 0402/0603 | TLV9062 VCC supply filter resistor (3V3_SYS → 3V3_RXAMP) |
+| Add | C_rxamp_hf | 100 nF ceramic ≥6.3 V | 0402/0603 | TLV9062 VCC HF decoupling on 3V3_RXAMP |
+| Add | C_rxamp_bulk | 1 µF ceramic ≥6.3 V | 0402/0603 | TLV9062 VCC bulk decoupling on 3V3_RXAMP |
+| Add | R_vref_filt | 220 Ω | 0402/0603 | VREF divider supply filter resistor (3V3_SYS → VREF divider) |
+| Add | C_vref_bulk | 4.7 µF ceramic ≥6.3 V | 0805/1206 | VREF bulk decoupling to GND |
 | Retain | U49 | SN74LVC1G04DRLR | SOT-353 | LCSC C19829625, NOT removed |
 | Retain | R170 | 2 kΩ | 0402/0603 | U49 output → EN_22 |
 | Retain | R172 | 100 kΩ | 0402/0603 | EN_22 pulldown |
 | Retain | R173 | 1 kΩ | 0402/0603 | GPIO5 → U49 input |
 
-**Net BOM impact:** +2 components (1 µF U49 decoupling cap, 100 nF VSYS input decoupling cap), 2 value/package changes (L4, input bulk cap). No components removed.
+**Net BOM impact:** +10 components (1 µF U49 decoupling cap, 100 nF VSYS input decoupling cap, 4.7 Ω comparator filter resistor, 100 nF comparator HF decoupling, 1 µF comparator bulk decoupling, 4.7 Ω RX amplifier filter resistor, 100 nF RX amplifier HF decoupling, 1 µF RX amplifier bulk decoupling, 220 Ω VREF filter resistor, 4.7 µF VREF bulk decoupling), 2 value/package changes (L4, input bulk cap). No components removed.
 
 ---
 
@@ -250,7 +366,7 @@ If the inductor upgrade and U49 decoupling do not fully resolve the brownout or 
 | R2: Schottky diode isolation on EN_22 | ❌ Deferred | Not needed if U49 decoupling + inductor fix resolves instability |
 | R3: Remove U49 from EN_22 path | ❌ Not applied | U49 retained for boot-safe behaviour |
 | R4: Add VSYS bulk capacitor | ⬜ Optional | 470–1000 µF footprint can be added as DNP if board space allows; current 100 µF + 100 nF local input capacitance is the main required change |
-| R5: Add 10 kΩ minimum load on 22V_SYS | ⬜ Optional | Can be added if 22 V regulation is still unstable at light load |
+| R5: Add 10 kΩ minimum load on 22V_SYS | ❌ Not added | Not added for V3; reconsider only if bring-up shows 22V_SYS instability at idle or during measurement startup |
 | R6: Add U49 decoupling | ✅ Applied | 1 µF ceramic on U49 VCC, moved closer to pins |
 | R7: Add EN_22 test point | ✅ Already present | Retained from V2 |
 | R8: Evaluate L7 (5 V boost inductor) | ⬜ Optional | Lower priority, 5 V boost has not exhibited issues |
@@ -267,7 +383,11 @@ The design strategy is:
 2. **Fix the suspected primary cause by upgrading L4.** The 1.5 A I_sat inductor was saturating at the MT3608's 2 A switch current limit.
 3. **Upgrade MT3608 input decoupling.** 100 µF + 100 nF ceramic on VSYS input side to support cold-start inrush and reduce high-frequency switching disturbance on VSYS.
 4. **Improve U49 supply decoupling.** Add 1 µF ceramic close to U49 VCC to reduce 3V3_SYS ripple coupling into the inverter.
-5. **Retain EN_22 test access.** The existing test point is kept for bring-up probing.
-6. **Avoid adding an EN_22 hold capacitor until testing proves it is needed.** Minimise simultaneous variables changed between V2 and V3.
+5. **Add comparator supply filtering.** 4.7 Ω series resistor + 100 nF + 1 µF local decoupling creates a filtered 3V3_COMP supply island, reducing TX-induced supply noise reaching the comparator.
+6. **Add RX amplifier supply filtering.** 4.7 Ω series resistor + 100 nF + 1 µF local decoupling creates a filtered 3V3_RXAMP supply island, reducing TX-induced supply noise reaching the RX amplifier and downstream comparator.
+7. **Improve VREF filtering.** Add 220 Ω series resistor in VREF divider supply path + 4.7 µF bulk capacitance on VREF to GND. Improves reference stability during TX burst and boost switching events.
+8. **Retain EN_22 test access.** The existing test point is kept for bring-up probing.
+9. **Avoid adding an EN_22 hold capacitor until testing proves it is needed.** Minimise simultaneous variables changed between V2 and V3.
+10. **Do not add a 22V_SYS bleed resistor.** The 22 V rail is only active during measurement windows; a permanent bleed wastes power. Test with upgraded inductor and input capacitance first. Bodge a temporary resistor during bring-up if needed.
 
 This reduces the number of simultaneous variables changed between V2 and V3 while still addressing the most likely root cause of the V2 brownout problem.

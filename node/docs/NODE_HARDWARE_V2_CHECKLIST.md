@@ -18,7 +18,7 @@ Working checklist for the next node PCB revision. This combines known V1 bring-u
 - [x] Remove EN/programming capacitor selection pads; fixed `1 uF` retained because flashing and boot behaviour were stable during V1 bring-up.
 - [x] Re-check ESP32 strapping pins so none can float or be driven into invalid states at boot.
 - [x] Keep an emergency programming/debug header on the board: `GND`, `3V3`, `TX`, `RX`, `EN`, `BOOT`.
-- [ ] Review decoupling and local bulk capacitance placement around the ESP32, charger, regulators, RTC, mux, ADC, and ultrasonic power stage. **MT3608 input cap upgraded to 1210 100µF 6.3V + 100 nF ceramic HF decoupling on VSYS; U49 VCC decoupling upgraded with 1 µF ceramic; remaining decoupling review still needed. See `NODE_V3_22V_BOOST_UPDATE.md`.**
+- [ ] Review decoupling and local bulk capacitance placement around the ESP32, charger, regulators, RTC, mux, ADC, and ultrasonic power stage. **MT3608 input cap upgraded to 1210 100µF 6.3V + 100 nF ceramic HF decoupling on VSYS; U49 VCC decoupling upgraded with 1 µF ceramic; comparator VCC supply filtered with 4.7 Ω + 100 nF + 1 µF (3V3_COMP island); TLV9062 RX amplifier VCC supply filtered with 4.7 Ω + 100 nF + 1 µF (3V3_RXAMP island); VREF supply filtered with 220 Ω + 4.7 µF bulk decoupling added; remaining decoupling review still needed. See `NODE_V3_22V_BOOST_UPDATE.md`.**
 
 ## 2. Power Architecture
 

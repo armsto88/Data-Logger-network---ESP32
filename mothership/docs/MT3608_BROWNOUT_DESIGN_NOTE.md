@@ -235,7 +235,7 @@ Enable source ──►|── EN_22 ── 10µF ── GND
 
 ---
 
-### R5. Add Minimum Load Resistor on 22V_SYS — **Recommended**
+### R5. Add Minimum Load Resistor on 22V_SYS — **Recommended** ❌ **NOT ADDED IN V3**
 
 **Problem:** With no load, the MT3608 enters pulse-skip/burst mode, causing 22V_SYS to fluctuate 14-20V. Even with inductor replacement (R1), light-load regulation may still be marginal.
 
@@ -246,6 +246,8 @@ Enable source ──►|── EN_22 ── 10µF ── GND
 **Alternative:** Use a 22kΩ resistor (~1mA) and verify stability. If 1mA is sufficient, the power waste is halved.
 
 **BOM impact:** +1 10kΩ 1/4W resistor.
+
+**V3 decision (2026-06-10):** Not added for V3. The 22 V rail is only required during ultrasonic measurement windows, and a permanent bleed load wastes power whenever the boost is enabled. The upgraded L4 inductor and improved MT3608 input capacitance should be tested first. If light-load regulation remains unstable, a temporary 22 kΩ or 10 kΩ resistor can be bodged from 22V_SYS to GND during bring-up to test whether a minimum load improves stability. The ultrasonic transducer should not be used as a direct DC load on 22V_SYS — it is a piezo/capacitive load that only loads the rail meaningfully during TX bursts. Reconsider only if bring-up shows 22V_SYS instability at idle or during measurement startup. See `node/docs/NODE_V3_22V_BOOST_UPDATE.md`.
 
 ---
 

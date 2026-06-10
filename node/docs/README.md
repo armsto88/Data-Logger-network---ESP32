@@ -24,3 +24,4 @@ Design notes, hardware checklists, and sensor implementation docs for the ESP32-
 - [ULTRASONIC_ANEMOMETER_WORK_PLAN.md](ULTRASONIC_ANEMOMETER_WORK_PLAN.md) — development roadmap for ultrasonic sensor
 - [ultrasonic_circuit_v2_design_advice.md](ultrasonic_circuit_v2_design_advice.md) — circuit design notes
 - [ULTRASONIC_NOISE_ANALYSIS_2026-04-11.md](ULTRASONIC_NOISE_ANALYSIS_2026-04-11.md) — signal noise analysis
+- [NODE_V3_ULTRASONIC_CHECKLIST.md](NODE_V3_ULTRASONIC_CHECKLIST.md) — V3 ultrasonic bring-up and validation checklist (22 V boost, signal chain, acoustic discrimination)
