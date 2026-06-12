@@ -71,6 +71,7 @@ These tests verify the analog signal chain is electrically functional and quiet 
 - [ ] **1.5.1** Confirm comparator part number on V3 board (expected: TLV9062IDR or equivalent)
 - [ ] **1.5.1a** Probe 3V3_COMP during TX burst — should be cleaner than 3V3_SYS (4.7 Ω filter + local decoupling working)
 - [ ] **1.5.1b** Probe 3V3_RXAMP during TX burst — should be cleaner than 3V3_SYS (4.7 Ω filter + local decoupling working)
+- [ ] **1.5.1c** Probe 3V3_MUX during TX burst — should be cleaner than 3V3_SYS (4.7 Ω filter + C101 100 nF working)
 - [ ] **1.5.2** Measure actual hysteresis at comparator decision point (target: tens of mV, not just a few mV)
 - [ ] **1.5.3** Test with R179 solder jumper open (1 MΩ hysteresis only) — record baseline noise edge count
 - [ ] **1.5.4** Test with R179 solder jumper closed (~500 kΩ effective hysteresis) — record noise edge count
@@ -80,7 +81,9 @@ These tests verify the analog signal chain is electrically functional and quiet 
 
 - [ ] **1.6.1** Measure VREF with oscilloscope during TX burst — check for dip or ripple (V3 now has 220 Ω supply filter + 4.7 µF bulk; VREF should be significantly more stable than V2)
 - [ ] **1.6.2** If VREF still moves during burst despite 220 Ω + 4.7 µF filtering, consider buffering VREF with an op-amp (V3 future change)
+- [ ] **1.6.2a** Probe VREF at three points during TX burst: main generator, comparator reference input, and TLV9062 bias area — all should be stable and free of TX-correlated spikes
 - [ ] **1.6.3** If VREF is still noisy, consider buffering with an op-amp (V3 future change, not immediate)
+- [ ] **1.6.3a** Verify VREF settling time: after analog power-up, allow 500 ms–1 s before firing first ultrasonic burst (total VREF capacitance is now several µF)
 
 ---
 
@@ -102,6 +105,7 @@ These tests determine whether the analog chain is clean enough for acoustic disc
 - [ ] **2.2.4** Compare edge counts: if boost noise dominates, investigate 3V3_SYS ripple coupling into analog chain
 - [ ] **2.2.4a** Probe 3V3_SYS vs 3V3_COMP during boost enable and TX burst — confirm comparator supply filtering is effective
 - [ ] **2.2.4b** Probe 3V3_SYS vs 3V3_RXAMP during boost enable and TX burst — confirm RX amplifier supply filtering is effective
+- [ ] **2.2.4c** Probe 3V3_SYS vs 3V3_MUX during boost enable and TX burst — confirm mux supply filtering is effective
 
 ### 2.3 Open vs Blocked Path
 
@@ -148,6 +152,7 @@ These tests verify the system can actually measure wind. They correspond to Phas
 - [ ] **3.3.1** Sweep BOOST_PRECHARGE_MS from 5 to 100 ms — find minimum reliable precharge time
 - [ ] **3.3.2** Verify 22V_SYS reaches target voltage before burst fires
 - [ ] **3.3.3** Record detection rate vs precharge time
+- [ ] **3.3.4** Verify VREF has settled before first burst after power-up (allow 500 ms–1 s minimum)
 
 ---
 
@@ -172,6 +177,7 @@ These are hardware changes that may be needed based on Phase 1–3 results. They
 - [ ] **4.3.1** Verify TX_PULSE trace is not running near RX analog nodes (layout audit)
 - [ ] **4.3.1a** If comparator supply filtering is insufficient, consider increasing R_comp_filt from 4.7 Ω to 10–22 Ω or adding ferrite bead in place of resistor
 - [ ] **4.3.1b** If RX amplifier supply filtering is insufficient, consider increasing R_rxamp_filt from 4.7 Ω to 10–22 Ω or adding ferrite bead in place of resistor
+- [ ] **4.3.1c** If mux supply filtering is insufficient, consider increasing R_mux_filt from 4.7 Ω to 10–22 Ω or adding ferrite bead in place of resistor
 - [ ] **4.3.2** Add analog mute/clamp on RX input during TX (requires PCB change)
 - [ ] **4.3.3** Add 3V3_A filtered analog rail for RX amplifier and comparator (requires PCB change) — note: V3 already has separate 3V3_COMP and 3V3_RXAMP islands; a full 3V3_A rail would be a single filtered supply feeding both, which is a different topology
 
@@ -208,6 +214,10 @@ These are hardware changes that may be needed based on Phase 1–3 results. They
 | VREF divider supply filter resistor | R_vref_filt | 220 Ω | ✅ Applied | 3V3_SYS → VREF divider supply isolation |
 | VREF bulk decoupling | C_vref_bulk | 4.7 µF ceramic | ✅ Applied | VREF to GND, improves stability during TX burst |
 | VREF filtering (total) | — | 100 nF + 1 µF + 4.7 µF | ✅ Applied | VREF decoupling stack with 220 Ω supply filter |
+| VREF local decoupling (comparator) | C_vref_comp | 100 nF ceramic | ✅ Applied | Near comparator reference input |
+| VREF local decoupling (TLV9062 bias) | C_vref_rxamp | 100 nF ceramic | ✅ Applied | Near TLV9062 preamp/bandpass bias (R101/R103, R104/R105) |
+| Mux supply filter resistor | R_mux_filt | 4.7 Ω | ✅ Applied | 3V3_SYS → 3V3_MUX series filter for U42 |
+| 3V3_MUX supply island | — | Filtered 3.3 V | ✅ Applied | Clean mux supply via 4.7 Ω + C101 100 nF |
 | U49 retained | U49 | SN74LVC1G04DRLR | ✅ Retained | Boot-safe EN_22 logic preserved |
 | EN_22 test point | TP | EN_22 | ✅ Present | For bring-up probing |
 | 22V_SYS bleed resistor | R_bleed | — | ❌ Not added | Reconsider if 22V unstable at idle |
@@ -231,7 +241,8 @@ These were done in V2 and are retained in V3:
 - [x] TLV9062IDR RX amplifier moved to 3V3_SYS domain
 - [x] Comparator supply filtered: 3V3_SYS → 4.7 Ω → 3V3_COMP with 100 nF + 1 µF local decoupling
 - [x] TLV9062 RX amplifier supply filtered: 3V3_SYS → 4.7 Ω → 3V3_RXAMP with 100 nF + 1 µF local decoupling
-- [x] VREF supply filtered: 3V3_SYS → 220 Ω → 47 kΩ/47 kΩ divider, with 100 nF + 1 µF + 4.7 µF decoupling to GND
+- [x] 74HC4052 mux supply filtered: 3V3_SYS → 4.7 Ω → 3V3_MUX with C101 100 nF local decoupling (RX clamp diodes D8/D9 remain on 3V3_SYS; U50/U51 remain on 3V3_SYS)
+- [x] VREF supply filtered: 3V3_SYS → 220 Ω → 47 kΩ/47 kΩ divider, with 100 nF + 1 µF + 4.7 µF decoupling to GND at main node, plus distributed 100 nF at comparator reference input and TLV9062 preamp/bandpass bias
 - [x] R108=1 kΩ retained (no extra comparator-input BAV99)
 - [x] COMP_RAW / TOF_EDGE naming convention
 - [x] U50 inverter for RX_WINDOW_EN = NOT RX_EN_N

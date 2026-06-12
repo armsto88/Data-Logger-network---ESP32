@@ -229,13 +229,22 @@ The ultrasonic mid-rail reference has been improved.
 **Applied change:**
 - Added 220 Ω series resistor from 3V3_SYS into the VREF divider supply path
 - Retained 47 kΩ / 47 kΩ divider
-- Retained 100 nF and 1 µF VREF filtering
-- Added 4.7 µF ceramic bulk capacitance from VREF to GND
+- Main VREF node has 100 nF + 1 µF + 4.7 µF to GND
+- Added 100 nF from VREF to GND near the comparator reference input
+- Added local 100 nF VREF decoupling near the TLV9062 preamp/bandpass bias networks feeding R101/R103 and R104/R105
 
 **Result:**
 - VREF remains approximately mid-rail at ~1.65 V
 - The added capacitance improves reference stability during TX burst and boost switching events
 - The 220 Ω resistor provides an additional supply-side isolation/tuning point
+- Distributed local decoupling reduces noise pickup on the longer VREF route
+- Comparator threshold is stabilised locally at the comparator reference input
+- Mid-rail bias used by the RX amplifier/filter stages is stabilised locally
+
+**Implementation notes:**
+- These capacitors connect only from VREF to GND
+- No extra capacitance has been added to ultrasonic signal nodes such as ST1_IN, ST1_OUT, ST2_IN, RX_AMP, COMP_RAW
+- Because total VREF capacitance is now several µF, firmware should allow VREF to settle before ultrasonic measurement. A 500 ms to 1 s delay after analog power-up is recommended before firing the first ultrasonic burst
 
 | Property | Value |
 |---|---|
@@ -248,7 +257,36 @@ The ultrasonic mid-rail reference has been improved.
 - Add 100 nF from the node between the 220 Ω resistor and the upper 47 kΩ divider resistor to GND if space allows
 
 **Bring-up check:**
-Probe 3V3_SYS and VREF during TX burst. VREF should remain stable and should not show visible TX-correlated spikes or steps.
+Probe VREF at the main generator, comparator input, and TLV9062 bias area during TX burst. VREF should remain stable and free of TX-correlated spikes or steps at all three probe points.
+
+### 10. 74HC4052 Mux Supply Filtering Applied — ✅ APPLIED
+
+Added local supply filtering for the ultrasonic 74HC4052 mux.
+
+**Applied change:**
+- Added 4.7 Ω series resistor between 3V3_SYS and U42 VCC
+- Created a local filtered mux supply node: **3V3_MUX**
+- Existing C101 100 nF decoupling remains on the mux side of the resistor and should be placed close to U42 VCC/GND
+
+**Purpose:**
+- Reduce 3V3_SYS switching disturbance reaching the analog mux
+- Reduce TX/boost-induced noise coupling through the RX channel selection path
+- Improve RX-disabled and receive-window analog stability
+
+| Property | Value |
+|---|---|
+| Series resistor | 4.7 Ω (0402 or 0603) |
+| Existing decoupling | C101 100 nF ceramic (on mux side of resistor) |
+| Filtered supply net | 3V3_MUX |
+| Source supply | 3V3_SYS through 4.7 Ω resistor |
+
+**Important implementation notes:**
+- The node after the 4.7 Ω resistor must not also be labelled 3V3_SYS, otherwise the resistor will be bypassed
+- RX clamp diodes D8/D9 should remain tied to normal 3V3_SYS, not 3V3_MUX, so clamp transient current is not injected into the filtered mux supply
+- U50/U51 digital blanking gates remain on 3V3_SYS
+
+**Bring-up check:**
+Probe 3V3_SYS, 3V3_MUX, RX_IN, COMP_RAW, and TOF_EDGE during TX burst and receive-window tests.
 
 ---
 
@@ -273,6 +311,8 @@ GPIO5 LOW  = 22 V boost OFF
 ```
 
 All PlatformIO build flags referencing `PIN_TX_22V_EN_N` and `TX_22V_EN_N` remain valid. The active-low naming convention matches the retained-U49 logic.
+
+**VREF settling delay:** Because total VREF capacitance is now several µF, firmware should allow VREF to settle before ultrasonic measurement. A 500 ms to 1 s delay after analog power-up is recommended before firing the first ultrasonic burst. This delay should be added to the ultrasonic bring-up sketches and production firmware.
 
 ---
 
@@ -349,12 +389,15 @@ If the inductor upgrade and U49 decoupling do not fully resolve the brownout or 
 | Add | C_rxamp_bulk | 1 µF ceramic ≥6.3 V | 0402/0603 | TLV9062 VCC bulk decoupling on 3V3_RXAMP |
 | Add | R_vref_filt | 220 Ω | 0402/0603 | VREF divider supply filter resistor (3V3_SYS → VREF divider) |
 | Add | C_vref_bulk | 4.7 µF ceramic ≥6.3 V | 0805/1206 | VREF bulk decoupling to GND |
+| Add | C_vref_comp | 100 nF ceramic ≥6.3 V | 0402/0603 | Local VREF decoupling near comparator reference input |
+| Add | C_vref_rxamp | 100 nF ceramic ≥6.3 V | 0402/0603 | Local VREF decoupling near TLV9062 preamp/bandpass bias (R101/R103, R104/R105) |
+| Add | R_mux_filt | 4.7 Ω | 0402/0603 | 74HC4052 mux VCC supply filter resistor (3V3_SYS → 3V3_MUX) |
 | Retain | U49 | SN74LVC1G04DRLR | SOT-353 | LCSC C19829625, NOT removed |
 | Retain | R170 | 2 kΩ | 0402/0603 | U49 output → EN_22 |
 | Retain | R172 | 100 kΩ | 0402/0603 | EN_22 pulldown |
 | Retain | R173 | 1 kΩ | 0402/0603 | GPIO5 → U49 input |
 
-**Net BOM impact:** +10 components (1 µF U49 decoupling cap, 100 nF VSYS input decoupling cap, 4.7 Ω comparator filter resistor, 100 nF comparator HF decoupling, 1 µF comparator bulk decoupling, 4.7 Ω RX amplifier filter resistor, 100 nF RX amplifier HF decoupling, 1 µF RX amplifier bulk decoupling, 220 Ω VREF filter resistor, 4.7 µF VREF bulk decoupling), 2 value/package changes (L4, input bulk cap). No components removed.
+**Net BOM impact:** +13 components (1 µF U49 decoupling cap, 100 nF VSYS input decoupling cap, 4.7 Ω comparator filter resistor, 100 nF comparator HF decoupling, 1 µF comparator bulk decoupling, 4.7 Ω RX amplifier filter resistor, 100 nF RX amplifier HF decoupling, 1 µF RX amplifier bulk decoupling, 220 Ω VREF filter resistor, 4.7 µF VREF bulk decoupling, 100 nF VREF decoupling near comparator, 100 nF VREF decoupling near TLV9062 bias, 4.7 Ω mux supply filter resistor), 2 value/package changes (L4, input bulk cap). No components removed. C101 (100 nF mux decoupling) is repositioned to the mux side of the 4.7 Ω resistor but is not a new component.
 
 ---
 
@@ -386,8 +429,9 @@ The design strategy is:
 5. **Add comparator supply filtering.** 4.7 Ω series resistor + 100 nF + 1 µF local decoupling creates a filtered 3V3_COMP supply island, reducing TX-induced supply noise reaching the comparator.
 6. **Add RX amplifier supply filtering.** 4.7 Ω series resistor + 100 nF + 1 µF local decoupling creates a filtered 3V3_RXAMP supply island, reducing TX-induced supply noise reaching the RX amplifier and downstream comparator.
 7. **Improve VREF filtering.** Add 220 Ω series resistor in VREF divider supply path + 4.7 µF bulk capacitance on VREF to GND. Improves reference stability during TX burst and boost switching events.
-8. **Retain EN_22 test access.** The existing test point is kept for bring-up probing.
-9. **Avoid adding an EN_22 hold capacitor until testing proves it is needed.** Minimise simultaneous variables changed between V2 and V3.
-10. **Do not add a 22V_SYS bleed resistor.** The 22 V rail is only active during measurement windows; a permanent bleed wastes power. Test with upgraded inductor and input capacitance first. Bodge a temporary resistor during bring-up if needed.
+8. **Add mux supply filtering.** 4.7 Ω series resistor between 3V3_SYS and U42 VCC creates a filtered 3V3_MUX supply island, reducing TX/boost-induced noise coupling through the RX channel selection path. RX clamp diodes (D8/D9) remain on 3V3_SYS; U50/U51 digital gates remain on 3V3_SYS.
+9. **Retain EN_22 test access.** The existing test point is kept for bring-up probing.
+10. **Avoid adding an EN_22 hold capacitor until testing proves it is needed.** Minimise simultaneous variables changed between V2 and V3.
+11. **Do not add a 22V_SYS bleed resistor.** The 22 V rail is only active during measurement windows; a permanent bleed wastes power. Test with upgraded inductor and input capacitance first. Bodge a temporary resistor during bring-up if needed.
 
 This reduces the number of simultaneous variables changed between V2 and V3 while still addressing the most likely root cause of the V2 brownout problem.

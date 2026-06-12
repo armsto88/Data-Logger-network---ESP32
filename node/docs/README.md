@@ -25,3 +25,4 @@ Design notes, hardware checklists, and sensor implementation docs for the ESP32-
 - [ultrasonic_circuit_v2_design_advice.md](ultrasonic_circuit_v2_design_advice.md) — circuit design notes
 - [ULTRASONIC_NOISE_ANALYSIS_2026-04-11.md](ULTRASONIC_NOISE_ANALYSIS_2026-04-11.md) — signal noise analysis
 - [NODE_V3_ULTRASONIC_CHECKLIST.md](NODE_V3_ULTRASONIC_CHECKLIST.md) — V3 ultrasonic bring-up and validation checklist (22 V boost, signal chain, acoustic discrimination)
+- [NODE_V3_ULTRASONIC_CHANGES_BRINGUP_FIRMWARE_GUIDE_2026-06-12.md](NODE_V3_ULTRASONIC_CHANGES_BRINGUP_FIRMWARE_GUIDE_2026-06-12.md) — V3 design changes, bring-up plan, and production firmware guidance (TX path, RX chain, layout, state machine)
