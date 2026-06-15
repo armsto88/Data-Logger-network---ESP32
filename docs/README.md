@@ -20,6 +20,7 @@ This folder contains shared/cross-system project notes. Mothership-specific and 
 - [NATIVE_APP_INTEGRATION_V2.md](NATIVE_APP_INTEGRATION_V2.md) — app integration and data schemas
 - [NATIVE_APP_INTEGRATION_STATUS_2026-04-13.md](NATIVE_APP_INTEGRATION_STATUS_2026-04-13.md) — app integration status
 - [NATIVE_APP_FULL_CONCEPT_AND_SCHEMAS.md](NATIVE_APP_FULL_CONCEPT_AND_SCHEMAS.md) — full app concept and data schemas
+- [MOTHERSHIP_APP_BACKEND_INTEGRATION_BRIEF_2026-06-12.md](MOTHERSHIP_APP_BACKEND_INTEGRATION_BRIEF_2026-06-12.md) — FieldMesh app/backend integration brief: product vision, use cases, firmware Q&A, and MVP roadmap
 - [MULTI_NODE_VALIDATION_2026-05-05.md](MULTI_NODE_VALIDATION_2026-05-05.md) — deployment validation
 - [SONNET_HANDOFF_NODE_COMM_WORKFLOW.md](SONNET_HANDOFF_NODE_COMM_WORKFLOW.md) — node communication workflow
 - [PHASE_C_APP_INTEGRATION_CHECKLIST.md](PHASE_C_APP_INTEGRATION_CHECKLIST.md) — app integration checklist
