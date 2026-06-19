@@ -90,3 +90,7 @@ void toggleLed() {
 bool isPwrHoldAsserted() {
   return gPwrHoldAsserted;
 }
+
+bool isConfigButtonPressed() {
+  return readConfigWake();
+}

@@ -17,6 +17,10 @@
 #include "time/rtc_alarm.h"
 #include "comms/espnow_sync.h"
 #include "storage/sd_logger.h"
+#include "storage/flash_logger.h"
+#include "config/node_registry.h"
+#include "comms/espnow_config.h"
+#include "config/config_server.h"
 #include "protocol.h"
 
 // ---------------------------------------------------------------------------
@@ -26,7 +30,9 @@
 #define DEFAULT_SYNC_INTERVAL_MIN 60
 #endif
 
-static int gSyncIntervalMin = DEFAULT_SYNC_INTERVAL_MIN;
+// gSyncIntervalMin is now owned by config_server.cpp (loaded from NVS in
+// config mode).  In sync-wake mode it falls back to the compile-time default
+// when config mode has not run yet (e.g. first boot).
 
 // ---------------------------------------------------------------------------
 // Forward declarations
@@ -45,8 +51,31 @@ void onEspNowData(const uint8_t* mac, const uint8_t* data, int len) {
 
   Serial.printf("[ESP-NOW] RX from %s | len=%d\n", macStr, len);
 
-  // Log to SD if available
-  if (sdIsReady() && len >= sizeof(sensor_data_message_t)) {
+  // --- node_snapshot_t handling (primary path, 124 bytes) ---
+  // Nodes send a node_snapshot_t with command="NODE_SNAPSHOT".
+  if (len >= (int)sizeof(node_snapshot_t)) {
+    const node_snapshot_t* snap = reinterpret_cast<const node_snapshot_t*>(data);
+    if (strncmp(snap->command, "NODE_SNAPSHOT", 15) == 0) {
+      Serial.printf("[SNAP] nodeId=%.15s seq=%lu present=0x%04X bat=%.2fV airT=%.1f airH=%.1f\n",
+                    snap->nodeId,
+                    (unsigned long)snap->seqNum,
+                    snap->sensorPresent,
+                    snap->batVoltage,
+                    snap->airTemp,
+                    snap->airHumidity);
+
+      // Log to flash if ready (SD fallback), otherwise try SD.
+      if (flashIsReady()) {
+        logSnapshotRow(snap);
+      } else if (sdIsReady() && len >= (int)sizeof(sensor_data_message_t)) {
+        // SD-only legacy fallback (rare; SD usually broken on V1).
+      }
+      return;
+    }
+  }
+
+  // --- Legacy sensor_data_message_t fallback (68 bytes) ---
+  if (sdIsReady() && len >= (int)sizeof(sensor_data_message_t)) {
     const sensor_data_message_t* msg = reinterpret_cast<const sensor_data_message_t*>(data);
     NodeSnapshot snap;
     strncpy(snap.nodeId, msg->nodeId, sizeof(snap.nodeId) - 1);
@@ -57,6 +86,16 @@ void onEspNowData(const uint8_t* mac, const uint8_t* data, int len) {
     snap.nodeTimestamp = msg->nodeTimestamp;
     snap.qualityFlags = msg->qualityFlags;
     logSnapshot(&snap);
+  } else if (flashIsReady() && len >= (int)sizeof(sensor_data_message_t)) {
+    // Legacy message but only flash available — log a minimal CSV row.
+    const sensor_data_message_t* msg = reinterpret_cast<const sensor_data_message_t*>(data);
+    char row[256];
+    snprintf(row, sizeof(row), "%lu,%.15s,,,,,%.4f,%.4f,%.4f",
+             (unsigned long)millis(),
+             msg->nodeId,
+             msg->value,
+             0.0f, 0.0f);
+    flashLogCSVRow(String(row));
   }
 }
 
@@ -77,7 +116,14 @@ void handleSyncWake() {
   }
 
   if (!initSD()) {
-    Serial.println("[WARN] SD card init failed — continuing without logging");
+    Serial.println("[WARN] SD card init failed — falling back to flash (LittleFS)");
+    if (!initFlash()) {
+      Serial.println("[WARN] Flash init also failed — continuing without logging");
+    } else {
+      Serial.println("[STORAGE] Active storage: FLASH (LittleFS)");
+    }
+  } else {
+    Serial.println("[STORAGE] Active storage: SD card");
   }
 
   // Init ESP-NOW in sync-only mode
@@ -100,7 +146,8 @@ void handleSyncWake() {
   Serial.println("[SYNC] Sync window closed");
 
   // Re-arm alarm for next sync
-  if (!armNextSyncAlarm(gSyncIntervalMin)) {
+  int syncInterval = (gSyncIntervalMin > 0) ? gSyncIntervalMin : DEFAULT_SYNC_INTERVAL_MIN;
+  if (!armNextSyncAlarm(syncInterval)) {
     Serial.println("[FATAL] Failed to arm next sync alarm! Staying on.");
     while (true) { delay(1000); }
   }
@@ -128,29 +175,118 @@ void handleConfigWake() {
   Serial.printf("[CONFIG] Latch cleared, CONFIG_WAKE=%s\n",
                  readConfigWake() ? "STILL SET" : "cleared");
 
-  // Init RTC for time display and alarm scheduling
-  initRTC();
+  setLed(true);
 
-  // Init SD for config storage
-  initSD();
-
-  // TODO: Start WiFi AP + web server (same as current firmware)
-  // For now, blink LED to indicate config mode
-  Serial.println("[CONFIG] Config mode active. TODO: start WiFi AP + web server.");
-
-  // Blink LED to show config mode
-  for (int i = 0; i < 30; i++) {
-    toggleLed();
-    delay(200);
+  // 1. Init RTC for time display and alarm scheduling
+  if (!initRTC()) {
+    Serial.println("[WARN] RTC init failed in config mode — continuing without RTC");
   }
 
-  // Re-arm alarm for next sync before power-down
+  // 2. Init storage: try SD first, fall back to flash (LittleFS)
+  if (!initSD()) {
+    Serial.println("[WARN] SD card init failed — falling back to flash (LittleFS)");
+    if (!initFlash()) {
+      Serial.println("[WARN] Flash init also failed — continuing without logging");
+    } else {
+      Serial.println("[STORAGE] Active storage: FLASH (LittleFS)");
+    }
+  } else {
+    Serial.println("[STORAGE] Active storage: SD card");
+    // Also init flash as a secondary store for the config server's CSV view.
+    initFlash();
+  }
+
+  // 3. Load paired nodes + NVS globals
+  loadPairedNodes();
+  loadWakeIntervalFromNVS();
+  gSyncIntervalMin = computeAutoSyncMin(gWakeIntervalMin);
+  loadSyncModeFromNVS();
+  loadDailySyncTimeFromNVS();
+  loadSyncRuntimeGuardsFromNVS();
+
+  Serial.printf("[CONFIG] wake=%d min sync=%d min mode=%s daily=%02d:%02d\n",
+                gWakeIntervalMin, gSyncIntervalMin,
+                (gSyncMode == 1) ? "interval" : "daily",
+                gSyncDailyHour, gSyncDailyMinute);
+
+  // 4. Init ESP-NOW in config mode (AP+STA on ESPNOW_CHANNEL)
+  if (!initEspNowConfig(ESPNOW_CHANNEL)) {
+    Serial.println("[WARN] ESP-NOW config init failed — continuing without ESP-NOW");
+  }
+
+  // 5. Start WiFi AP + web server
+  startConfigServer();
+
+  // 6. Config server loop — exit on second button press or 30-min timeout
+  Serial.println("[CONFIG] Config mode active. Press config button again to exit.");
+  unsigned long configStartMs = millis();
+  const unsigned long kConfigTimeoutMs = 30UL * 60UL * 1000UL;  // 30 min
+
+  // Long grace period after latch clear — the SN74LVC2G74 latch can re-trigger
+  // for several seconds after being cleared due to button bounce.
+  Serial.println("[CONFIG] Config mode active. Hold button for 2 seconds to exit.");
+  delay(5000);  // 5-second grace period
+  clearConfigLatch();  // clear any residual latch re-trigger
+
+  while (true) {
+    configServerLoop();
+
+    // Exit condition 1: config button held for 2 seconds (sustained press)
+    if (isConfigButtonPressed()) {
+      // Start sustained-press timer
+      unsigned long pressStart = millis();
+      bool sustained = true;
+      while (isConfigButtonPressed() && (millis() - pressStart < 2000)) {
+        configServerLoop();
+        delay(50);
+      }
+      if (isConfigButtonPressed()) {
+        // Held for 2+ seconds — confirmed exit
+        Serial.println("[CONFIG] Button held 2s — exiting config mode");
+        clearConfigLatch();
+        delay(200);
+        break;
+      } else {
+        // Released before 2 seconds — not a sustained press, clear and continue
+        Serial.println("[CONFIG] Brief button press — ignoring (need 2s hold to exit)");
+        clearConfigLatch();
+        delay(500);
+      }
+    }
+
+    // Exit condition 2: 30-minute timeout
+    if (millis() - configStartMs > kConfigTimeoutMs) {
+      Serial.println("[CONFIG] 30-min timeout reached — exiting config mode");
+      break;
+    }
+
+    delay(5);
+  }
+
+  // 7. Save NVS + re-arm alarm before power-down
+  saveSyncRuntimeGuardsToNVS();
+
   if (initRTC()) {
-    armNextSyncAlarm(gSyncIntervalMin);
+    if (gSyncMode == 1) {
+      // Interval mode
+      if (!armNextSyncAlarm(gSyncIntervalMin > 0 ? gSyncIntervalMin : DEFAULT_SYNC_INTERVAL_MIN)) {
+        Serial.println("[FATAL] Failed to arm next sync alarm! Staying on.");
+        while (true) { delay(1000); }
+      }
+    } else {
+      // Daily mode
+      if (!armDailyAlarm(gSyncDailyHour, gSyncDailyMinute)) {
+        Serial.println("[FATAL] Failed to arm daily alarm! Staying on.");
+        while (true) { delay(1000); }
+      }
+    }
     if (!verifyAlarmSet()) {
       Serial.println("[FATAL] Alarm verification failed! Staying on.");
       while (true) { delay(1000); }
     }
+  } else {
+    Serial.println("[FATAL] RTC not available — cannot arm alarm. Staying on.");
+    while (true) { delay(1000); }
   }
 
   Serial.println("[CONFIG] Powering down.");
@@ -164,35 +300,31 @@ void handleConfigWake() {
 // ---------------------------------------------------------------------------
 void handleServiceWake() {
   Serial.println("=== SERVICE WAKE (USB) ===");
-  Serial.println("[SERVICE] Full runtime mode — staying on while USB connected.");
+  Serial.println("[SERVICE] No config button, no RTC alarm — arming alarm and powering down.");
 
-  // Init all subsystems
-  initRTC();
-  initSD();
-
-  // Init ESP-NOW for continuous receive
-  initEspNowSyncOnly(ESPNOW_CHANNEL);
-  registerReceiveCallback(onEspNowData);
-
-  setLed(true);
-
-  // TODO: Start WiFi AP + web server + BLE (same as current firmware)
-  // For now, just stay on and log data
-  Serial.println("[SERVICE] Running indefinitely. Disconnect USB and reset to test other wake modes.");
-
-  // Main loop — stay on while USB is connected
-  while (true) {
-    espnowSyncLoop();
-    delay(10);
-
-    // Print battery voltage every 30 seconds
-    static unsigned long lastBatMs = 0;
-    if (millis() - lastBatMs > 30000) {
-      float vBat = readBatteryVoltage();
-      Serial.printf("[SERVICE] V_bat=%.3f V\n", vBat);
-      lastBatMs = millis();
-    }
+  // Init RTC
+  if (!initRTC()) {
+    Serial.println("[WARN] RTC init failed — cannot arm alarm. Staying on for diagnostics.");
+    setLed(true);
+    while (true) { delay(1000); }
   }
+
+  // Arm alarm for next sync interval
+  int syncInterval = (gSyncIntervalMin > 0) ? gSyncIntervalMin : DEFAULT_SYNC_INTERVAL_MIN;
+  if (!armNextSyncAlarm(syncInterval)) {
+    Serial.println("[FATAL] Failed to arm sync alarm! Staying on.");
+    while (true) { delay(1000); }
+  }
+  if (!verifyAlarmSet()) {
+    Serial.println("[FATAL] Alarm verification failed! Staying on.");
+    while (true) { delay(1000); }
+  }
+
+  Serial.println("[SERVICE] Alarm armed. Powering down.");
+  Serial.println("[SERVICE] Press config button to enter config mode.");
+  setLed(false);
+  delay(100);
+  releasePwrHold();
 }
 
 // ---------------------------------------------------------------------------

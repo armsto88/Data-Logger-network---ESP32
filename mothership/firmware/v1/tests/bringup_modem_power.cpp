@@ -18,7 +18,7 @@
 #define MODEM_PG_TIMEOUT_MS 5000
 #endif
 #ifndef MODEM_RAIL_ON_MS
-#define MODEM_RAIL_ON_MS 5000
+#define MODEM_RAIL_ON_MS 15000  // 15 s — enough time to probe with multimeter
 #endif
 
 void setup() {
@@ -27,8 +27,10 @@ void setup() {
   digitalWrite(PIN_PWR_HOLD, HIGH);
 
   // Modem power enable (active HIGH)
-  pinMode(PIN_4V_EN, OUTPUT);
-  digitalWrite(PIN_4V_EN, LOW);
+  // Set output level LOW BEFORE enabling output to prevent a glitch
+  // that could briefly enable the TPS63020 and cause a VSYS brownout.
+  GPIO.out_w1tc = (1ULL << PIN_4V_EN);   // write LOW to the output register first
+  pinMode(PIN_4V_EN, OUTPUT);            // then enable output — pin starts LOW, no glitch
 
   // Power-good input (input-only, external pull-up on PCB)
   pinMode(PIN_MODEM_PG, INPUT);
@@ -45,15 +47,31 @@ void setup() {
   // Phase 1: Check initial state (rail should be OFF)
   Serial.println();
   Serial.println("--- Phase 1: Initial state (4V_EN=LOW) ---");
+  Serial.flush();
+  delay(100);
   int pgInitial = digitalRead(PIN_MODEM_PG);
   Serial.printf("ESP_PG = %s (expected LOW when rail off)\n",
                  pgInitial == HIGH ? "HIGH" : "LOW");
 
-  // Phase 2: Enable modem power rail
+  // Phase 2: Enable modem power rail (with PWM soft-start)
   Serial.println();
-  Serial.println("--- Phase 2: Enabling 4V_EN (rail ON) ---");
+  Serial.println("--- Phase 2: Enabling 4V_EN (rail ON, soft-start) ---");
+
+  // Soft-start: ramp PWM duty from 0 to 100% over 500ms to limit TPS63020 inrush
+  ledcSetup(0, 1000, 10);        // channel 0, 1 kHz, 10-bit resolution (0-1023)
+  ledcAttachPin(PIN_4V_EN, 0);   // attach GPIO33 to LEDC channel 0
+  Serial.println("[SS] Soft-start ramping 4V_EN 0% -> 100% over 500 ms...");
+  unsigned long ssStart = millis();
+  while (millis() - ssStart < 500) {
+    int duty = map(millis() - ssStart, 0, 500, 0, 1023);
+    ledcWrite(0, duty);
+    delay(5);
+  }
+  // Switch to full DC HIGH (detach PWM, set pin HIGH)
+  ledcDetachPin(PIN_4V_EN);
+  pinMode(PIN_4V_EN, OUTPUT);
   digitalWrite(PIN_4V_EN, HIGH);
-  Serial.printf("4V_EN = HIGH at t=%lu ms\n", millis());
+  Serial.printf("4V_EN = HIGH (full) at t=%lu ms\n", millis());
 
   // Wait for power-good with timeout
   unsigned long enableStart = millis();

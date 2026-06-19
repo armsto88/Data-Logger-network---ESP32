@@ -1,7 +1,7 @@
 #pragma once
 
 #include <Arduino.h>
-#include "../../../shared/protocol.h"
+#include "protocol.h"
 
 namespace local_queue {
 

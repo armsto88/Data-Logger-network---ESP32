@@ -22,10 +22,10 @@
 #define PIN_SD_MOSI 23
 #endif
 #ifndef SD_SPI_SPEED
-#define SD_SPI_SPEED 40000000  // 40 MHz default
+#define SD_SPI_SPEED 400000  // 400 kHz — SD spec init speed, most conservative
 #endif
 
-static SPIClass gSDSPI(VSPI);
+static SPIClass gSDSPI(HSPI);
 
 void setup() {
   // CRITICAL: assert PWR_HOLD immediately
@@ -39,7 +39,21 @@ void setup() {
   Serial.printf("SD CS=%d SCK=%d MISO=%d MOSI=%d\n",
                 PIN_SD_CS, PIN_SD_SCK, PIN_SD_MISO, PIN_SD_MOSI);
 
-  // Init SPI on the correct pins
+  // Manual CS control for diagnostics
+  pinMode(PIN_SD_CS, OUTPUT);
+  digitalWrite(PIN_SD_CS, HIGH);  // deselect
+
+  // Read MISO idle state
+  pinMode(PIN_SD_MISO, INPUT);
+  Serial.printf("[DBG] MISO idle state: %d (expect 1/HIGH due to pull-up or card)\n", digitalRead(PIN_SD_MISO));
+
+  // Assert CS and check MISO response
+  digitalWrite(PIN_SD_CS, LOW);
+  delay(1);
+  Serial.printf("[DBG] MISO with CS asserted: %d (expect 0 if card responds)\n", digitalRead(PIN_SD_MISO));
+  digitalWrite(PIN_SD_CS, HIGH);
+
+  // Init SPI on the correct pins using HSPI
   gSDSPI.begin(PIN_SD_SCK, PIN_SD_MISO, PIN_SD_MOSI, PIN_SD_CS);
 
   if (!SD.begin(PIN_SD_CS, gSDSPI, SD_SPI_SPEED)) {

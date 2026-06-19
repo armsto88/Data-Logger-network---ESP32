@@ -78,6 +78,32 @@ bool alarm1FlagSet() {
   return (status & 0x01) != 0;
 }
 
+uint8_t toBcd(uint8_t val) { return ((val / 10) << 4) | (val % 10); }
+
+bool armAlarm1Seconds(int seconds) {
+  if (!rtcOk) return false;
+  DateTime now = rtc.now();
+  DateTime base = now;  // non-const copy for operator+
+  DateTime future = base + TimeSpan(0, 0, 0, seconds);
+  uint8_t sec = toBcd(future.second());
+  uint8_t min = toBcd(future.minute());
+  uint8_t hr  = toBcd(future.hour());
+  uint8_t dy  = toBcd(future.day());
+  // Write alarm 1 registers: 0x07=seconds, 0x08=minutes, 0x09=hours, 0x0A=day
+  Wire.beginTransmission(RTC_ADDR);
+  Wire.write(0x07);
+  Wire.write(sec);        // A1M1=0 (match seconds)
+  Wire.write(min);        // A1M2=0 (match minutes)
+  Wire.write(hr);         // A1M3=0 (match hours)
+  Wire.write(0x80 | dy);  // A1M4=1 (don't match day — alarm any day)
+  if (Wire.endTransmission() != 0) return false;
+  // Enable Alarm 1 interrupt: INTCN=1, A1IE=1 in control register 0x0E
+  uint8_t ctrl = 0;
+  if (!readReg(0x0E, ctrl)) return false;
+  ctrl |= 0x05;  // INTCN=1, A1IE=1
+  return writeReg(0x0E, ctrl);
+}
+
 const char* wakeReasonStr(WakeReason r) {
   switch (r) {
     case WAKE_RTC_ALARM:    return "RTC_ALARM";
@@ -203,6 +229,19 @@ void loop() {
   }
 
   if (elapsed >= SHUTDOWN_DELAY_MS) {
+    // Arm RTC alarm for 15 seconds from now before shutting down
+    int alarmSec = 15;
+    if (rtcOk) {
+      Serial.printf("[RTC] Arming Alarm 1 for %d seconds from now...\n", alarmSec);
+      if (armAlarm1Seconds(alarmSec)) {
+        Serial.println("[RTC] Alarm 1 armed — board will wake via RTC alarm after shutdown.");
+      } else {
+        Serial.println("[RTC] FAILED to arm Alarm 1 — board will not wake via RTC.");
+      }
+    } else {
+      Serial.println("[RTC] Not available — cannot arm alarm.");
+    }
+    delay(100);
     Serial.println("Releasing PWR_HOLD — board will power off.");
     Serial.println("If you can read this, PWR_HOLD release did not cut power.");
     digitalWrite(PIN_CFG_LED, LOW);

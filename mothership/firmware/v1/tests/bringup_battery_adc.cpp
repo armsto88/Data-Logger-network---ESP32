@@ -3,7 +3,7 @@
 // Voltage divider: R1=220kΩ, R2=100kΩ → V_bat = V_adc × 3.2
 // With ADC attenuation DB_11 (0–3.6 V range): V_adc = raw × 3.6 / 4095
 // Combined: V_bat = raw × 3.6 × 3.2 / 4095 = raw × 0.00281
-// Simplified: V_bat = raw × 0.00257 (using 3.3 V reference for more accuracy)
+// Simplified: V_bat = raw × 0.00281 (using 3.6 V reference for ADC_11db range)
 
 #include <Arduino.h>
 
@@ -26,7 +26,7 @@
 #define BAT_DIVIDER_R2 100000.0f
 #endif
 #ifndef BAT_ADC_VREF
-#define BAT_ADC_VREF 3.3f
+#define BAT_ADC_VREF 3.6f  // ADC_11db attenuation range is 0–3.6 V
 #endif
 #ifndef BAT_ADC_MAX
 #define BAT_ADC_MAX 4095.0f

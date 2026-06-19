@@ -106,7 +106,8 @@ void printTime(const char* prefix, const DateTime& t) {
 }
 
 bool armNextAlarm(const DateTime& fromNow) {
-  DateTime next = fromNow + TimeSpan(0, 0, 0, ALARM_INTERVAL_S);
+  DateTime base = fromNow;  // non-const copy for operator+
+  DateTime next = base + TimeSpan(0, 0, 0, ALARM_INTERVAL_S);
   if (!writeAlarm1Exact(next)) {
     return false;
   }

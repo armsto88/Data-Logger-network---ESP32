@@ -14,3 +14,4 @@ float readBatteryVoltage();
 void setLed(bool on);
 void toggleLed();
 bool isPwrHoldAsserted();
+bool isConfigButtonPressed();  // wraps readConfigWake() for config server exit polling
