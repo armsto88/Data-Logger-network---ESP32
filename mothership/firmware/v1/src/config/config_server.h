@@ -12,6 +12,7 @@ extern int gSyncIntervalMin;
 extern int gSyncMode;
 extern int gSyncDailyHour;
 extern int gSyncDailyMinute;
+extern unsigned long gLastSyncBroadcastUnix;
 extern const int kAllowedIntervals[];
 
 // NVS loaders (call once at boot before startConfigServer()).
@@ -22,6 +23,8 @@ void loadSyncRuntimeGuardsFromNVS();
 void saveSyncRuntimeGuardsToNVS();
 
 int computeAutoSyncMin(int wakeMin);
+
+extern volatile bool gShutdownRequested;
 
 void startConfigServer();
 void configServerLoop();

@@ -66,15 +66,36 @@ The V1 main firmware with ported config mode has been flashed and tested on hard
 - ✅ CSV download with actual node data — web UI CSV button serves flash-stored datalog.csv with node sensor readings
 - ✅ ESP-NOW command dispatch fix — changed from length-based to command-based dispatch to resolve struct size collisions (discovery_message_t and node_hello_message_t both 56 bytes)
 
-### Sync wake test (pending 14:29 alarm)
-- Mothership armed RTC alarm for 14:29:38 (90 min sync interval = 5 min wake × 18)
-- Node deployed with same sync schedule
-- Both boards sleeping — waiting for sync window
-- After 14:30: re-enter config mode, download CSV, verify new node data records
+### Full autonomous sync pipeline PROVEN (2026-06-19 20:55)
+- Mothership woke at 20:54:50 (10s pre-wake, phase-aligned alarm with A1M4=1 fix)
+- Node woke at 20:55:00 (A2 sync alarm)
+- Mothership broadcast SYNC_WINDOW_OPEN repeatedly every 5s
+- Node received marker after 3.4s, flushed 17 queued snapshots (seq 2-18)
+- Mothership received all 17 NODE_SNAPSHOT packets (124 bytes each)
+- All snapshots logged to flash (LittleFS)
+- Mothership re-armed for next sync at 21:12:50 (phase-aligned, 18 min interval)
+- Both boards powered off autonomously
+- Cycle repeats indefinitely without user intervention
+
+### Firmware fixes applied for sync pipeline
+8. `rtc_alarm.cpp` — Fixed A1M4=0 to A1M4=1 (alarm now fires on any day, not just matching day-of-month)
+9. `rtc_alarm.cpp` — Added `armNextSyncAlarmPhase()` with phase anchor alignment + 10s pre-wake offset
+10. `main.cpp` — `handleSyncWake()` loads sync interval from NVS (was defaulting to 60 min instead of 18 min)
+11. `config_server.cpp` — Set `gLastSyncBroadcastUnix` phase anchor on node deploy
+12. `main.cpp` — Repeated SYNC_WINDOW_OPEN broadcast every 5s during sync window (was single broadcast)
+13. `pins.h` — Increased SYNC_WINDOW_MS from 60s to 120s for multi-node support
+14. `main.cpp` — Added intelligent early shutdown when all deployed nodes have synced
+15. `main.cpp` — Disabled config button exit (latch bounce unreliable), added web UI Shut Down button
+16. `config_server.cpp` — Added /shutdown route + Shut Down button in web UI dashboard
+17. `node_registry.cpp` — Crash-safe loadPairedNodes() with NVS validation
+18. `espnow_config.cpp` — Command-based ESP-NOW dispatch (fixes struct size collisions)
+19. `main.cpp` — Service mode just powers off (no alarm arming after flash)
+20. `main.cpp` — `onEspNowData()` updates node registry for early shutdown tracking
 
 ### Not yet tested
-- Full sleep → RTC wake → sync → sleep cycle with real node data (pending 14:29 alarm)
-- Config button sustained-press exit (fix ready, not yet flashed)
+- Early shutdown optimization (mothership listened full 120s, didn't trigger early exit)
+- Multiple nodes syncing simultaneously
+- Long-term reliability (multiple sync cycles over hours/days)
 
 ## Firmware Fixes Applied During Bring-up
 

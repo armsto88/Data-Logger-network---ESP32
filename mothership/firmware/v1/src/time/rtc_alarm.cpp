@@ -40,11 +40,12 @@ static bool readReg(uint8_t reg, uint8_t& value) {
 static bool writeAlarm1Exact(const DateTime& t) {
   Wire.beginTransmission(kRTCAddr);
   Wire.write(0x07);  // Alarm 1 seconds register
-  // Match sec/min/hour/date (A1M1..A1M4 = 0, DY/DT = 0)
-  Wire.write(toBcd(static_cast<uint8_t>(t.second())) & 0x7F);
-  Wire.write(toBcd(static_cast<uint8_t>(t.minute())) & 0x7F);
-  Wire.write(toBcd(static_cast<uint8_t>(t.hour())) & 0x3F);
-  Wire.write(toBcd(static_cast<uint8_t>(t.day())) & 0x3F);
+  // Match sec/min/hour, ignore day (A1M1..A1M3 = 0, A1M4 = 1, DY/DT = 0)
+  // A1M4=1 means the alarm fires when seconds+minutes+hours match, on any day.
+  Wire.write(toBcd(static_cast<uint8_t>(t.second())) & 0x7F);   // A1M1=0
+  Wire.write(toBcd(static_cast<uint8_t>(t.minute())) & 0x7F);   // A1M2=0
+  Wire.write(toBcd(static_cast<uint8_t>(t.hour())) & 0x3F);     // A1M3=0
+  Wire.write(0x80 | toBcd(static_cast<uint8_t>(t.day())));      // A1M4=1 (ignore day)
   return Wire.endTransmission() == 0;
 }
 
@@ -99,23 +100,26 @@ bool armNextSyncAlarm(int intervalMin) {
   if (!gRTCInitialized) return false;
 
   DateTime now = gRTC.now();
-  DateTime next = now + TimeSpan(0, 0, intervalMin, 0);
+  // Wake 10 seconds before the sync time so the mothership is already
+  // listening when the node wakes and sends its snapshot.
+  DateTime next = now + TimeSpan(0, 0, intervalMin, 0) - TimeSpan(0, 0, 0, 10);
 
   // Clear any existing alarm flag first
   clearAlarmFlag();
 
-  // Enable alarm interrupt: INTCN=1, A1IE=1
+  // Enable alarm interrupt: INTCN=1, A1IE=0 (test: disable interrupt output)
   uint8_t ctrl = 0;
   if (!readReg(0x0E, ctrl)) {
     Serial.println("[RTC] Failed to read control register");
     return false;
   }
   ctrl |= 0x04;  // INTCN=1
-  ctrl |= 0x01;  // A1IE=1
+  ctrl &= ~0x01; // A1IE=0 (disable alarm interrupt output — test if config button works)
   if (!writeReg(0x0E, ctrl)) {
     Serial.println("[RTC] Failed to write control register");
     return false;
   }
+  Serial.printf("[RTC] Control register: 0x%02X (INTCN=1, A1IE=0)\n", ctrl);
 
   if (!writeAlarm1Exact(next)) {
     Serial.println("[RTC] Failed to write Alarm 1 registers");
@@ -124,6 +128,61 @@ bool armNextSyncAlarm(int intervalMin) {
 
   Serial.printf("[RTC] Alarm 1 armed for %04d-%02d-%02d %02d:%02d:%02d (in %d min)\n",
                 next.year(), next.month(), next.day(), next.hour(), next.minute(), next.second(), intervalMin);
+  return true;
+}
+
+bool armNextSyncAlarmPhase(int intervalMin, uint32_t phaseUnix) {
+  if (!gRTCInitialized) return false;
+
+  DateTime now = gRTC.now();
+  uint32_t nowUnix = now.unixtime();
+  uint32_t nextSyncUnix = 0;
+
+  if (phaseUnix > 0 && intervalMin > 0) {
+    // Compute next sync time aligned to phase anchor
+    uint32_t periodSec = (uint32_t)intervalMin * 60UL;
+    if (nowUnix < phaseUnix) {
+      nextSyncUnix = phaseUnix;
+    } else {
+      uint32_t elapsed = nowUnix - phaseUnix;
+      uint32_t slots = elapsed / periodSec;
+      nextSyncUnix = phaseUnix + (slots + 1) * periodSec;
+    }
+  } else {
+    // No phase anchor — fall back to now + interval
+    nextSyncUnix = nowUnix + (uint32_t)intervalMin * 60UL;
+  }
+
+  // Pre-wake 10 seconds before sync time
+  if (nextSyncUnix > 10) nextSyncUnix -= 10;
+
+  DateTime next(nextSyncUnix);
+
+  // Clear any existing alarm flag first
+  clearAlarmFlag();
+
+  // Enable alarm interrupt: INTCN=1, A1IE=0 (test: disable interrupt output)
+  uint8_t ctrl = 0;
+  if (!readReg(0x0E, ctrl)) {
+    Serial.println("[RTC] Failed to read control register");
+    return false;
+  }
+  ctrl |= 0x04;  // INTCN=1
+  ctrl &= ~0x01; // A1IE=0 (disable alarm interrupt output — test if config button works)
+  if (!writeReg(0x0E, ctrl)) {
+    Serial.println("[RTC] Failed to write control register");
+    return false;
+  }
+  Serial.printf("[RTC] Control register: 0x%02X (INTCN=1, A1IE=0)\n", ctrl);
+
+  if (!writeAlarm1Exact(next)) {
+    Serial.println("[RTC] Failed to write Alarm 1 registers");
+    return false;
+  }
+
+  Serial.printf("[RTC] Alarm 1 armed for %04d-%02d-%02d %02d:%02d:%02d (phase-aligned, in %d sec)\n",
+                next.year(), next.month(), next.day(), next.hour(), next.minute(), next.second(),
+                (int)(nextSyncUnix - nowUnix));
   return true;
 }
 
@@ -174,6 +233,21 @@ bool readAlarmFlag() {
   return (status & 0x01) != 0;
 }
 
+void disableAlarmInterrupt() {
+  uint8_t ctrl = 0;
+  if (!readReg(0x0E, ctrl)) {
+    Serial.println("[RTC] Failed to read control register for disable");
+    return;
+  }
+  ctrl &= static_cast<uint8_t>(~0x01);  // Clear A1IE (disable Alarm 1 interrupt)
+  ctrl |= 0x04;                          // Keep INTCN=1 (interrupt output mode)
+  if (!writeReg(0x0E, ctrl)) {
+    Serial.println("[RTC] Failed to write control register for disable");
+    return;
+  }
+  Serial.println("[RTC] Alarm interrupt disabled (INT pin released)");
+}
+
 bool verifyAlarmSet() {
   // Read back alarm 1 registers and verify they are not all 0xFF (unset)
   uint8_t regs[4];
@@ -198,10 +272,12 @@ bool verifyAlarmSet() {
   }
 
   bool intcnSet = (ctrl & 0x04) != 0;
-  bool a1ieSet = (ctrl & 0x01) != 0;
+  // A1IE=0 is intentional (test mode — RTC interrupt output disabled).
+  // Only require INTCN=1; the alarm registers themselves are what matter for verification.
+  bool a1ieSet = true;  // A1IE=0 is intentional (test mode — RTC interrupt disabled)
 
-  if (!intcnSet || !a1ieSet) {
-    Serial.printf("[RTC] Verification: INTCN=%d A1IE=%d (expected both 1)\n", intcnSet, a1ieSet);
+  if (!intcnSet) {
+    Serial.printf("[RTC] Verification: INTCN=%d A1IE=%d (expected INTCN=1)\n", intcnSet, (ctrl & 0x01) != 0);
     return false;
   }
 

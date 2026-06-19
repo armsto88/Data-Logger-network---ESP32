@@ -60,6 +60,8 @@ const size_t kAllowedCount = sizeof(kAllowedIntervals) / sizeof(kAllowedInterval
 WebServer server(80);
 DNSServer dnsServer;
 
+volatile bool gShutdownRequested = false;
+
 // ---------------------------------------------------------------------------
 // RTC helpers (adapt production's rtc_manager API to V1's rtc_alarm.h)
 // ---------------------------------------------------------------------------
@@ -915,6 +917,9 @@ static void handleRoot() {
             "</form>"
             "<button class='btn' type='button' onclick='toggleInfoPanel()'><svg class='icon' viewBox='0 0 24 24' aria-hidden='true'><path d='M12 2a10 10 0 1010 10A10 10 0 0012 2zm0 4a1.25 1.25 0 11-1.25 1.25A1.25 1.25 0 0112 6zm2 12h-4v-1.8h1.1v-4.2H10v-1.8h3v6h1z'/></svg> INFO</button>"
             "<a href='/download-csv' class='btn btn--success'><svg class='icon' viewBox='0 0 24 24' aria-hidden='true'><path d='M12 3a1 1 0 011 1v8.59l2.3-2.3 1.4 1.42-4.7 4.7-4.7-4.7 1.4-1.42 2.3 2.3V4a1 1 0 011-1zm-7 14h14v2H5v-2z'/></svg> CSV</a>"
+            "<form class='async-form' action='/shutdown' method='POST'>"
+            "<button type='submit' class='btn btn--warn'><svg class='icon' viewBox='0 0 24 24' aria-hidden='true'><path d='M13 3h-2v10h2V3zm4.83 2.17l-1.42 1.42C17.99 7.86 19 9.81 19 12c0 3.87-3.13 7-7 7s-7-3.13-7-7c0-2.19 1.01-4.14 2.58-5.42L6.17 5.17C4.23 6.82 3 9.26 3 12c0 4.97 4.03 9 9 9s9-4.03 9-9c0-2.74-1.23-5.18-3.17-6.83z'/></svg> Shut Down</button>"
+            "</form>"
             "<div id='info-panel' class='subpanel'>"
             "<h3><svg class='icon' viewBox='0 0 24 24' aria-hidden='true'><path d='M12 2a10 10 0 1010 10A10 10 0 0012 2zm0 4a1.25 1.25 0 11-1.25 1.25A1.25 1.25 0 0112 6zm2 12h-4v-1.8h1.1v-4.2H10v-1.8h3v6h1z'/></svg> INFO</h3>"
             "<div class='help'><strong>Device ID:</strong> ");
@@ -1568,6 +1573,9 @@ static void handleNodeConfigSave() {
     globalPhaseUnix = nextDailyUnix;
   }
   globalPhaseUnix -= (globalPhaseUnix % 60UL);
+  // Update the phase anchor so armNextSyncAlarmPhase uses it when config exits
+  gLastSyncBroadcastUnix = globalPhaseUnix;
+  saveSyncRuntimeGuardsToNVS();
   if (dc.wakeIntervalMin != (uint8_t)interval) { dc.wakeIntervalMin = (uint8_t)interval; cfgChanged = true; }
   const uint16_t desiredSyncMin = (gSyncMode == SYNC_MODE_DAILY) ? 0u : (uint16_t)computeAutoSyncMin(interval);
   if (dc.syncIntervalMin != desiredSyncMin) { dc.syncIntervalMin = desiredSyncMin; cfgChanged = true; }
@@ -1676,6 +1684,20 @@ static void handleNodeConfigSave() {
 // ---------------------------------------------------------------------------
 // Start + loop
 // ---------------------------------------------------------------------------
+static void handleShutdown() {
+  gShutdownRequested = true;
+  if (isAjaxRequest()) {
+    sendAjaxResult(true, "Shutting down — arming alarm and powering off");
+    return;
+  }
+  String html = headCommon("Shutting Down");
+  html += F("<div class='section center'><h3>Shutting Down</h3>"
+            "<p>Arming RTC alarm and powering off...</p>"
+            "<p class='muted'>The board will wake at the next sync time.</p></div>");
+  html += footCommon();
+  server.send(200, "text/html", html);
+}
+
 void startConfigServer() {
   // WiFi AP + STA (AP for web UI, STA for ESP-NOW on same channel).
   // ESP-NOW was already initialised by initEspNowConfig() before this call.
@@ -1708,6 +1730,7 @@ void startConfigServer() {
   server.on("/mobile/status.php", HTTP_ANY, sendCaptivePortalLanding);
   server.on("/favicon.ico", HTTP_ANY, []() { server.send(204); });
 
+  server.on("/shutdown", HTTP_POST, handleShutdown);
   server.on("/set-time", HTTP_POST, handleSetTime);
   server.on("/download-csv", HTTP_GET, handleDownloadCSV);
   server.on("/discover-nodes", HTTP_POST, handleDiscoverNodes);
@@ -1732,6 +1755,9 @@ void startConfigServer() {
 }
 
 void configServerLoop() {
+  if (gShutdownRequested) {
+    return;  // Signal to main loop to exit config mode
+  }
   dnsServer.processNextRequest();
   server.handleClient();
   espnowConfigPoll();

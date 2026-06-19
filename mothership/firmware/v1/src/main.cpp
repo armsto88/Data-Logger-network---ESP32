@@ -70,6 +70,15 @@ void onEspNowData(const uint8_t* mac, const uint8_t* data, int len) {
       } else if (sdIsReady() && len >= (int)sizeof(sensor_data_message_t)) {
         // SD-only legacy fallback (rare; SD usually broken on V1).
       }
+
+      // Mark node as seen in registry for early shutdown tracking
+      for (auto& n : registeredNodes) {
+        if (strncmp(n.nodeId.c_str(), snap->nodeId, 16) == 0 || memcmp(n.mac, mac, 6) == 0) {
+          n.lastSeen = millis();
+          n.isActive = true;
+          break;
+        }
+      }
       return;
     }
   }
@@ -109,6 +118,11 @@ void handleSyncWake() {
   // Clear the RTC alarm flag that woke us
   clearAlarmFlag();
 
+  // Load sync interval from NVS (gSyncIntervalMin is only set during config mode)
+  loadWakeIntervalFromNVS();
+  gSyncIntervalMin = computeAutoSyncMin(gWakeIntervalMin);
+  Serial.printf("[SYNC] Loaded from NVS: wake=%d min sync=%d min\n", gWakeIntervalMin, gSyncIntervalMin);
+
   // Init subsystems
   if (!initRTC()) {
     Serial.println("[FATAL] RTC init failed — cannot re-arm alarm. Staying on.");
@@ -132,14 +146,48 @@ void handleSyncWake() {
   }
   registerReceiveCallback(onEspNowData);
 
-  // Broadcast sync window open
-  broadcastSyncWindowOpen();
-
   // Listen for node data for SYNC_WINDOW_MS
-  Serial.printf("[SYNC] Listening for %d ms...\n", SYNC_WINDOW_MS);
+  // Broadcast SYNC_WINDOW_OPEN repeatedly every 5 seconds so nodes that wake
+  // later (e.g., 10 seconds after the mothership) can still catch the marker.
+  // Intelligent early shutdown: exit once all deployed nodes have reported,
+  // with a minimum listen time of 15 seconds.
+
+  // Count deployed nodes for early shutdown tracking
+  int deployedCount = 0;
+  for (const auto& n : registeredNodes) {
+    if (n.state == DEPLOYED) deployedCount++;
+  }
+
+  Serial.printf("[SYNC] Listening for %d ms (deployed nodes: %d)...\n", SYNC_WINDOW_MS, deployedCount);
+
   unsigned long startMs = millis();
+  unsigned long lastBroadcastMs = 0;
+  const unsigned long kMinListenMs = 15000;  // minimum 15s listen
+
   while (millis() - startMs < SYNC_WINDOW_MS) {
+    // Re-broadcast sync window marker every 5 seconds
+    if (millis() - lastBroadcastMs >= 5000 || lastBroadcastMs == 0) {
+      broadcastSyncWindowOpen();
+      lastBroadcastMs = millis();
+    }
     espnowSyncLoop();
+
+    // Check if all deployed nodes have synced (after minimum listen time)
+    if (deployedCount > 0 && (millis() - startMs) >= kMinListenMs) {
+      int syncedCount = 0;
+      for (const auto& n : registeredNodes) {
+        // A node is considered synced if it was seen recently (within this sync window)
+        if (n.state == DEPLOYED && n.isActive && (millis() - n.lastSeen) < kMinListenMs) {
+          syncedCount++;
+        }
+      }
+      if (syncedCount >= deployedCount) {
+        Serial.printf("[SYNC] All %d deployed nodes synced — shutting down early (after %lu ms)\n",
+                      syncedCount, millis() - startMs);
+        break;
+      }
+    }
+
     delay(10);
   }
 
@@ -147,7 +195,10 @@ void handleSyncWake() {
 
   // Re-arm alarm for next sync
   int syncInterval = (gSyncIntervalMin > 0) ? gSyncIntervalMin : DEFAULT_SYNC_INTERVAL_MIN;
-  if (!armNextSyncAlarm(syncInterval)) {
+  // Load the phase anchor from NVS so the mothership wakes aligned with nodes
+  loadSyncRuntimeGuardsFromNVS();
+  uint32_t phaseUnix = (uint32_t)gLastSyncBroadcastUnix;
+  if (!armNextSyncAlarmPhase(syncInterval, phaseUnix)) {
     Serial.println("[FATAL] Failed to arm next sync alarm! Staying on.");
     while (true) { delay(1000); }
   }
@@ -161,6 +212,8 @@ void handleSyncWake() {
   Serial.println("[SYNC] Alarm armed and verified. Powering down.");
   setLed(false);
   delay(100);
+  // Disable alarm interrupt so INT pin goes high — allows config button to wake board
+  disableAlarmInterrupt();
   releasePwrHold();  // Board powers off here
 }
 
@@ -222,36 +275,24 @@ void handleConfigWake() {
   unsigned long configStartMs = millis();
   const unsigned long kConfigTimeoutMs = 30UL * 60UL * 1000UL;  // 30 min
 
-  // Long grace period after latch clear — the SN74LVC2G74 latch can re-trigger
-  // for several seconds after being cleared due to button bounce.
-  Serial.println("[CONFIG] Config mode active. Hold button for 2 seconds to exit.");
-  delay(5000);  // 5-second grace period
-  clearConfigLatch();  // clear any residual latch re-trigger
+  // Config button is for WAKING only — not for exiting.
+  // The SN74LVC2G74 latch bounces unpredictably, so we don't poll it for exit.
+  // Exit is via web UI /shutdown route or 30-minute timeout.
+  Serial.println("[CONFIG] Config mode active. Use web UI Shut Down button or wait 30 min.");
+
+  // Clear any residual latch from the wake press
+  clearConfigLatch();
+  delay(100);
+  clearConfigLatch();
 
   while (true) {
     configServerLoop();
 
-    // Exit condition 1: config button held for 2 seconds (sustained press)
-    if (isConfigButtonPressed()) {
-      // Start sustained-press timer
-      unsigned long pressStart = millis();
-      bool sustained = true;
-      while (isConfigButtonPressed() && (millis() - pressStart < 2000)) {
-        configServerLoop();
-        delay(50);
-      }
-      if (isConfigButtonPressed()) {
-        // Held for 2+ seconds — confirmed exit
-        Serial.println("[CONFIG] Button held 2s — exiting config mode");
-        clearConfigLatch();
-        delay(200);
-        break;
-      } else {
-        // Released before 2 seconds — not a sustained press, clear and continue
-        Serial.println("[CONFIG] Brief button press — ignoring (need 2s hold to exit)");
-        clearConfigLatch();
-        delay(500);
-      }
+    // Exit condition 1: web UI shutdown button
+    if (gShutdownRequested) {
+      Serial.println("[CONFIG] Shut down requested via web UI — exiting config mode");
+      gShutdownRequested = false;
+      break;
     }
 
     // Exit condition 2: 30-minute timeout
@@ -260,7 +301,7 @@ void handleConfigWake() {
       break;
     }
 
-    delay(5);
+    delay(10);
   }
 
   // 7. Save NVS + re-arm alarm before power-down
@@ -268,8 +309,9 @@ void handleConfigWake() {
 
   if (initRTC()) {
     if (gSyncMode == 1) {
-      // Interval mode
-      if (!armNextSyncAlarm(gSyncIntervalMin > 0 ? gSyncIntervalMin : DEFAULT_SYNC_INTERVAL_MIN)) {
+      // Interval mode — phase-aligned with nodes
+      uint32_t phaseUnix = (uint32_t)gLastSyncBroadcastUnix;
+      if (!armNextSyncAlarmPhase(gSyncIntervalMin > 0 ? gSyncIntervalMin : DEFAULT_SYNC_INTERVAL_MIN, phaseUnix)) {
         Serial.println("[FATAL] Failed to arm next sync alarm! Staying on.");
         while (true) { delay(1000); }
       }
@@ -292,6 +334,8 @@ void handleConfigWake() {
   Serial.println("[CONFIG] Powering down.");
   setLed(false);
   delay(100);
+  // Disable alarm interrupt so INT pin goes high — allows config button to wake board
+  disableAlarmInterrupt();
   releasePwrHold();
 }
 
@@ -300,28 +344,13 @@ void handleConfigWake() {
 // ---------------------------------------------------------------------------
 void handleServiceWake() {
   Serial.println("=== SERVICE WAKE (USB) ===");
-  Serial.println("[SERVICE] No config button, no RTC alarm — arming alarm and powering down.");
+  Serial.println("[SERVICE] No config button, no RTC alarm.");
+  Serial.println("[SERVICE] Powering off. Press config button to enter config mode.");
 
-  // Init RTC
-  if (!initRTC()) {
-    Serial.println("[WARN] RTC init failed — cannot arm alarm. Staying on for diagnostics.");
-    setLed(true);
-    while (true) { delay(1000); }
-  }
+  // Init RTC just to clear any stale alarm flags
+  initRTC();
+  clearAlarmFlag();
 
-  // Arm alarm for next sync interval
-  int syncInterval = (gSyncIntervalMin > 0) ? gSyncIntervalMin : DEFAULT_SYNC_INTERVAL_MIN;
-  if (!armNextSyncAlarm(syncInterval)) {
-    Serial.println("[FATAL] Failed to arm sync alarm! Staying on.");
-    while (true) { delay(1000); }
-  }
-  if (!verifyAlarmSet()) {
-    Serial.println("[FATAL] Alarm verification failed! Staying on.");
-    while (true) { delay(1000); }
-  }
-
-  Serial.println("[SERVICE] Alarm armed. Powering down.");
-  Serial.println("[SERVICE] Press config button to enter config mode.");
   setLed(false);
   delay(100);
   releasePwrHold();
@@ -368,9 +397,15 @@ void setup() {
 }
 
 void loop() {
-  // Should not reach here — all handlers either power down or loop internally.
-  // If we somehow get here, stay on and blink LED to indicate unexpected state.
-  Serial.println("[WARN] Unexpected return to main loop!");
-  toggleLed();
-  delay(500);
+  // If we reach here, releasePwrHold() didn't cut power.
+  // This happens when USB/SW10 is still holding VSYS after flashing.
+  // Just keep trying to release PWR_HOLD — the board will die when
+  // the user flicks SW10 to remove USB power.
+  static unsigned long lastRetry = 0;
+  if (millis() - lastRetry > 2000) {
+    Serial.println("[WAIT] Board still alive — flick SW10 to cut USB power.");
+    digitalWrite(PIN_PWR_HOLD, LOW);
+    lastRetry = millis();
+  }
+  delay(100);
 }

@@ -347,6 +347,21 @@ void savePairedNodes() {
   Serial.printf("[REG] Saved %d paired/deployed nodes to NVS\n", count);
 }
 
+// Maximum number of paired/deployed nodes we will attempt to restore.
+// Guards against corrupted NVS "count" values causing runaway loops.
+static const int kMaxPairedNodes = 64;
+
+// Returns true if a MAC looks valid (not all-zero and not all-0xFF).
+static bool macLooksValid(const uint8_t mac[6]) {
+  bool allZero = true;
+  bool allFF   = true;
+  for (int i = 0; i < 6; ++i) {
+    if (mac[i] != 0x00) allZero = false;
+    if (mac[i] != 0xFF) allFF   = false;
+  }
+  return !(allZero || allFF);
+}
+
 void loadPairedNodes() {
   Preferences prefs;
   if (!prefs.begin("paired_nodes", false)) {
@@ -357,31 +372,84 @@ void loadPairedNodes() {
   int count = prefs.getInt("count", 0);
   Serial.printf("[REG] Loading %d paired/deployed nodes from NVS\n", count);
 
+  // Sanity-check the stored count. A negative or absurdly large value
+  // indicates corruption; clear the namespace and start fresh.
+  if (count < 0 || count > kMaxPairedNodes) {
+    Serial.printf("[REG] Paired-node count %d out of range (max %d) — clearing NVS\n",
+                  count, kMaxPairedNodes);
+    prefs.clear();
+    prefs.end();
+    return;
+  }
+
+  int restored = 0;
+  int skipped  = 0;
+
   for (int i = 0; i < count; ++i) {
     char key[16];
 
+    // --- MAC ---
     snprintf(key, sizeof(key), "mac%d", i);
     String macs = prefs.getString(key, "");
-    if (macs.length() != 12) continue;
-
-    uint8_t mac[6];
-    for (int j = 0; j < 6; ++j) {
-      String byteStr = macs.substring(j * 2, j * 2 + 2);
-      mac[j] = (uint8_t)strtoul(byteStr.c_str(), nullptr, 16);
+    if (macs.length() != 12) {
+      Serial.printf("[REG] Node %d: invalid MAC string (len=%u) — skipping\n",
+                    i, (unsigned)macs.length());
+      ++skipped;
+      continue;
     }
 
-    snprintf(key, sizeof(key), "id%d", i);
-    String nid = prefs.getString(key, "NODE");
+    uint8_t mac[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+    bool macParseOk = true;
+    for (int j = 0; j < 6; ++j) {
+      String byteStr = macs.substring(j * 2, j * 2 + 2);
+      // strtoul returns 0 on garbage; guard against non-hex chars.
+      char* endp = nullptr;
+      unsigned long b = strtoul(byteStr.c_str(), &endp, 16);
+      if (endp == byteStr.c_str() || *endp != '\0') {
+        macParseOk = false;
+        break;
+      }
+      mac[j] = (uint8_t)b;
+    }
+    if (!macParseOk || !macLooksValid(mac)) {
+      Serial.printf("[REG] Node %d: MAC parse failed or invalid (%s) — skipping\n",
+                    i, macs.c_str());
+      ++skipped;
+      continue;
+    }
 
+    // --- Node ID ---
+    snprintf(key, sizeof(key), "id%d", i);
+    String nid = prefs.getString(key, "");
+    if (nid.length() == 0 || nid.length() > 32) {
+      Serial.printf("[REG] Node %d: invalid nodeId (len=%u) — skipping\n",
+                    i, (unsigned)nid.length());
+      ++skipped;
+      continue;
+    }
+
+    // --- Node type ---
     snprintf(key, sizeof(key), "typ%d", i);
     String ntype = prefs.getString(key, "restored");
+    if (ntype.length() > 32) {
+      ntype = ntype.substring(0, 32);
+    }
 
+    // --- State ---
     snprintf(key, sizeof(key), "st%d", i);
     uint8_t stRaw = prefs.getUChar(key, (uint8_t)PAIRED);
-    NodeState state = (stRaw <= DEPLOYED) ? (NodeState)stRaw : PAIRED;
+    if (stRaw > (uint8_t)DEPLOYED) {
+      Serial.printf("[REG] Node %d: invalid state %u (max %u) — skipping\n",
+                    i, stRaw, (uint8_t)DEPLOYED);
+      ++skipped;
+      continue;
+    }
+    NodeState state = (NodeState)stRaw;
 
+    // --- Battery voltage ---
     snprintf(key, sizeof(key), "batv%d", i);
     float savedBatV = prefs.getFloat(key, 0.0f);
+    if (isnan(savedBatV) || isinf(savedBatV)) savedBatV = 0.0f;
 
     NodeInfo newNode{};
     memcpy(newNode.mac, mac, 6);
@@ -417,7 +485,21 @@ void loadPairedNodes() {
 
     Serial.printf("[REG] restored %s (%s) state=%s\n",
                   nid.c_str(), macToStr(mac).c_str(), stateToStr(state));
+    ++restored;
   }
 
   prefs.end();
+
+  // If every stored node was rejected as corrupt, wipe the namespace so
+  // we don't keep tripping over the same bad data on every boot.
+  if (count > 0 && restored == 0) {
+    Serial.printf("[REG] All %d paired nodes failed validation — clearing NVS\n", count);
+    Preferences clear;
+    if (clear.begin("paired_nodes", false)) {
+      clear.clear();
+      clear.end();
+    }
+  } else {
+    Serial.printf("[REG] Load complete: %d restored, %d skipped\n", restored, skipped);
+  }
 }

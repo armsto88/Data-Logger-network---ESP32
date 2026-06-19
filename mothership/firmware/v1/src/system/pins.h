@@ -105,7 +105,7 @@
 #define ESPNOW_CHANNEL         11
 #endif
 #ifndef SYNC_WINDOW_MS
-#define SYNC_WINDOW_MS         60000
+#define SYNC_WINDOW_MS         120000  // 120 seconds — allows multiple nodes to sync
 #endif
 #ifndef DEFAULT_SYNC_INTERVAL_MIN
 #define DEFAULT_SYNC_INTERVAL_MIN 60
