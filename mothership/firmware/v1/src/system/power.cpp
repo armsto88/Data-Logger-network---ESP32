@@ -4,16 +4,19 @@
 static bool gPwrHoldAsserted = false;
 
 void powerInit() {
-  // PWR_HOLD — must be driven HIGH to keep VSYS powered
+  // PWR_HOLD must be the first initialized output. Never drive it LOW during
+  // startup: even a short low pulse can release the external power gate before
+  // wake-source detection has completed.
+  digitalWrite(PIN_PWR_HOLD, HIGH);
   pinMode(PIN_PWR_HOLD, OUTPUT);
-  digitalWrite(PIN_PWR_HOLD, LOW);  // Will be asserted in assertPwrHold()
+  gPwrHoldAsserted = true;
 
   // Config latch sense (active LOW when latch is set)
   pinMode(PIN_CONFIG_WAKE, INPUT);
 
   // Config latch clear (pulse HIGH to clear)
-  pinMode(PIN_CONFIG_CLEAR, OUTPUT);
   digitalWrite(PIN_CONFIG_CLEAR, LOW);
+  pinMode(PIN_CONFIG_CLEAR, OUTPUT);
 
   // Status LED
   pinMode(PIN_CFG_LED, OUTPUT);
@@ -37,7 +40,6 @@ void powerInit() {
   // Modem STATUS
   pinMode(PIN_MODEM_STATUS, INPUT);
 
-  gPwrHoldAsserted = false;
 }
 
 void assertPwrHold() {

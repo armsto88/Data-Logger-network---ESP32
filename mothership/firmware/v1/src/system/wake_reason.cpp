@@ -18,33 +18,36 @@ static bool wakeReadReg(uint8_t reg, uint8_t& value) {
   return true;
 }
 
-static bool wakeAlarm1FlagSet() {
+static bool wakeReadAlarm1Flag(bool& alarmSet) {
   uint8_t status = 0;
   if (!wakeReadReg(0x0F, status)) return false;
-  return (status & 0x01) != 0;
+  alarmSet = (status & 0x01) != 0;
+  return true;
 }
 
-WakeReason detectWakeReason() {
-  // 1. Check config latch (active LOW = config button was pressed)
-  if (readConfigWake()) {
-    return WAKE_CONFIG_BUTTON;
-  }
+WakeSources detectWakeSources() {
+  WakeSources sources{};
+  sources.configRequested = readConfigWake();
 
-  // 2. Check DS3231 alarm flag
-  // Init I2C if not already done
+  // Read the RTC even when config is requested so simultaneous wake sources
+  // are not collapsed into an if/else decision.
   if (!gWakeRTCInitialized) {
     Wire.begin(PIN_SDA, PIN_SCL);
     Wire.setClock(100000);
     gWakeRTCInitialized = true;
   }
+  sources.rtcStatusRead = wakeReadAlarm1Flag(sources.rtcAlarm);
+  return sources;
+}
 
-  if (wakeAlarm1FlagSet()) {
-    return WAKE_RTC_ALARM;
-  }
-
-  // 3. If neither config nor RTC alarm, assume USB service wake
-  // In production, check USB_VBUS or esp_sleep_get_wakeup_cause()
+WakeReason selectWakeReason(const WakeSources& sources) {
+  if (sources.configRequested) return WAKE_CONFIG_BUTTON;
+  if (sources.rtcAlarm) return WAKE_RTC_ALARM;
   return WAKE_USB_SERVICE;
+}
+
+WakeReason detectWakeReason() {
+  return selectWakeReason(detectWakeSources());
 }
 
 const char* wakeReasonStr(WakeReason reason) {
@@ -72,5 +75,15 @@ void printWakeReason(WakeReason reason) {
     default:
       Serial.println("[WAKE] Could not determine wake source");
       break;
+  }
+}
+
+void printWakeSources(const WakeSources& sources) {
+  Serial.printf("[WAKE] Sources: config=%s rtc_alarm=%s rtc_read=%s\n",
+                sources.configRequested ? "YES" : "no",
+                sources.rtcAlarm ? "YES" : "no",
+                sources.rtcStatusRead ? "ok" : "FAILED");
+  if (sources.configRequested && sources.rtcAlarm) {
+    Serial.println("[WAKE] Config and RTC are both active — config takes priority");
   }
 }

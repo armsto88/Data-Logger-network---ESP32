@@ -115,9 +115,6 @@ void handleSyncWake() {
   Serial.println("=== SYNC WAKE ===");
   setLed(true);
 
-  // Clear the RTC alarm flag that woke us
-  clearAlarmFlag();
-
   // Load sync interval from NVS (gSyncIntervalMin is only set during config mode)
   loadWakeIntervalFromNVS();
   gSyncIntervalMin = computeAutoSyncMin(gWakeIntervalMin);
@@ -212,8 +209,6 @@ void handleSyncWake() {
   Serial.println("[SYNC] Alarm armed and verified. Powering down.");
   setLed(false);
   delay(100);
-  // Disable alarm interrupt so INT pin goes high — allows config button to wake board
-  disableAlarmInterrupt();
   releasePwrHold();  // Board powers off here
 }
 
@@ -223,19 +218,22 @@ void handleSyncWake() {
 void handleConfigWake() {
   Serial.println("=== CONFIG WAKE ===");
 
-  // Clear the config latch
-  clearConfigLatch();
-  Serial.printf("[CONFIG] Latch cleared, CONFIG_WAKE=%s\n",
-                 readConfigWake() ? "STILL SET" : "cleared");
-
+  // Keep the config request latched for the whole session. It is cleared only
+  // during the final shutdown sequence, after the RTC alarm is armed.
   setLed(true);
 
-  // 1. Init RTC for time display and alarm scheduling
+  // Step 1: Init RTC for time display and alarm scheduling
+  Serial.println("[CFG-DBG] Step 1: initRTC...");
+  Serial.flush();
   if (!initRTC()) {
     Serial.println("[WARN] RTC init failed in config mode — continuing without RTC");
   }
+  Serial.println("[CFG-DBG] Step 1 done: initRTC");
+  Serial.flush();
 
-  // 2. Init storage: try SD first, fall back to flash (LittleFS)
+  // Step 2: Init storage: try SD first, fall back to flash (LittleFS)
+  Serial.println("[CFG-DBG] Step 2: initSD / initFlash...");
+  Serial.flush();
   if (!initSD()) {
     Serial.println("[WARN] SD card init failed — falling back to flash (LittleFS)");
     if (!initFlash()) {
@@ -248,30 +246,73 @@ void handleConfigWake() {
     // Also init flash as a secondary store for the config server's CSV view.
     initFlash();
   }
+  Serial.println("[CFG-DBG] Step 2 done: initSD / initFlash");
+  Serial.flush();
 
-  // 3. Load paired nodes + NVS globals
+  // Step 3: Load paired nodes
+  Serial.println("[CFG-DBG] Step 3: loading paired nodes...");
+  Serial.flush();
   loadPairedNodes();
+  Serial.println("[CFG-DBG] Step 3 done: loadPairedNodes OK");
+  Serial.flush();
+
+  // Step 4: Load wake interval from NVS
+  Serial.println("[CFG-DBG] Step 4: loadWakeIntervalFromNVS...");
+  Serial.flush();
   loadWakeIntervalFromNVS();
+  Serial.println("[CFG-DBG] Step 4 done: loadWakeIntervalFromNVS");
+  Serial.flush();
+
+  // Step 5: Compute auto sync min
+  Serial.println("[CFG-DBG] Step 5: computeAutoSyncMin...");
+  Serial.flush();
   gSyncIntervalMin = computeAutoSyncMin(gWakeIntervalMin);
+  Serial.println("[CFG-DBG] Step 5 done: computeAutoSyncMin");
+  Serial.flush();
+
+  // Step 6: Load sync mode from NVS
+  Serial.println("[CFG-DBG] Step 6: loadSyncModeFromNVS...");
+  Serial.flush();
   loadSyncModeFromNVS();
+  Serial.println("[CFG-DBG] Step 6 done: loadSyncModeFromNVS");
+  Serial.flush();
+
+  // Step 7: Load daily sync time from NVS
+  Serial.println("[CFG-DBG] Step 7: loadDailySyncTimeFromNVS...");
+  Serial.flush();
   loadDailySyncTimeFromNVS();
+  Serial.println("[CFG-DBG] Step 7 done: loadDailySyncTimeFromNVS");
+  Serial.flush();
+
+  // Step 8: Load sync runtime guards from NVS
+  Serial.println("[CFG-DBG] Step 8: loadSyncRuntimeGuardsFromNVS...");
+  Serial.flush();
   loadSyncRuntimeGuardsFromNVS();
+  Serial.println("[CFG-DBG] Step 8 done: loadSyncRuntimeGuardsFromNVS");
+  Serial.flush();
 
   Serial.printf("[CONFIG] wake=%d min sync=%d min mode=%s daily=%02d:%02d\n",
                 gWakeIntervalMin, gSyncIntervalMin,
                 (gSyncMode == 1) ? "interval" : "daily",
                 gSyncDailyHour, gSyncDailyMinute);
 
-  // 4. Init ESP-NOW in config mode (AP+STA on ESPNOW_CHANNEL)
+  // Step 9: Init ESP-NOW in config mode (AP+STA on ESPNOW_CHANNEL)
+  Serial.println("[CFG-DBG] Step 9: initEspNowConfig...");
+  Serial.flush();
   if (!initEspNowConfig(ESPNOW_CHANNEL)) {
     Serial.println("[WARN] ESP-NOW config init failed — continuing without ESP-NOW");
   }
+  Serial.println("[CFG-DBG] Step 9 done: initEspNowConfig");
+  Serial.flush();
 
-  // 5. Start WiFi AP + web server
+  // Step 10: Start WiFi AP + web server
+  Serial.println("[CFG-DBG] Step 10: startConfigServer...");
+  Serial.flush();
   startConfigServer();
+  Serial.println("[CFG-DBG] Step 10 done: startConfigServer");
+  Serial.flush();
 
-  // 6. Config server loop — exit on second button press or 30-min timeout
-  Serial.println("[CONFIG] Config mode active. Press config button again to exit.");
+  // Config server loop — exit from the web UI or on the 30-minute timeout.
   unsigned long configStartMs = millis();
   const unsigned long kConfigTimeoutMs = 30UL * 60UL * 1000UL;  // 30 min
 
@@ -279,11 +320,6 @@ void handleConfigWake() {
   // The SN74LVC2G74 latch bounces unpredictably, so we don't poll it for exit.
   // Exit is via web UI /shutdown route or 30-minute timeout.
   Serial.println("[CONFIG] Config mode active. Use web UI Shut Down button or wait 30 min.");
-
-  // Clear any residual latch from the wake press
-  clearConfigLatch();
-  delay(100);
-  clearConfigLatch();
 
   while (true) {
     configServerLoop();
@@ -333,9 +369,8 @@ void handleConfigWake() {
 
   Serial.println("[CONFIG] Powering down.");
   setLed(false);
+  clearConfigLatch();
   delay(100);
-  // Disable alarm interrupt so INT pin goes high — allows config button to wake board
-  disableAlarmInterrupt();
   releasePwrHold();
 }
 
@@ -346,10 +381,6 @@ void handleServiceWake() {
   Serial.println("=== SERVICE WAKE (USB) ===");
   Serial.println("[SERVICE] No config button, no RTC alarm.");
   Serial.println("[SERVICE] Powering off. Press config button to enter config mode.");
-
-  // Init RTC just to clear any stale alarm flags
-  initRTC();
-  clearAlarmFlag();
 
   setLed(false);
   delay(100);
@@ -374,9 +405,18 @@ void setup() {
   float vBat = readBatteryVoltage();
   Serial.printf("[PWR] Battery: %.3f V\n", vBat);
 
-  // Detect wake reason
-  WakeReason reason = detectWakeReason();
+  // Capture wake inputs independently. Config wins if the button latch and
+  // RTC alarm are active at the same time.
+  WakeSources sources = detectWakeSources();
+  WakeReason reason = selectWakeReason(sources);
+  printWakeSources(sources);
   printWakeReason(reason);
+
+  // PWR_HOLD is already secure. Clear a pending RTC flag only after both wake
+  // inputs have been captured, including when config mode takes priority.
+  if (sources.rtcAlarm && !clearAlarmFlag()) {
+    Serial.println("[WAKE] Warning: failed to clear RTC alarm flag");
+  }
 
   // Branch based on wake reason
   switch (reason) {

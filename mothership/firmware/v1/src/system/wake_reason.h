@@ -13,6 +13,17 @@ enum WakeReason {
   WAKE_UNKNOWN         // Cannot determine wake source
 };
 
+struct WakeSources {
+  bool configRequested;
+  bool rtcAlarm;
+  bool rtcStatusRead;
+};
+
+// Capture wake inputs independently. Both configRequested and rtcAlarm may be
+// true; selectWakeReason() gives the config request priority in that case.
+WakeSources detectWakeSources();
+WakeReason  selectWakeReason(const WakeSources& sources);
 WakeReason detectWakeReason();
 const char* wakeReasonStr(WakeReason reason);
+void printWakeSources(const WakeSources& sources);
 void printWakeReason(WakeReason reason);

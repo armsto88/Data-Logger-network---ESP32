@@ -107,19 +107,19 @@ bool armNextSyncAlarm(int intervalMin) {
   // Clear any existing alarm flag first
   clearAlarmFlag();
 
-  // Enable alarm interrupt: INTCN=1, A1IE=0 (test: disable interrupt output)
+  // Enable the Alarm 1 interrupt output.
   uint8_t ctrl = 0;
   if (!readReg(0x0E, ctrl)) {
     Serial.println("[RTC] Failed to read control register");
     return false;
   }
   ctrl |= 0x04;  // INTCN=1
-  ctrl &= ~0x01; // A1IE=0 (disable alarm interrupt output — test if config button works)
+  ctrl |= 0x01;  // A1IE=1
   if (!writeReg(0x0E, ctrl)) {
     Serial.println("[RTC] Failed to write control register");
     return false;
   }
-  Serial.printf("[RTC] Control register: 0x%02X (INTCN=1, A1IE=0)\n", ctrl);
+  Serial.printf("[RTC] Control register: 0x%02X (INTCN=1, A1IE=1)\n", ctrl);
 
   if (!writeAlarm1Exact(next)) {
     Serial.println("[RTC] Failed to write Alarm 1 registers");
@@ -161,19 +161,19 @@ bool armNextSyncAlarmPhase(int intervalMin, uint32_t phaseUnix) {
   // Clear any existing alarm flag first
   clearAlarmFlag();
 
-  // Enable alarm interrupt: INTCN=1, A1IE=0 (test: disable interrupt output)
+  // Enable the Alarm 1 interrupt output.
   uint8_t ctrl = 0;
   if (!readReg(0x0E, ctrl)) {
     Serial.println("[RTC] Failed to read control register");
     return false;
   }
   ctrl |= 0x04;  // INTCN=1
-  ctrl &= ~0x01; // A1IE=0 (disable alarm interrupt output — test if config button works)
+  ctrl |= 0x01;  // A1IE=1
   if (!writeReg(0x0E, ctrl)) {
     Serial.println("[RTC] Failed to write control register");
     return false;
   }
-  Serial.printf("[RTC] Control register: 0x%02X (INTCN=1, A1IE=0)\n", ctrl);
+  Serial.printf("[RTC] Control register: 0x%02X (INTCN=1, A1IE=1)\n", ctrl);
 
   if (!writeAlarm1Exact(next)) {
     Serial.println("[RTC] Failed to write Alarm 1 registers");
@@ -272,12 +272,11 @@ bool verifyAlarmSet() {
   }
 
   bool intcnSet = (ctrl & 0x04) != 0;
-  // A1IE=0 is intentional (test mode — RTC interrupt output disabled).
-  // Only require INTCN=1; the alarm registers themselves are what matter for verification.
-  bool a1ieSet = true;  // A1IE=0 is intentional (test mode — RTC interrupt disabled)
+  bool a1ieSet = (ctrl & 0x01) != 0;
 
-  if (!intcnSet) {
-    Serial.printf("[RTC] Verification: INTCN=%d A1IE=%d (expected INTCN=1)\n", intcnSet, (ctrl & 0x01) != 0);
+  if (!intcnSet || !a1ieSet) {
+    Serial.printf("[RTC] Verification: INTCN=%d A1IE=%d (both must be 1)\n",
+                  intcnSet, a1ieSet);
     return false;
   }
 
