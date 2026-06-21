@@ -13,6 +13,7 @@
 
 bool initFlash();
 bool logSnapshotRow(const node_snapshot_t* snap);
+bool logSnapshotBatch(const node_snapshot_t* snapshots, int count);
 bool flashLogCSVRow(const String& row);
 String flashGetCSVStats();
 bool flashCreateCSVHeader();

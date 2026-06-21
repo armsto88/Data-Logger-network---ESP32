@@ -21,6 +21,9 @@
 #include "config/node_registry.h"
 #include "comms/espnow_config.h"
 #include "config/config_server.h"
+#include "config/transmission_settings.h"
+#include "storage/upload_queue.h"
+#include "comms/modem_driver.h"
 #include "protocol.h"
 
 // ---------------------------------------------------------------------------
@@ -29,6 +32,11 @@
 #ifndef DEFAULT_SYNC_INTERVAL_MIN
 #define DEFAULT_SYNC_INTERVAL_MIN 60
 #endif
+
+// ---------------------------------------------------------------------------
+// Upload subsystem globals
+// ---------------------------------------------------------------------------
+UploadQueue uploadQueue;
 
 // gSyncIntervalMin is now owned by config_server.cpp (loaded from NVS in
 // config mode).  In sync-wake mode it falls back to the compile-time default
@@ -40,6 +48,7 @@
 void handleSyncWake();
 void handleConfigWake();
 void handleServiceWake();
+void performModemUpload(const TransmissionSettings& txSettings);
 
 // ---------------------------------------------------------------------------
 // ESP-NOW receive callback
@@ -109,6 +118,69 @@ void onEspNowData(const uint8_t* mac, const uint8_t* data, int len) {
 }
 
 // ---------------------------------------------------------------------------
+// Modem upload sequence (called from handleSyncWake when txSettings.enabled)
+// ---------------------------------------------------------------------------
+void performModemUpload(const TransmissionSettings& txSettings) {
+  Serial.println("[UPLOAD] === Starting modem upload sequence ===");
+
+  ModemDriver modem;
+  modem.init();
+
+  // 1. Power on modem
+  if (!modem.powerOn()) {
+    Serial.println("[UPLOAD] FAIL: Modem power-on failed");
+    uploadQueue.incrementRetryCount();
+    return;
+  }
+  Serial.println("[UPLOAD] Modem powered on");
+
+  // 2. Wait for network registration (60s timeout — will fail without antenna)
+  Serial.println("[UPLOAD] Waiting for network registration (60s timeout)...");
+  if (!modem.waitForNetwork(60000)) {
+    Serial.println("[UPLOAD] Network registration failed/timeout — skipping upload");
+    modem.gracefulShutdown();
+    uploadQueue.incrementRetryCount();
+    return;
+  }
+  Serial.println("[UPLOAD] Network registered");
+
+  // 3. Get new data from cursor
+  UploadPayload payload = uploadQueue.getNewData(txSettings.maxBytesPerSession);
+  if (payload.byteLength == 0) {
+    Serial.println("[UPLOAD] No new data to upload");
+    modem.gracefulShutdown();
+    return;
+  }
+  Serial.printf("[UPLOAD] Payload: %u bytes, ~%u rows\n", payload.byteLength, payload.rowEstimate);
+
+  // 4. Build URL with auth token
+  String url = buildUploadUrl(txSettings);
+
+  // 5. HTTPS POST
+  Serial.printf("[UPLOAD] POSTing to %s\n", url.c_str());
+  HttpsPostResult result = modem.httpsPost(url, payload.csvData, "text/csv", txSettings.authToken);
+
+  // 6. Handle result
+  if (result.success && result.httpStatus == 200) {
+    Serial.printf("[UPLOAD] SUCCESS: HTTP %d, %u bytes uploaded\n", result.httpStatus, payload.byteLength);
+    uint32_t nowUnix = getRTCTime();
+    uploadQueue.advanceCursor(payload.startOffset + payload.byteLength, nowUnix);
+    uploadQueue.purgeUploaded();
+    uploadQueue.resetRetryCount();
+  } else {
+    Serial.printf("[UPLOAD] FAIL: HTTP %d, %s\n", result.httpStatus, result.errorDetail.c_str());
+    uploadQueue.incrementRetryCount();
+  }
+
+  // 7. Emergency purge check (regardless of upload success)
+  uploadQueue.emergencyPurgeIfFull(80);
+
+  // 8. Graceful shutdown
+  modem.gracefulShutdown();
+  Serial.println("[UPLOAD] Modem upload sequence complete");
+}
+
+// ---------------------------------------------------------------------------
 // Sync wake handler
 // ---------------------------------------------------------------------------
 void handleSyncWake() {
@@ -135,6 +207,13 @@ void handleSyncWake() {
     }
   } else {
     Serial.println("[STORAGE] Active storage: SD card");
+  }
+
+  // Init upload queue (after flash is ready) and emergency-purge before
+  // logging new data so there is always space for incoming node snapshots.
+  if (flashIsReady()) {
+    uploadQueue.init();
+    uploadQueue.emergencyPurgeIfFull(80);
   }
 
   // Init ESP-NOW in sync-only mode
@@ -189,6 +268,46 @@ void handleSyncWake() {
   }
 
   Serial.println("[SYNC] Sync window closed");
+
+  // --- LTE upload phase ---
+  // Entirely conditional on txSettings.enabled — a complete no-op when
+  // disabled, with no serial spam.  Upload failure never blocks the sync
+  // wake from completing; local logging is always primary.
+  TransmissionSettings txSettings;
+  loadTransmissionSettings(txSettings);
+
+  if (txSettings.enabled && flashIsReady()) {
+    uploadQueue.incrementWakeCounter();
+
+    // Determine upload policy: uploadIntervalMin=0 means every wake.
+    // Otherwise compute how many sync wakes to skip.
+    uint8_t policyWakes = 1;  // default: every wake
+    if (txSettings.uploadIntervalMin > 0 && gSyncIntervalMin > 0) {
+      policyWakes = (uint8_t)(txSettings.uploadIntervalMin / gSyncIntervalMin);
+      if (policyWakes < 1) policyWakes = 1;
+    }
+
+    if (uploadQueue.shouldUploadThisWake(policyWakes)) {
+      float batV = readBatteryVoltage();
+      uint16_t batMv = (uint16_t)(batV * 1000);
+
+      if (batMv >= txSettings.minBatteryMv) {
+        if (!uploadQueue.maxRetriesExceeded(txSettings.maxRetriesPerWindow)) {
+          if (uploadQueue.getPendingBytes() > 0) {
+            performModemUpload(txSettings);
+          } else {
+            Serial.println("[UPLOAD] No new data to upload");
+          }
+        } else {
+          Serial.printf("[UPLOAD] Max retries (%u) exceeded — skipping\n", txSettings.maxRetriesPerWindow);
+        }
+      } else {
+        Serial.printf("[UPLOAD] Battery %u mV < min %u mV — skipping\n", batMv, txSettings.minBatteryMv);
+      }
+    } else {
+      Serial.println("[UPLOAD] Not scheduled this wake — skipping");
+    }
+  }
 
   // Re-arm alarm for next sync
   int syncInterval = (gSyncIntervalMin > 0) ? gSyncIntervalMin : DEFAULT_SYNC_INTERVAL_MIN;

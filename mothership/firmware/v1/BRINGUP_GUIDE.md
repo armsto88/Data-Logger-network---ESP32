@@ -26,10 +26,10 @@ This guide walks through bringing up a fresh V1 mothership PCB one subsystem at 
 ### Test order and dependencies
 
 ```
-PWR_HOLD ──► Config Latch ──► RTC Alarm ──► SD Card ──► Battery ADC ──► ESP-NOW ──► Wake Reason ──► Modem Power
-   │              │                │              │            │             │              │               │
-   │              │                │              │            │             │              │               │
-   └─ VSYS must hold  └─ GPIO works  └─ I2C works  └─ SPI works  └─ ADC works  └─ WiFi works  └─ Full boot   └─ 4V rail
+PWR_HOLD ──► Config Latch ──► RTC Alarm ──► SD Card ──► Battery ADC ──► ESP-NOW ──► Wake Reason ──► Modem Power ──► Modem UART ──► Modem Identify ──► Modem SIM ──► Modem Network ──► Modem Power Cycle
+   │              │                │              │            │             │              │               │              │              │              │              │                  │
+   │              │                │              │            │             │              │               │              │              │              │              │                  │
+   └─ VSYS must hold  └─ GPIO works  └─ I2C works  └─ SPI works  └─ ADC works  └─ WiFi works  └─ Full boot   └─ 4V rail   └─ UART link  └─ IMEI read  └─ SIM present  └─ Net status  └─ Repeated on/off
 ```
 
 > **Critical:** Every test sketch asserts `PWR_HOLD` (GPIO26) as its very first action. If PWR_HOLD doesn't work, the board will power off immediately. **Test PWR_HOLD first.**
@@ -480,6 +480,325 @@ ESP_PG = LOW (expected LOW after rail off)
 | ESP_PG always HIGH (even in Phase 1) | GPIO35 external pull-up too strong, or TPS63020 PG output floating | Verify PG pin connection and pull-up/pull-down resistors |
 | MODEM_VBAT_3V9 voltage wrong | TPS63020 output not regulating correctly | Check inductor value, input voltage, and output capacitor |
 | Board resets when 4V_EN enabled | Inrush current causing VSYS sag | Add soft-start or verify VSYS supply can handle the load |
+
+---
+
+### 3.9 Modem AT Command Bring-up Suite
+
+**What it validates:** The full A7670G modem bring-up chain — power rail, PWRKEY boot pulse, STATUS feedback, UART2 link, and AT command response. Tests 9–13 run the modem through progressively deeper checks: UART link, modem identity, SIM presence, network status, and repeated power cycling. **All five tests are designed to PASS without an antenna.** Network registration is NOT expected; `CSQ: 99,99` and `CREG: 0,2` are the expected no-antenna responses and count as PASS.
+
+The suite shares a common helper header `tests/modem_at_helper.h` that provides:
+
+| Helper | Purpose |
+|---|---|
+| `modemRailOn()` | PWM soft-start 4V_EN (GPIO33) 0→100% over 500 ms, wait for ESP_PG (GPIO35) HIGH |
+| `modemRailOff()` | Drive 4V_EN LOW immediately |
+| `modemPulsePwrkey()` | Drive M_PWRKEY (GPIO14) HIGH for 1100 ms then LOW |
+| `modemReadStatus()` | Read STATUS (GPIO4) level |
+| `modemWaitBoot(ms)` | Wait for STATUS HIGH and/or AT→OK on Serial2 |
+| `modemSendAT(cmd)` | Send AT command, return true if `OK` seen in response |
+| `modemSendATRaw(cmd)` | Send AT command, return true if any response seen |
+| `modemGracefulOff()` | AT+CPOF → wait STATUS LOW → fallback PWRKEY 2.5 s long-press → rail off |
+| `modemInitUart()` | Initialise Serial2 @ 115200 baud on GPIO16 (RX) / GPIO17 (TX) |
+
+**Power-on sequence used by all modem tests:**
+
+1. Assert `PWR_HOLD` (GPIO26) HIGH first
+2. `modemRailOn()`: PWM soft-start 4V_EN (GPIO33) 0→100% over 500 ms, wait for ESP_PG (GPIO35) HIGH
+3. `modemPulsePwrkey()`: drive M_PWRKEY (GPIO14) HIGH for 1100 ms then LOW
+4. `modemWaitBoot(15000)`: wait for STATUS (GPIO4) HIGH and/or AT→OK on Serial2
+
+**Power-off sequence:** `modemGracefulOff()` — AT+CPOF, wait STATUS LOW, fallback PWRKEY 2.5 s, then 4V_EN LOW.
+
+> **No-antenna note:** Tests 9–13 validate that the modem powers on, boots, responds to AT commands, reads the SIM, and reports network status — all without needing RF. `CSQ: 99,99` (no signal) and `CREG: 0,2` (not registered, searching) are the expected responses and count as PASS.
+
+---
+
+#### 3.9.1 Test 9: Modem UART (`mothership-v1-modem-uart`)
+
+**What it validates:** Rail → PWRKEY → STATUS → UART2 → AT responds OK. This is the first test that actually boots the modem and confirms the UART link works end-to-end.
+
+**Build and flash:**
+
+```bash
+pio run -e mothership-v1-modem-uart -t upload -t monitor
+```
+
+**What to observe:**
+
+- The sketch asserts PWR_HOLD, soft-starts the 4V rail, pulses PWRKEY, and waits for STATUS HIGH.
+- It then opens Serial2 @ 115200 baud and sends `AT` repeatedly until `OK` is seen.
+- On success it prints `UART link works, AT→OK` and gracefully powers off the modem.
+
+**Expected serial output:**
+
+```
+=== Mothership V1 Modem UART Bring-up ===
+[PWR] PWR_HOLD=HIGH
+[RAIL] PWM soft-start 4V_EN 0→100% over 500 ms
+[RAIL] ESP_PG=HIGH after 150 ms — rail GOOD
+[PWRKEY] pulse HIGH 1100 ms
+[BOOT] waiting STATUS HIGH or AT→OK (timeout 15000 ms)
+[BOOT] STATUS=HIGH after 3200 ms
+[UART] Serial2 @ 115200 baud (RX=GPIO16, TX=GPIO17)
+[AT] sending: AT
+[AT] response: OK
+=== Modem UART bring-up PASSED ===
+[OFF] AT+CPOF sent
+[OFF] STATUS=LOW
+[OFF] 4V_EN=LOW — rail off
+```
+
+**Pass criteria:**
+
+- ESP_PG goes HIGH after `modemRailOn()`.
+- STATUS goes HIGH after `modemPulsePwrkey()` + `modemWaitBoot()`.
+- `AT` command returns `OK` on Serial2.
+- `modemGracefulOff()` cleanly powers off the modem (STATUS LOW, 4V_EN LOW).
+
+**Common failure modes:**
+
+| Symptom | Likely cause | Fix |
+|---|---|---|
+| ESP_PG never HIGH | TPS63020 rail not up — run Test 8 first | Check GPIO33 / TPS63020 (see Test 8) |
+| STATUS never HIGH | PWRKEY pulse too short or not connected | Verify GPIO14 → NMOS gate → A7670 PWRKEY trace; confirm 1100 ms pulse |
+| `AT` returns nothing | UART wiring wrong, baud mismatch, TX/RX swapped | Verify GPIO17→modem RXD, GPIO16←modem TXD; confirm 115200 baud |
+| `AT` returns garbled text | Baud mismatch or noise | Confirm 115200 baud; check UART trace integrity |
+| Modem won't power off | AT+CPOF not accepted, PWRKEY fallback failing | Verify GPIO14 long-press path; check STATUS pin |
+
+---
+
+#### 3.9.2 Test 10: Modem Identify (`mothership-v1-modem-identify`)
+
+**What it validates:** ATI, AT+GMM (model), AT+CGSN (IMEI), AT+CGMR (firmware version). Confirms the modem is the expected A7670G and reads its identity.
+
+**Build and flash:**
+
+```bash
+pio run -e mothership-v1-modem-identify -t upload -t monitor
+```
+
+**What to observe:**
+
+- The sketch boots the modem (same sequence as Test 9) and sends the identity commands in order.
+- It prints the raw response to each command and extracts the IMEI.
+- IMEI must be 15 digits to pass.
+
+**Expected serial output:**
+
+```
+=== Mothership V1 Modem Identify Bring-up ===
+[BOOT] modem booted, STATUS=HIGH
+[AT] ATI
+[AT] response: A7670G R2
+       OK
+[AT] AT+GMM
+[AT] response: A7670G
+       OK
+[AT] AT+CGSN
+[AT] response: 865XXXXXXXXXXXX
+       OK
+[IMEI] 865XXXXXXXXXXXX (15 digits) — OK
+[AT] AT+CGMR
+[AT] response: A7670G V1.0
+       OK
+=== Modem Identify bring-up PASSED ===
+[OFF] graceful shutdown complete
+```
+
+**Pass criteria:**
+
+- ATI responds with a model string containing `A7670G`.
+- AT+GMM responds with the model name.
+- AT+CGSN returns a 15-digit IMEI.
+- AT+CGMR returns a firmware version string.
+
+**Common failure modes:**
+
+| Symptom | Likely cause | Fix |
+|---|---|---|
+| IMEI not 15 digits | Wrong modem, or response parsing failed | Check raw AT+CGSN output; verify modem is A7670G |
+| ATI returns empty | UART link not established | Run Test 9 first to confirm UART |
+| AT+CGSN returns ERROR | SIM not inserted (some modems require SIM for IMEI) | Insert SIM and retry |
+| Model string doesn't contain A7670G | Wrong modem fitted | Verify modem part number on PCB |
+
+---
+
+#### 3.9.3 Test 11: Modem SIM (`mothership-v1-modem-sim`)
+
+**What it validates:** AT+CPIN? (SIM status), AT+CIMI (IMSI), AT+CCID (ICCID). Confirms a SIM is present and readable.
+
+**Build and flash:**
+
+```bash
+pio run -e mothership-v1-modem-sim -t upload -t monitor
+```
+
+**What to observe:**
+
+- The sketch boots the modem and sends the three SIM-related commands.
+- `+CPIN: READY` indicates the SIM is present and unlocked.
+- AT+CIMI returns the IMSI (subscriber identity).
+- AT+CCID returns the ICCID (card serial).
+
+**Expected serial output:**
+
+```
+=== Mothership V1 Modem SIM Bring-up ===
+[BOOT] modem booted, STATUS=HIGH
+[AT] AT+CPIN?
+[AT] response: +CPIN: READY
+       OK
+[CPIN] READY — SIM present
+[AT] AT+CIMI
+[AT] response: 505XXXXXXXXX
+       OK
+[IMSI] 505XXXXXXXXX
+[AT] AT+CCID
+[AT] response: 8961XXXXXXXXXXXXXXXXX
+       OK
+[CCID] 8961XXXXXXXXXXXXXXXXX
+=== Modem SIM bring-up PASSED ===
+[OFF] graceful shutdown complete
+```
+
+**Pass criteria:**
+
+- `+CPIN: READY` is returned (SIM present and unlocked).
+- AT+CIMI returns a non-empty IMSI.
+- AT+CCID returns a non-empty ICCID.
+
+**Common failure modes:**
+
+| Symptom | Likely cause | Fix |
+|---|---|---|
+| `+CPIN: NOT INSERTED` | SIM not seated, SIM holder solder issue | Reseat SIM, check SIM holder solder and trace |
+| `+CPIN: SIM PIN` | SIM has PIN lock enabled | Disable PIN lock on SIM (AT+CLCK="SC",0) or use a PIN-free SIM |
+| AT+CCID returns ERROR | SIM not fully initialised, or command unsupported | Wait longer after boot; some modems need a delay before CCID |
+| All SIM commands fail | SIM not present or dead | Try a known-good SIM |
+
+---
+
+#### 3.9.4 Test 12: Modem Network (`mothership-v1-modem-network`)
+
+**What it validates:** AT+CSQ (signal), AT+CREG? (GSM registration), AT+CEREG? (EPS registration), AT+CGATT? (GPRS attach), AT+COPS? (operator). **No antenna is required** — the test only checks that the modem responds to each command, not that it registers.
+
+**Build and flash:**
+
+```bash
+pio run -e mothership-v1-modem-network -t upload -t monitor
+```
+
+**What to observe:**
+
+- The sketch boots the modem and sends the five network-status commands.
+- Without an antenna, `CSQ: 99,99` (no signal) and `CREG: 0,2` (not registered, searching) are expected and count as PASS.
+- The test validates that every command gets a response — not that registration succeeds.
+
+**Expected serial output (no antenna):**
+
+```
+=== Mothership V1 Modem Network Bring-up ===
+[BOOT] modem booted, STATUS=HIGH
+[AT] AT+CSQ
+[AT] response: +CSQ: 99,99
+       OK
+[CSQ] 99,99 — no signal (expected without antenna)
+[AT] AT+CREG?
+[AT] response: +CREG: 0,2
+       OK
+[CREG] 0,2 — not registered, searching (expected without antenna)
+[AT] AT+CEREG?
+[AT] response: +CEREG: 0,2
+       OK
+[CEREG] 0,2 — not registered, searching
+[AT] AT+CGATT?
+[AT] response: +CGATT: 0
+       OK
+[CGATT] 0 — not attached
+[AT] AT+COPS?
+[AT] response: +COPS: 0
+       OK
+[COPS] no operator (expected without antenna)
+=== Modem Network bring-up PASSED ===
+[OFF] graceful shutdown complete
+```
+
+**Pass criteria:**
+
+- All five commands return a response (not ERROR/timeout).
+- `CSQ: 99,99` is acceptable (no antenna).
+- `CREG: 0,2` is acceptable (searching, not registered).
+- `CGATT: 0` is acceptable (not attached).
+- `COPS: 0` (no operator) is acceptable (no antenna).
+
+**Common failure modes:**
+
+| Symptom | Likely cause | Fix |
+|---|---|---|
+| Any command returns ERROR | Modem not fully booted, or command unsupported | Increase `modemWaitBoot()` timeout; verify firmware supports command |
+| Any command times out | UART link dropped mid-test | Run Test 9 to confirm UART stability; check for loose wiring |
+| `+CME ERROR: 30` | No SIM inserted (some network commands require SIM) | Run Test 11 first; insert SIM |
+| `CSQ: 0,0` with antenna | Antenna or RF path issue | Check antenna connection and RF connector; verify modem band config |
+
+---
+
+#### 3.9.5 Test 13: Modem Power Cycle (`mothership-v1-modem-powercycle`)
+
+**What it validates:** Three full on→boot→AT→AT+CPOF→off cycles. Confirms the modem can be repeatedly powered on and off cleanly without hanging or leaving the rail on.
+
+**Build and flash:**
+
+```bash
+pio run -e mothership-v1-modem-powercycle -t upload -t monitor
+```
+
+**What to observe:**
+
+- The sketch runs three complete power cycles using the shared helpers.
+- Each cycle: `modemRailOn()` → `modemPulsePwrkey()` → `modemWaitBoot()` → `AT` → `AT+CPOF` → `modemGracefulOff()`.
+- All three cycles must complete cleanly (STATUS goes HIGH on, LOW off each time).
+
+**Expected serial output:**
+
+```
+=== Mothership V1 Modem Power Cycle Bring-up ===
+--- Cycle 1/3 ---
+[RAIL] ESP_PG=HIGH after 150 ms
+[PWRKEY] pulse 1100 ms
+[BOOT] STATUS=HIGH after 3100 ms
+[AT] AT → OK
+[OFF] AT+CPOF → STATUS=LOW → 4V_EN=LOW
+--- Cycle 2/3 ---
+[RAIL] ESP_PG=HIGH after 140 ms
+[PWRKEY] pulse 1100 ms
+[BOOT] STATUS=HIGH after 2900 ms
+[AT] AT → OK
+[OFF] AT+CPOF → STATUS=LOW → 4V_EN=LOW
+--- Cycle 3/3 ---
+[RAIL] ESP_PG=HIGH after 160 ms
+[PWRKEY] pulse 1100 ms
+[BOOT] STATUS=HIGH after 3300 ms
+[AT] AT → OK
+[OFF] AT+CPOF → STATUS=LOW → 4V_EN=LOW
+=== Modem Power Cycle bring-up PASSED ===
+```
+
+**Pass criteria:**
+
+- All 3 cycles complete.
+- STATUS goes HIGH after each boot and LOW after each graceful off.
+- `AT` returns `OK` in every cycle.
+- 4V_EN ends LOW after every cycle (rail fully off).
+
+**Common failure modes:**
+
+| Symptom | Likely cause | Fix |
+|---|---|---|
+| Cycle 2 STATUS never HIGH | Modem didn't fully power off in cycle 1 | Increase off-delay; verify `modemGracefulOff()` drives 4V_EN LOW |
+| `AT` fails on later cycles | UART not re-initialised after power cycle | Ensure `modemInitUart()` is called after each `modemRailOn()` |
+| STATUS stays HIGH during off | AT+CPOF not accepted, PWRKEY fallback too short | Increase PWRKEY long-press to 2.5 s; verify GPIO14 path |
+| 4V_EN stuck HIGH | `modemRailOff()` not called or GPIO33 stuck | Verify GPIO33 solder; check TPS63020 enable pin |
 
 ---
 

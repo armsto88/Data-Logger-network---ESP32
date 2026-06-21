@@ -4,6 +4,9 @@
 
 #include "config/config_server.h"
 #include "config/node_registry.h"
+#include "config/transmission_settings.h"
+#include "storage/upload_queue.h"
+#include "comms/modem_driver.h"
 #include "comms/espnow_config.h"
 #include "time/rtc_alarm.h"
 #include "storage/flash_logger.h"
@@ -61,6 +64,10 @@ WebServer server(80);
 DNSServer dnsServer;
 
 volatile bool gShutdownRequested = false;
+
+// Upload queue instance for config-mode UI (separate from the sync-wake
+// global in main.cpp, which is only active during a sync wake).
+UploadQueue gUploadQueue;
 
 // ---------------------------------------------------------------------------
 // RTC helpers (adapt production's rtc_manager API to V1's rtc_alarm.h)
@@ -807,6 +814,47 @@ static String buildStatusJson() {
   json += "\"pendingToUnpaired\":";
   json += String((unsigned)pendingToUnpairedCount);
   json += "}";
+
+  // Upload subsystem status
+  TransmissionSettings txSettings;
+  loadTransmissionSettings(txSettings);
+  UploadCursor cursor = {0, 0, 0, 0, 0};
+  uint32_t pendingBytes = 0;
+  uint32_t pendingRows = 0;
+  if (flashIsReady()) {
+    gUploadQueue.init();
+    cursor = gUploadQueue.getCursor();
+    pendingBytes = gUploadQueue.getPendingBytes();
+    pendingRows = gUploadQueue.getPendingRows();
+  }
+  const uint64_t fsTotal = (uint64_t)LittleFS.totalBytes();
+  const uint64_t fsUsed  = (uint64_t)LittleFS.usedBytes();
+  const uint32_t flashUsagePct = (fsTotal > 0)
+    ? (uint32_t)((fsUsed * 100ULL) / fsTotal) : 0;
+
+  json += ",\"upload\":{";
+  json += "\"enabled\":";
+  json += txSettings.enabled ? "true" : "false";
+  json += ",\"cursorOffset\":";
+  json += String(cursor.byteOffset);
+  json += ",\"pendingBytes\":";
+  json += String(pendingBytes);
+  json += ",\"pendingRows\":";
+  json += String(pendingRows);
+  json += ",\"rowsUploaded\":";
+  json += String(cursor.rowsUploaded);
+  json += ",\"lastUploadUnix\":";
+  json += String(cursor.lastUploadUnix);
+  json += ",\"retryCount\":";
+  json += String(cursor.retryCount);
+  json += ",\"flashUsagePct\":";
+  json += String(flashUsagePct);
+  json += ",\"flashTotalBytes\":";
+  json += String((unsigned long)fsTotal);
+  json += ",\"flashUsedBytes\":";
+  json += String((unsigned long)fsUsed);
+  json += "}";
+
   json += "}";
   return json;
 }
@@ -885,7 +933,30 @@ static String buildDataStatusSectionHtml() {
   out += lastConfirmedSync;
   out += F("</p>");
 
-  out += F("<p class='muted'>Use the CSV button at the top to export data.</p></div>");
+  // Upload status summary
+  TransmissionSettings txSettings;
+  loadTransmissionSettings(txSettings);
+  UploadCursor cursor = {0, 0, 0, 0, 0};
+  uint32_t pendingRows = 0;
+  if (flashIsReady()) {
+    gUploadQueue.init();
+    cursor = gUploadQueue.getCursor();
+    pendingRows = gUploadQueue.getPendingRows();
+  }
+  out += F("<p class='muted'><strong>LTE upload:</strong> ");
+  out += txSettings.enabled ? String("enabled") : String("disabled");
+  out += F(" &nbsp;|&nbsp; <strong>Pending rows:</strong> ");
+  out += String(pendingRows);
+  out += F(" &nbsp;|&nbsp; <strong>Rows uploaded:</strong> ");
+  out += String(cursor.rowsUploaded);
+  if (cursor.lastUploadUnix > 0) {
+    DateTime lastUp(cursor.lastUploadUnix);
+    out += F(" &nbsp;|&nbsp; <strong>Last upload:</strong> ");
+    out += formatDateTimeDisplay(lastUp);
+  }
+  out += F("</p>");
+
+  out += F("<p class='muted'>Use the CSV button at the top to export data, or <a href='/upload'>LTE Upload</a> to configure transmission.</p></div>");
   return out;
 }
 
@@ -917,6 +988,7 @@ static void handleRoot() {
             "</form>"
             "<button class='btn' type='button' onclick='toggleInfoPanel()'><svg class='icon' viewBox='0 0 24 24' aria-hidden='true'><path d='M12 2a10 10 0 1010 10A10 10 0 0012 2zm0 4a1.25 1.25 0 11-1.25 1.25A1.25 1.25 0 0112 6zm2 12h-4v-1.8h1.1v-4.2H10v-1.8h3v6h1z'/></svg> INFO</button>"
             "<a href='/download-csv' class='btn btn--success'><svg class='icon' viewBox='0 0 24 24' aria-hidden='true'><path d='M12 3a1 1 0 011 1v8.59l2.3-2.3 1.4 1.42-4.7 4.7-4.7-4.7 1.4-1.42 2.3 2.3V4a1 1 0 011-1zm-7 14h14v2H5v-2z'/></svg> CSV</a>"
+            "<a href='/upload' class='btn'><svg class='icon' viewBox='0 0 24 24' aria-hidden='true'><path d='M12 2a10 10 0 100 20 10 10 0 000-20zm-1 14l-4-4 1.4-1.4L11 13.2V7h2v6.2l2.6-2.6L17 12l-4 4z'/></svg> LTE Upload</a>"
             "<form class='async-form' action='/shutdown' method='POST'>"
             "<button type='submit' class='btn btn--warn'><svg class='icon' viewBox='0 0 24 24' aria-hidden='true'><path d='M13 3h-2v10h2V3zm4.83 2.17l-1.42 1.42C17.99 7.86 19 9.81 19 12c0 3.87-3.13 7-7 7s-7-3.13-7-7c0-2.19 1.01-4.14 2.58-5.42L6.17 5.17C4.23 6.82 3 9.26 3 12c0 4.97 4.03 9 9 9s9-4.03 9-9c0-2.74-1.23-5.18-3.17-6.83z'/></svg> Shut Down</button>"
             "</form>"
@@ -1682,6 +1754,314 @@ static void handleNodeConfigSave() {
 }
 
 // ---------------------------------------------------------------------------
+// LTE upload settings + manual upload handlers
+// ---------------------------------------------------------------------------
+
+static String formatUploadTime(uint32_t unixSec) {
+  if (unixSec == 0) return String("never");
+  DateTime dt(unixSec);
+  return formatDateTimeDisplay(dt);
+}
+
+static void handleUploadSettings() {
+  TransmissionSettings tx;
+  loadTransmissionSettings(tx);
+
+  UploadCursor cursor = {0, 0, 0, 0, 0};
+  uint32_t pendingBytes = 0;
+  uint32_t pendingRows = 0;
+  if (flashIsReady()) {
+    gUploadQueue.init();
+    cursor = gUploadQueue.getCursor();
+    pendingBytes = gUploadQueue.getPendingBytes();
+    pendingRows = gUploadQueue.getPendingRows();
+  }
+  const uint64_t fsTotal = (uint64_t)LittleFS.totalBytes();
+  const uint64_t fsUsed  = (uint64_t)LittleFS.usedBytes();
+  const uint32_t flashUsagePct = (fsTotal > 0)
+    ? (uint32_t)((fsUsed * 100ULL) / fsTotal) : 0;
+
+  String actionsHtml = String("<a href='/' class='btn btn--sm'>Back</a>");
+  String html = headCommon("LTE Upload Settings", actionsHtml);
+
+  html += F("<div class='section'>");
+  html += F("<h3>LTE Upload Settings</h3>");
+  html += F("<p class='muted'>Configure transmission of logged data to a cloud endpoint via the A7670G modem.</p>");
+
+  html += F("<form class='async-form' action='/set-transmission' method='POST'>");
+
+  // Enabled checkbox
+  html += F("<label class='label'><input type='checkbox' name='enabled' value='1'");
+  if (tx.enabled) html += F(" checked");
+  html += F("> <strong>Enable LTE upload</strong></label>");
+  html += F("<div class='help'>When enabled, the mothership uploads new data during sync wakes (subject to schedule and battery checks).</div>");
+
+  html += F("<label class='label' for='url'>Endpoint URL</label>");
+  html += F("<input class='input' id='url' name='url' type='text' placeholder='https://...cloudfunction...'");
+  html += F(" value='");
+  html += jsonEscapeLocal(tx.endpointUrl);
+  html += F("'>");
+
+  html += F("<label class='label' for='token'>Auth token</label>");
+  html += F("<input class='input' id='token' name='token' type='password' placeholder='auth token' value='");
+  html += jsonEscapeLocal(tx.authToken);
+  html += F("'>");
+
+  html += F("<label class='label' for='site_id'>Site ID</label>");
+  html += F("<input class='input' id='site_id' name='site_id' type='text' placeholder='site-001' value='");
+  html += jsonEscapeLocal(tx.siteId);
+  html += F("'>");
+
+  html += F("<label class='label' for='deploy_id'>Deployment ID</label>");
+  html += F("<input class='input' id='deploy_id' name='deploy_id' type='text' placeholder='deploy-001' value='");
+  html += jsonEscapeLocal(tx.deploymentId);
+  html += F("'>");
+
+  html += F("<div class='row'>");
+  html += F("<div class='col'><label class='label' for='upload_min'>Upload interval (min, 0=every wake)</label>");
+  html += F("<input class='input' id='upload_min' name='upload_min' type='number' min='0' value='");
+  html += String(tx.uploadIntervalMin);
+  html += F("'></div>");
+  html += F("<div class='col'><label class='label' for='min_bat_mv'>Min battery (mV)</label>");
+  html += F("<input class='input' id='min_bat_mv' name='min_bat_mv' type='number' min='0' value='");
+  html += String(tx.minBatteryMv);
+  html += F("'></div>");
+  html += F("</div>");
+
+  html += F("<div class='row'>");
+  html += F("<div class='col'><label class='label' for='max_bytes'>Max bytes per session</label>");
+  html += F("<input class='input' id='max_bytes' name='max_bytes' type='number' min='0' value='");
+  html += String(tx.maxBytesPerSession);
+  html += F("'></div>");
+  html += F("<div class='col'><label class='label' for='max_retries'>Max retries per window</label>");
+  html += F("<input class='input' id='max_retries' name='max_retries' type='number' min='0' value='");
+  html += String(tx.maxRetriesPerWindow);
+  html += F("'></div>");
+  html += F("</div>");
+
+  html += F("<label class='label'><input type='checkbox' name='allow_manual' value='1'");
+  if (tx.allowManualUpload) html += F(" checked");
+  html += F("> <strong>Allow manual upload from this page</strong></label>");
+  html += F("<div class='help'>Manual upload powers on the modem and transmits now. This takes 30-60s and draws extra power (WiFi AP + modem active simultaneously).</div>");
+
+  html += F("<button type='submit' class='btn btn--primary'>Save settings</button>");
+  html += F("</form>");
+  html += F("</div>");
+
+  // Upload status section
+  html += F("<div class='section'><h3>Upload status</h3>");
+  html += F("<div class='stats' style='margin:0 0 10px 0'>");
+  html += F("<div class='stat'><strong>Cursor offset</strong><span class='num' style='font-size:16px'>");
+  html += String(cursor.byteOffset);
+  html += F("</span></div>");
+  html += F("<div class='stat'><strong>Pending</strong><span class='num' style='font-size:16px'>");
+  html += formatBytesUi(pendingBytes);
+  html += F("</span></div>");
+  html += F("<div class='stat'><strong>Pending rows</strong><span class='num'>");
+  html += String(pendingRows);
+  html += F("</span></div></div>");
+
+  html += F("<div class='stats' style='margin:0 0 10px 0'>");
+  html += F("<div class='stat'><strong>Rows uploaded</strong><span class='num'>");
+  html += String(cursor.rowsUploaded);
+  html += F("</span></div>");
+  html += F("<div class='stat'><strong>Retries</strong><span class='num'>");
+  html += String(cursor.retryCount);
+  html += F("</span></div>");
+  html += F("<div class='stat'><strong>Flash used</strong><span class='num' style='font-size:16px'>");
+  html += String(flashUsagePct);
+  html += F("%</span></div></div>");
+
+  html += F("<p class='muted'><strong>Last upload:</strong> ");
+  html += formatUploadTime(cursor.lastUploadUnix);
+  html += F("</p>");
+
+  // Manual upload button
+  if (tx.allowManualUpload) {
+    html += F("<form action='/manual-upload' method='POST'>");
+    html += F("<input type='hidden' name='ajax' value='1'>");
+    html += F("<button type='submit' class='btn btn--warn'>Upload now (30-60s)</button>");
+    html += F("</form>");
+  } else {
+    html += F("<p class='muted'>Manual upload is disabled in settings.</p>");
+  }
+
+  html += F("</div>");
+
+  html += footCommon();
+  server.send(200, "text/html", html);
+}
+
+static void handleSetTransmission() {
+  TransmissionSettings tx;
+  tx.enabled          = server.hasArg("enabled") && server.arg("enabled") == "1";
+  tx.endpointUrl      = server.arg("url");
+  tx.authToken        = server.arg("token");
+  tx.siteId           = server.arg("site_id");
+  tx.deploymentId     = server.arg("deploy_id");
+  tx.uploadIntervalMin= (uint16_t)server.arg("upload_min").toInt();
+  tx.minBatteryMv     = (uint16_t)server.arg("min_bat_mv").toInt();
+  tx.maxBytesPerSession = (uint32_t)server.arg("max_bytes").toInt();
+  tx.maxRetriesPerWindow = (uint8_t)server.arg("max_retries").toInt();
+  tx.allowManualUpload = server.hasArg("allow_manual") && server.arg("allow_manual") == "1";
+
+  // Preserve phase anchor (not edited via this form)
+  TransmissionSettings prev;
+  loadTransmissionSettings(prev);
+  tx.uploadPhaseUnix = prev.uploadPhaseUnix;
+
+  saveTransmissionSettings(tx);
+  Serial.printf("[UI] Transmission settings saved: enabled=%d url=%s site=%s\n",
+                tx.enabled ? 1 : 0, tx.endpointUrl.c_str(), tx.siteId.c_str());
+
+  if (isAjaxRequest()) {
+    sendAjaxResult(true, "Transmission settings saved");
+    return;
+  }
+
+  String html = headCommon("LTE Upload Settings", "<a href='/' class='btn btn--sm'>Back</a>");
+  html += F("<div class='section center'><h3>Settings saved</h3>"
+            "<a href='/upload' class='btn btn--primary'>Back to LTE Upload</a></div>");
+  html += footCommon();
+  server.send(200, "text/html", html);
+}
+
+static void handleManualUpload() {
+  TransmissionSettings tx;
+  loadTransmissionSettings(tx);
+
+  if (!tx.allowManualUpload) {
+    if (isAjaxRequest()) {
+      sendAjaxResult(false, "Manual upload is disabled in settings");
+      return;
+    }
+    String html = headCommon("LTE Upload", "<a href='/upload' class='btn btn--sm'>Back</a>");
+    html += F("<div class='section center'><h3>Manual upload disabled</h3>"
+              "<p class='muted'>Enable manual upload in the settings first.</p>"
+              "<a href='/upload' class='btn btn--primary'>Back</a></div>");
+    html += footCommon();
+    server.send(400, "text/html", html);
+    return;
+  }
+
+  // NOTE: This is a blocking handler — the web request hangs for 30-60s
+  // while the modem powers on, registers, and uploads.  This could be
+  // improved later with a background task + status polling, but for V1
+  // field use the blocking approach is acceptable.
+  Serial.println("[UI] Manual upload requested — starting blocking sequence");
+
+  String resultMsg;
+  bool ok = false;
+
+  if (!flashIsReady()) {
+    resultMsg = "Flash not ready — cannot read data";
+  } else {
+    gUploadQueue.init();
+    if (gUploadQueue.getPendingBytes() == 0) {
+      resultMsg = "No new data to upload";
+      ok = true;
+    } else {
+      ModemDriver modem;
+      modem.init();
+
+      if (!modem.powerOn()) {
+        resultMsg = "Modem power-on failed";
+      } else if (!modem.waitForNetwork(60000)) {
+        resultMsg = "Network registration failed/timeout (antenna connected?)";
+        modem.gracefulShutdown();
+      } else {
+        UploadPayload payload = gUploadQueue.getNewData(tx.maxBytesPerSession);
+        if (payload.byteLength == 0) {
+          resultMsg = "No new data to upload";
+          ok = true;
+          modem.gracefulShutdown();
+        } else {
+          String url = buildUploadUrl(tx);
+          Serial.printf("[UI] Manual upload POST %u bytes to %s\n", payload.byteLength, url.c_str());
+          HttpsPostResult result = modem.httpsPost(url, payload.csvData, "text/csv", tx.authToken);
+          if (result.success && result.httpStatus == 200) {
+            uint32_t nowUnix = getRTCTimeUnix();
+            gUploadQueue.advanceCursor(payload.startOffset + payload.byteLength, nowUnix);
+            gUploadQueue.purgeUploaded();
+            gUploadQueue.resetRetryCount();
+            char buf[64];
+            snprintf(buf, sizeof(buf), "Upload OK: HTTP 200, %u bytes", payload.byteLength);
+            resultMsg = String(buf);
+            ok = true;
+          } else {
+            char buf[96];
+            snprintf(buf, sizeof(buf), "Upload failed: HTTP %d, %s",
+                     result.httpStatus, result.errorDetail.c_str());
+            resultMsg = String(buf);
+            gUploadQueue.incrementRetryCount();
+          }
+          modem.gracefulShutdown();
+        }
+      }
+    }
+  }
+
+  Serial.printf("[UI] Manual upload result: %s\n", resultMsg.c_str());
+
+  if (isAjaxRequest()) {
+    sendAjaxResult(ok, resultMsg);
+    return;
+  }
+
+  String html = headCommon("LTE Upload", "<a href='/upload' class='btn btn--sm'>Back</a>");
+  html += F("<div class='section center'><h3>Manual upload</h3><p>");
+  html += resultMsg;
+  html += F("</p><a href='/upload' class='btn btn--primary'>Back to LTE Upload</a></div>");
+  html += footCommon();
+  server.send(200, "text/html", html);
+}
+
+static void handleUploadStatus() {
+  TransmissionSettings tx;
+  loadTransmissionSettings(tx);
+
+  UploadCursor cursor = {0, 0, 0, 0, 0};
+  uint32_t pendingBytes = 0;
+  uint32_t pendingRows = 0;
+  if (flashIsReady()) {
+    gUploadQueue.init();
+    cursor = gUploadQueue.getCursor();
+    pendingBytes = gUploadQueue.getPendingBytes();
+    pendingRows = gUploadQueue.getPendingRows();
+  }
+  const uint64_t fsTotal = (uint64_t)LittleFS.totalBytes();
+  const uint64_t fsUsed  = (uint64_t)LittleFS.usedBytes();
+  const uint32_t flashUsagePct = (fsTotal > 0)
+    ? (uint32_t)((fsUsed * 100ULL) / fsTotal) : 0;
+
+  String json;
+  json.reserve(320);
+  json += "{";
+  json += "\"enabled\":";
+  json += tx.enabled ? "true" : "false";
+  json += ",\"cursorOffset\":";
+  json += String(cursor.byteOffset);
+  json += ",\"pendingBytes\":";
+  json += String(pendingBytes);
+  json += ",\"pendingRows\":";
+  json += String(pendingRows);
+  json += ",\"rowsUploaded\":";
+  json += String(cursor.rowsUploaded);
+  json += ",\"lastUploadUnix\":";
+  json += String(cursor.lastUploadUnix);
+  json += ",\"retryCount\":";
+  json += String(cursor.retryCount);
+  json += ",\"flashUsagePct\":";
+  json += String(flashUsagePct);
+  json += ",\"flashTotalBytes\":";
+  json += String((unsigned long)fsTotal);
+  json += ",\"flashUsedBytes\":";
+  json += String((unsigned long)fsUsed);
+  json += "}";
+  server.send(200, "application/json", json);
+}
+
+// ---------------------------------------------------------------------------
 // Start + loop
 // ---------------------------------------------------------------------------
 static void handleShutdown() {
@@ -1745,6 +2125,11 @@ void startConfigServer() {
   server.on("/node-config", HTTP_GET, handleNodeConfigForm);
   server.on("/node-config", HTTP_POST, handleNodeConfigSave);
   server.on("/revert-node", HTTP_POST, handleRevertNode);
+
+  server.on("/upload", HTTP_GET, handleUploadSettings);
+  server.on("/set-transmission", HTTP_POST, handleSetTransmission);
+  server.on("/manual-upload", HTTP_POST, handleManualUpload);
+  server.on("/upload-status", HTTP_GET, handleUploadStatus);
 
   server.onNotFound(sendCaptivePortalLanding);
   dnsServer.start(53, "*", WiFi.softAPIP());

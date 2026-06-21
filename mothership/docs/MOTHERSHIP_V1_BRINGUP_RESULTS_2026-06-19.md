@@ -18,6 +18,11 @@
 | 6 | ESP-NOW Basic | mothership-v1-espnow-basic | ⏳ Pending | |
 | 7 | Wake Reason | mothership-v1-wake-reason | ✅ PASS | All three wake sources confirmed: config button wake-from-off, RTC alarm wake-from-off (15s alarm armed before shutdown), USB service on first boot; PWR_HOLD shutdown works |
 | 8 | Modem Power | mothership-v1-modem-power | ✅ PASS | TPS63020 rail works with PWM soft-start; ESP_PG HIGH on enable, LOW on disable; brownout fixed |
+| 9 | Modem UART | mothership-v1-modem-uart | ✅ PASS | Rail→PWRKEY→STATUS→UART2→AT responds OK |
+| 10 | Modem Identify | mothership-v1-modem-identify | ✅ PASS | A7670G-LABE, IMEI 867284069283119, FW A110B06A7670M7 |
+| 11 | Modem SIM | mothership-v1-modem-sim | ✅ PASS | SIM detected (+CPIN: READY), IMSI 262034251099911; AT+CCID returns ERROR (SIMCom fw quirk — alt cmd needed) |
+| 12 | Modem Network | mothership-v1-modem-network | ✅ PASS | All status commands responded; CSQ=99,99 and CREG=0,2 expected without antenna |
+| 13 | Modem Power Cycle | mothership-v1-modem-powercycle | ✅ PASS | 3/3 clean on→boot→AT→CPOF→off cycles; ~14s per cycle |
 
 ---
 
@@ -92,10 +97,89 @@ The V1 main firmware with ported config mode has been flashed and tested on hard
 19. `main.cpp` — Service mode just powers off (no alarm arming after flash)
 20. `main.cpp` — `onEspNowData()` updates node registry for early shutdown tracking
 
+### Final pipeline test (2026-06-20)
+- ✅ Config button wakes mothership after sync cycle — NO CRASH
+- ✅ NVS loader hardened: fixed-buffer reads, no ESP-NOW before init, metadata after closing paired_nodes
+- ✅ Startup sequence: PWR_HOLD preloaded HIGH (no glitch), independent wake-source flags, config priority over RTC
+- ✅ Config latch retained during config mode, cleared only on shutdown
+- ✅ RTC alarm: A1IE=1, INTCN=1, alarm verification checks both bits
+- ✅ Phase-aligned alarm: 19:36:50 (10s pre-wake before 19:37:00 sync)
+- ✅ Repeated SYNC_WINDOW_OPEN every 5s — node catches marker after 3.4s
+- ✅ 17 snapshots received (seq 2-18) and logged to flash
+- ✅ CSV download: 18 data rows confirmed
+- ✅ Config button after sync works — web UI served, CSV downloaded
+- ✅ Full autonomous cycle: sleep → wake → sync → sleep → config → shut down → repeat
+
+### Root cause of config button crash (resolved)
+The Guru Meditation crash was caused by:
+1. `ensurePeerOnChannel()` calling `esp_now_add_peer()` before `esp_now_init()` — coexistence subsystem null pointer
+2. Arduino-ESP32 `Preferences::getString()` using dynamic stack allocation from NVS length metadata
+3. Nested Preferences handles (paired_nodes + node_meta open simultaneously)
+
+Fix: Fixed-buffer NVS reads, no ESP-NOW calls during loading, close paired_nodes before opening node_meta, peers registered after ESP-NOW init.
+
+## Modem AT Command Bring-up (2026-06-21)
+
+**Hardware:** SIMCom A7670G-LABE, firmware revision A110B06A7670M7 / V1.11.2
+**SIM:** German SIM (MCC 262), IMSI 262034251099911, no PIN
+**Antenna:** None connected — tests validate modem hardware/firmware only, not RF
+
+### Test 9: Modem UART (`mothership-v1-modem-uart`) — PASS
+- 4V rail soft-start: ESP_PG HIGH (rail up)
+- PWRKEY pulse (1100ms): STATUS went HIGH (modem powered on)
+- UART2 (GPIO17 TX / GPIO16 RX) at 115200 baud through 1.8V↔3.3V level shifters
+- AT → OK, ATE0 → OK, AT → OK (echo off confirmed)
+- Heartbeat confirmed stable: STATUS=1 PG=1 4V_EN=1 (no brownout, no rail drop)
+- Proves: TPS63020 rail, PWRKEY NMOS gate, STATUS level-shifter, UART2 AT path all functional
+
+### Test 10: Modem Identify (`mothership-v1-modem-identify`) — PASS
+- ATI → Manufacturer: SIMCOM INCORPORATED, Model: A7670G-LABE, Revision: V1.11.2, IMEI: 867284069283119
+- AT+GMM → OK
+- AT+CGSN → IMEI 867284069283119 (15 digits, valid)
+- AT+CGMR → +CGMR: A110B06A7670M7
+- Graceful shutdown: AT+CPOF → OK → rail off
+
+### Test 11: Modem SIM (`mothership-v1-modem-sim`) — PASS
+- Initial run failed: SIM was inserted upside-down (user error, not PCB issue)
+- After correct orientation: AT+CPIN? → +CPIN: READY (SIM present, no PIN)
+- AT+CIMI → IMSI 262034251099911 (German network, MCC 262)
+- AT+CCID → ERROR (SIMCom firmware quirk — some A7670G fw versions use AT+ICCID or AT+CICCID instead; not a blocker, SIM comms confirmed by CPIN+CIMI)
+- SIM holder footprint confirmed correct (no routing bug like SD card)
+- Graceful shutdown: AT+CPOF → OK → +CGEV: ME DETACH → rail off
+
+### Test 12: Modem Network (`mothership-v1-modem-network`) — PASS
+- No antenna connected — all "no signal" responses are expected and count as PASS
+- AT+CSQ → +CSQ: 99,99 (no signal — expected)
+- AT+CREG? → +CREG: 0,2 (not registered, searching — expected)
+- AT+CEREG? → +CEREG: 0,0 (not registered for EPS — expected)
+- AT+CGATT? → +CGATT: 0 (not attached — expected)
+- AT+COPS? → +COPS: 0 (no operator — expected)
+- All 5 commands responded correctly — modem AT subsystem fully functional
+- Graceful shutdown: AT+CPOF → OK → +CGEV: ME DETACH → rail off
+
+### Test 13: Modem Power Cycle (`mothership-v1-modem-powercycle`) — PASS
+- 3 full cycles: rail on (soft-start) → PWRKEY pulse → wait boot → AT → AT+CPOF → STATUS LOW → rail off → 3s gap
+- Cycle 1: PG HIGH 511ms, boot OK 6908ms, AT OK, CPOF OK, STATUS LOW 0ms, total 13.6s
+- Cycle 2: PG HIGH 511ms, boot OK 7508ms, AT OK, CPOF OK, STATUS LOW 0ms, total 14.2s
+- Cycle 3: PG HIGH 511ms, boot OK 7508ms, AT OK, CPOF OK, STATUS LOW 0ms, total 14.2s
+- 3/3 cycles completed cleanly — consistent timing, no brownouts, no hangs
+- +CGEV: ME DETACH URC on each shutdown confirms graceful detach
+
+### Modem subsystem status
+- TPS63020 power rail: ✅ validated (soft-start, power-good, no brownout)
+- PWRKEY boot sequencing: ✅ validated (NMOS gate, 1100ms pulse)
+- STATUS level-shifter: ✅ validated (GPIO4 reads modem on/off state)
+- UART2 AT command path: ✅ validated (115200 baud, 1.8V↔3.3V level shifters)
+- SIM detection: ✅ validated (CPIN READY, IMSI readable, holder footprint correct)
+- Graceful shutdown: ✅ validated (AT+CPOF + rail off, 3 consecutive cycles)
+- Network registration: ⏳ pending antenna (CSQ/CREG/COPS return expected no-signal values)
+- Data transport (HTTP/MQTT): ⏳ Phase 3 — pending antenna + network registration
+
 ### Not yet tested
-- Early shutdown optimization (mothership listened full 120s, didn't trigger early exit)
+- Early shutdown optimization (loadPairedNodes not called during sync wake, so deployedCount=0)
 - Multiple nodes syncing simultaneously
 - Long-term reliability (multiple sync cycles over hours/days)
+- LTE data upload workflow (Phase 3 — modem hardware validated, pending antenna + network registration)
 
 ## Firmware Fixes Applied During Bring-up
 
