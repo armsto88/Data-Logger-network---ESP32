@@ -18,6 +18,8 @@ bool flashLogCSVRow(const String& row);
 String flashGetCSVStats();
 bool flashCreateCSVHeader();
 bool flashIsReady();
+bool flashMountFailed();
+bool flashFormatExplicit();
 
 // CSV download helpers (for future WiFi AP web server integration).
 String readCSVFile();          // whole file as a String

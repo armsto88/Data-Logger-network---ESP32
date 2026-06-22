@@ -32,6 +32,7 @@ struct UploadCursor {
   uint32_t lastUploadUnix;  // timestamp of last successful upload
   uint8_t  retryCount;      // current retry count within this window
   uint32_t wakeCounter;     // sync-wake counter for upload policy scheduling
+  uint32_t nextAttemptUnix; // earliest retry time after reaching retry limit
 };
 
 // ---------------------------------------------------------------------------
@@ -75,6 +76,9 @@ class UploadQueue {
   // purged region.
   bool emergencyPurgeIfFull(uint8_t thresholdPct);
 
+  bool recoverDataFile();
+  void validateCursor();
+
   // Accessors
   UploadCursor getCursor() const { return m_cursor; }
   uint32_t getPendingBytes() const;
@@ -85,15 +89,15 @@ class UploadQueue {
   void incrementWakeCounter();
   void resetRetryCount();
   void incrementRetryCount();
+  void incrementRetryCount(uint32_t nowUnix, uint32_t cooldownSec);
   bool maxRetriesExceeded(uint8_t maxRetries) const;
+  bool maxRetriesExceeded(uint8_t maxRetries, uint32_t nowUnix) const;
 
  private:
   // Persist m_cursor to NVS namespace "tx".
   void saveCursor();
   // Load m_cursor from NVS.
   void loadCursor();
-  // If file size < cursor offset, reset cursor to header end.
-  void validateCursor();
   // Byte offset of the first data row (end of header line).
   uint32_t headerEndOffset() const;
 

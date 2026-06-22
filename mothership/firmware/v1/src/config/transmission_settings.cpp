@@ -26,10 +26,22 @@ void loadTransmissionSettings(TransmissionSettings& s) {
   }
 
   s.enabled            = prefs.getBool("enabled", DEFAULT_TX_ENABLED);
-  s.endpointUrl        = prefs.getString("url", String(""));
-  s.authToken          = prefs.getString("token", String(""));
-  s.siteId             = prefs.getString("site_id", String(""));
-  s.deploymentId       = prefs.getString("deploy_id", String(""));
+  char stringBuf[256] = {};
+  prefs.getString("url", stringBuf, sizeof(stringBuf));
+  stringBuf[sizeof(stringBuf) - 1] = '\0';
+  s.endpointUrl = String(stringBuf);
+  memset(stringBuf, 0, sizeof(stringBuf));
+  prefs.getString("token", stringBuf, sizeof(stringBuf));
+  stringBuf[sizeof(stringBuf) - 1] = '\0';
+  s.authToken = String(stringBuf);
+  memset(stringBuf, 0, sizeof(stringBuf));
+  prefs.getString("site_id", stringBuf, sizeof(stringBuf));
+  stringBuf[sizeof(stringBuf) - 1] = '\0';
+  s.siteId = String(stringBuf);
+  memset(stringBuf, 0, sizeof(stringBuf));
+  prefs.getString("deploy_id", stringBuf, sizeof(stringBuf));
+  stringBuf[sizeof(stringBuf) - 1] = '\0';
+  s.deploymentId = String(stringBuf);
   s.uploadIntervalMin  = prefs.getUShort("upload_min", 0);
   s.uploadPhaseUnix    = prefs.getUInt("phase_unix", 0);
   s.minBatteryMv       = prefs.getUShort("min_bat_mv", DEFAULT_MIN_BAT_MV);

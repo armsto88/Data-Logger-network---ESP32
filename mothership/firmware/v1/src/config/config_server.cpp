@@ -46,16 +46,77 @@ int gSyncIntervalMin = 0;
 int gSyncDailyHour = 6;
 int gSyncDailyMinute = 0;
 long gLastSyncBroadcastEpochDay = -1;
-enum SyncMode {
-  SYNC_MODE_DAILY = 0,
-  SYNC_MODE_INTERVAL = 1,
-};
 int gSyncMode = SYNC_MODE_INTERVAL;
 unsigned long gLastSyncBroadcastMs = 0;
 unsigned long gLastSyncBroadcastUnix = 0;
 long long gLastSyncIntervalSlot = -1;
 const int kAllowedIntervals[] = {1, 5, 10, 20, 30, 60};
 const size_t kAllowedCount = sizeof(kAllowedIntervals) / sizeof(kAllowedIntervals[0]);
+
+struct __attribute__((packed)) SyncAnchorRecord {
+  uint32_t magic;
+  uint16_t version;
+  uint16_t generation;
+  uint32_t phaseUnix;
+  uint16_t intervalMin;
+  uint8_t mode;
+  uint8_t reserved;
+  uint32_t crc;
+};
+
+static constexpr uint32_t kSyncAnchorMagic = 0x53594E43UL;
+static constexpr uint16_t kSyncAnchorVersion = 1;
+static constexpr uint32_t kMinValidPhaseUnix = 1704067200UL;  // 2024-01-01 UTC
+static constexpr const char* kSyncAnchorA = "sync_anchor_a";
+static constexpr const char* kSyncAnchorB = "sync_anchor_b";
+
+static uint32_t syncAnchorCrc(const SyncAnchorRecord& record) {
+  const uint8_t* data = reinterpret_cast<const uint8_t*>(&record);
+  const size_t length = offsetof(SyncAnchorRecord, crc);
+  uint32_t crc = 0xFFFFFFFFUL;
+  for (size_t i = 0; i < length; ++i) {
+    crc ^= data[i];
+    for (uint8_t bit = 0; bit < 8; ++bit) {
+      crc = (crc >> 1) ^ (0xEDB88320UL & (0UL - (crc & 1UL)));
+    }
+  }
+  return ~crc;
+}
+
+static bool syncAnchorIntervalValid(uint16_t interval, uint8_t mode) {
+  if (mode == SYNC_MODE_DAILY && interval == 0) return true;
+  for (size_t i = 0; i < kAllowedCount; ++i) {
+    if (interval == static_cast<uint16_t>(kAllowedIntervals[i] * kSyncFillK)) return true;
+  }
+  return interval == 60;  // conservative first-boot/default rescue interval
+}
+
+static bool syncAnchorValid(const SyncAnchorRecord& record) {
+  return record.magic == kSyncAnchorMagic &&
+         record.version == kSyncAnchorVersion &&
+         record.phaseUnix >= kMinValidPhaseUnix &&
+         (record.mode == SYNC_MODE_DAILY || record.mode == SYNC_MODE_INTERVAL) &&
+         syncAnchorIntervalValid(record.intervalMin, record.mode) &&
+         record.crc == syncAnchorCrc(record);
+}
+
+static bool readSyncAnchor(Preferences& prefs, const char* key,
+                           SyncAnchorRecord& record) {
+  if (prefs.getBytesLength(key) != sizeof(record)) return false;
+  return prefs.getBytes(key, &record, sizeof(record)) == sizeof(record);
+}
+
+static SyncAnchorRecord makeSyncAnchor(uint16_t generation) {
+  SyncAnchorRecord record{};
+  record.magic = kSyncAnchorMagic;
+  record.version = kSyncAnchorVersion;
+  record.generation = generation;
+  record.phaseUnix = static_cast<uint32_t>(gLastSyncBroadcastUnix);
+  record.intervalMin = static_cast<uint16_t>(max(gSyncIntervalMin, 0));
+  record.mode = static_cast<uint8_t>(gSyncMode);
+  record.crc = syncAnchorCrc(record);
+  return record;
+}
 
 // ---------------------------------------------------------------------------
 // Web server + DNS
@@ -174,21 +235,100 @@ static void saveDailySyncTimeToNVS(int hh, int mm) {
 }
 
 void loadSyncRuntimeGuardsFromNVS() {
-  if (gPrefs.begin("ui", true)) {
-    gLastSyncBroadcastEpochDay = gPrefs.getLong("sync_day", -1);
-    gLastSyncBroadcastUnix = gPrefs.getULong("sync_last_unix", 0);
-    gLastSyncIntervalSlot = gPrefs.getLong64("sync_slot", -1);
-    gPrefs.end();
+  if (!gPrefs.begin("ui", false)) return;
+
+  gLastSyncBroadcastEpochDay = gPrefs.getLong("sync_day", -1);
+  gLastSyncIntervalSlot = gPrefs.getLong64("sync_slot", -1);
+
+  SyncAnchorRecord anchorA{};
+  SyncAnchorRecord anchorB{};
+  const bool hasA = readSyncAnchor(gPrefs, kSyncAnchorA, anchorA);
+  const bool hasB = readSyncAnchor(gPrefs, kSyncAnchorB, anchorB);
+  const bool validA = hasA && syncAnchorValid(anchorA);
+  const bool validB = hasB && syncAnchorValid(anchorB);
+
+  const SyncAnchorRecord* selected = nullptr;
+  const char* selectedKey = nullptr;
+  if (validA && validB) {
+    selected = static_cast<int16_t>(anchorB.generation - anchorA.generation) > 0 ?
+               &anchorB : &anchorA;
+    selectedKey = selected == &anchorB ? kSyncAnchorB : kSyncAnchorA;
+  } else if (validA) {
+    selected = &anchorA;
+    selectedKey = kSyncAnchorA;
+  } else if (validB) {
+    selected = &anchorB;
+    selectedKey = kSyncAnchorB;
   }
+
+  if (selected) {
+    gLastSyncBroadcastUnix = selected->phaseUnix;
+    gSyncIntervalMin = selected->intervalMin;
+    gSyncMode = selected->mode;
+    Serial.printf("[SYNC] Loaded anchor %s generation=%u phase=%lu interval=%u mode=%u\n",
+                  selectedKey, selected->generation,
+                  static_cast<unsigned long>(selected->phaseUnix),
+                  selected->intervalMin, selected->mode);
+    gPrefs.end();
+    return;
+  }
+
+  const uint32_t legacyPhase = gPrefs.getULong("sync_last_unix", 0);
+  gLastSyncBroadcastUnix = legacyPhase;
+  if (legacyPhase >= kMinValidPhaseUnix) {
+    Serial.println("[SYNC] Falling back to legacy phase anchor");
+    if (!hasA && !hasB) {
+      SyncAnchorRecord migrated = makeSyncAnchor(0);
+      const size_t written = gPrefs.putBytes(kSyncAnchorA, &migrated, sizeof(migrated));
+      Serial.printf("[SYNC] Legacy anchor migration to A: %s\n",
+                    written == sizeof(migrated) ? "OK" : "FAILED");
+    }
+  } else {
+    gLastSyncBroadcastUnix = 0;
+    Serial.println("[WARN] Phase anchor lost - fleet may desync");
+  }
+  gPrefs.end();
 }
 
 void saveSyncRuntimeGuardsToNVS() {
-  if (gPrefs.begin("ui", false)) {
-    gPrefs.putLong("sync_day", gLastSyncBroadcastEpochDay);
-    gPrefs.putULong("sync_last_unix", gLastSyncBroadcastUnix);
-    gPrefs.putLong64("sync_slot", gLastSyncIntervalSlot);
-    gPrefs.end();
+  if (!gPrefs.begin("ui", false)) {
+    Serial.println("[SYNC] Anchor save failed: NVS unavailable");
+    return;
   }
+
+  SyncAnchorRecord anchorA{};
+  SyncAnchorRecord anchorB{};
+  const bool validA = readSyncAnchor(gPrefs, kSyncAnchorA, anchorA) && syncAnchorValid(anchorA);
+  const bool validB = readSyncAnchor(gPrefs, kSyncAnchorB, anchorB) && syncAnchorValid(anchorB);
+
+  uint16_t nextGeneration = 0;
+  if (validA && validB) {
+    const uint16_t newest = static_cast<int16_t>(anchorB.generation - anchorA.generation) > 0 ?
+                            anchorB.generation : anchorA.generation;
+    nextGeneration = static_cast<uint16_t>(newest + 1U);
+  } else if (validA) {
+    nextGeneration = static_cast<uint16_t>(anchorA.generation + 1U);
+  } else if (validB) {
+    nextGeneration = static_cast<uint16_t>(anchorB.generation + 1U);
+  }
+
+  SyncAnchorRecord record = makeSyncAnchor(nextGeneration);
+  const char* key = (nextGeneration & 1U) == 0 ? kSyncAnchorA : kSyncAnchorB;
+  bool verified = false;
+  for (int attempt = 1; attempt <= 2 && !verified; ++attempt) {
+    const size_t written = gPrefs.putBytes(key, &record, sizeof(record));
+    SyncAnchorRecord readBack{};
+    verified = written == sizeof(record) && readSyncAnchor(gPrefs, key, readBack) &&
+               memcmp(&record, &readBack, sizeof(record)) == 0 && syncAnchorValid(readBack);
+    Serial.printf("[SYNC] Anchor save %s generation=%u attempt=%d: %s\n",
+                  key, nextGeneration, attempt, verified ? "OK" : "FAILED");
+  }
+
+  // Keep legacy guard fields current for downgrade compatibility.
+  gPrefs.putLong("sync_day", gLastSyncBroadcastEpochDay);
+  gPrefs.putULong("sync_last_unix", gLastSyncBroadcastUnix);
+  gPrefs.putLong64("sync_slot", gLastSyncIntervalSlot);
+  gPrefs.end();
 }
 
 // ---------------------------------------------------------------------------

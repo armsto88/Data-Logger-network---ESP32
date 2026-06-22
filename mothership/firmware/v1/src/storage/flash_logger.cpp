@@ -16,13 +16,17 @@ static const char* kCSVHeader =
     "windSpeed,windDir,soil1Vwc,soil1Temp,soil2Vwc,soil2Temp,aux1,aux2";
 
 static bool gFlashReady = false;
+static bool gFlashMountFailed = false;
 
 bool initFlash() {
-  if (!LittleFS.begin(true)) {  // formatOnFail = true
+  if (!LittleFS.begin(false)) {
     Serial.println("[FLASH] LittleFS mount failed");
     gFlashReady = false;
+    gFlashMountFailed = true;
     return false;
   }
+
+  gFlashMountFailed = false;
 
   Serial.printf("[FLASH] LittleFS mounted: %u bytes total, %u bytes used\n",
                 (unsigned)LittleFS.totalBytes(),
@@ -179,8 +183,18 @@ bool flashLogCSVRow(const String& row) {
     Serial.println("[FLASH] Failed to open datalog.csv for append");
     return false;
   }
-  f.println(row);
+  const size_t written = f.println(row);
+  const bool writeError = f.getWriteError();
   f.close();
+
+  // Arduino-ESP32 Print::println() appends CRLF (two bytes).
+  const size_t expected = row.length() + 2;
+  if (writeError || written != expected) {
+    Serial.printf("[FLASH] Write failed: wrote %u of %u bytes, error=%d\n",
+                  static_cast<unsigned>(written), static_cast<unsigned>(expected),
+                  writeError);
+    return false;
+  }
   return true;
 }
 
@@ -207,6 +221,36 @@ String flashGetCSVStats() {
 
 bool flashIsReady() {
   return gFlashReady;
+}
+
+bool flashMountFailed() {
+  return gFlashMountFailed;
+}
+
+bool flashFormatExplicit() {
+  gFlashReady = false;
+  LittleFS.end();
+
+  if (!LittleFS.format()) {
+    Serial.println("[FLASH] Explicit format failed");
+    gFlashMountFailed = true;
+    return false;
+  }
+  if (!LittleFS.begin(false)) {
+    Serial.println("[FLASH] Mount failed after explicit format");
+    gFlashMountFailed = true;
+    return false;
+  }
+  if (!flashCreateCSVHeader()) {
+    Serial.println("[FLASH] Header creation failed after explicit format");
+    gFlashMountFailed = true;
+    return false;
+  }
+
+  gFlashReady = true;
+  gFlashMountFailed = false;
+  Serial.println("[FLASH] Explicit format complete");
+  return true;
 }
 
 // ---------------------------------------------------------------------------

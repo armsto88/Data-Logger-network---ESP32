@@ -19,6 +19,8 @@ void setup() {
   Serial.println();
   Serial.println("=== Mothership V1 Modem Power-Cycle Stress Bring-up ===");
   Serial.printf("Cycles: %d | Gap between cycles: %lu ms\n", NUM_CYCLES, (unsigned long)CYCLE_GAP_MS);
+  const uint32_t sessionStartMs = millis();
+  const uint32_t sessionLimitMs = 180000UL;
 
   uint8_t successCount = 0;
 
@@ -100,7 +102,13 @@ void setup() {
   Serial.println();
   Serial.println("=== Modem power-cycle stress bring-up complete ===");
   Serial.printf("Successful cycles: %d / %d\n", successCount, NUM_CYCLES);
-  if (successCount == NUM_CYCLES) {
+  const uint32_t sessionElapsedMs = millis() - sessionStartMs;
+  const bool withinWatchdog = sessionElapsedMs < sessionLimitMs;
+  Serial.printf("Session watchdog check: %lu/%lu ms (%s)\n",
+                static_cast<unsigned long>(sessionElapsedMs),
+                static_cast<unsigned long>(sessionLimitMs),
+                withinWatchdog ? "PASS" : "FAIL");
+  if (successCount == NUM_CYCLES && withinWatchdog) {
     Serial.println("OVERALL PASS: All 3 cycles completed cleanly.");
   } else {
     Serial.println("OVERALL FAIL: One or more cycles failed.");

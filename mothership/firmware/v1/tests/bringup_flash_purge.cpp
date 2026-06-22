@@ -285,8 +285,8 @@ void setup() {
   Serial.println();
   Serial.println("[STEP 12] Verify cursor at header end and no pending data...");
   UploadCursor c = uploadQueue.getCursor();
-  // headerEndOffset = strlen(header) + 1 (for '\n' added by println).
-  uint32_t expectedOffset = (uint32_t)(strlen(kExpectedHeader) + 1);
+  // Arduino-ESP32 println appends CRLF.
+  uint32_t expectedOffset = (uint32_t)(strlen(kExpectedHeader) + 2);
   Serial.printf("  cursor offset=%u, expected header end=%u\n",
                 (unsigned)c.byteOffset, (unsigned)expectedOffset);
 

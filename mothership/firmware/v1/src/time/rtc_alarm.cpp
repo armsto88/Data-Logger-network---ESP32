@@ -61,25 +61,39 @@ static bool readAlarm1Registers(uint8_t regs[4]) {
 
 // --- Public API ---
 
-bool initRTC() {
+RtcInitStatus initRTC() {
   Wire.begin(PIN_SDA, PIN_SCL);
   Wire.setClock(100000);
 
   if (!gRTC.begin(&Wire)) {
+    gRTCInitialized = false;
     Serial.println("[RTC] DS3231 not found at 0x68");
-    return false;
-  }
-
-  if (gRTC.lostPower()) {
-    Serial.println("[RTC] DS3231 lost power — time is invalid, needs setting");
+    return RTC_ABSENT;
   }
 
   gRTCInitialized = true;
+  const bool lostPower = gRTC.lostPower();
+  if (lostPower) {
+    Serial.println("[RTC] DS3231 lost power — time is invalid, needs setting");
+  }
 
   DateTime now = gRTC.now();
   Serial.printf("[RTC] DS3231 initialized, current time: %04d-%02d-%02d %02d:%02d:%02d\n",
                 now.year(), now.month(), now.day(), now.hour(), now.minute(), now.second());
-  return true;
+  if (lostPower || now.year() < 2024) {
+    if (!lostPower) {
+      Serial.printf("[RTC] DS3231 time is invalid: year %d is before 2024\n", now.year());
+    }
+    return RTC_PRESENT_TIME_INVALID;
+  }
+  return RTC_OK;
+}
+
+bool rtcTimeValid() {
+  if (!gRTCInitialized) return false;
+  if (gRTC.lostPower()) return false;
+  DateTime now = gRTC.now();
+  return now.year() >= 2024;
 }
 
 uint32_t getRTCTime() {
@@ -96,16 +110,60 @@ void setRTCTime(uint32_t unixTime) {
                 dt.year(), dt.month(), dt.day(), dt.hour(), dt.minute(), dt.second());
 }
 
+bool armRescueAlarm(int intervalMin) {
+  if (!gRTCInitialized || intervalMin <= 0) return false;
+
+  DateTime now = gRTC.now();
+  DateTime rescueTime = now + TimeSpan(0, 0, intervalMin, 0);
+
+  // Enable the Alarm 1 interrupt output before programming the fallback.
+  uint8_t ctrl = 0;
+  if (!readReg(0x0E, ctrl)) {
+    Serial.println("[RTC] Failed to read control register for rescue alarm");
+    return false;
+  }
+  ctrl |= 0x04;  // INTCN=1
+  ctrl |= 0x01;  // A1IE=1
+  if (!writeReg(0x0E, ctrl)) {
+    Serial.println("[RTC] Failed to write control register for rescue alarm");
+    return false;
+  }
+
+  if (!writeAlarm1Exact(rescueTime)) {
+    Serial.println("[RTC] Failed to write rescue alarm registers");
+    return false;
+  }
+
+  if (!verifyAlarmSet(rescueTime)) {
+    Serial.println("[RTC] Rescue alarm read-back verification failed");
+    return false;
+  }
+
+  if (!clearAlarmFlag()) {
+    Serial.println("[RTC] Failed to clear alarm flag after rescue verification");
+    return false;
+  }
+
+  Serial.printf("[RTC] Rescue alarm armed for %04d-%02d-%02d %02d:%02d:%02d (in %d min)\n",
+                rescueTime.year(), rescueTime.month(), rescueTime.day(),
+                rescueTime.hour(), rescueTime.minute(), rescueTime.second(), intervalMin);
+  return true;
+}
+
 bool armNextSyncAlarm(int intervalMin) {
   if (!gRTCInitialized) return false;
 
   DateTime now = gRTC.now();
+  uint32_t nowUnix = now.unixtime();
+  uint32_t periodSec = static_cast<uint32_t>(intervalMin) * 60UL;
   // Wake 10 seconds before the sync time so the mothership is already
   // listening when the node wakes and sends its snapshot.
   DateTime next = now + TimeSpan(0, 0, intervalMin, 0) - TimeSpan(0, 0, 0, 10);
-
-  // Clear any existing alarm flag first
-  clearAlarmFlag();
+  uint32_t nextSyncUnix = next.unixtime();
+  if (nextSyncUnix <= nowUnix + 5) {
+    nextSyncUnix += periodSec;
+    next = DateTime(nextSyncUnix);
+  }
 
   // Enable the Alarm 1 interrupt output.
   uint8_t ctrl = 0;
@@ -123,6 +181,16 @@ bool armNextSyncAlarm(int intervalMin) {
 
   if (!writeAlarm1Exact(next)) {
     Serial.println("[RTC] Failed to write Alarm 1 registers");
+    return false;
+  }
+
+  if (!verifyAlarmSet(next)) {
+    Serial.println("[RTC] Alarm 1 read-back verification failed");
+    return false;
+  }
+
+  if (!clearAlarmFlag()) {
+    Serial.println("[RTC] Failed to clear alarm flag after verification");
     return false;
   }
 
@@ -137,10 +205,10 @@ bool armNextSyncAlarmPhase(int intervalMin, uint32_t phaseUnix) {
   DateTime now = gRTC.now();
   uint32_t nowUnix = now.unixtime();
   uint32_t nextSyncUnix = 0;
+  uint32_t periodSec = static_cast<uint32_t>(intervalMin) * 60UL;
 
   if (phaseUnix > 0 && intervalMin > 0) {
     // Compute next sync time aligned to phase anchor
-    uint32_t periodSec = (uint32_t)intervalMin * 60UL;
     if (nowUnix < phaseUnix) {
       nextSyncUnix = phaseUnix;
     } else {
@@ -155,11 +223,11 @@ bool armNextSyncAlarmPhase(int intervalMin, uint32_t phaseUnix) {
 
   // Pre-wake 10 seconds before sync time
   if (nextSyncUnix > 10) nextSyncUnix -= 10;
+  if (nextSyncUnix <= nowUnix + 5) {
+    nextSyncUnix += periodSec;
+  }
 
   DateTime next(nextSyncUnix);
-
-  // Clear any existing alarm flag first
-  clearAlarmFlag();
 
   // Enable the Alarm 1 interrupt output.
   uint8_t ctrl = 0;
@@ -177,6 +245,16 @@ bool armNextSyncAlarmPhase(int intervalMin, uint32_t phaseUnix) {
 
   if (!writeAlarm1Exact(next)) {
     Serial.println("[RTC] Failed to write Alarm 1 registers");
+    return false;
+  }
+
+  if (!verifyAlarmSet(next)) {
+    Serial.println("[RTC] Alarm 1 read-back verification failed");
+    return false;
+  }
+
+  if (!clearAlarmFlag()) {
+    Serial.println("[RTC] Failed to clear alarm flag after verification");
     return false;
   }
 
@@ -197,9 +275,6 @@ bool armDailyAlarm(int hour, int minute) {
     alarmTime = alarmTime + TimeSpan(1, 0, 0, 0);  // +1 day
   }
 
-  // Clear any existing alarm flag first
-  clearAlarmFlag();
-
   // Enable alarm interrupt: INTCN=1, A1IE=1
   uint8_t ctrl = 0;
   if (!readReg(0x0E, ctrl)) return false;
@@ -209,6 +284,16 @@ bool armDailyAlarm(int hour, int minute) {
 
   if (!writeAlarm1Exact(alarmTime)) {
     Serial.println("[RTC] Failed to write daily alarm registers");
+    return false;
+  }
+
+  if (!verifyAlarmSet(alarmTime)) {
+    Serial.println("[RTC] Daily alarm read-back verification failed");
+    return false;
+  }
+
+  if (!clearAlarmFlag()) {
+    Serial.println("[RTC] Failed to clear alarm flag after verification");
     return false;
   }
 
@@ -286,5 +371,55 @@ bool verifyAlarmSet() {
   }
 
   Serial.println("[RTC] Alarm verification passed");
+  return true;
+}
+
+bool verifyAlarmSet(const DateTime& expected) {
+  uint8_t regs[4];
+  if (!readAlarm1Registers(regs)) {
+    Serial.println("[RTC] Failed to read alarm registers for verification");
+    return false;
+  }
+
+  const uint8_t alarmSecond = fromBcd(regs[0] & 0x7F);
+  const uint8_t alarmMinute = fromBcd(regs[1] & 0x7F);
+  const uint8_t alarmHour = fromBcd(regs[2] & 0x3F);
+  const uint8_t alarmDay = fromBcd(regs[3] & 0x3F);
+
+  const bool maskBitsMatch =
+      (regs[0] & 0x80) == 0 &&  // A1M1=0
+      (regs[1] & 0x80) == 0 &&  // A1M2=0
+      (regs[2] & 0x80) == 0 &&  // A1M3=0
+      (regs[3] & 0x80) != 0;    // A1M4=1
+  const bool hourMode24 = (regs[2] & 0x40) == 0;
+  const bool decodedTimeMatches =
+      alarmSecond == expected.second() &&
+      alarmMinute == expected.minute() &&
+      alarmHour == expected.hour();
+  const bool bcdTimeMatches =
+      (regs[0] & 0x7F) == (toBcd(static_cast<uint8_t>(expected.second())) & 0x7F) &&
+      (regs[1] & 0x7F) == (toBcd(static_cast<uint8_t>(expected.minute())) & 0x7F) &&
+      (regs[2] & 0x3F) == (toBcd(static_cast<uint8_t>(expected.hour())) & 0x3F);
+
+  uint8_t ctrl = 0;
+  if (!readReg(0x0E, ctrl)) {
+    Serial.println("[RTC] Failed to read control register for verification");
+    return false;
+  }
+
+  const bool intcnSet = (ctrl & 0x04) != 0;
+  const bool a1ieSet = (ctrl & 0x01) != 0;
+  if (!maskBitsMatch || !hourMode24 || !decodedTimeMatches || !bcdTimeMatches ||
+      !intcnSet || !a1ieSet) {
+    Serial.printf(
+        "[RTC] Verification failed: alarm=%02u:%02u:%02u day=%u "
+        "expected=%02u:%02u:%02u masks=%d mode24=%d INTCN=%d A1IE=%d\n",
+        alarmHour, alarmMinute, alarmSecond, alarmDay,
+        expected.hour(), expected.minute(), expected.second(),
+        maskBitsMatch, hourMode24, intcnSet, a1ieSet);
+    return false;
+  }
+
+  Serial.println("[RTC] Alarm time verification passed");
   return true;
 }

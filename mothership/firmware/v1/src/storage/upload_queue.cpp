@@ -4,6 +4,28 @@
 static const char* kTxNamespace = "tx";
 static const char* kDataFile    = "/datalog.csv";
 static const char* kTempFile    = "/datalog_tmp.csv";
+static const char* kBackupFile  = "/datalog_bak.csv";
+
+static bool commitTempDataFile(const char* context) {
+  LittleFS.remove(kBackupFile);
+
+  const bool hadDataFile = LittleFS.exists(kDataFile);
+  if (hadDataFile && !LittleFS.rename(kDataFile, kBackupFile)) {
+    Serial.printf("[UQ] %s: failed to rename data file to backup\n", context);
+    return false;
+  }
+
+  if (!LittleFS.rename(kTempFile, kDataFile)) {
+    Serial.printf("[UQ] %s: temp-to-data rename failed; restoring backup\n", context);
+    if (hadDataFile) LittleFS.rename(kBackupFile, kDataFile);
+    return false;
+  }
+
+  if (hadDataFile && !LittleFS.remove(kBackupFile)) {
+    Serial.printf("[UQ] %s: warning - backup cleanup deferred to recovery\n", context);
+  }
+  return true;
+}
 
 // ---------------------------------------------------------------------------
 // Construction / init
@@ -15,9 +37,14 @@ UploadQueue::UploadQueue()
   m_cursor.lastUploadUnix = 0;
   m_cursor.retryCount     = 0;
   m_cursor.wakeCounter    = 0;
+  m_cursor.nextAttemptUnix = 0;
 }
 
 bool UploadQueue::init() {
+  if (!recoverDataFile()) {
+    Serial.println("[UQ] init: data-file recovery failed");
+    return false;
+  }
   loadCursor();
   validateCursor();
   m_initialised = true;
@@ -42,6 +69,8 @@ void UploadQueue::loadCursor() {
   m_cursor.lastUploadUnix = prefs.getUInt("last_upload_unix", 0);
   m_cursor.retryCount     = prefs.getUChar("retry_count", 0);
   m_cursor.wakeCounter    = prefs.getUInt("wake_counter", 0);
+  // NVS keys are limited to 15 characters; keep this key deliberately short.
+  m_cursor.nextAttemptUnix = prefs.getUInt("next_attempt", 0);
   prefs.end();
 }
 
@@ -56,6 +85,7 @@ void UploadQueue::saveCursor() {
   prefs.putUInt("last_upload_unix", m_cursor.lastUploadUnix);
   prefs.putUChar("retry_count", m_cursor.retryCount);
   prefs.putUInt("wake_counter", m_cursor.wakeCounter);
+  prefs.putUInt("next_attempt", m_cursor.nextAttemptUnix);
   prefs.end();
 }
 
@@ -63,8 +93,43 @@ void UploadQueue::saveCursor() {
 // Helpers
 // ---------------------------------------------------------------------------
 uint32_t UploadQueue::headerEndOffset() const {
-  // Header line length + '\n' (println adds \n).
-  return (uint32_t)(strlen(kUploadCSVHeader) + 1);
+  // Arduino-ESP32 Print::println() appends CRLF.
+  return static_cast<uint32_t>(strlen(kUploadCSVHeader) + 2);
+}
+
+bool UploadQueue::recoverDataFile() {
+  const bool hasData = LittleFS.exists(kDataFile);
+  const bool hasTemp = LittleFS.exists(kTempFile);
+  const bool hasBackup = LittleFS.exists(kBackupFile);
+
+  if (hasData) {
+    if (hasTemp) {
+      Serial.println("[UQ] recovery: data+temp found; keeping data and removing temp");
+      LittleFS.remove(kTempFile);
+    }
+    if (hasBackup) {
+      Serial.println("[UQ] recovery: committed data+backup found; removing backup");
+      LittleFS.remove(kBackupFile);
+    }
+    return true;
+  }
+
+  if (hasBackup) {
+    Serial.println("[UQ] recovery: restoring backup as data file");
+    if (!LittleFS.rename(kBackupFile, kDataFile)) return false;
+    if (hasTemp) {
+      Serial.println("[UQ] recovery: removing uncommitted temp file");
+      LittleFS.remove(kTempFile);
+    }
+    return true;
+  }
+
+  if (hasTemp) {
+    Serial.println("[UQ] recovery: promoting lone temp file");
+    return LittleFS.rename(kTempFile, kDataFile);
+  }
+
+  return true;
 }
 
 void UploadQueue::validateCursor() {
@@ -75,14 +140,50 @@ void UploadQueue::validateCursor() {
     return;
   }
   size_t fileSize = f.size();
-  f.close();
 
   if (m_cursor.byteOffset > fileSize || m_cursor.byteOffset < headerEndOffset()) {
     Serial.printf("[UQ] validateCursor: offset %u > file %u — resetting to header end\n",
                   (unsigned)m_cursor.byteOffset, (unsigned)fileSize);
     m_cursor.byteOffset = headerEndOffset();
     saveCursor();
+    f.close();
+    return;
   }
+
+  if (m_cursor.byteOffset == headerEndOffset()) {
+    f.close();
+    return;
+  }
+
+  if (!f.seek(m_cursor.byteOffset - 1)) {
+    m_cursor.byteOffset = headerEndOffset();
+    saveCursor();
+    f.close();
+    return;
+  }
+
+  if (f.read() == '\n') {
+    f.close();
+    return;
+  }
+
+  Serial.printf("[UQ] validateCursor: offset %u is mid-row; scanning forward\n",
+                static_cast<unsigned>(m_cursor.byteOffset));
+  bool foundBoundary = false;
+  if (f.seek(m_cursor.byteOffset)) {
+    while (f.available()) {
+      if (f.read() == '\n') {
+        m_cursor.byteOffset = static_cast<uint32_t>(f.position());
+        foundBoundary = true;
+        break;
+      }
+    }
+  }
+  if (!foundBoundary) {
+    m_cursor.byteOffset = headerEndOffset();
+  }
+  f.close();
+  saveCursor();
 }
 
 uint32_t UploadQueue::getPendingBytes() const {
@@ -119,6 +220,13 @@ UploadPayload UploadQueue::getNewData(uint32_t maxBytes) {
   payload.startOffset = m_cursor.byteOffset;
   payload.rowEstimate = 0;
 
+  const uint32_t freeHeap = ESP.getFreeHeap();
+  if (static_cast<uint64_t>(freeHeap) < static_cast<uint64_t>(maxBytes) * 2ULL) {
+    Serial.printf("[UPLOAD] Insufficient heap for payload: free=%u requested=%u\n",
+                  static_cast<unsigned>(freeHeap), static_cast<unsigned>(maxBytes));
+    return payload;
+  }
+
   File f = LittleFS.open(kDataFile, "r");
   if (!f) {
     Serial.println("[UQ] getNewData: cannot open datalog.csv");
@@ -131,42 +239,90 @@ UploadPayload UploadQueue::getNewData(uint32_t maxBytes) {
     return payload;
   }
 
-  // Prepend CSV header.
-  payload.csvData  = String(kUploadCSVHeader);
-  payload.csvData += "\n";
-
-  // Read up to maxBytes, ending on a '\n' boundary.
-  uint32_t bytesRead = 0;
-  bool hitNewline = false;
-  while (f.available() && bytesRead < maxBytes) {
-    int c = f.read();
-    if (c < 0) break;
-    payload.csvData += (char)c;
-    bytesRead++;
-    if (c == '\n') {
-      hitNewline = true;
-      payload.rowEstimate++;
-      // If we've read at least maxBytes we can stop now that we're on a boundary.
-      if (bytesRead >= maxBytes) break;
-    }
+  const uint32_t reserveSize = maxBytes + strlen(kUploadCSVHeader) + 258U;
+  if (!payload.csvData.reserve(reserveSize)) {
+    Serial.println("[UPLOAD] String allocation failed");
+    f.close();
+    return payload;
   }
 
-  // If we stopped mid-row (no trailing newline) and hit maxBytes, continue
-  // reading until the next '\n' so we don't split a row.
-  if (!hitNewline && bytesRead >= maxBytes && f.available()) {
-    while (f.available()) {
-      int c = f.read();
-      if (c < 0) break;
-      payload.csvData += (char)c;
-      bytesRead++;
-      if (c == '\n') {
-        payload.rowEstimate++;
+  payload.csvData = String(kUploadCSVHeader);
+  payload.csvData += "\n";
+  const uint32_t payloadHeaderLength = payload.csvData.length();
+
+  uint8_t buf[4096];
+  uint32_t bytesRead = 0;
+  uint32_t lastBoundaryBytes = 0;
+  bool allocationFailed = false;
+
+  auto appendBytes = [&](const uint8_t* data, size_t count) -> bool {
+    const uint32_t before = payload.csvData.length();
+    if (!payload.csvData.concat(reinterpret_cast<const char*>(data), count) ||
+        payload.csvData.length() != before + count) {
+      Serial.println("[UPLOAD] String allocation failed");
+      return false;
+    }
+    return true;
+  };
+
+  while (f.available() && bytesRead < maxBytes) {
+    const uint32_t remaining = maxBytes - bytesRead;
+    const size_t request = remaining < sizeof(buf) ? remaining : sizeof(buf);
+    const int count = f.read(buf, request);
+    if (count <= 0) break;
+    if (!appendBytes(buf, static_cast<size_t>(count))) {
+      allocationFailed = true;
+      break;
+    }
+    for (int i = 0; i < count; ++i) {
+      if (buf[i] == '\n') {
+        ++payload.rowEstimate;
+        lastBoundaryBytes = bytesRead + static_cast<uint32_t>(i) + 1U;
+      }
+    }
+    bytesRead += static_cast<uint32_t>(count);
+  }
+
+  // If maxBytes lands inside a row, consume exactly through the next newline.
+  if (!allocationFailed && bytesRead >= maxBytes &&
+      (bytesRead == 0 || payload.csvData[payload.csvData.length() - 1] != '\n')) {
+    bool foundNewline = false;
+    while (f.available() && !foundNewline) {
+      const int count = f.read(buf, sizeof(buf));
+      if (count <= 0) break;
+      size_t appendCount = static_cast<size_t>(count);
+      for (int i = 0; i < count; ++i) {
+        if (buf[i] == '\n') {
+          appendCount = static_cast<size_t>(i + 1);
+          foundNewline = true;
+          break;
+        }
+      }
+      if (!appendBytes(buf, appendCount)) {
+        allocationFailed = true;
         break;
+      }
+      bytesRead += static_cast<uint32_t>(appendCount);
+      if (foundNewline) {
+        ++payload.rowEstimate;
+        lastBoundaryBytes = bytesRead;
       }
     }
   }
 
   f.close();
+  if (allocationFailed) {
+    payload.csvData = String();
+    payload.byteLength = 0;
+    payload.rowEstimate = 0;
+    return payload;
+  }
+
+  // Never return a crash-truncated final row.
+  if (bytesRead > lastBoundaryBytes) {
+    payload.csvData.remove(payloadHeaderLength + lastBoundaryBytes);
+    bytesRead = lastBoundaryBytes;
+  }
   payload.byteLength = bytesRead;
   return payload;
 }
@@ -230,10 +386,8 @@ bool UploadQueue::purgeUploaded() {
   wf.close();
   rf.close();
 
-  // Swap files.
-  LittleFS.remove(kDataFile);
-  if (!LittleFS.rename(kTempFile, kDataFile)) {
-    Serial.println("[UQ] purgeUploaded: rename failed — data may be lost!");
+  // Commit with backup-then-swap.
+  if (!commitTempDataFile("purgeUploaded")) {
     return false;
   }
 
@@ -341,10 +495,8 @@ bool UploadQueue::emergencyPurgeIfFull(uint8_t thresholdPct) {
   wf.close();
   rf.close();
 
-  // Swap files.
-  LittleFS.remove(kDataFile);
-  if (!LittleFS.rename(kTempFile, kDataFile)) {
-    Serial.println("[UQ] emergencyPurge: rename failed — data may be lost!");
+  // Commit with backup-then-swap.
+  if (!commitTempDataFile("emergencyPurge")) {
     return false;
   }
 
@@ -385,14 +537,28 @@ void UploadQueue::incrementWakeCounter() {
 
 void UploadQueue::resetRetryCount() {
   m_cursor.retryCount = 0;
+  m_cursor.nextAttemptUnix = 0;
   saveCursor();
 }
 
 void UploadQueue::incrementRetryCount() {
-  m_cursor.retryCount++;
+  if (m_cursor.retryCount < UINT8_MAX) ++m_cursor.retryCount;
+  saveCursor();
+}
+
+void UploadQueue::incrementRetryCount(uint32_t nowUnix, uint32_t cooldownSec) {
+  if (m_cursor.retryCount < UINT8_MAX) ++m_cursor.retryCount;
+  m_cursor.nextAttemptUnix = nowUnix + cooldownSec;
   saveCursor();
 }
 
 bool UploadQueue::maxRetriesExceeded(uint8_t maxRetries) const {
+  return m_cursor.retryCount >= maxRetries;
+}
+
+bool UploadQueue::maxRetriesExceeded(uint8_t maxRetries, uint32_t nowUnix) const {
+  if (m_cursor.nextAttemptUnix > 0 && nowUnix >= m_cursor.nextAttemptUnix) {
+    return false;
+  }
   return m_cursor.retryCount >= maxRetries;
 }

@@ -43,6 +43,7 @@ WakeSources detectWakeSources() {
 WakeReason selectWakeReason(const WakeSources& sources) {
   if (sources.configRequested) return WAKE_CONFIG_BUTTON;
   if (sources.rtcAlarm) return WAKE_RTC_ALARM;
+  if (!sources.rtcStatusRead) return WAKE_UNKNOWN;
   return WAKE_USB_SERVICE;
 }
 
@@ -71,6 +72,9 @@ void printWakeReason(WakeReason reason) {
       break;
     case WAKE_USB_SERVICE:
       Serial.println("[WAKE] No config or RTC alarm — USB service / debug wake");
+      break;
+    case WAKE_UNKNOWN:
+      Serial.println("[WAKE] RTC status read failed - wake source is unknown");
       break;
     default:
       Serial.println("[WAKE] Could not determine wake source");

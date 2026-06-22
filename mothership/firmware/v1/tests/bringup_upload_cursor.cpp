@@ -52,13 +52,14 @@ static void clearTxNvs() {
 static void printCursor(const char* label) {
   UploadCursor c = uploadQueue.getCursor();
   Serial.printf("[CURSOR] %s: offset=%u rowsUploaded=%u lastUploadUnix=%u "
-                "retryCount=%u wakeCounter=%u\n",
+                "retryCount=%u wakeCounter=%u nextAttempt=%u\n",
                 label,
                 (unsigned)c.byteOffset,
                 (unsigned)c.rowsUploaded,
                 (unsigned)c.lastUploadUnix,
                 (unsigned)c.retryCount,
-                (unsigned)c.wakeCounter);
+                (unsigned)c.wakeCounter,
+                (unsigned)c.nextAttemptUnix);
 }
 
 static void printPayload(const UploadPayload& p) {
@@ -252,6 +253,29 @@ void setup() {
     Serial.println("PASS: No pending data after NVS re-init.");
   } else {
     Serial.printf("FAIL: Expected 0 bytes, got %u\n", (unsigned)payload4.byteLength);
+    overallPass = false;
+  }
+
+  // --- Step 13: retry cooldown releases a previously exhausted window ---
+  Serial.println("[STEP 13] Retry cooldown test...");
+  const uint32_t retryNow = 1782100800UL;
+  for (int i = 0; i < 3; ++i) {
+    uploadQueue.incrementRetryCount(retryNow + static_cast<uint32_t>(i), 3600UL);
+  }
+  UploadCursor retryCursor = uploadQueue.getCursor();
+  if (uploadQueue.maxRetriesExceeded(3, retryNow + 2) &&
+      !uploadQueue.maxRetriesExceeded(3, retryCursor.nextAttemptUnix)) {
+    Serial.println("PASS: Retry lockout clears after cooldown.");
+  } else {
+    Serial.println("FAIL: Retry cooldown did not release lockout.");
+    overallPass = false;
+  }
+  uploadQueue.resetRetryCount();
+  retryCursor = uploadQueue.getCursor();
+  if (retryCursor.retryCount == 0 && retryCursor.nextAttemptUnix == 0) {
+    Serial.println("PASS: Retry reset clears count and cooldown.");
+  } else {
+    Serial.println("FAIL: Retry reset left persisted state.");
     overallPass = false;
   }
 

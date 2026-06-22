@@ -7,6 +7,11 @@
 // and flash_logger.h instead of production's rtc_manager.h / sd_manager.h.
 
 // Sync globals (defined in config_server.cpp, loaded/saved from NVS).
+enum SyncMode {
+  SYNC_MODE_DAILY = 0,
+  SYNC_MODE_INTERVAL = 1,
+};
+
 extern int gWakeIntervalMin;
 extern int gSyncIntervalMin;
 extern int gSyncMode;

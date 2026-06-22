@@ -10,6 +10,7 @@
 //   5. Release PWR_HOLD to power off
 
 #include <Arduino.h>
+#include <Wire.h>
 
 #include "system/pins.h"
 #include "system/power.h"
@@ -32,6 +33,7 @@
 #ifndef DEFAULT_SYNC_INTERVAL_MIN
 #define DEFAULT_SYNC_INTERVAL_MIN 60
 #endif
+static constexpr uint32_t kSyncSessionLimitMs = 180000UL;
 
 // ---------------------------------------------------------------------------
 // Upload subsystem globals
@@ -48,101 +50,121 @@ UploadQueue uploadQueue;
 void handleSyncWake();
 void handleConfigWake();
 void handleServiceWake();
-void performModemUpload(const TransmissionSettings& txSettings);
+void performModemUpload(const TransmissionSettings& txSettings, uint32_t sessionStartMs);
+
+static void boundedRetryAndShutdown(const char* context) {
+  constexpr int kMaxAttempts = 3;
+
+  for (int attempt = 1; attempt <= kMaxAttempts; ++attempt) {
+    Serial.printf("[RETRY] %s: attempt %d/%d\n", context, attempt, kMaxAttempts);
+
+    Wire.begin(PIN_SDA, PIN_SCL);
+    Wire.setClock(100000);
+    delay(100);
+
+    if (initRTC() != RTC_ABSENT && armRescueAlarm(DEFAULT_SYNC_INTERVAL_MIN)) {
+      Serial.printf("[RETRY] %s: rescue alarm armed on attempt %d\n", context, attempt);
+      Serial.println("[RETRY] Releasing PWR_HOLD - board will wake on rescue alarm");
+      releasePwrHold();
+      return;
+    }
+
+    delay(500);
+  }
+
+  Serial.printf("[RETRY] %s: all attempts failed - trying one final best-effort rescue alarm\n",
+                context);
+  Wire.begin(PIN_SDA, PIN_SCL);
+  Wire.setClock(100000);
+  delay(100);
+  const RtcInitStatus rtcStatus = initRTC();
+  const bool rescueArmed = armRescueAlarm(DEFAULT_SYNC_INTERVAL_MIN);
+  Serial.printf("[RETRY] %s: final RTC init=%s rescue alarm=%s\n",
+                context, rtcStatus == RTC_OK ? "ok" :
+                         (rtcStatus == RTC_PRESENT_TIME_INVALID ? "TIME_INVALID" : "ABSENT"),
+                rescueArmed ? "armed" : "FAILED");
+  Serial.printf("[RETRY] %s: releasing PWR_HOLD as last resort\n", context);
+  releasePwrHold();
+}
 
 // ---------------------------------------------------------------------------
-// ESP-NOW receive callback
+// ESP-NOW snapshot processing (main task only)
 // ---------------------------------------------------------------------------
-void onEspNowData(const uint8_t* mac, const uint8_t* data, int len) {
+void processSnapshot(const node_snapshot_t* snap, const uint8_t* mac) {
+  if (!snap || !mac) return;
+
   char macStr[18];
   snprintf(macStr, sizeof(macStr), "%02X:%02X:%02X:%02X:%02X:%02X",
            mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
 
-  Serial.printf("[ESP-NOW] RX from %s | len=%d\n", macStr, len);
+  Serial.printf("[SNAP] RX=%s nodeId=%.15s seq=%lu present=0x%04X bat=%.2fV airT=%.1f airH=%.1f\n",
+                macStr, snap->nodeId, static_cast<unsigned long>(snap->seqNum),
+                snap->sensorPresent, snap->batVoltage, snap->airTemp,
+                snap->airHumidity);
 
-  // --- node_snapshot_t handling (primary path, 124 bytes) ---
-  // Nodes send a node_snapshot_t with command="NODE_SNAPSHOT".
-  if (len >= (int)sizeof(node_snapshot_t)) {
-    const node_snapshot_t* snap = reinterpret_cast<const node_snapshot_t*>(data);
-    if (strncmp(snap->command, "NODE_SNAPSHOT", 15) == 0) {
-      Serial.printf("[SNAP] nodeId=%.15s seq=%lu present=0x%04X bat=%.2fV airT=%.1f airH=%.1f\n",
-                    snap->nodeId,
-                    (unsigned long)snap->seqNum,
-                    snap->sensorPresent,
-                    snap->batVoltage,
-                    snap->airTemp,
-                    snap->airHumidity);
+  if (flashIsReady() && !logSnapshotRow(snap)) {
+    Serial.println("[SNAP] Flash logging failed");
+  }
 
-      // Log to flash if ready (SD fallback), otherwise try SD.
-      if (flashIsReady()) {
-        logSnapshotRow(snap);
-      } else if (sdIsReady() && len >= (int)sizeof(sensor_data_message_t)) {
-        // SD-only legacy fallback (rare; SD usually broken on V1).
-      }
-
-      // Mark node as seen in registry for early shutdown tracking
-      for (auto& n : registeredNodes) {
-        if (strncmp(n.nodeId.c_str(), snap->nodeId, 16) == 0 || memcmp(n.mac, mac, 6) == 0) {
-          n.lastSeen = millis();
-          n.isActive = true;
-          break;
-        }
-      }
-      return;
+  for (auto& n : registeredNodes) {
+    if (strncmp(n.nodeId.c_str(), snap->nodeId, 16) == 0 ||
+        memcmp(n.mac, mac, 6) == 0) {
+      n.lastSeen = millis();
+      n.isActive = true;
+      break;
     }
   }
 
-  // --- Legacy sensor_data_message_t fallback (68 bytes) ---
-  if (sdIsReady() && len >= (int)sizeof(sensor_data_message_t)) {
-    const sensor_data_message_t* msg = reinterpret_cast<const sensor_data_message_t*>(data);
-    NodeSnapshot snap;
-    strncpy(snap.nodeId, msg->nodeId, sizeof(snap.nodeId) - 1);
-    strncpy(snap.sensorType, msg->sensorType, sizeof(snap.sensorType) - 1);
-    strncpy(snap.sensorLabel, msg->sensorLabel, sizeof(snap.sensorLabel) - 1);
-    snap.sensorId = msg->sensorId;
-    snap.value = msg->value;
-    snap.nodeTimestamp = msg->nodeTimestamp;
-    snap.qualityFlags = msg->qualityFlags;
-    logSnapshot(&snap);
-  } else if (flashIsReady() && len >= (int)sizeof(sensor_data_message_t)) {
-    // Legacy message but only flash available — log a minimal CSV row.
-    const sensor_data_message_t* msg = reinterpret_cast<const sensor_data_message_t*>(data);
-    char row[256];
-    snprintf(row, sizeof(row), "%lu,%.15s,,,,,%.4f,%.4f,%.4f",
-             (unsigned long)millis(),
-             msg->nodeId,
-             msg->value,
-             0.0f, 0.0f);
-    flashLogCSVRow(String(row));
-  }
+  // Legacy sensor_data_message_t packets are intentionally ignored. All
+  // deployed V1 nodes send node_snapshot_t.
 }
 
 // ---------------------------------------------------------------------------
 // Modem upload sequence (called from handleSyncWake when txSettings.enabled)
 // ---------------------------------------------------------------------------
-void performModemUpload(const TransmissionSettings& txSettings) {
+void performModemUpload(const TransmissionSettings& txSettings, uint32_t sessionStartMs) {
   Serial.println("[UPLOAD] === Starting modem upload sequence ===");
+
+  const uint32_t retryNowUnix = getRTCTime();
+  const uint32_t retryIntervalMin = txSettings.uploadIntervalMin > 0 ?
+      txSettings.uploadIntervalMin :
+      static_cast<uint32_t>(gSyncIntervalMin > 0 ? gSyncIntervalMin : DEFAULT_SYNC_INTERVAL_MIN);
+  const uint32_t retryCooldownSec = retryIntervalMin * 60UL;
 
   ModemDriver modem;
   modem.init();
 
+  auto sessionExpired = [&]() -> bool {
+    return millis() - sessionStartMs > kSyncSessionLimitMs;
+  };
+
   // 1. Power on modem
   if (!modem.powerOn()) {
     Serial.println("[UPLOAD] FAIL: Modem power-on failed");
-    uploadQueue.incrementRetryCount();
+    uploadQueue.incrementRetryCount(retryNowUnix, retryCooldownSec);
     return;
   }
   Serial.println("[UPLOAD] Modem powered on");
+  if (sessionExpired()) {
+    Serial.println("[WATCHDOG] Session timeout after modem power-on - forcing shutdown");
+    modem.gracefulShutdown();
+    return;
+  }
 
   // 2. Wait for network registration (60s timeout — will fail without antenna)
   Serial.println("[UPLOAD] Waiting for network registration (60s timeout)...");
   if (!modem.waitForNetwork(60000)) {
     Serial.println("[UPLOAD] Network registration failed/timeout — skipping upload");
     modem.gracefulShutdown();
-    uploadQueue.incrementRetryCount();
+    uploadQueue.incrementRetryCount(retryNowUnix, retryCooldownSec);
     return;
   }
   Serial.println("[UPLOAD] Network registered");
+  if (sessionExpired()) {
+    Serial.println("[WATCHDOG] Session timeout after network registration - forcing shutdown");
+    modem.gracefulShutdown();
+    return;
+  }
 
   // 3. Get new data from cursor
   UploadPayload payload = uploadQueue.getNewData(txSettings.maxBytesPerSession);
@@ -155,6 +177,11 @@ void performModemUpload(const TransmissionSettings& txSettings) {
 
   // 4. Build URL with auth token
   String url = buildUploadUrl(txSettings);
+  if (sessionExpired()) {
+    Serial.println("[WATCHDOG] Session timeout before HTTPS upload - forcing shutdown");
+    modem.gracefulShutdown();
+    return;
+  }
 
   // 5. HTTPS POST
   Serial.printf("[UPLOAD] POSTing to %s\n", url.c_str());
@@ -169,7 +196,7 @@ void performModemUpload(const TransmissionSettings& txSettings) {
     uploadQueue.resetRetryCount();
   } else {
     Serial.printf("[UPLOAD] FAIL: HTTP %d, %s\n", result.httpStatus, result.errorDetail.c_str());
-    uploadQueue.incrementRetryCount();
+    uploadQueue.incrementRetryCount(retryNowUnix, retryCooldownSec);
   }
 
   // 7. Emergency purge check (regardless of upload success)
@@ -185,17 +212,28 @@ void performModemUpload(const TransmissionSettings& txSettings) {
 // ---------------------------------------------------------------------------
 void handleSyncWake() {
   Serial.println("=== SYNC WAKE ===");
+  const uint32_t sessionStartMs = millis();
+  bool sessionTimedOut = false;
   setLed(true);
 
   // Load sync interval from NVS (gSyncIntervalMin is only set during config mode)
   loadWakeIntervalFromNVS();
+  loadSyncModeFromNVS();
+  loadDailySyncTimeFromNVS();
   gSyncIntervalMin = computeAutoSyncMin(gWakeIntervalMin);
-  Serial.printf("[SYNC] Loaded from NVS: wake=%d min sync=%d min\n", gWakeIntervalMin, gSyncIntervalMin);
+  Serial.printf("[SYNC] Loaded from NVS: wake=%d min sync=%d min mode=%s daily=%02d:%02d\n",
+                gWakeIntervalMin, gSyncIntervalMin,
+                gSyncMode == SYNC_MODE_DAILY ? "daily" : "interval",
+                gSyncDailyHour, gSyncDailyMinute);
 
   // Init subsystems
-  if (!initRTC()) {
-    Serial.println("[FATAL] RTC init failed — cannot re-arm alarm. Staying on.");
-    while (true) { delay(1000); }
+  const RtcInitStatus rtcStatus = initRTC();
+  if (rtcStatus != RTC_OK) {
+    Serial.printf("[FATAL] RTC %s - sync scheduling is unsafe\n",
+                  rtcStatus == RTC_PRESENT_TIME_INVALID ? "time invalid" : "absent");
+    boundedRetryAndShutdown(rtcStatus == RTC_PRESENT_TIME_INVALID ?
+                            "RTC time invalid" : "RTC init failed");
+    return;
   }
 
   if (!initSD()) {
@@ -220,7 +258,7 @@ void handleSyncWake() {
   if (!initEspNowSyncOnly(ESPNOW_CHANNEL)) {
     Serial.println("[WARN] ESP-NOW init failed — sync window will be empty");
   }
-  registerReceiveCallback(onEspNowData);
+  initSnapQueue(8);
 
   // Listen for node data for SYNC_WINDOW_MS
   // Broadcast SYNC_WINDOW_OPEN repeatedly every 5 seconds so nodes that wake
@@ -240,13 +278,27 @@ void handleSyncWake() {
   unsigned long lastBroadcastMs = 0;
   const unsigned long kMinListenMs = 15000;  // minimum 15s listen
 
-  while (millis() - startMs < SYNC_WINDOW_MS) {
+  if (millis() - sessionStartMs > kSyncSessionLimitMs) {
+    Serial.println("[WATCHDOG] Session timeout before ESP-NOW listen - skipping window");
+    sessionTimedOut = true;
+  }
+
+  while (!sessionTimedOut && millis() - startMs < SYNC_WINDOW_MS) {
+    if (millis() - sessionStartMs > kSyncSessionLimitMs) {
+      Serial.println("[WATCHDOG] Session timeout during ESP-NOW listen");
+      sessionTimedOut = true;
+      break;
+    }
     // Re-broadcast sync window marker every 5 seconds
     if (millis() - lastBroadcastMs >= 5000 || lastBroadcastMs == 0) {
       broadcastSyncWindowOpen();
       lastBroadcastMs = millis();
     }
-    espnowSyncLoop();
+    EspNowSnapSlot slots[4];
+    int drained = drainSnapQueue(slots, 4);
+    for (int i = 0; i < drained; ++i) {
+      processSnapshot(&slots[i].snap, slots[i].mac);
+    }
 
     // Check if all deployed nodes have synced (after minimum listen time)
     if (deployedCount > 0 && (millis() - startMs) >= kMinListenMs) {
@@ -269,6 +321,19 @@ void handleSyncWake() {
 
   Serial.println("[SYNC] Sync window closed");
 
+  // Drain packets already accepted before unregistering the producer.
+  EspNowSnapSlot finalSlots[4];
+  int finalDrained = 0;
+  do {
+    finalDrained = drainSnapQueue(finalSlots, 4);
+    for (int i = 0; i < finalDrained; ++i) {
+      processSnapshot(&finalSlots[i].snap, finalSlots[i].mac);
+    }
+  } while (finalDrained > 0);
+
+  // Stop the WiFi-task producer before upload or purge code touches files.
+  deinitEspNowSync();
+
   // --- LTE upload phase ---
   // Entirely conditional on txSettings.enabled — a complete no-op when
   // disabled, with no serial spam.  Upload failure never blocks the sync
@@ -276,7 +341,12 @@ void handleSyncWake() {
   TransmissionSettings txSettings;
   loadTransmissionSettings(txSettings);
 
-  if (txSettings.enabled && flashIsReady()) {
+  if (millis() - sessionStartMs > kSyncSessionLimitMs) {
+    Serial.println("[WATCHDOG] Session timeout before upload - skipping upload");
+    sessionTimedOut = true;
+  }
+
+  if (!sessionTimedOut && txSettings.enabled && flashIsReady()) {
     uploadQueue.incrementWakeCounter();
 
     // Determine upload policy: uploadIntervalMin=0 means every wake.
@@ -292,9 +362,13 @@ void handleSyncWake() {
       uint16_t batMv = (uint16_t)(batV * 1000);
 
       if (batMv >= txSettings.minBatteryMv) {
-        if (!uploadQueue.maxRetriesExceeded(txSettings.maxRetriesPerWindow)) {
+        if (!uploadQueue.maxRetriesExceeded(txSettings.maxRetriesPerWindow, getRTCTime())) {
           if (uploadQueue.getPendingBytes() > 0) {
-            performModemUpload(txSettings);
+            performModemUpload(txSettings, sessionStartMs);
+            if (millis() - sessionStartMs > kSyncSessionLimitMs) {
+              Serial.println("[WATCHDOG] Session timeout during upload - proceeding to alarm re-arm");
+              sessionTimedOut = true;
+            }
           } else {
             Serial.println("[UPLOAD] No new data to upload");
           }
@@ -309,20 +383,35 @@ void handleSyncWake() {
     }
   }
 
-  // Re-arm alarm for next sync
-  int syncInterval = (gSyncIntervalMin > 0) ? gSyncIntervalMin : DEFAULT_SYNC_INTERVAL_MIN;
-  // Load the phase anchor from NVS so the mothership wakes aligned with nodes
+  if (millis() - sessionStartMs > kSyncSessionLimitMs) {
+    Serial.println("[WATCHDOG] Session limit reached - forcing alarm re-arm and shutdown");
+    sessionTimedOut = true;
+  }
+
+  // Re-arm according to the configured schedule mode.
   loadSyncRuntimeGuardsFromNVS();
-  uint32_t phaseUnix = (uint32_t)gLastSyncBroadcastUnix;
-  if (!armNextSyncAlarmPhase(syncInterval, phaseUnix)) {
-    Serial.println("[FATAL] Failed to arm next sync alarm! Staying on.");
-    while (true) { delay(1000); }
+  if (gSyncMode == SYNC_MODE_DAILY) {
+    if (!armDailyAlarm(gSyncDailyHour, gSyncDailyMinute)) {
+      Serial.println("[FATAL] Failed to arm daily alarm - starting bounded recovery");
+      boundedRetryAndShutdown("Daily alarm arm failed");
+      return;
+    }
+  } else {
+    const int syncInterval = (gSyncIntervalMin > 0) ?
+                             gSyncIntervalMin : DEFAULT_SYNC_INTERVAL_MIN;
+    const uint32_t phaseUnix = static_cast<uint32_t>(gLastSyncBroadcastUnix);
+    if (!armNextSyncAlarmPhase(syncInterval, phaseUnix)) {
+      Serial.println("[FATAL] Failed to arm next sync alarm - starting bounded recovery");
+      boundedRetryAndShutdown("Sync alarm arm failed");
+      return;
+    }
   }
 
   // Verify alarm is properly set before power-down
   if (!verifyAlarmSet()) {
-    Serial.println("[FATAL] Alarm verification failed! Staying on.");
-    while (true) { delay(1000); }
+    Serial.println("[FATAL] Alarm verification failed - starting bounded recovery");
+    boundedRetryAndShutdown("Alarm verification failed");
+    return;
   }
 
   Serial.println("[SYNC] Alarm armed and verified. Powering down.");
@@ -344,8 +433,12 @@ void handleConfigWake() {
   // Step 1: Init RTC for time display and alarm scheduling
   Serial.println("[CFG-DBG] Step 1: initRTC...");
   Serial.flush();
-  if (!initRTC()) {
+  const RtcInitStatus configRtcStatus = initRTC();
+  if (configRtcStatus == RTC_ABSENT) {
     Serial.println("[WARN] RTC init failed in config mode — continuing without RTC");
+  }
+  if (configRtcStatus == RTC_PRESENT_TIME_INVALID) {
+    Serial.println("[WARN] RTC time invalid in config mode - set the clock before shutdown");
   }
   Serial.println("[CFG-DBG] Step 1 done: initRTC");
   Serial.flush();
@@ -462,7 +555,11 @@ void handleConfigWake() {
   // 7. Save NVS + re-arm alarm before power-down
   saveSyncRuntimeGuardsToNVS();
 
-  if (initRTC()) {
+  const RtcInitStatus shutdownRtcStatus = initRTC();
+  if (shutdownRtcStatus != RTC_ABSENT) {
+    if (shutdownRtcStatus == RTC_PRESENT_TIME_INVALID) {
+      Serial.println("[WARN] RTC time remains invalid - arming best-effort alarm");
+    }
     if (gSyncMode == 1) {
       // Interval mode — phase-aligned with nodes
       uint32_t phaseUnix = (uint32_t)gLastSyncBroadcastUnix;
@@ -520,6 +617,22 @@ void setup() {
   Serial.println("=== Mothership V1 Firmware ===");
   Serial.printf("Build: %s %s\n", __DATE__, __TIME__);
 
+  // Arm a conservative fallback before wake classification or long-running
+  // sync/upload work. Preserve the flag that caused an RTC wake because the
+  // rescue alarm's verified commit clears A1F by design.
+  bool rtcAlarmPendingAtBoot = false;
+  const RtcInitStatus bootRtcStatus = initRTC();
+  if (bootRtcStatus != RTC_ABSENT) {
+    rtcAlarmPendingAtBoot = readAlarmFlag();
+    if (armRescueAlarm(DEFAULT_SYNC_INTERVAL_MIN)) {
+      Serial.printf("[BOOT] Rescue alarm armed for %d minutes\n", DEFAULT_SYNC_INTERVAL_MIN);
+    } else {
+      Serial.println("[BOOT] Warning: failed to arm rescue alarm");
+    }
+  } else {
+    Serial.println("[BOOT] Warning: RTC unavailable; rescue alarm not armed");
+  }
+
   // Print battery voltage at boot
   float vBat = readBatteryVoltage();
   Serial.printf("[PWR] Battery: %.3f V\n", vBat);
@@ -527,6 +640,7 @@ void setup() {
   // Capture wake inputs independently. Config wins if the button latch and
   // RTC alarm are active at the same time.
   WakeSources sources = detectWakeSources();
+  sources.rtcAlarm = sources.rtcAlarm || rtcAlarmPendingAtBoot;
   WakeReason reason = selectWakeReason(sources);
   printWakeSources(sources);
   printWakeReason(reason);
@@ -547,6 +661,10 @@ void setup() {
       break;
     case WAKE_USB_SERVICE:
       handleServiceWake();
+      break;
+    case WAKE_UNKNOWN:
+      Serial.println("[WAKE] Unknown wake reason (RTC read failed) - arming rescue and shutting down");
+      boundedRetryAndShutdown("WAKE_UNKNOWN: RTC status read failed");
       break;
     default:
       Serial.println("[WAKE] Unknown wake reason — defaulting to sync");
