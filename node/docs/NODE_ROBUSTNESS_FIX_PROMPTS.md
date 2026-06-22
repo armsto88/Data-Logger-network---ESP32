@@ -1,708 +1,1116 @@
-# Node Firmware Robustness Fix — Implementation Prompts
+# Full Node Firmware Integrity Repair and Robustness Hardening
 
-**Date:** 2026-06-22
-**Purpose:** Step-by-step prompts for a repo coding agent to implement robustness fixes for the node firmware.
+You are working on the ESP32 environmental sensor node firmware.
 
-## Instructions
+Primary project:
 
-1. Read the full node firmware at `node/firmware/src/main.cpp` and `node/firmware/src/storage/local_queue.cpp` before starting any stage.
-2. Execute ONE stage at a time. Do not skip ahead.
-3. After each stage, verify compilation by running ALL the commands listed in that stage's "Validation" section.
-4. Do not proceed to the next stage until the current stage compiles cleanly and previous stages' tests still compile.
-5. The system WORKS today. It has been validated in full autonomous sync cycles with the mothership. No change may regress the working sync flow. Every change is additive and defensive.
-6. After completing all stages, run `pio run -e esp32wroom` (from `node/firmware/`) one final time to confirm the full firmware compiles.
+    node/firmware/
 
-## Bug inventory and staging
+Important files include:
 
-| Stage | Bug(s) | Severity | Files | Risk |
-|-------|--------|----------|-------|------|
-| 1 | ESP-NOW callback I2C/NVS races + espnowSendWithRecover from callback | High | `main.cpp` | **highest** |
-| 2 | Alarm read-back verification + clear-after-verify | Medium | `main.cpp` | low |
-| 3 | Queue persist failure revert + backup key | Medium | `local_queue.{h,cpp}` | medium |
-| 4 | Flush retry limit / backoff | Medium | `main.cpp` | low |
-| 5 | RTC lost power diagnostic flag | Medium | `main.cpp` | low |
-| 6 | CONFIG_SNAPSHOT re-arm trigger | Medium | `main.cpp` | trivial |
-| 7 | I2C scan gating | Medium | `main.cpp` | trivial |
-| 8 | Low-priority cleanup (strncpy, getString, dead code, etc.) | Low | `main.cpp`, `local_queue.cpp` | low |
+    src/main.cpp
+    src/protocol.h or the shared protocol header used by this project
+    src/storage/local_queue.h
+    src/storage/local_queue.cpp
+    src/sensors.h
+    src/sensors.cpp
+    platformio.ini
+    tests/
 
----
+Read the complete node firmware, protocol definitions, queue implementation,
+PlatformIO configuration, and existing tests before changing anything.
 
-## Stage 1: ESP-NOW callback safety (High — highest risk)
+The firmware currently works in some autonomous tests. Preserve the existing
+functional flow while fixing the verified integrity defects below. Do not make
+large cosmetic refactors. Every behaviour change must be deliberate, logged,
+tested, and compiled.
 
-### Files to modify
-- `node/firmware/src/main.cpp`
-
-### Context
-The ESP-NOW receive callback `onDataReceived()` runs on the Wi-Fi task. It currently performs I2C writes (`rtc.adjust()`, `ds3231DisableAlarmInterrupt()`, `clearDS3231_AlarmFlags()`), NVS writes (`persistNodeConfig()`, `local_queue::clear()`), and calls `espnowSendWithRecover()` which can `esp_now_deinit()` from within the callback. The `Wire` and `Preferences` libraries are not thread-safe. Concurrent access from the Wi-Fi task and main task can corrupt I2C state or NVS data.
-
-The codebase already has a deferral pattern: `g_rearmAlarmsPending` and `g_deployBootstrapPending` flags are set in the callback and serviced from the main loop. This stage extends that pattern to ALL I2C and NVS operations.
-
-### Bug: I2C and NVS races from onDataReceived() callback
-
-**Fix:** Introduce a command queue (or a set of pending-action flags) that the callback sets instead of performing I2C/NVS work directly. The main loop drains the queue and performs the operations.
-
-#### Approach: Pending action flags
-
-Add the following volatile flags (already have `g_deployBootstrapPending` and `g_rearmAlarmsPending`):
-
-```cpp
-// Pending actions set by ESP-NOW callback, serviced from main loop
-static volatile bool g_pendingTimeSync = false;
-static time_sync_response_t g_pendingTimeSyncData;  // copied in callback, applied in loop
-static volatile bool g_pendingPairNode = false;
-static volatile bool g_pendingUnpair = false;
-static volatile bool g_pendingConfigSnapshot = false;
-static config_snapshot_message_t g_pendingConfigSnapshotData;
-static volatile bool g_pendingDeployAck = false;  // DEPLOY_ACK to send from main loop
-static uint8_t g_pendingDeployAckMac[6];
-static volatile bool g_pendingPairingResponse = false;
-static pairing_response_t g_pendingPairingResponseData;
-```
-
-#### Changes to onDataReceived():
-
-For each command handler that currently does I2C/NVS work, change it to ONLY copy the data and set a flag:
-
-1. **TIME_SYNC handler:** Instead of `rtc.adjust()`, `persistNodeConfig()`, and setting `g_rearmAlarmsPending`:
-   - Copy the response into `g_pendingTimeSyncData`
-   - Set `g_pendingTimeSync = true`
-   - Return immediately
-
-2. **PAIR_NODE / PAIRING_RESPONSE handler:** Instead of `ds3231DisableAlarmInterrupt()`, `clearDS3231_AlarmFlags()`, `local_queue::clear()`, `persistNodeConfig()`:
-   - Copy mothership MAC into a pending buffer
-   - Set `g_pendingPairNode = true` (or `g_pendingPairingResponse = true` with the response data)
-   - Return immediately
-
-3. **UNPAIR_NODE handler:** Instead of `ds3231DisableAlarmInterrupt()`, `clearDS3231_AlarmFlags()`, `persistNodeConfig()`, `local_queue::clear()`:
-   - Set `g_pendingUnpair = true`
-   - Return immediately
-
-4. **DEPLOY_NODE handler:** This is the most complex. Currently does `rtc.adjust()`, `persistNodeConfig()`, sends DEPLOY_ACK via `espnowSendWithRecover()`, sets `g_deployBootstrapPending`:
-   - Copy the deployment command data into a pending buffer
-   - Copy the sender MAC for DEPLOY_ACK
-   - Set `g_pendingDeploy = true` (new flag) and `g_pendingDeployAck = true`
-   - Do NOT call `rtc.adjust()`, `persistNodeConfig()`, or `espnowSendWithRecover()` from the callback
-   - Return immediately
-
-5. **CONFIG_SNAPSHOT handler:** Instead of `persistNodeConfig()` and `esp_now_send()` for the ACK:
-   - Copy the snapshot data into `g_pendingConfigSnapshotData`
-   - Set `g_pendingConfigSnapshot = true`
-   - For the ACK: copy the MAC and set `g_pendingConfigAck = true` (new flag)
-   - Return immediately
-
-6. **SET_SCHEDULE / SET_SYNC_SCHED handlers:** These already set `g_rearmAlarmsPending` (good) but also call `persistNodeConfig()`:
-   - Remove the `persistNodeConfig()` call from the callback
-   - Set a `g_pendingPersistConfig = true` flag instead
-   - The main loop will persist
-
-7. **DEPLOY_ACK send:** Replace `espnowSendWithRecover(mac, ...)` with a flag + main-loop send. Use raw `esp_now_send()` from the callback ONLY if the peer is already registered (no recovery path). Better: defer entirely to the main loop.
-
-#### Changes to loop():
-
-Add a section at the top of `loop()` (after `processPowerCut()`) to service pending actions:
-
-```cpp
-// --- Service pending ESP-NOW callback actions (main task context) ---
-
-if (g_pendingTimeSync) {
-  g_pendingTimeSync = false;
-  // Apply the time sync: rtc.adjust(), update rtcSynced, lastTimeSyncUnix, persistNodeConfig
-  // Set g_rearmAlarmsPending if deployed
-  // (move the existing TIME_SYNC handler logic here)
-}
-
-if (g_pendingPairNode) {
-  g_pendingPairNode = false;
-  // Apply pairing: set mothership MAC, clear alarms, clear queue, persist
-  // (move the existing PAIR_NODE handler logic here)
-}
-
-if (g_pendingUnpair) {
-  g_pendingUnpair = false;
-  // Apply unpair: clear MAC, clear alarms, clear queue, persist, set g_postUnpairHold
-  // (move the existing UNPAIR handler logic here)
-}
-
-if (g_pendingDeploy) {
-  g_pendingDeploy = false;
-  // Apply deployment: rtc.adjust(), set interval/sync/phase, persist, set g_deployBootstrapPending
-  // (move the existing DEPLOY_NODE handler logic here)
-}
-
-if (g_pendingDeployAck) {
-  g_pendingDeployAck = false;
-  // Send DEPLOY_ACK from main task using espnowSendWithRecover
-  espnowSendWithRecover(g_pendingDeployAckMac, ...);
-}
-
-if (g_pendingConfigSnapshot) {
-  g_pendingConfigSnapshot = false;
-  // Apply config snapshot: update interval/sync/phase, persist, set g_rearmAlarmsPending
-  // (move the existing CONFIG_SNAPSHOT handler logic here)
-  // Also fix Bug: set g_rearmAlarmsPending = true when schedule changes (Stage 6)
-}
-
-if (g_pendingPersistConfig) {
-  g_pendingPersistConfig = false;
-  persistNodeConfig();
-}
-```
-
-#### Important constraints:
-- The callback can still do `memcpy` (safe), `strcmp` (safe on stack data), and set volatile flags (safe)
-- The callback must NOT do: `rtc.adjust()`, `persistNodeConfig()`, `local_queue::clear()`, `ds3231DisableAlarmInterrupt()`, `clearDS3231_AlarmFlags()`, `espnowSendWithRecover()`, or any I2C/NVS operation
-- The callback CAN do: `esp_now_send()` with raw call (no recovery) for simple ACKs IF the peer is already registered — but deferring to the main loop is safer
-- Keep the `g_syncWindowMarkerMs = millis()` assignment in the callback — it's just a volatile uint32 write, safe
-- Keep the `g_deployBootstrapPending = true` and `g_rearmAlarmsPending = true` flag sets — they're already deferred
-
-### Testing
-Create `node/firmware/tests/bringup_callback_safety.cpp` with env `[env:esp32wroom-callback-safety]` in `node/firmware/platformio.ini`:
-1. Assert PWR_HOLD HIGH first
-2. Init RTC, NVS, load config
-3. Simulate receiving a TIME_SYNC packet by calling the callback directly with test data
-4. Confirm the callback returns quickly (no I2C/NVS blocking)
-5. Confirm the pending flag is set
-6. Run one loop iteration, confirm the time sync is applied
-7. Print PASS/FAIL
-8. Loop: idle heartbeat
-
-### Validation
-1. `pio run -e esp32wroom` (from `node/firmware/`) — must compile
-2. `pio run -e esp32wroom-callback-safety` — must compile
-3. Existing bringup tests that compile against the main env must still compile
-
-### What NOT to change
-- Do NOT modify `local_queue.cpp`, `rtc_manager.h`, `protocol.h`, or `platformio.ini` (except adding the new test env)
-- Do NOT change the `onDataSent()` callback — it only sets volatile flags, which is safe
-- Do NOT change `bringupEspNow()`, `shutdownEspNow()`, `espnowSendWithRecover()` — these are called from the main task
-- Do NOT change `handleRtcWakeEvents()` or `finalizeWakeAndSleep()` — these run on the main task
-- Do NOT remove the `g_syncWindowMarkerMs` assignment in the callback
+Do not merely produce recommendations. Implement the changes.
 
 ---
 
-## Stage 2: Alarm read-back verification (Medium)
+# Primary goals
 
-### Files to modify
-- `node/firmware/src/main.cpp`
+The repaired firmware must guarantee, as far as the hardware permits, that:
 
-### Context
-Stage 1 is complete. The ESP-NOW callback no longer does I2C work. This stage adds alarm register read-back verification, matching the mothership's Stage 1 fix.
+1. ESP-NOW callbacks never perform unsafe I2C, NVS, filesystem, Wi-Fi
+   reinitialisation, peer mutation, or blocking send operations.
 
-### Bug: No alarm read-back verification
+2. Commands received during an autonomous wake are processed before the node
+   powers off.
 
-`ds3231WriteA1()` and `ds3231WriteA2()` return `WireRtc.endTransmission() == 0` (I2C ACK only). No read-back of the actual register values. A partial write could leave the alarm at the wrong time.
+3. A received packet cannot be misidentified because two protocol structures
+   happen to have the same byte size.
 
-**Fix:** Add read-back verification functions:
+4. A queued sensor snapshot is not removed because an unrelated ESP-NOW send
+   callback reported success.
 
-```cpp
-static bool verifyAlarm1Registers(uint8_t expectedSec, uint8_t expectedMin, uint8_t expectedHour, uint8_t expectedDayReg) {
-  uint8_t regs[4];
-  WireRtc.beginTransmission(0x68);
-  WireRtc.write(0x07);
-  if (WireRtc.endTransmission(false) != 0) return false;
-  WireRtc.requestFrom((uint8_t)0x68, (uint8_t)4);
-  if (WireRtc.available() < 4) return false;
-  for (int i = 0; i < 4; i++) regs[i] = WireRtc.read();
-  return regs[0] == expectedSec && regs[1] == expectedMin && regs[2] == expectedHour && regs[3] == expectedDayReg;
-}
+5. The node does not release PWR_HOLD unless a valid future wake source has been
+   programmed and verified.
 
-static bool verifyAlarm2Registers(uint8_t expectedMin, uint8_t expectedHour, uint8_t expectedDayReg) {
-  uint8_t regs[3];
-  WireRtc.beginTransmission(0x68);
-  WireRtc.write(0x0B);
-  if (WireRtc.endTransmission(false) != 0) return false;
-  WireRtc.requestFrom((uint8_t)0x68, (uint8_t)3);
-  if (WireRtc.available() < 3) return false;
-  for (int i = 0; i < 3; i++) regs[i] = WireRtc.read();
-  return regs[0] == expectedMin && regs[1] == expectedHour && regs[2] == expectedDayReg;
-}
-```
+6. Queue mutations and configuration updates survive interrupted or failed NVS
+   writes without silently rolling back or advancing to inconsistent state.
 
-Update `ds3231ArmNextInNMinutes()` to verify after write:
-- After `ds3231WriteA1(secBCD, minBCD, hourBCD, dayReg)`, call `verifyAlarm1Registers(secBCD, minBCD, hourBCD, dayReg)`
-- If verification fails, return false
+7. Invalid, malformed, unauthorised, stale, or misdirected radio commands are
+   rejected.
 
-Update `ds3231ArmSyncWake()` to verify after write:
-- After `ds3231WriteA2(minBCD, hourBCD, dayReg)`, call `verifyAlarm2Registers(minBCD, hourBCD, dayReg)`
-- If verification fails, return false
+8. The existing interval-based sync flow continues to work while daily sync
+   mode is handled consistently.
 
-Update `armDeploymentWakeAlarms()`:
-- Move `clearDS3231_AlarmFlags()` to AFTER both alarm writes AND verifications succeed
-- If either verification fails, do NOT clear flags — return false
-- The existing 3-retry loop in `finalizeWakeAndSleep()` handles the retry
+9. Tests exercise production code rather than reimplementing mock copies of the
+   production logic.
 
-### Testing
-Create `node/firmware/tests/bringup_alarm_verify.cpp` with env `[env:esp32wroom-alarm-verify]`:
-1. Assert PWR_HOLD HIGH first
-2. Init RTC
-3. Arm alarm 1 minute from now
-4. Verify alarm registers match
-5. Corrupt one register manually
-6. Confirm verification fails
-7. Re-arm, confirm verification passes
-8. Print PASS/FAIL
-9. Loop: idle heartbeat
-
-### Validation
-1. `pio run -e esp32wroom` — must compile
-2. `pio run -e esp32wroom-alarm-verify` — must compile
-
-### What NOT to change
-- Do NOT modify `local_queue.cpp`, `rtc_manager.h`, `protocol.h`
-- Do NOT change the alarm register addresses or BCD encoding
-- Do NOT change the `ds3231WriteA1`/`ds3231WriteA2` function signatures
+10. No temporary communication failure causes queued ecological data to be
+    deliberately deleted.
 
 ---
 
-## Stage 3: Queue persist failure revert + backup (Medium)
+# Verified critical defects
 
-### Files to modify
-- `node/firmware/src/storage/local_queue.h`
-- `node/firmware/src/storage/local_queue.cpp`
+Treat these as confirmed defects, not hypothetical possibilities.
 
-### Context
-Stages 1-2 are complete. This stage makes the local queue more robust against NVS write failures.
+## A. CONFIG_SNAPSHOT packet-size collision
 
-### Bug: persist() failure doesn't revert in-memory mutation
+On the ESP32 ABI:
 
-`enqueue()` mutates `g_blob` (head/tail/used/nextSeq) BEFORE calling `persist()`. If `persist()` fails, the in-memory state is ahead of NVS. On power-off, the last snapshot is lost.
+    sizeof(pairing_command_t) == 52
+    sizeof(config_snapshot_message_t) == 52
 
-**Fix:** In `enqueue()`:
-- Save a backup of `g_blob` before mutation
-- Mutate `g_blob`
-- Call `persist()`
-- If `persist()` fails, restore `g_blob` from backup and return false
+The current receive callback dispatches primarily by structure size. It checks
+pairing_command_t first and returns from that branch even when the command is
+not PAIR_NODE.
 
-```cpp
-bool enqueue(const node_snapshot_t& snap) {
-  if (!g_ready && !begin()) return false;
+As a result, CONFIG_SNAPSHOT packets are swallowed and never reach their
+handler.
 
-  QueueBlob backup = g_blob;  // save state before mutation
+Fix dispatch before doing any CONFIG_SNAPSHOT schedule work.
 
-  // ... existing mutation logic ...
+## B. Deferred work can be lost at power-off
 
-  if (!persist()) {
-    g_blob = backup;  // revert on failure
-    Serial.println("[QUEUE] persist failed — reverting in-memory state");
-    return false;
-  }
-  return true;
-}
-```
+The callback sets pending-action flags, but processPowerCut() runs at the start
+of loop() before those actions are serviced.
 
-Do the same for `pop()`:
-```cpp
-bool pop() {
-  if (!g_ready && !begin()) return false;
-  if (g_blob.used == 0) return false;
-  QueueBlob backup = g_blob;
-  g_blob.tail = (uint16_t)((g_blob.tail + 1) % kCapacity);
-  g_blob.used--;
-  if (!persist()) {
-    g_blob = backup;
-    Serial.println("[QUEUE] pop persist failed — reverting");
-    return false;
-  }
-  return true;
-}
-```
+During a sync wake:
 
-### Bug: Single NVS key, no redundancy
+1. TIME_SYNC, CONFIG_SNAPSHOT, schedule, or ACK-related data arrives.
+2. The callback sets a pending flag.
+3. handleRtcWakeEvents() finishes.
+4. finalizeWakeAndSleep() schedules the power cut.
+5. The next loop iteration executes processPowerCut().
+6. Power can be removed before the pending command is applied.
 
-The entire queue is in one NVS key `"blob"`. If this key corrupts, all data is lost.
+POST_WAKE_WINDOW_MS is currently defined but not meaningfully used.
 
-**Fix:** Add a backup key. In `persist()`:
-- Write to `"blob"` (primary)
-- Also write to `"blob_bak"` (backup)
-- If primary write fails but backup succeeds, log a warning
-- In `load()`: try primary first; if checksum fails, try backup; if backup is valid, restore it to primary
+## C. ESP-NOW callbacks can be attributed to the wrong packet
 
-```cpp
-bool persist() {
-  g_blob.checksum = computeChecksum(g_blob);
-  Preferences p;
-  if (!p.begin("node_q", false)) return false;
-  size_t n = p.putBytes("blob", &g_blob, sizeof(g_blob));
-  size_t nBak = p.putBytes("blob_bak", &g_blob, sizeof(g_blob));
-  p.end();
-  if (n != sizeof(g_blob)) {
-    Serial.printf("[QUEUE] primary write failed (%u/%u)\n", (unsigned)n, (unsigned)sizeof(g_blob));
-  }
-  return (n == sizeof(g_blob)) || (nBak == sizeof(g_blob));
-}
+The firmware uses one global completion pair:
 
-bool load() {
-  Preferences p;
-  if (!p.begin("node_q", true)) return false;
-  
-  // Try primary
-  size_t n = p.getBytesLength("blob");
-  if (n == sizeof(g_blob)) {
-    QueueBlob primary;
-    p.getBytes("blob", &primary, sizeof(g_blob));
-    if (primary.magic == kMagic && primary.version == kVersion && 
-        primary.checksum == computeChecksum(primary) &&
-        primary.head < kCapacity && primary.tail < kCapacity && 
-        primary.used <= kCapacity) {
-      g_blob = primary;
-      p.end();
-      // Restore backup if primary is valid but backup is stale
-      return true;
-    }
-  }
-  
-  // Try backup
-  n = p.getBytesLength("blob_bak");
-  if (n == sizeof(g_blob)) {
-    QueueBlob backup;
-    p.getBytes("blob_bak", &backup, sizeof(g_blob));
-    if (backup.magic == kMagic && backup.version == kVersion &&
-        backup.checksum == computeChecksum(backup) &&
-        backup.head < kCapacity && backup.tail < kCapacity &&
-        backup.used <= kCapacity) {
-      Serial.println("[QUEUE] primary corrupted, restoring from backup");
-      g_blob = backup;
-      p.end();
-      // Write restored state back to primary
-      persist();
-      return true;
-    }
-  }
-  
-  p.end();
-  return false;
-}
-```
+    g_lastSendDone
+    g_lastSendStatus
 
-### Testing
-Extend existing bringup tests or create `node/firmware/tests/bringup_queue_robust.cpp` with env `[env:esp32wroom-queue-robust]`:
-1. Assert PWR_HOLD HIGH first
-2. Init queue, enqueue 5 snapshots
-3. Corrupt the primary NVS key (write garbage to "blob")
-4. Re-init queue — confirm it loads from backup
-5. Confirm all 5 snapshots are intact
-6. Test persist failure revert: fill queue, simulate persist failure (mock or comment), confirm in-memory state reverts
-7. Print PASS/FAIL
-8. Loop: idle heartbeat
+for all transmissions.
 
-### Validation
-1. `pio run -e esp32wroom` — must compile
-2. `pio run -e esp32wroom-queue-robust` — must compile
+Functions such as sendNodeHello() start multiple sends without waiting for the
+individual callbacks. A delayed callback from HELLO, broadcast fallback, status,
+or another packet can satisfy the queue flush wait and cause a snapshot to be
+popped even when that snapshot was not delivered.
 
-### What NOT to change
-- Do NOT change the `QueueBlob` struct size or field layout
-- Do NOT change the `kCapacity` value (24)
-- Do NOT change the checksum algorithm (FNV-1a)
-- Do NOT modify `main.cpp`
+## D. Alarm writes are not verified
+
+Alarm 1 and Alarm 2 writes only check the I2C ACK from endTransmission(). The
+actual registers and control bits are not read back.
+
+After three failed arm attempts, finalizeWakeAndSleep() still schedules the
+power cut.
+
+The node can therefore switch itself off without a valid future wake alarm.
+
+## E. Queue mutation is not transactional
+
+local_queue::enqueue() and local_queue::pop() mutate the RAM queue before
+persisting it.
+
+If persistence fails, RAM and NVS represent different queue states. A hard
+power cut can then lose or resurrect records.
+
+## F. Configuration state is not atomic
+
+Configuration values and configVersion are persisted separately.
+
+A power interruption can leave the node reporting a new config version while
+still using older schedule values.
+
+## G. Callback safety is only partially implemented
+
+The callback already defers many RTC and NVS operations, but it still performs
+or triggers operations such as:
+
+    esp_now_del_peer()
+    esp_now_add_peer()
+    sendDiscoveryRequest()
+    bringupEspNow()
+    WiFi mode changes
+    mutation of shared configuration fields
+
+The callback must not directly mutate operational state that the main task is
+using.
+
+## H. Existing callback-safety test does not test production code
+
+The existing callback-safety test reimplements a simplified mock callback and
+mock service routine.
+
+A passing result does not verify src/main.cpp.
+
+Tests must call actual production helpers or helpers extracted from production
+code.
 
 ---
 
-## Stage 4: Flush retry limit / backoff (Medium)
+# General implementation rules
 
-### Files to modify
-- `node/firmware/src/main.cpp`
+1. Work in stages.
 
-### Context
-Stages 1-3 are complete. This stage prevents the node from getting stuck trying to flush the same snapshot forever when the mothership is unreachable.
+2. Compile the main firmware after every stage:
 
-### Bug: No retry limit on failed flush
+       cd node/firmware
+       pio run -e esp32wroom
 
-`flushQueuedToMothership()` pops only after delivery confirmation. If delivery consistently fails, the loop breaks on the first failure (preserving the queue). But there's no backoff — every sync wake attempts the same flush and fails. The queue fills up over time.
+3. Do not proceed to the next stage while the main environment fails.
 
-**Fix:** Add a per-snapshot retry counter. After 3 failed delivery attempts for the same snapshot (same seqNum), skip it and try the next one. Mark the skipped snapshot with a `QF_FLUSH_FAILED` flag (new flag, bit 0x0002 in qualityFlags). The mothership can detect this flag in the CSV.
+4. Preserve existing sensor acquisition, local queue format migration, pairing,
+   deployment, rescue mode, sync scheduling, and power-hold functionality unless
+   a change is explicitly required below.
 
-Add a static retry counter in `flushQueuedToMothership()`:
-```cpp
-static uint8_t g_currentSnapRetryCount = 0;
-static uint32_t g_currentSnapSeq = 0xFFFFFFFFUL;
+5. Do not silently discard data to unblock the queue.
 
-// In the flush loop, after a failed send or delivery timeout:
-if (snap.seqNum != g_currentSnapSeq) {
-  g_currentSnapSeq = snap.seqNum;
-  g_currentSnapRetryCount = 0;
-}
-g_currentSnapRetryCount++;
+6. Do not implement “force-pop after three failed syncs.” Temporary radio
+   failure is not evidence that a snapshot is invalid.
 
-if (g_currentSnapRetryCount >= 3) {
-  Serial.printf("[FLUSH] Skipping seq=%lu after 3 failed attempts\n", (unsigned long)snap.seqNum);
-  // Mark with QF_FLUSH_FAILED and pop it — data is retained in the queue's
-  // drop counter but this snapshot is sacrificed to unblock the queue
-  // Actually: DON'T pop — just break and try again next sync. But after 3
-  // consecutive sync wakes with the same seq stuck, force-pop it.
-  break;
-}
-```
+7. Do not use dynamic allocation in radio callbacks.
 
-Actually, a simpler approach: add a persistent "consecutive flush failure" counter in NVS. If the same snapshot fails to flush for 3 consecutive sync wakes, force-pop it (data loss is better than a permanently stuck queue). Reset the counter on any successful flush.
+8. Prefer fixed-size FreeRTOS queues, bounded buffers, fixed-width integer
+   types, and explicit return-value checking.
 
-Add to `persistNodeConfig()` / `loadNodeConfig()`:
-```cpp
-uint8_t g_consecutiveFlushFailures = 0;
-// persist: p.putUChar("flush_fails", g_consecutiveFlushFailures);
-// load: g_consecutiveFlushFailures = p.getUChar("flush_fails", 0);
-```
+9. Do not add blocking I2C, NVS, Preferences, filesystem, Wi-Fi reset, peer
+   mutation, or send-and-wait calls to ESP-NOW callbacks.
 
-In `flushQueuedToMothership()`, after the flush loop:
-```cpp
-if (sent == 0 && local_queue::count() > 0) {
-  g_consecutiveFlushFailures++;
-  persistNodeConfig();
-  if (g_consecutiveFlushFailures >= 3) {
-    Serial.printf("[FLUSH] 3 consecutive failures — force-popping stuck snapshot\n");
-    node_snapshot_t stuck;
-    if (local_queue::peek(stuck)) {
-      local_queue::pop();
-      g_consecutiveFlushFailures = 0;
-      persistNodeConfig();
-    }
-  }
-} else if (sent > 0) {
-  g_consecutiveFlushFailures = 0;
-  persistNodeConfig();
-}
-```
+10. Do not change wire protocol layouts without:
+    - introducing a protocol version;
+    - updating all relevant size checks;
+    - documenting compatibility;
+    - compiling both legacy-compatible and new-protocol modes where applicable.
 
-### Testing
-No new test file needed — this is logic that only triggers after 3 consecutive sync failures. Verify by code review and compile.
+11. Do not claim tests passed unless the actual commands were run.
 
-### Validation
-1. `pio run -e esp32wroom` — must compile
-
-### What NOT to change
-- Do NOT modify `local_queue.cpp`
-- Do NOT change the `flushQueuedToMothership()` function signature
-- Do NOT change the `waitForSendDelivery()` timeout (200ms)
+12. If a hardware-only test cannot be executed, compile it and clearly mark it
+    as requiring bench validation.
 
 ---
 
-## Stage 5: RTC lost power diagnostic flag (Medium)
+# Stage 0 — Establish the baseline
 
-### Files to modify
-- `node/firmware/src/main.cpp`
+Before modifying code:
 
-### Context
-Stages 1-4 are complete. This stage makes the RTC-lost-power condition visible rather than silent.
+1. Read all production source files and protocol structures.
 
-### Bug: RTC lost power silently undeploys
+2. Record:
 
-When `rtc.lostPower()` is true, `setup()` sets `rtcSynced=false`, `deployedFlag=false`, and persists. The node silently drops out of the fleet with no indication.
+       sizeof(node_snapshot_t)
+       sizeof(pairing_command_t)
+       sizeof(config_snapshot_message_t)
+       sizeof(deployment_command_t)
+       sizeof(unpair_command_t)
+       sizeof(time_sync_response_t)
+       sizeof(config_ack_message_t)
 
-**Fix:** Add a persistent diagnostic flag:
-```cpp
-bool g_rtcPowerLost = false;  // set when RTC lost power, cleared on successful TIME_SYNC
-```
+3. Run:
 
-In `setup()`, when `rtc.lostPower()`:
-```cpp
-if (rtc.lostPower()) {
-  Serial.println("⚠️ RTC lost power since last run — node will need re-sync");
-  g_rtcPowerLost = true;
-  rtcSynced = false;
-  // Do NOT clear deployedFlag — keep it so the node tries to re-sync
-  // instead of silently going UNPAIRED. The node will request TIME_SYNC
-  // in the loop and re-arm once time is restored.
-  // Actually: keep the existing behavior of clearing deployedFlag for safety,
-  // but set the diagnostic flag so it's visible.
-  deployedFlag = false;
-  lastTimeSyncUnix = 0;
-  persistNodeConfig();
-}
-```
+       pio run -e esp32wroom
 
-Add `g_rtcPowerLost` to `persistNodeConfig()` / `loadNodeConfig()`:
-```cpp
-// persist: p.putBool("rtc_lost", g_rtcPowerLost);
-// load: g_rtcPowerLost = p.getBool("rtc_lost", false);
-```
+4. Save the baseline compiler output.
 
-In the TIME_SYNC handler (now in the main loop from Stage 1), clear the flag:
-```cpp
-if (g_pendingTimeSync) {
-  // ... apply time sync ...
-  g_rtcPowerLost = false;
-  persistNodeConfig();
-}
-```
+5. Identify which existing test environments actually compile production code
+   and which duplicate logic.
 
-In `sendNodeHello()` and `sendNodeStatusUpdate()`, include the flag:
-```cpp
-// In sendNodeStatusUpdate:
-st.rescueMode = g_rescueModeActive ? 1 : 0;
-// Add: st.rtcPowerLost = g_rtcPowerLost ? 1 : 0;  // if the protocol struct has room
-// If no room in the struct, add it to the NODE_HELLO message instead
-```
+6. Do not “fix” unrelated compiler warnings unless they affect correctness.
 
-Note: if the protocol structs don't have a spare field for this, just log it prominently in serial output and skip the protocol change. The serial log is the primary diagnostic for now.
-
-### Testing
-No new test file needed — verify by code review and compile.
-
-### Validation
-1. `pio run -e esp32wroom` — must compile
-
-### What NOT to change
-- Do NOT modify `protocol.h` (unless adding a field to an existing struct with room)
-- Do NOT change the `rtc.lostPower()` detection logic
-- Do NOT prevent the node from going to UNPAIRED/PAIRED state — just make it visible
+Deliver a short baseline report before implementing Stage 1.
 
 ---
 
-## Stage 6: CONFIG_SNAPSHOT re-arm trigger (Medium)
+# Stage 1 — Replace size-first packet dispatch
 
-### Files to modify
-- `node/firmware/src/main.cpp`
+## Required behaviour
 
-### Context
-Stages 1-5 are complete. This is a one-line fix.
+Dispatch must be command-first and then exact-size validated.
 
-### Bug: CONFIG_SNAPSHOT handler doesn't trigger re-arm
+Do not cast incomingData to a complete packet before confirming:
 
-When `CONFIG_SNAPSHOT` changes `g_intervalMin` or `g_syncIntervalMin`, the handler doesn't set `g_rearmAlarmsPending = true`. The node continues on the old schedule until the next wake fires.
+- minimum command-field length;
+- the command field contains a null terminator within its fixed-width array;
+- the command is recognised;
+- len exactly matches the expected structure size.
 
-**Fix:** In the CONFIG_SNAPSHOT handler (now in the main loop from Stage 1), after applying schedule changes:
-```cpp
-if (snap.wakeIntervalMin > 0 && snap.wakeIntervalMin != g_intervalMin) {
-  g_intervalMin = snap.wakeIntervalMin;
-  g_rearmAlarmsPending = true;  // ADD THIS
-  Serial.printf("   ↪ wake interval updated: %u min\n", g_intervalMin);
-}
-if (snap.syncIntervalMin > 0) {
-  g_syncIntervalMin = snap.syncIntervalMin;
-  g_syncPhaseUnix   = snap.syncPhaseUnix;
-  g_lastSyncSlot    = 0xFFFFFFFFUL;
-  g_rearmAlarmsPending = true;  // ADD THIS
-  Serial.printf("   ↪ sync schedule updated: %u min, phase=%lu\n", ...);
-}
-```
+Create a production helper that can be unit tested, for example:
 
-### Testing
-No new test file needed — one-line fix, verify by compile.
+    enum class IncomingMessageType : uint8_t {
+      INVALID,
+      DISCOVER_RESPONSE,
+      DISCOVERY_SCAN,
+      PAIRING_RESPONSE,
+      PAIR_NODE,
+      DEPLOY_NODE,
+      UNPAIR_NODE,
+      SET_SCHEDULE,
+      SET_SYNC_SCHED,
+      SYNC_WINDOW_OPEN,
+      TIME_SYNC,
+      CONFIG_SNAPSHOT,
+      SNAPSHOT_ACK
+    };
 
-### Validation
-1. `pio run -e esp32wroom` — must compile
+    IncomingMessageType classifyIncomingMessage(
+        const uint8_t* data,
+        size_t len
+    );
 
-### What NOT to change
-- Do NOT modify any other handler
-- Do NOT change the CONFIG_SNAPSHOT ACK logic
+The helper must never read beyond len.
 
----
+For each recognised command:
 
-## Stage 7: I2C scan gating (Medium)
+1. Verify exact expected size.
+2. Copy into the correct destination type.
+3. Explicitly ensure every fixed-width text field is terminated.
+4. Validate target nodeId when the structure provides one.
+5. Reject command/size mismatches.
 
-### Files to modify
-- `node/firmware/src/main.cpp`
+Add a regression test proving that:
 
-### Context
-Stages 1-6 are complete. This stage reduces boot time by gating the I2C scan.
+- a 52-byte PAIR_NODE is classified as PAIR_NODE;
+- a 52-byte CONFIG_SNAPSHOT is classified as CONFIG_SNAPSHOT;
+- neither packet is swallowed by the other;
+- malformed unterminated command fields are rejected;
+- truncated and oversized packets are rejected.
 
-### Bug: testI2CBusesMuxAndADS() runs on every boot
+Do not use a test that reimplements the dispatcher. The test must call the
+production classification helper.
 
-The I2C scan of 127 addresses runs on every boot, adding ~1-2 seconds. It runs before the alarm re-arm in `setup()`, so a bus hang delays re-arming.
+Validation:
 
-**Fix:** Gate the scan behind a build flag:
-```cpp
-#ifdef NODE_I2C_SCAN_ON_BOOT
-  testI2CBusesMuxAndADS();
-#endif
-```
-
-In `platformio.ini`, do NOT add `-D NODE_I2C_SCAN_ON_BOOT` to the default build flags. Add it only to a debug build env if needed.
-
-Alternatively, only run the scan on the first boot (persist a flag in NVS):
-```cpp
-Preferences p;
-if (p.begin("node_cfg", true)) {
-  bool scanned = p.getBool("i2c_scanned", false);
-  p.end();
-  if (!scanned) {
-    testI2CBusesMuxAndADS();
-    if (p.begin("node_cfg", false)) {
-      p.putBool("i2c_scanned", true);
-      p.end();
-    }
-  }
-} else {
-  testI2CBusesMuxAndADS();  // run if NVS read fails
-}
-```
-
-Use the build-flag approach (simpler, no NVS change).
-
-### Testing
-No new test file needed.
-
-### Validation
-1. `pio run -e esp32wroom` — must compile (scan should NOT run by default)
-2. `pio run -e esp32wroom -v` — verbose build, confirm the flag is not set
-
-### What NOT to change
-- Do NOT remove `testI2CBusesMuxAndADS()` — keep it for debugging
-- Do NOT modify `platformio.ini` beyond adding the test envs from previous stages
+    pio run -e esp32wroom
+    pio run -e <new-dispatch-test-env>
 
 ---
 
-## Stage 8: Low-priority cleanup (Low)
+# Stage 2 — Introduce an ordered node event queue
 
-### Files to modify
-- `node/firmware/src/main.cpp`
-- `node/firmware/src/storage/local_queue.cpp`
+Replace the collection of loosely related single-slot pending flags with an
+ordered, fixed-capacity event queue, or use the event queue as the authoritative
+path while temporarily retaining flags only for migration.
 
-### Context
-Stages 1-7 are complete. This stage addresses the remaining low-priority findings.
+The callback runs on the Wi-Fi task, not the main Arduino loop. It must:
 
-### 8a: strcmp on potentially unterminated strings
-In `onDataReceived()`, after `memcpy` into protocol structs, force null termination:
-```cpp
-discovery_response_t resp;
-memcpy(&resp, incomingData, sizeof(resp));
-resp.command[sizeof(resp.command) - 1] = '\0';  // ADD
-```
-Do this for ALL struct copies in `onDataReceived()`.
+1. classify and validate the packet;
+2. copy the validated packet and sender MAC into a fixed-size event;
+3. enqueue the event without blocking;
+4. update only atomic counters if the queue is full;
+5. return.
 
-### 8b: loadNodeConfig() unsafe getString()
-Replace `String macHex = p.getString("msmac", "");` with:
-```cpp
-char macHexBuf[16] = {0};
-p.getString("msmac", macHexBuf, sizeof(macHexBuf) - 1);
-String macHex = String(macHexBuf);
-```
+Suggested form:
 
-### 8c: g_intervalMin bounds check
-In the SET_SCHEDULE handler (now in main loop from Stage 1):
-```cpp
-if (cmd.intervalMinutes > 0 && cmd.intervalMinutes <= 255) {
-  g_intervalMin = (uint8_t)cmd.intervalMinutes;
-} else {
-  Serial.printf("⚠️ SET_SCHEDULE interval %d out of range, ignored\n", cmd.intervalMinutes);
-}
-```
+    enum class NodeEventType : uint8_t {
+      DISCOVERY_RESPONSE,
+      DISCOVERY_SCAN,
+      PAIRING_RESPONSE,
+      PAIR_NODE,
+      DEPLOY_NODE,
+      UNPAIR_NODE,
+      SET_SCHEDULE,
+      SET_SYNC_SCHED,
+      SYNC_WINDOW_OPEN,
+      TIME_SYNC,
+      CONFIG_SNAPSHOT,
+      SNAPSHOT_ACK
+    };
 
-### 8d: Remove dead code shouldSyncAt()
-The function `shouldSyncAt()` (lines ~799-807) is never called. Remove it and its forward declaration. Also remove `nextSyncSlotUnix()` if it's only used by `shouldSyncAt()` (check first — it may be used elsewhere).
+    struct NodeEvent {
+      NodeEventType type;
+      uint8_t senderMac[6];
+      uint16_t payloadLength;
+      union {
+        discovery_response_t discovery;
+        pairing_response_t pairingResponse;
+        deployment_command_t deploy;
+        schedule_command_message_t schedule;
+        sync_schedule_command_message_t syncSchedule;
+        time_sync_response_t timeSync;
+        config_snapshot_message_t configSnapshot;
+        snapshot_ack_t snapshotAck;
+      } payload;
+    };
 
-### 8e: CONFIG_SNAPSHOT ACK peer check
-In the CONFIG_SNAPSHOT handler (now in main loop from Stage 1), replace raw `esp_now_send(mac, ...)` with `espnowSendWithRecover(mac, ...)` or at least add `ensureEspNowPeer(mac)` before sending.
+Use a fixed-size FreeRTOS queue or a fixed ring buffer. Do not allocate from the
+heap in the callback.
 
-### Testing
-No new test files needed — these are minor code quality fixes.
+The callback must no longer call or indirectly trigger:
 
-### Validation
-1. `pio run -e esp32wroom` — must compile
-2. All previous test envs must still compile
+    rtc.adjust()
+    rtc.now()
+    persistNodeConfig()
+    local_queue::clear()
+    local_queue::enqueue()
+    local_queue::pop()
+    ds3231DisableAlarmInterrupt()
+    ds3231DisableAlarm2Interrupt()
+    clearDS3231_AlarmFlags()
+    esp_now_del_peer()
+    esp_now_add_peer()
+    espnowSendWithRecover()
+    bringupEspNow()
+    shutdownEspNow()
+    WiFi.mode()
+    sendDiscoveryRequest()
+    sendTimeSyncRequest()
+    sendNodeStatusUpdate()
 
-### What NOT to change
-- Do NOT change any protocol struct sizes or layouts
-- Do NOT change the queue capacity or checksum algorithm
-- Do NOT remove any functionality — only fix safety issues
+Keep the SYNC_WINDOW_OPEN timestamp capture lightweight. Prefer enqueuing the
+event as well so ordering remains visible to the main task.
+
+Add counters for:
+
+    callbackEventsReceived
+    callbackEventsDropped
+    callbackInvalidPackets
+
+Report queue overflow prominently. Do not silently overwrite a pending event.
+
+Validation must call the real callback or the production enqueue entry point,
+not a rewritten mock implementation.
 
 ---
 
-## Final validation
+# Stage 3 — Centralise main-task event processing
 
-After all 8 stages are complete, run:
-```
-cd node/firmware
-pio run -e esp32wroom
-```
+Create:
 
-This must compile cleanly. The node firmware is now robustness-hardened for unattended field operation.
+    static void serviceNodeEvents(uint32_t maxEvents = ...);
+
+This must be the only normal place where incoming radio commands change:
+
+- RTC state;
+- deployment state;
+- schedule state;
+- mothership MAC;
+- peers;
+- NVS;
+- queue contents;
+- outbound acknowledgements.
+
+Preserve arrival order.
+
+Call serviceNodeEvents():
+
+1. near the top of loop();
+2. while waiting in sync-listen loops;
+3. while waiting for stale-sync recovery;
+4. after a sync marker arrives;
+5. after each outbound send completes;
+6. after queue flushing;
+7. during the post-wake command window;
+8. before alarm rearming;
+9. before scheduling a power cut;
+10. immediately before executing a scheduled power cut.
+
+Do not let processPowerCut() run while any of these are true:
+
+- the node event queue is non-empty;
+- a critical event is being applied;
+- a configuration write is dirty or in progress;
+- an ACK is pending;
+- an ESP-NOW send is active;
+- the post-wake processing window has not elapsed.
+
+Use POST_WAKE_WINDOW_MS as an actual bounded command-processing window.
+
+Implement:
+
+    static bool hasCriticalPendingWork();
+
+and make processPowerCut() defer the cut when this returns true.
+
+Use overflow-safe millis() comparisons.
+
+Add a test that:
+
+1. injects TIME_SYNC or CONFIG_SNAPSHOT during a simulated sync wake;
+2. schedules a power cut;
+3. verifies the event is applied and persisted first;
+4. verifies power-cut eligibility becomes true only afterward.
+
+---
+
+# Stage 4 — Create a single serialized ESP-NOW send manager
+
+There must be at most one active send whose completion affects state.
+
+Create one main-task send API, for example:
+
+    struct SendResult {
+      esp_err_t queueResult;
+      bool callbackReceived;
+      esp_now_send_status_t deliveryStatus;
+    };
+
+    SendResult sendEspNowAndWait(
+        const uint8_t* destination,
+        const void* payload,
+        size_t payloadLength,
+        uint32_t timeoutMs
+    );
+
+Requirements:
+
+1. Only the main task may call it.
+
+2. It must ensure the peer exists before sending.
+
+3. It must record the expected destination MAC.
+
+4. onDataSent() must compare the callback MAC with the currently active send.
+
+5. A callback for an older or unrelated send must not complete the current send.
+
+6. Do not start a second send until the first has completed or timed out.
+
+7. Direct and broadcast HELLO sends must occur sequentially.
+
+8. ACK, status, discovery, time request, snapshot, and fallback sends must use the
+   same serialized mechanism.
+
+9. shutdownEspNow() must not run while a send is active.
+
+10. Recovery must not deinitialise ESP-NOW while a send callback is still
+    outstanding.
+
+11. On timeout, invalidate the active send generation before retrying.
+
+A generation/token counter is recommended even though the ESP-NOW callback does
+not provide an application token. Pair it with expected destination and strict
+single-send serialization.
+
+Replace direct raw esp_now_send() calls that are followed by assumptions about
+delivery.
+
+Add a regression test or deterministic harness showing that a delayed HELLO
+callback cannot satisfy the wait for a snapshot.
+
+Do not pop queue records based solely on a stale global send flag.
+
+---
+
+# Stage 5 — Verify DS3231 alarms and fail safely
+
+Add low-level register read helpers with checked return values.
+
+For Alarm 1 verify registers:
+
+    0x07 through 0x0A
+
+For Alarm 2 verify registers:
+
+    0x0B through 0x0D
+
+Verify the control register at:
+
+    0x0E
+
+Required bits:
+
+    INTCN
+    A1IE
+    A2IE
+
+Verify the status register at:
+
+    0x0F
+
+Required sequence:
+
+1. calculate the intended alarm values;
+2. write Alarm 1;
+3. read back Alarm 1 and compare exact bytes;
+4. write Alarm 2;
+5. read back Alarm 2 and compare exact bytes;
+6. enable alarm interrupt bits;
+7. read back the control register;
+8. only after successful verification, clear stale A1F/A2F flags;
+9. read back status to confirm the intended result.
+
+Return detailed status rather than one ambiguous Boolean if useful:
+
+    struct AlarmArmResult {
+      bool alarm1Written;
+      bool alarm1Verified;
+      bool alarm2Written;
+      bool alarm2Verified;
+      bool controlVerified;
+      bool flagsCleared;
+    };
+
+The node must not release PWR_HOLD if no verified future wake path exists.
+
+After bounded retries:
+
+- retain PWR_HOLD;
+- enter an explicit alarm-fault state;
+- log the exact failure;
+- attempt a safe recovery path;
+- send a status fault when radio contact is available.
+
+Do not invent an ESP32 deep-sleep fallback unless its wake source and GPIO hold
+behaviour are verified for this board.
+
+If the existing RTC INT deep-sleep fallback is retained:
+
+- verify RTC_INT_PIN is RTC-capable;
+- check the return code;
+- do not enter deep sleep when wake configuration failed.
+
+Add a hardware bring-up test that:
+
+1. writes Alarm 1 and Alarm 2;
+2. confirms read-back;
+3. intentionally corrupts one register;
+4. proves verification fails;
+5. rearms and verifies success.
+
+---
+
+# Stage 6 — Correct sync and schedule semantics
+
+Validate all incoming schedule values before changing state.
+
+For data wake interval:
+
+- reject zero unless zero has an explicitly documented meaning;
+- reject values outside the supported range;
+- do not cast an unrestricted integer directly to uint8_t.
+
+For synchronization:
+
+- preserve the documented meaning that syncIntervalMin == 0 represents daily
+  synchronization;
+- accept zero only when a valid daily phase is present;
+- validate interval upper bounds;
+- validate syncPhaseUnix;
+- ensure the calculated alarm is in the future.
+
+Fix the pre-wake rounding inconsistency.
+
+The existing comment says “round up,” while the implementation floors to the
+start of the minute. Define and test the intended behaviour.
+
+For DS3231 Alarm 2 minute resolution:
+
+- choose the programmed minute deterministically;
+- ensure it is not already in the past;
+- ensure the listening window includes the intended target and grace period.
+
+Fix CONFIG_SNAPSHOT handling so any actual change to:
+
+    wakeIntervalMin
+    syncIntervalMin
+    syncPhaseUnix
+
+sets the rearm requirement.
+
+Do not rearm unnecessarily when values are unchanged.
+
+Add tests covering:
+
+- interval mode;
+- daily mode;
+- phase in the future;
+- phase in the past;
+- pre-wake crossing a minute boundary;
+- data and sync alarms occurring close together.
+
+---
+
+# Stage 7 — Make configuration persistence transactional
+
+Do not continue persisting a collection of independent keys where the config
+version can advance separately from the values.
+
+Create a versioned configuration record containing all fields required to
+reconstruct node state, for example:
+
+    magic
+    schemaVersion
+    generation
+    checksum
+    mothershipMAC
+    paired/deployed intent
+    rtcSynced
+    rtcPowerLost
+    recoveryReason
+    wakeIntervalMin
+    syncIntervalMin
+    syncPhaseUnix
+    lastTimeSyncUnix
+    lastSyncSlot
+    appliedConfigVersion
+
+Use fixed-width integer fields.
+
+Store it using alternating A/B NVS records:
+
+    node_cfg_a
+    node_cfg_b
+
+Each commit must:
+
+1. create a complete candidate record;
+2. increment generation;
+3. calculate checksum;
+4. write to the inactive slot;
+5. read it back;
+6. validate magic, schema, generation, bounds, and checksum;
+7. only then treat it as committed.
+
+At boot:
+
+1. validate both slots;
+2. select the newest valid generation using wrap-safe comparison;
+3. migrate the existing legacy key/value configuration if neither slot exists;
+4. never choose an older valid record when a newer valid backup exists.
+
+The configuration version and its values must be committed together.
+
+Do not set appliedConfigVersion before the schedule and phase are durably
+committed.
+
+Persist only when data changed. Add a dirty flag and remove unconditional
+per-boot configuration writes where possible.
+
+Keep a migration path so deployed nodes with existing NVS data are not reset.
+
+Add fault-injection tests for:
+
+- interrupted write to slot A;
+- corrupted checksum;
+- newer valid B plus older valid A;
+- migration from legacy keys;
+- config version not advancing when value persistence fails.
+
+---
+
+# Stage 8 — Make local queue persistence transactional
+
+Review the existing QueueBlob size and stack usage before choosing a rollback
+mechanism.
+
+Do not blindly allocate a full QueueBlob backup on a small task stack.
+
+For enqueue rollback, preserve only what is modified:
+
+- previous head;
+- previous tail if full-policy changes it;
+- previous used count;
+- previous next sequence;
+- the record slot being overwritten;
+- previous checksum/generation metadata.
+
+For pop rollback, preserve:
+
+- previous tail;
+- previous used count;
+- previous checksum/generation metadata.
+
+If persistence fails:
+
+- restore RAM state;
+- return false;
+- leave the queue logically unchanged.
+
+Replace the single-key persistence design with generation-based A/B records or
+an equivalent journalled approach.
+
+Requirements:
+
+1. Both records contain:
+   - magic;
+   - schema version;
+   - generation;
+   - capacity/layout identifier;
+   - queue data;
+   - checksum.
+
+2. Persist to the inactive slot.
+
+3. Verify the written record.
+
+4. On load, choose the newest valid generation.
+
+5. Support migration from the legacy "blob" key.
+
+6. Do not write a “backup” and always load the primary first. That design can
+   silently load an older queue after a partial write.
+
+7. Keep the existing capacity unless there is a separately justified storage
+   migration.
+
+8. Preserve the current queue-full policy unless explicitly documented.
+
+9. Expose:
+   - dropped due to capacity;
+   - persistence failures;
+   - recovered-from-secondary count;
+   - corrupt-record count.
+
+Do not force-pop data because radio delivery failed.
+
+Add tests using the real queue implementation for:
+
+- enqueue persistence failure rollback;
+- pop persistence failure rollback;
+- corrupted newest slot;
+- corrupted older slot;
+- newest valid generation selection;
+- legacy migration;
+- queue full behaviour;
+- hard-reset reload preserving sequence order.
+
+---
+
+# Stage 9 — Add durable snapshot acknowledgement support
+
+The robust end state is that a snapshot remains in the node queue until the
+mothership confirms durable persistence.
+
+Add a versioned protocol message such as:
+
+    struct snapshot_ack_t {
+      char command[16];       // "SNAPSHOT_ACK"
+      char nodeId[16];
+      uint32_t seqNum;
+      uint8_t persisted;
+      uint8_t protocolVersion;
+      uint16_t reserved;
+    };
+
+Do not remove the head record after only ESP-NOW link-layer success.
+
+Required robust flow:
+
+1. peek queue head;
+2. send snapshot;
+3. wait for radio delivery;
+4. continue servicing inbound events;
+5. wait for matching SNAPSHOT_ACK containing:
+   - expected nodeId;
+   - expected seqNum;
+   - persisted == 1;
+   - sender MAC == paired mothership;
+6. pop only that exact head record;
+7. on timeout, retain it for the next sync;
+8. ignore duplicate or stale acknowledgements.
+
+Add a queue method that explicitly acknowledges the current head sequence:
+
+    bool acknowledgeHead(uint32_t seqNum);
+
+It must reject a nonmatching sequence.
+
+Because the current mothership may not yet support SNAPSHOT_ACK:
+
+- implement this as a coordinated protocol feature;
+- support a clearly named compatibility build flag;
+- do not silently pretend legacy link-layer delivery is durable;
+- print a prominent startup warning in legacy mode;
+- do not enable ACK-required mode by default until the matching mothership
+  implementation is present and verified.
+
+Compile both modes:
+
+    legacy compatibility mode
+    durable ACK mode
+
+Do not introduce a protocol layout change without updating protocol versioning.
+
+---
+
+# Stage 10 — Enforce sender and target validation
+
+Once a node is paired, operational messages must only be accepted from the
+persisted mothership MAC.
+
+Operational messages include:
+
+    TIME_SYNC
+    SET_SCHEDULE
+    SET_SYNC_SCHED
+    SYNC_WINDOW_OPEN
+    DEPLOY_NODE
+    CONFIG_SNAPSHOT
+    UNPAIR_NODE
+    SNAPSHOT_ACK
+
+Rules:
+
+1. In UNPAIRED state:
+   - accept discovery and explicit pairing workflow;
+   - do not persist a mothership binding merely because DISCOVER_RESPONSE arrived.
+
+2. In PAIRED or DEPLOYED state:
+   - reject operational packets from any other MAC;
+   - log a bounded diagnostic counter rather than flooding Serial.
+
+3. Verify nodeId whenever the structure contains one.
+
+4. Remove reliance on broadcast UNPAIR.
+
+5. If the current unpair structure has no target node ID:
+   - accept it only as a direct packet from the paired mothership;
+   - do not accept broadcast unpair;
+   - plan a versioned targeted unpair structure.
+
+6. Validate all date and time components before rtc.adjust().
+
+7. Reject implausible Unix times and clearly invalid phase values.
+
+8. Add protocol replay/message IDs in the versioned protocol path if practical.
+
+Do not enable ESP-NOW encryption without coordinating keys and provisioning, but
+structure the code so sender validation is mandatory even before encryption is
+added.
+
+---
+
+# Stage 11 — Repair RTC recovery and power-hold behaviour
+
+Make RTC readiness a persistent runtime condition, not a local setup variable.
+
+Add:
+
+    static bool g_rtcReady;
+    static bool g_rtcPowerLost;
+    static RecoveryReason g_recoveryReason;
+
+When rtc.begin() fails:
+
+- do not continue using rtc.now() as though valid;
+- do not arm alarms;
+- do not release power using an unverified RTC wake path;
+- enter a visible recovery state.
+
+When rtc.lostPower() is true:
+
+- preserve the paired mothership identity;
+- preserve deployment intent separately from operational readiness;
+- mark time invalid;
+- disable stale alarms;
+- request time recovery;
+- do not sample with knowingly invalid timestamps;
+- clear the diagnostic only after a valid TIME_SYNC is applied and persisted.
+
+Do not silently turn a deployed node into an ordinary unpaired node.
+
+Expose the recovery reason in NODE_STATUS or NODE_HELLO when protocol space or
+versioning permits.
+
+Power-hold initialization must assert the ON level immediately.
+
+Do not intentionally write the OFF level before asserting hold.
+
+Check the actual hardware polarity and initialise with:
+
+    pinMode(PWR_HOLD_PIN, OUTPUT);
+    digitalWrite(PWR_HOLD_PIN, kPwrHoldOnLevel);
+
+before lengthy setup work.
+
+---
+
+# Stage 12 — Reduce unnecessary boot work and NVS wear
+
+Gate the full I2C scan behind:
+
+    #ifndef NODE_I2C_SCAN_ON_BOOT
+    #define NODE_I2C_SCAN_ON_BOOT 0
+    #endif
+
+Use:
+
+    #if NODE_I2C_SCAN_ON_BOOT
+      testI2CBusesMuxAndADS();
+    #endif
+
+Do not enable it in the default production environment.
+
+Retain a dedicated bring-up/debug environment that enables it.
+
+Remove unconditional configuration persistence at every boot when nothing
+changed.
+
+Review queue persistence frequency and report approximate write volume, but do
+not weaken durability merely to reduce writes.
+
+Remove dead code only after confirming it is unused:
+
+- shouldSyncAt() may be removable;
+- nextSyncSlotUnix() is used and must remain unless replaced.
+
+Use bounded string copies and validate termination.
+
+Preferences::getString() is valid; changing it to a fixed buffer is optional
+cleanup, not a critical bug.
+
+---
+
+# Stage 13 — Production tests
+
+Tests must reuse production code.
+
+Do not write another test that duplicates a simplified callback, dispatcher,
+queue, or configuration store.
+
+Extract small production modules where necessary to make real logic testable,
+for example:
+
+    message_dispatch.h/.cpp
+    node_event_queue.h/.cpp
+    config_store.h/.cpp
+    espnow_send_manager.h/.cpp
+    alarm_manager.h/.cpp
+
+Avoid unnecessary architecture churn, but prefer tested production helpers over
+unverifiable monolithic logic.
+
+Required test coverage:
+
+1. Packet dispatch collision.
+2. Malformed and unterminated commands.
+3. Wrong packet sizes.
+4. Wrong sender MAC.
+5. Wrong target node ID.
+6. Callback returns without I2C/NVS/peer work.
+7. Event ordering is preserved.
+8. Event queue overflow is counted and safe.
+9. Pending TIME_SYNC is applied before power cut.
+10. Pending CONFIG_SNAPSHOT is applied before power cut.
+11. Delayed unrelated send callback cannot acknowledge a snapshot.
+12. Alarm write/read-back success.
+13. Alarm corruption detection.
+14. No power cut after alarm verification failure.
+15. Daily sync mode.
+16. Interval sync mode.
+17. Config A/B recovery.
+18. Queue A/B recovery.
+19. Queue mutation rollback.
+20. ACK sequence matching.
+21. ACK timeout retains the snapshot.
+22. Legacy compatibility mode build.
+23. Durable ACK mode build.
+24. RTC lost-power recovery state.
+25. PWR_HOLD starts asserted.
+
+Every test environment must be declared in platformio.ini and compile cleanly.
+
+---
+
+# Stage 14 — Final integration validation
+
+Run all applicable builds, including:
+
+    cd node/firmware
+
+    pio run -e esp32wroom
+    pio run -e <dispatch-test>
+    pio run -e <callback-production-test>
+    pio run -e <alarm-verify-test>
+    pio run -e <queue-robustness-test>
+    pio run -e <config-store-test>
+    pio run -e <daily-sync-test>
+    pio run -e <legacy-protocol-build>
+    pio run -e <durable-ack-build>
+
+Then perform or provide a bench-test checklist for:
+
+1. Fresh unpaired boot.
+2. Explicit pairing.
+3. Deployment.
+4. First data capture.
+5. Interval sync wake.
+6. Daily sync wake.
+7. CONFIG_SNAPSHOT update.
+8. TIME_SYNC during sync window.
+9. Mothership unavailable for multiple cycles.
+10. Queue retained through power cycles.
+11. Queue flush after mothership returns.
+12. Alarm I2C failure.
+13. RTC lost power.
+14. Rapid reboot rescue mode.
+15. Direct unpair of only the intended node.
+16. SD/mothership durable ACK integration once supported.
+
+---
+
+# Required implementation constraints
+
+Do not:
+
+- force-pop snapshots after three communication failures;
+- clear the local queue during ordinary pairing unless this is explicitly
+  required and confirmed;
+- persist pairing merely from discovery;
+- accept broadcast unpair;
+- power off after alarm verification fails;
+- use packet size alone to identify commands;
+- perform NVS, I2C, peer mutation, Wi-Fi reset, or blocking send work in the
+  receive callback;
+- delete queued data on link-layer success when durable ACK mode is enabled;
+- advance configVersion before configuration values are committed;
+- rewrite tests as independent copies of production behaviour;
+- remove rescue mode, sensor acquisition, or current logging without equivalent
+  replacement;
+- claim compilation success without showing the command results.
+
+---
+
+# Deliverables
+
+At the end, provide:
+
+1. A concise defect-to-fix mapping.
+
+2. A list of every modified and added file.
+
+3. Full contents of each modified source file, or a clean patch if the repo
+   environment supports reliable patch review.
+
+4. The exact PlatformIO commands run and their results.
+
+5. Test results separated into:
+   - compiled;
+   - executed on host;
+   - executed on hardware;
+   - still requiring hardware.
+
+6. Any protocol changes and compatibility implications.
+
+7. NVS migration behaviour for existing deployed nodes.
+
+8. Remaining risks that could not be resolved without matching mothership
+   changes.
+
+9. A clear statement of whether:
+   - legacy mothership mode remains supported;
+   - durable SNAPSHOT_ACK mode is implemented;
+   - durable ACK mode is enabled by default.
+
+Do not leave placeholder TODOs in release-critical paths.
+
+Implement one stage at a time and preserve a compilable firmware after every
+stage.
