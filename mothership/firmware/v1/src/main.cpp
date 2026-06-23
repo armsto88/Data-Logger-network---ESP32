@@ -11,6 +11,7 @@
 
 #include <Arduino.h>
 #include <Wire.h>
+#include <esp_now.h>
 
 #include "system/pins.h"
 #include "system/power.h"
@@ -90,6 +91,42 @@ static void boundedRetryAndShutdown(const char* context) {
 // ---------------------------------------------------------------------------
 // ESP-NOW snapshot processing (main task only)
 // ---------------------------------------------------------------------------
+static bool ensureSnapshotAckPeer(const uint8_t* mac) {
+  if (!mac) return false;
+
+  esp_now_peer_info_t peer{};
+  memcpy(peer.peer_addr, mac, 6);
+  peer.channel = ESPNOW_CHANNEL;
+  peer.ifidx = WIFI_IF_STA;
+  peer.encrypt = false;
+
+  esp_err_t addResult = esp_now_add_peer(&peer);
+  return addResult == ESP_OK || addResult == ESP_ERR_ESPNOW_EXIST;
+}
+
+static void sendSnapshotAck(const uint8_t* mac, const node_snapshot_t* snap, bool persisted) {
+  if (!mac || !snap) return;
+
+  snapshot_ack_t ack{};
+  strncpy(ack.command, "SNAPSHOT_ACK", sizeof(ack.command) - 1);
+  strncpy(ack.nodeId, snap->nodeId, sizeof(ack.nodeId) - 1);
+  ack.seqNum = snap->seqNum;
+  ack.persisted = persisted ? 1 : 0;
+  ack.protocolVersion = NODE_PROTOCOL_VERSION;
+
+  if (!ensureSnapshotAckPeer(mac)) {
+    Serial.printf("[SNAP-ACK] peer add failed for %.15s seq=%lu\n",
+                  snap->nodeId, static_cast<unsigned long>(snap->seqNum));
+    return;
+  }
+
+  esp_err_t sendResult = esp_now_send(mac, reinterpret_cast<const uint8_t*>(&ack), sizeof(ack));
+  Serial.printf("[SNAP-ACK] %.15s seq=%lu persisted=%u send=%s\n",
+                ack.nodeId, static_cast<unsigned long>(ack.seqNum),
+                static_cast<unsigned>(ack.persisted),
+                sendResult == ESP_OK ? "OK" : esp_err_to_name(sendResult));
+}
+
 void processSnapshot(const node_snapshot_t* snap, const uint8_t* mac) {
   if (!snap || !mac) return;
 
@@ -102,9 +139,16 @@ void processSnapshot(const node_snapshot_t* snap, const uint8_t* mac) {
                 snap->sensorPresent, snap->batVoltage, snap->airTemp,
                 snap->airHumidity);
 
-  if (flashIsReady() && !logSnapshotRow(snap)) {
-    Serial.println("[SNAP] Flash logging failed");
+  bool persisted = false;
+  if (flashIsReady()) {
+    persisted = logSnapshotRow(snap);
+    if (!persisted) {
+      Serial.println("[SNAP] Flash logging failed");
+    }
+  } else {
+    Serial.println("[SNAP] Flash unavailable; snapshot not durably logged");
   }
+  sendSnapshotAck(mac, snap, persisted);
 
   for (auto& n : registeredNodes) {
     if (strncmp(n.nodeId.c_str(), snap->nodeId, 16) == 0 ||
@@ -237,14 +281,14 @@ void handleSyncWake() {
   }
 
   if (!initSD()) {
-    Serial.println("[WARN] SD card init failed — falling back to flash (LittleFS)");
-    if (!initFlash()) {
-      Serial.println("[WARN] Flash init also failed — continuing without logging");
-    } else {
-      Serial.println("[STORAGE] Active storage: FLASH (LittleFS)");
-    }
+    Serial.println("[WARN] SD card init failed — continuing with flash if available");
   } else {
-    Serial.println("[STORAGE] Active storage: SD card");
+    Serial.println("[STORAGE] SD card mounted");
+  }
+  if (!initFlash()) {
+    Serial.println("[WARN] Flash init failed — continuing without snapshot logging/upload queue");
+  } else {
+    Serial.println("[STORAGE] Active snapshot/upload storage: FLASH (LittleFS)");
   }
 
   // Init upload queue (after flash is ready) and emergency-purge before
@@ -524,14 +568,14 @@ void handleConfigWake() {
   Serial.println("[CFG-DBG] Step 10 done: startConfigServer");
   Serial.flush();
 
-  // Config server loop — exit from the web UI or on the 30-minute timeout.
+  // Config server loop — exit from the web UI or on the 10-minute timeout.
   unsigned long configStartMs = millis();
-  const unsigned long kConfigTimeoutMs = 30UL * 60UL * 1000UL;  // 30 min
+  const unsigned long kConfigTimeoutMs = 10UL * 60UL * 1000UL;  // 10 min
 
   // Config button is for WAKING only — not for exiting.
   // The SN74LVC2G74 latch bounces unpredictably, so we don't poll it for exit.
-  // Exit is via web UI /shutdown route or 30-minute timeout.
-  Serial.println("[CONFIG] Config mode active. Use web UI Shut Down button or wait 30 min.");
+  // Exit is via web UI /shutdown route or 10-minute timeout.
+  Serial.println("[CONFIG] Config mode active. Use web UI Shut Down button or wait 10 min.");
 
   while (true) {
     configServerLoop();
@@ -543,9 +587,9 @@ void handleConfigWake() {
       break;
     }
 
-    // Exit condition 2: 30-minute timeout
+    // Exit condition 2: 10-minute timeout
     if (millis() - configStartMs > kConfigTimeoutMs) {
-      Serial.println("[CONFIG] 30-min timeout reached — exiting config mode");
+      Serial.println("[CONFIG] 10-min timeout reached — exiting config mode");
       break;
     }
 
@@ -564,23 +608,27 @@ void handleConfigWake() {
       // Interval mode — phase-aligned with nodes
       uint32_t phaseUnix = (uint32_t)gLastSyncBroadcastUnix;
       if (!armNextSyncAlarmPhase(gSyncIntervalMin > 0 ? gSyncIntervalMin : DEFAULT_SYNC_INTERVAL_MIN, phaseUnix)) {
-        Serial.println("[FATAL] Failed to arm next sync alarm! Staying on.");
-        while (true) { delay(1000); }
+        Serial.println("[FATAL] Failed to arm next sync alarm - starting bounded recovery");
+        boundedRetryAndShutdown("Config wake sync alarm arm failed");
+        return;
       }
     } else {
       // Daily mode
       if (!armDailyAlarm(gSyncDailyHour, gSyncDailyMinute)) {
-        Serial.println("[FATAL] Failed to arm daily alarm! Staying on.");
-        while (true) { delay(1000); }
+        Serial.println("[FATAL] Failed to arm daily alarm - starting bounded recovery");
+        boundedRetryAndShutdown("Config wake daily alarm arm failed");
+        return;
       }
     }
     if (!verifyAlarmSet()) {
-      Serial.println("[FATAL] Alarm verification failed! Staying on.");
-      while (true) { delay(1000); }
+      Serial.println("[FATAL] Alarm verification failed - starting bounded recovery");
+      boundedRetryAndShutdown("Config wake alarm verification failed");
+      return;
     }
   } else {
-    Serial.println("[FATAL] RTC not available — cannot arm alarm. Staying on.");
-    while (true) { delay(1000); }
+    Serial.println("[FATAL] RTC not available - cannot arm alarm; starting bounded recovery");
+    boundedRetryAndShutdown("Config wake RTC unavailable");
+    return;
   }
 
   Serial.println("[CONFIG] Powering down.");

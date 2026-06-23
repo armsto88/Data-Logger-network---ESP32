@@ -83,6 +83,7 @@ typedef struct time_sync_response {
 // Unpair (server -> node)
 typedef struct unpair_command {
     char command[16];           // "UNPAIR_NODE"
+    char nodeId[16];            // target node ID; prevents broadcast unpairing every node
     char mothership_id[16];
 } unpair_command_t;
 
@@ -252,7 +253,7 @@ static_assert(sizeof(node_snapshot_t) == 124, "node_snapshot_t size mismatch");
 static_assert(sizeof(pairing_command_t) == 52, "pairing_command_t size mismatch");
 static_assert(sizeof(config_snapshot_message_t) == 52, "config_snapshot_message_t size mismatch");
 static_assert(sizeof(deployment_command_t) == 88, "deployment_command_t size mismatch");
-static_assert(sizeof(unpair_command_t) == 32, "unpair_command_t size mismatch");
+static_assert(sizeof(unpair_command_t) == 48, "unpair_command_t size mismatch");
 static_assert(sizeof(time_sync_response_t) == 56, "time_sync_response_t size mismatch");
 static_assert(sizeof(config_apply_ack_message_t) == 40, "config_apply_ack_message_t size mismatch");
 static_assert(sizeof(snapshot_ack_t) == 40, "snapshot_ack_t size mismatch");

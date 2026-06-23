@@ -2005,6 +2005,7 @@ bool sendUnpairToNode(const String& nodeId) {
         if (n.nodeId == nodeId) {
             unpair_command_t cmd{};
             strncpy(cmd.command, "UNPAIR_NODE", sizeof(cmd.command) - 1);
+            strncpy(cmd.nodeId, nodeId.c_str(), sizeof(cmd.nodeId) - 1);
             strncpy(cmd.mothership_id, DEVICE_ID, sizeof(cmd.mothership_id) - 1);
 
             ensurePeerOnChannel(n.mac, ESPNOW_CHANNEL);

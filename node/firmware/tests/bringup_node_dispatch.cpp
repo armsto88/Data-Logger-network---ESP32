@@ -51,14 +51,23 @@ void setup() {
   cfg.syncIntervalMin = 15;
   cfg.syncPhaseUnix = 1800000000UL;
 
+  unpair_command_t unpair{};
+  strncpy(unpair.command, "UNPAIR_NODE", sizeof(unpair.command) - 1);
+  strncpy(unpair.nodeId, "ENV_TEST", sizeof(unpair.nodeId) - 1);
+  strncpy(unpair.mothership_id, "M001", sizeof(unpair.mothership_id) - 1);
+
   report("PAIR_NODE is 52 bytes", sizeof(pairing_command_t) == 52);
   report("CONFIG_SNAPSHOT is 52 bytes", sizeof(config_snapshot_message_t) == 52);
+  report("UNPAIR_NODE is 48 bytes", sizeof(unpair_command_t) == 48);
   report("PAIR_NODE classified command-first",
          classifyIncomingMessage(reinterpret_cast<uint8_t*>(&pair), sizeof(pair)) ==
              IncomingMessageType::PAIR_NODE);
   report("CONFIG_SNAPSHOT classified command-first",
          classifyIncomingMessage(reinterpret_cast<uint8_t*>(&cfg), sizeof(cfg)) ==
              IncomingMessageType::CONFIG_SNAPSHOT);
+  report("UNPAIR_NODE classified command-first",
+         classifyIncomingMessage(reinterpret_cast<uint8_t*>(&unpair), sizeof(unpair)) ==
+             IncomingMessageType::UNPAIR_NODE);
 
   pairing_command_t badPair = pair;
   memset(badPair.command, 'X', sizeof(badPair.command));
@@ -85,6 +94,16 @@ void setup() {
                                         reinterpret_cast<uint8_t*>(&pair),
                                         sizeof(pair),
                                         "ENV_OTHER"));
+  report("targeted UNPAIR accepted",
+         incomingMessageHasValidTarget(IncomingMessageType::UNPAIR_NODE,
+                                       reinterpret_cast<uint8_t*>(&unpair),
+                                       sizeof(unpair),
+                                       "ENV_TEST"));
+  report("wrong-target UNPAIR rejected",
+         !incomingMessageHasValidTarget(IncomingMessageType::UNPAIR_NODE,
+                                        reinterpret_cast<uint8_t*>(&unpair),
+                                        sizeof(unpair),
+                                        "ENV_OTHER"));
 
   Serial.printf("RESULT: %s\n", g_pass ? "PASS" : "FAIL");
 }
@@ -97,4 +116,3 @@ void loop() {
   }
   delay(250);
 }
-

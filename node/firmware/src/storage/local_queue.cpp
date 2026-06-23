@@ -102,7 +102,9 @@ bool writeAndVerifySlot(const char* key, QueueBlob& candidate) {
   }
 
   const size_t written = p.putBytes(key, &candidate, sizeof(candidate));
-  QueueBlob verify{};
+  // Single-threaded: only called from loopTask (enqueue/pop), never from
+  // ESP-NOW callbacks. Static keeps this ~3KB buffer off the stack.
+  static QueueBlob verify{};
   const bool readOk = readSlot(p, key, verify);
   p.end();
 
@@ -148,7 +150,8 @@ bool loadLegacy(Preferences& p, QueueBlob& out) {
 
   if (p.getBytesLength(kLegacyBlob) != sizeof(LegacyQueueBlob)) return false;
 
-  LegacyQueueBlob legacy{};
+  // Single-threaded init-time scratch buffer; static keeps it off the stack.
+  static LegacyQueueBlob legacy{};
   const size_t n = p.getBytes(kLegacyBlob, &legacy, sizeof(legacy));
   if (n != sizeof(legacy)) return false;
   const uint32_t legacyChecksum = fnv1a32(reinterpret_cast<const uint8_t*>(&legacy),
@@ -176,11 +179,13 @@ bool load() {
   Preferences p;
   if (!p.begin(kNs, true)) return false;
 
-  QueueBlob a{}, b{};
+  // Init-time scratch buffers (single-threaded, not reentrant). Static
+  // moves ~12KB off the 8KB loopTask stack into BSS.
+  static QueueBlob a{}, b{};
   const bool aValid = readSlot(p, kSlotA, a);
   const bool bValid = readSlot(p, kSlotB, b);
 
-  QueueBlob raw{};
+  static QueueBlob raw{};
   if (!aValid && readRawSlot(p, kSlotA, raw)) ++g_stats.corruptRecords;
   if (!bValid && readRawSlot(p, kSlotB, raw)) ++g_stats.corruptRecords;
 
@@ -210,7 +215,7 @@ bool load() {
     return true;
   }
 
-  QueueBlob migrated{};
+  static QueueBlob migrated{};
   const bool legacyOk = loadLegacy(p, migrated);
   p.end();
   if (legacyOk) {

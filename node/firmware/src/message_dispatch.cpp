@@ -164,7 +164,11 @@ bool incomingMessageHasValidTarget(IncomingMessageType type,
     }
     case IncomingMessageType::DISCOVER_RESPONSE:
     case IncomingMessageType::DISCOVERY_SCAN:
-    case IncomingMessageType::UNPAIR_NODE:
+      return true;
+    case IncomingMessageType::UNPAIR_NODE: {
+      const auto* p = asPacket<unpair_command_t>(data, len);
+      return p && targetMatches(p->nodeId, sizeof(p->nodeId), nodeId);
+    }
     case IncomingMessageType::SET_SCHEDULE:
     case IncomingMessageType::SET_SYNC_SCHED:
     case IncomingMessageType::SYNC_WINDOW_OPEN:
@@ -210,6 +214,7 @@ bool incomingMessageTextFieldsTerminated(IncomingMessageType type,
     case IncomingMessageType::UNPAIR_NODE: {
       const auto* p = asPacket<unpair_command_t>(data, len);
       return p && hasNullWithin(p->command, sizeof(p->command)) &&
+             hasNullWithin(p->nodeId, sizeof(p->nodeId)) &&
              hasNullWithin(p->mothership_id, sizeof(p->mothership_id));
     }
     case IncomingMessageType::SET_SCHEDULE: {
@@ -243,4 +248,3 @@ bool incomingMessageTextFieldsTerminated(IncomingMessageType type,
       return false;
   }
 }
-

@@ -1,8 +1,18 @@
 #include "storage/flash_logger.h"
 #include "protocol.h"
 #include <time.h>
+#include <math.h>
 
 static const char* kFlashFile = "/datalog.csv";
+
+// Format a float as "%.3f" or "nan" if NaN. ESP32 newlib snprintf produces
+// garbage for NaN with %.3f, so guard with isnan() and emit a literal.
+static int appendFloat(char* buf, size_t bufSize, int offset, float val) {
+  if (isnan(val)) {
+    return snprintf(buf + offset, bufSize - offset, "%s", "nan");
+  }
+  return snprintf(buf + offset, bufSize - offset, "%.3f", val);
+}
 
 // CSV header matching node_snapshot_t fields.
 // Columns: datetime, nodeId, seqNum, sensorPresent, qualityFlags, configVersion,
@@ -19,11 +29,26 @@ static bool gFlashReady = false;
 static bool gFlashMountFailed = false;
 
 bool initFlash() {
-  if (!LittleFS.begin(false)) {
-    Serial.println("[FLASH] LittleFS mount failed");
-    gFlashReady = false;
-    gFlashMountFailed = true;
-    return false;
+  // formatOnFail=true: after a flash erase (NVS + LittleFS wiped), the
+  // LittleFS partition has no valid filesystem. Auto-format on mount failure
+  // so flash logging recovers automatically instead of staying disabled.
+  if (!LittleFS.begin(true)) {
+    Serial.println("[FLASH] LittleFS begin(true) failed — attempting explicit format");
+    LittleFS.end();
+    delay(100);
+    if (!LittleFS.format()) {
+      Serial.println("[FLASH] Explicit LittleFS format failed");
+      gFlashReady = false;
+      gFlashMountFailed = true;
+      return false;
+    }
+    if (!LittleFS.begin(false)) {
+      Serial.println("[FLASH] LittleFS mount failed after explicit format");
+      gFlashReady = false;
+      gFlashMountFailed = true;
+      return false;
+    }
+    Serial.println("[FLASH] LittleFS formatted and mounted after explicit format");
   }
 
   gFlashMountFailed = false;
@@ -87,29 +112,34 @@ bool logSnapshotRow(const node_snapshot_t* snap) {
     snprintf(tsBuf, sizeof(tsBuf), "unknown");
   }
 
-  // Build CSV row from node_snapshot_t fields.
+  // Build CSV row from node_snapshot_t fields. Non-float fields first, then
+  // each float via appendFloat() to avoid newlib NaN garbage from %.3f.
   char row[512];
   int n = snprintf(row, sizeof(row),
-    "%s,%.15s,%lu,%u,%u,%u,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f",
+    "%s,%.15s,%lu,%u,%u,%u,",
     tsBuf,
     snap->nodeId,
     (unsigned long)snap->seqNum,
     snap->sensorPresent,
     snap->qualityFlags,
-    snap->configVersion,
-    snap->batVoltage,
-    snap->airTemp,
-    snap->airHumidity,
-    snap->spectral[0], snap->spectral[1], snap->spectral[2], snap->spectral[3],
-    snap->spectral[4], snap->spectral[5], snap->spectral[6], snap->spectral[7],
-    snap->windSpeed,
-    snap->windDir,
-    snap->soil1Vwc,
-    snap->soil1Temp,
-    snap->soil2Vwc,
-    snap->soil2Temp,
-    snap->aux1,
-    snap->aux2);
+    snap->configVersion);
+  if (n <= 0) return false;
+
+  n += appendFloat(row, sizeof(row), n, snap->batVoltage);   n += snprintf(row + n, sizeof(row) - n, ",");
+  n += appendFloat(row, sizeof(row), n, snap->airTemp);      n += snprintf(row + n, sizeof(row) - n, ",");
+  n += appendFloat(row, sizeof(row), n, snap->airHumidity);  n += snprintf(row + n, sizeof(row) - n, ",");
+  for (int i = 0; i < 8; i++) {
+    n += appendFloat(row, sizeof(row), n, snap->spectral[i]);
+    n += snprintf(row + n, sizeof(row) - n, ",");
+  }
+  n += appendFloat(row, sizeof(row), n, snap->windSpeed);    n += snprintf(row + n, sizeof(row) - n, ",");
+  n += appendFloat(row, sizeof(row), n, snap->windDir);      n += snprintf(row + n, sizeof(row) - n, ",");
+  n += appendFloat(row, sizeof(row), n, snap->soil1Vwc);     n += snprintf(row + n, sizeof(row) - n, ",");
+  n += appendFloat(row, sizeof(row), n, snap->soil1Temp);    n += snprintf(row + n, sizeof(row) - n, ",");
+  n += appendFloat(row, sizeof(row), n, snap->soil2Vwc);     n += snprintf(row + n, sizeof(row) - n, ",");
+  n += appendFloat(row, sizeof(row), n, snap->soil2Temp);    n += snprintf(row + n, sizeof(row) - n, ",");
+  n += appendFloat(row, sizeof(row), n, snap->aux1);         n += snprintf(row + n, sizeof(row) - n, ",");
+  n += appendFloat(row, sizeof(row), n, snap->aux2);
 
   if (n <= 0) return false;
   return flashLogCSVRow(String(row));
@@ -141,28 +171,34 @@ bool logSnapshotBatch(const node_snapshot_t* snapshots, int count) {
       snprintf(tsBuf, sizeof(tsBuf), "unknown");
     }
 
+    // Build CSV row. Non-float fields first, then each float via
+    // appendFloat() to avoid newlib NaN garbage from %.3f.
     char row[512];
     int n = snprintf(row, sizeof(row),
-      "%s,%.15s,%lu,%u,%u,%u,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f",
+      "%s,%.15s,%lu,%u,%u,%u,",
       tsBuf,
       snap->nodeId,
       (unsigned long)snap->seqNum,
       snap->sensorPresent,
       snap->qualityFlags,
-      snap->configVersion,
-      snap->batVoltage,
-      snap->airTemp,
-      snap->airHumidity,
-      snap->spectral[0], snap->spectral[1], snap->spectral[2], snap->spectral[3],
-      snap->spectral[4], snap->spectral[5], snap->spectral[6], snap->spectral[7],
-      snap->windSpeed,
-      snap->windDir,
-      snap->soil1Vwc,
-      snap->soil1Temp,
-      snap->soil2Vwc,
-      snap->soil2Temp,
-      snap->aux1,
-      snap->aux2);
+      snap->configVersion);
+    if (n <= 0) continue;
+
+    n += appendFloat(row, sizeof(row), n, snap->batVoltage);   n += snprintf(row + n, sizeof(row) - n, ",");
+    n += appendFloat(row, sizeof(row), n, snap->airTemp);      n += snprintf(row + n, sizeof(row) - n, ",");
+    n += appendFloat(row, sizeof(row), n, snap->airHumidity);  n += snprintf(row + n, sizeof(row) - n, ",");
+    for (int i = 0; i < 8; i++) {
+      n += appendFloat(row, sizeof(row), n, snap->spectral[i]);
+      n += snprintf(row + n, sizeof(row) - n, ",");
+    }
+    n += appendFloat(row, sizeof(row), n, snap->windSpeed);    n += snprintf(row + n, sizeof(row) - n, ",");
+    n += appendFloat(row, sizeof(row), n, snap->windDir);      n += snprintf(row + n, sizeof(row) - n, ",");
+    n += appendFloat(row, sizeof(row), n, snap->soil1Vwc);     n += snprintf(row + n, sizeof(row) - n, ",");
+    n += appendFloat(row, sizeof(row), n, snap->soil1Temp);    n += snprintf(row + n, sizeof(row) - n, ",");
+    n += appendFloat(row, sizeof(row), n, snap->soil2Vwc);     n += snprintf(row + n, sizeof(row) - n, ",");
+    n += appendFloat(row, sizeof(row), n, snap->soil2Temp);    n += snprintf(row + n, sizeof(row) - n, ",");
+    n += appendFloat(row, sizeof(row), n, snap->aux1);         n += snprintf(row + n, sizeof(row) - n, ",");
+    n += appendFloat(row, sizeof(row), n, snap->aux2);
 
     if (n > 0) {
       f.println(row);

@@ -57,6 +57,7 @@ void forceTermination(NodeEvent& ev) {
       break;
     case NodeEventType::UNPAIR_NODE:
       ev.payload.unpair.command[sizeof(ev.payload.unpair.command) - 1] = '\0';
+      ev.payload.unpair.nodeId[sizeof(ev.payload.unpair.nodeId) - 1] = '\0';
       ev.payload.unpair.mothership_id[sizeof(ev.payload.unpair.mothership_id) - 1] = '\0';
       break;
     case NodeEventType::SET_SCHEDULE:
@@ -209,4 +210,3 @@ NodeEventCounters getNodeEventCounters() {
 void noteInvalidNodePacket() {
   ++g_counters.callbackInvalidPackets;
 }
-

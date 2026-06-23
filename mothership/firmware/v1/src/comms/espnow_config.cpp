@@ -34,6 +34,24 @@ static void ensurePeerOnChannel(const uint8_t mac[6], uint8_t channel) {
   esp_now_add_peer(&peer);
 }
 
+static void sendSnapshotAck(const uint8_t* mac, const node_snapshot_t& snap, bool persisted) {
+  if (!mac) return;
+
+  snapshot_ack_t ack{};
+  strncpy(ack.command, "SNAPSHOT_ACK", sizeof(ack.command) - 1);
+  strncpy(ack.nodeId, snap.nodeId, sizeof(ack.nodeId) - 1);
+  ack.seqNum = snap.seqNum;
+  ack.persisted = persisted ? 1 : 0;
+  ack.protocolVersion = NODE_PROTOCOL_VERSION;
+
+  ensurePeerOnChannel(mac, ESPNOW_CHANNEL);
+  esp_err_t res = esp_now_send(mac, reinterpret_cast<const uint8_t*>(&ack), sizeof(ack));
+  Serial.printf("[SNAP-ACK] %.15s seq=%lu persisted=%u send=%s\n",
+                ack.nodeId, static_cast<unsigned long>(ack.seqNum),
+                static_cast<unsigned>(ack.persisted),
+                res == ESP_OK ? "OK" : esp_err_to_name(res));
+}
+
 // RTC helpers — adapt production's getRTCTimeUnix()/getRTCTimeString() to V1.
 static uint32_t getRTCTimeUnix() {
   return getRTCTime();
@@ -105,9 +123,16 @@ static void onEspNowRecv(const uint8_t* mac, const uint8_t* data, int len) {
         }
       }
 
+      bool persisted = false;
       if (flashIsReady()) {
-        logSnapshotRow(&snap);
+        persisted = logSnapshotRow(&snap);
+        if (!persisted) {
+          Serial.println("[SNAP] Flash logging failed");
+        }
+      } else {
+        Serial.println("[SNAP] Flash unavailable; snapshot not durably logged");
       }
+      sendSnapshotAck(mac, snap, persisted);
       Serial.printf("[SNAP] %s seq=%lu present=0x%04X bat=%.2f\n",
                     snap.nodeId, (unsigned long)snap.seqNum,
                     (unsigned)snap.sensorPresent, snap.batVoltage);
@@ -509,6 +534,7 @@ bool sendUnpairToNode(const String& nodeId) {
     if (n.nodeId == nodeId) {
       unpair_command_t cmd{};
       strncpy(cmd.command, "UNPAIR_NODE", sizeof(cmd.command) - 1);
+      strncpy(cmd.nodeId, nodeId.c_str(), sizeof(cmd.nodeId) - 1);
       strncpy(cmd.mothership_id, kDeviceId, sizeof(cmd.mothership_id) - 1);
 
       ensurePeerOnChannel(n.mac, ESPNOW_CHANNEL);

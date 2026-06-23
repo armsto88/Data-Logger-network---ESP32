@@ -1314,7 +1314,7 @@ static void handleDownloadCSV() {
     return;
   }
   server.sendHeader("Content-Type", "text/csv");
-  server.sendHeader("Content-Disposition", "attachment; filename=datalog.csv");
+  server.sendHeader("Content-Disposition", "inline; filename=datalog.csv");
   server.sendHeader("Connection", "close");
   server.streamFile(file, "text/csv");
   file.close();
