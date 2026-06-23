@@ -481,7 +481,7 @@ const char COMMON_CSS[] PROGMEM = R"CSS(
   --shadow:0 2px 10px rgba(74,74,72,.12);
 }
 *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
-html{scroll-behior:smooth}
+html{scroll-behavior:smooth}
 html,body{margin:0;padding:0;background:linear-gradient(180deg,#f1f2eb 0%, #d8dad3 100%);color:var(--text);
   font:16px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,system-ui,sans-serif}
 a{color:var(--primary);text-decoration:none}
@@ -638,6 +638,36 @@ a{color:var(--primary);text-decoration:none}
 .health-subtext{
   font-size:.7rem;
   color:#6b7280;
+}
+
+@media(max-width:480px){
+  /* Prevent horizontal scroll from any wide content */
+  body{overflow-x:hidden}
+
+  /* Quick-action grid: 2 columns on phones instead of 3 */
+  .quick-row{grid-template-columns:1fr 1fr}
+  .quick-row .subpanel{grid-column:1 / -1}
+
+  /* Node cards: stack name above timing/status */
+  .node-row{grid-template-columns:1fr;gap:8px}
+  .node-timing,.node-status{grid-template-columns:1fr 1fr;gap:6px}
+  .node-timing-cell,.node-status-cell{min-width:0}
+
+  /* Small buttons: meet 44px touch target minimum */
+  .btn--sm{min-height:44px;padding:10px 14px}
+
+  /* Reduce section spacing to reduce vertical scrolling */
+  .section{margin:10px 0;padding:12px}
+
+  /* Sticky header so navigation stays visible while scrolling */
+  .header{position:sticky;top:0;z-index:10;background:var(--bg);padding:10px 0}
+
+  /* KPI stat numbers: prevent text overflow on narrow screens */
+  .stats--kpi .stat .num{overflow:hidden;text-overflow:ellipsis}
+
+  /* Top time bar: slightly smaller on phones */
+  .top-time{padding:10px 12px;min-height:52px}
+  .top-time__value{font-size:1.1rem}
 }
 
 @media(min-width:768px){.container{max-width:720px}}
@@ -1630,7 +1660,7 @@ static void handleNodesPage() {
   }
   html += F("</div>");
 
-  html += F("<script>setTimeout(function(){ location.reload(); }, 15000);</script>");
+  // Auto-reload removed — use manual refresh button instead (better for mobile UX)
 
   html += footCommon();
   server.send(200, "text/html", html);
