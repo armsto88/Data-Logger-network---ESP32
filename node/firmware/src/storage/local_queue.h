@@ -14,8 +14,23 @@ bool begin();
 bool enqueue(const node_snapshot_t& snap);
 bool peek(node_snapshot_t& out);
 bool pop();
+bool acknowledgeHead(uint32_t seqNum);
 uint16_t count();
 uint32_t nextSeq();
 void clear();
+
+struct QueueStats {
+  uint32_t droppedDueToCapacity;
+  uint32_t persistenceFailures;
+  uint32_t recoveredFromSecondary;
+  uint32_t corruptRecords;
+};
+
+QueueStats stats();
+
+#ifdef LOCAL_QUEUE_TESTING
+void resetForTest();
+bool forceCorruptActiveRecordForTest();
+#endif
 
 }  // namespace local_queue

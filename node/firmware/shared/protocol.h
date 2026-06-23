@@ -144,6 +144,26 @@ typedef struct config_apply_ack_message {
     uint8_t ok;                 // 1 = applied OK, 0 = failed
 } config_apply_ack_message_t;
 
+// Mothership -> Node: optional durable persistence acknowledgement for a
+// NODE_SNAPSHOT. Legacy mothership firmware does not send this yet, so node
+// firmware keeps link-layer compatibility mode enabled by default.
+#ifndef NODE_PROTOCOL_VERSION
+#define NODE_PROTOCOL_VERSION 1
+#endif
+
+#ifndef NODE_REQUIRE_DURABLE_SNAPSHOT_ACK
+#define NODE_REQUIRE_DURABLE_SNAPSHOT_ACK 0
+#endif
+
+typedef struct snapshot_ack {
+    char     command[16];       // "SNAPSHOT_ACK"
+    char     nodeId[16];
+    uint32_t seqNum;
+    uint8_t  persisted;         // 1 = mothership durably stored this seq
+    uint8_t  protocolVersion;   // NODE_PROTOCOL_VERSION
+    uint16_t reserved;
+} snapshot_ack_t;
+
 // Optional: RNT-compatible pairing struct
 typedef struct rnt_pairing_t {
     uint8_t msgType;            // 0 = PAIRING, 1 = DATA
@@ -229,6 +249,13 @@ typedef struct __attribute__((packed)) node_snapshot {
 } node_snapshot_t;
 // Total: 124 bytes
 static_assert(sizeof(node_snapshot_t) == 124, "node_snapshot_t size mismatch");
+static_assert(sizeof(pairing_command_t) == 52, "pairing_command_t size mismatch");
+static_assert(sizeof(config_snapshot_message_t) == 52, "config_snapshot_message_t size mismatch");
+static_assert(sizeof(deployment_command_t) == 88, "deployment_command_t size mismatch");
+static_assert(sizeof(unpair_command_t) == 32, "unpair_command_t size mismatch");
+static_assert(sizeof(time_sync_response_t) == 56, "time_sync_response_t size mismatch");
+static_assert(sizeof(config_apply_ack_message_t) == 40, "config_apply_ack_message_t size mismatch");
+static_assert(sizeof(snapshot_ack_t) == 40, "snapshot_ack_t size mismatch");
 #define SENSOR_ID_AUX2          3002
 
 #define ESPNOW_CHANNEL 11
