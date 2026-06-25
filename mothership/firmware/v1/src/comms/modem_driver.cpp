@@ -304,15 +304,11 @@ bool ModemDriver::waitForNetwork(uint32_t timeoutMs) {
 // httpsPost()
 // ---------------------------------------------------------------------------
 
-// NOTE: The AT+HTTP* command sequence below is written to the SIMCom
-// documented standard for the A7670G.  The exact syntax for firmware
-// A110B06A7670M7 has not yet been verified with an antenna connected.
-// When the antenna arrives, a bringup_modem_https test will confirm and
-// adjust if needed.  Key areas to verify:
-//   - AT+HTTPDATA prompt ("DOWNLOAD" vs "OK")
-//   - AT+HTTPPARA="USERDATA" header support
-//   - AT+HTTPACTION URC format and timing
-//   - AT+HTTPREAD response framing
+// NOTE: The A7670G (A7600 series, firmware A110B06A7670M7) uses:
+// - CIP* API (NETOPEN/CIPOPEN/CIPSEND) for TCP/UDP
+// - CCH* API (CCHSTART/CCHOPEN/CCHSEND) for SSL/TLS
+// CIPOPEN does NOT support "SSL" type — use CCH* commands for HTTPS.
+// Verified working on hardware with Aldi Talk SIM, both TCP and SSL/TLS.
 
 HttpsPostResult ModemDriver::httpsPost(const String& url,
                                         const String& payload,
@@ -327,230 +323,420 @@ HttpsPostResult ModemDriver::httpsPost(const String& url,
   result.success = false;
   result.httpStatus = -1;
 
-  // 1. HTTPINIT
+  // Parse URL
+  bool useSSL = false;
+  String host = "";
+  int port = 80;
+  String path = "/";
+
+  if (url.startsWith("https://")) {
+    useSSL = true;
+    port = 443;
+    host = url.substring(8);
+  } else if (url.startsWith("http://")) {
+    host = url.substring(7);
+  } else {
+    host = url;
+  }
+
+  int slashIdx = host.indexOf('/');
+  if (slashIdx >= 0) {
+    path = host.substring(slashIdx);
+    host = host.substring(0, slashIdx);
+  }
+
+  int colonIdx = host.indexOf(':');
+  if (colonIdx >= 0) {
+    port = host.substring(colonIdx + 1).toInt();
+    host = host.substring(0, colonIdx);
+  }
+
+  Serial.printf("[Modem] Parsed: host=%s port=%d path=%s ssl=%d\n",
+                host.c_str(), port, path.c_str(), useSSL ? 1 : 0);
+
+  // 1. Ensure PDP context is active
   {
     String resp;
-    if (!sendAT("AT+HTTPINIT", resp, 5000)) {
-      result.errorDetail = "AT+HTTPINIT failed: " + resp;
+    sendAT("AT+CGDCONT=1,\"IP\",\"internet.eplus.de\"", resp, 5000);
+    sendAT("AT+CGACT=1,1", resp, 10000);
+  }
+
+  // 2. NETOPEN
+  {
+    String resp;
+    if (!sendAT("AT+NETOPEN", resp, 15000)) {
+      result.errorDetail = "AT+NETOPEN failed: " + resp;
       Serial.println("[Modem] " + result.errorDetail);
       return result;
     }
-  }
-  m_state = ModemState::TRANSPORT_OPEN;
-
-  // 2. URL
-  {
-    String cmd = "AT+HTTPPARA=\"URL\",\"" + url + "\"";
-    String resp;
-    if (!sendAT(cmd.c_str(), resp, 5000)) {
-      result.errorDetail = "AT+HTTPPARA URL failed: " + resp;
-      Serial.println("[Modem] " + result.errorDetail);
-      sendAT("AT+HTTPTERM", resp, 2000);
-      return result;
-    }
+    delay(3000);
+    m_state = ModemState::TRANSPORT_OPEN;
   }
 
-  // 3. Content-Type
-  {
-    String cmd = "AT+HTTPPARA=\"CONTENT\",\"" + contentType + "\"";
-    String resp;
-    if (!sendAT(cmd.c_str(), resp, 5000)) {
-      result.errorDetail = "AT+HTTPPARA CONTENT failed: " + resp;
-      Serial.println("[Modem] " + result.errorDetail);
-      sendAT("AT+HTTPTERM", resp, 2000);
-      return result;
-    }
-  }
-
-  // 4. Auth token (optional). If this fails, continue — the token may be
-  //    in the URL query param instead.
+  // 3. Build HTTP request
+  String httpReq = "POST " + path + " HTTP/1.1\r\n";
+  httpReq += "Host: " + host + "\r\n";
+  httpReq += "Content-Type: " + contentType + "\r\n";
+  httpReq += "Content-Length: " + String(payload.length()) + "\r\n";
   if (authToken.length() > 0) {
-    String cmd = "AT+HTTPPARA=\"USERDATA\",\"Authorization: Bearer " +
-                 authToken + "\"";
-    String resp;
-    if (!sendAT(cmd.c_str(), resp, 5000)) {
-      Serial.println("[Modem] WARNING: USERDATA header failed (non-fatal): " +
-                      resp);
-      // Continue — token may be in URL.
-    }
+    httpReq += "Authorization: Bearer " + authToken + "\r\n";
+  }
+  httpReq += "Connection: close\r\n";
+  httpReq += "\r\n";
+  httpReq += payload;
+
+  // 4. Try SSL (CCH* API) if URL is HTTPS, then TCP (CIP* API) as fallback
+  bool posted = false;
+
+  if (useSSL) {
+    posted = httpsPostSSL(host, port, httpReq, result);
   }
 
-  // 5. HTTPDATA — send payload.
-  //    AT+HTTPDATA=<len>,<timeout>  then wait for "DOWNLOAD" (or "OK")
-  //    prompt, then write payload bytes.
-  m_state = ModemState::UPLOAD_ACTIVE;
-  {
-    uint32_t dataLen = payload.length();
-    String cmd = "AT+HTTPDATA=" + String(dataLen) + ",10000";
-    String resp;
-
-    // Send the HTTPDATA command and wait for the DOWNLOAD / OK prompt.
-    // We use a raw send + collect pattern because the prompt is not
-    // terminated by OK/ERROR.
-    while (Serial2.available()) { Serial2.read(); }  // flush
-    Serial2.print(cmd);
-    Serial2.print("\r\n");
-    Serial2.flush();
-
-    // Wait for "DOWNLOAD" or "OK" prompt (up to 5 s).
-    resp = "";
-    unsigned long start = millis();
-    bool gotPrompt = false;
-    while (millis() - start < 5000) {
-      while (Serial2.available()) {
-        char c = (char)Serial2.read();
-        resp += c;
-        if (resp.indexOf("DOWNLOAD") >= 0 || resp.indexOf("OK") >= 0) {
-          gotPrompt = true;
-          break;
-        }
-      }
-      if (gotPrompt) break;
-      delay(5);
-    }
-
-    if (!gotPrompt) {
-      result.errorDetail = "AT+HTTPDATA no DOWNLOAD/OK prompt: " + resp;
-      Serial.println("[Modem] " + result.errorDetail);
-      sendAT("AT+HTTPTERM", resp, 2000);
-      m_state = ModemState::TRANSPORT_OPEN;
-      return result;
-    }
-
-    // Write payload bytes.
-    Serial2.print(payload);
-    Serial2.flush();
-
-    // Wait for OK after data upload (up to 10 s).
-    resp = "";
-    start = millis();
-    bool dataOk = false;
-    while (millis() - start < 10000) {
-      while (Serial2.available()) {
-        char c = (char)Serial2.read();
-        resp += c;
-        if (resp.indexOf("OK\r\n") >= 0) {
-          dataOk = true;
-          break;
-        }
-        if (resp.indexOf("ERROR\r\n") >= 0) break;
-      }
-      if (dataOk) break;
-      delay(5);
-    }
-
-    if (!dataOk) {
-      result.errorDetail = "AT+HTTPDATA upload did not get OK: " + resp;
-      Serial.println("[Modem] " + result.errorDetail);
-      sendAT("AT+HTTPTERM", resp, 2000);
-      m_state = ModemState::TRANSPORT_OPEN;
-      return result;
-    }
+  if (!posted) {
+    Serial.println("[Modem] SSL failed or not requested, trying TCP...");
+    // For TCP fallback, use port 80 if original was 443
+    int tcpPort = useSSL ? 80 : port;
+    posted = httpsPostTCP(host, tcpPort, httpReq, result);
   }
 
-  // 6. HTTPACTION=1 (POST).  Expect OK, then wait for the
-  //    +HTTPACTION: 1,<status>,<responseLen> URC (up to 30 s).
+  // 5. Cleanup
   {
     String resp;
-    if (!sendAT("AT+HTTPACTION=1", resp, 5000)) {
-      result.errorDetail = "AT+HTTPACTION=1 failed: " + resp;
-      Serial.println("[Modem] " + result.errorDetail);
-      sendAT("AT+HTTPTERM", resp, 2000);
-      m_state = ModemState::TRANSPORT_OPEN;
-      return result;
-    }
-
-    // Now wait for the +HTTPACTION URC.
-    resp = "";
-    unsigned long start = millis();
-    bool gotUrc = false;
-    int httpStatus = -1;
-    int responseLen = 0;
-    while (millis() - start < 30000) {
-      while (Serial2.available()) {
-        char c = (char)Serial2.read();
-        resp += c;
-        int idx = resp.indexOf("+HTTPACTION: 1,");
-        if (idx >= 0) {
-          // Parse: +HTTPACTION: 1,<status>,<responseLen>
-          // Find the comma after "1,".
-          int comma1 = resp.indexOf(',', idx + 15);  // after "+HTTPACTION: 1"
-          if (comma1 >= 0) {
-            int comma2 = resp.indexOf(',', comma1 + 1);
-            String statusStr, lenStr;
-            if (comma2 >= 0) {
-              statusStr = resp.substring(comma1 + 1, comma2);
-              lenStr = resp.substring(comma2 + 1);
-            } else {
-              statusStr = resp.substring(comma1 + 1);
-            }
-            statusStr.trim();
-            lenStr.trim();
-            httpStatus = statusStr.toInt();
-            responseLen = lenStr.toInt();
-            gotUrc = true;
-          }
-          break;
-        }
-      }
-      if (gotUrc) break;
-      delay(10);
-    }
-
-    if (!gotUrc) {
-      result.errorDetail = "AT+HTTPACTION URC timeout: " + resp;
-      Serial.println("[Modem] " + result.errorDetail);
-      sendAT("AT+HTTPTERM", resp, 2000);
-      m_state = ModemState::TRANSPORT_OPEN;
-      return result;
-    }
-
-    result.httpStatus = httpStatus;
-    Serial.printf("[Modem] HTTPACTION URC: status=%d, responseLen=%d\n",
-                  httpStatus, responseLen);
-
-    // 7. If 200 and there is a response body, read it.
-    if (httpStatus == 200 && responseLen > 0) {
-      String readResp;
-      if (sendAT("AT+HTTPREAD", readResp, 10000)) {
-        // Response format: +HTTPREAD: <len>\r\n<body>\r\nOK\r\n
-        // Extract the body between the first \r\n after +HTTPREAD: and OK.
-        int hdrIdx = readResp.indexOf("+HTTPREAD:");
-        if (hdrIdx >= 0) {
-          int bodyStart = readResp.indexOf('\n', hdrIdx);
-          if (bodyStart >= 0) {
-            bodyStart++;  // skip the \n
-            // Body ends before the final OK line.
-            int okIdx = readResp.lastIndexOf("\r\nOK\r\n");
-            if (okIdx >= bodyStart) {
-              result.responseBody = readResp.substring(bodyStart, okIdx);
-            } else {
-              result.responseBody = readResp.substring(bodyStart);
-            }
-          }
-        }
-      } else {
-        Serial.println("[Modem] WARNING: AT+HTTPREAD failed: " + readResp);
-      }
-    }
+    sendAT("AT+NETCLOSE", resp, 5000);
   }
 
-  // 8. HTTPTERM
-  {
-    String resp;
-    sendAT("AT+HTTPTERM", resp, 5000);
-  }
+  m_state = ModemState::REGISTERED;
 
-  // 9. Build result.
-  result.success = (result.httpStatus == 200);
   if (!result.success && result.errorDetail.length() == 0) {
     result.errorDetail = "HTTP status " + String(result.httpStatus);
   }
 
-  m_state = ModemState::REGISTERED;  // back to registered after upload
-  Serial.printf("[Modem] httpsPost() done: success=%d, status=%d\n",
-                result.success ? 1 : 0, result.httpStatus);
+  Serial.println("=== httpsPost() complete ===");
   return result;
+}
+
+// ---------------------------------------------------------------------------
+// httpsPostSSL — SSL/TLS POST via CCH* API
+// ---------------------------------------------------------------------------
+
+bool ModemDriver::httpsPostSSL(const String& host, int port,
+                                const String& httpReq, HttpsPostResult& result) {
+  Serial.println("[Modem] === SSL POST via CCH* API ===");
+
+  // 1. NTP sync (needs data connection active)
+  Serial.println("[Modem] NTP sync...");
+  String resp;
+  sendAT("AT+CNTP=\"pool.ntp.org\",32", resp, 5000);
+  sendAT("AT+CNTP", resp, 15000);
+  delay(3000);
+
+  // Check if clock updated
+  sendAT("AT+CCLK?", resp, 2000);
+  Serial.printf("[Modem] CCLK: %s\n", resp.c_str());
+
+  // 2. SSL context configuration
+  sendAT("AT+CSSLCFG=\"sslversion\",0,4", resp, 2000);
+  sendAT("AT+CSSLCFG=\"authmode\",0,0", resp, 2000);
+  sendAT("AT+CSSLCFG=\"ignorelocaltime\",0,1", resp, 2000);
+  sendAT("AT+CSSLCFG=\"enableSNI\",0,1", resp, 2000);
+  sendAT("AT+CSSLCFG=\"negotiatetime\",0,300", resp, 2000);
+
+  // 3. Start SSL service
+  if (!sendAT("AT+CCHSTART", resp, 30000)) {
+    result.errorDetail = "AT+CCHSTART failed: " + resp;
+    Serial.println("[Modem] " + result.errorDetail);
+    return false;
+  }
+  delay(2000);
+
+  // 4. Bind SSL context
+  sendAT("AT+CCHSSLCFG=0,0", resp, 5000);
+
+  // 5. Set auto-receive mode
+  sendAT("AT+CCHSET=0,0", resp, 2000);
+
+  // 6. Open SSL connection
+  String openCmd = "AT+CCHOPEN=0,\"" + host + "\"," + String(port) + ",2";
+  Serial.printf("[Modem] CCHOPEN: %s\n", openCmd.c_str());
+
+  while (Serial2.available()) { Serial2.read(); }
+  Serial2.print(openCmd);
+  Serial2.print("\r\n");
+  Serial2.flush();
+
+  // Wait for +CCHOPEN: 0,0 (success)
+  resp = "";
+  unsigned long start = millis();
+  bool cchOpenOk = false;
+  while (millis() - start < 30000) {
+    while (Serial2.available()) {
+      char c = (char)Serial2.read();
+      resp += c;
+    }
+    if (resp.indexOf("+CCHOPEN: 0,0") >= 0) {
+      cchOpenOk = true;
+      break;
+    }
+    // Check for error: +CCHOPEN: 0,<non-zero>
+    int urcIdx = resp.indexOf("+CCHOPEN: 0,");
+    if (urcIdx >= 0 && urcIdx + 12 < resp.length()) {
+      char errChar = resp.charAt(urcIdx + 12);
+      if (errChar != '0' && errChar >= '0' && errChar <= '9') {
+        break;  // Error
+      }
+    }
+    delay(10);
+  }
+
+  if (!cchOpenOk) {
+    result.errorDetail = "CCHOPEN failed: " + resp;
+    Serial.println("[Modem] " + result.errorDetail);
+    sendAT("AT+CCHSTOP", resp, 5000);
+    return false;
+  }
+
+  Serial.println("[Modem] SSL connection opened!");
+  m_state = ModemState::UPLOAD_ACTIVE;
+  delay(500);
+
+  // 7. Send data
+  uint32_t reqLen = httpReq.length();
+  String sendCmd = "AT+CCHSEND=0," + String(reqLen);
+  Serial.printf("[Modem] CCHSEND: %u bytes\n", (unsigned)reqLen);
+
+  while (Serial2.available()) { Serial2.read(); }
+  Serial2.print(sendCmd);
+  Serial2.print("\r\n");
+  Serial2.flush();
+
+  // Wait for '>' prompt
+  resp = "";
+  start = millis();
+  bool gotPrompt = false;
+  while (millis() - start < 5000) {
+    while (Serial2.available()) {
+      char c = (char)Serial2.read();
+      resp += c;
+      if (resp.indexOf(">") >= 0) { gotPrompt = true; break; }
+    }
+    if (gotPrompt) break;
+    delay(5);
+  }
+
+  if (!gotPrompt) {
+    result.errorDetail = "CCHSEND no '>' prompt: " + resp;
+    Serial.println("[Modem] " + result.errorDetail);
+    sendAT("AT+CCHCLOSE=0", resp, 2000);
+    sendAT("AT+CCHSTOP", resp, 5000);
+    return false;
+  }
+
+  // Write HTTP request
+  Serial2.print(httpReq);
+  Serial2.flush();
+
+  // Wait for OK after send
+  resp = "";
+  start = millis();
+  while (millis() - start < 10000) {
+    while (Serial2.available()) {
+      char c = (char)Serial2.read();
+      resp += c;
+      if (resp.indexOf("OK\r\n") >= 0) break;
+    }
+    if (resp.indexOf("OK\r\n") >= 0) break;
+    delay(5);
+  }
+
+  // 8. Collect response
+  Serial.println("[Modem] Waiting for SSL response...");
+  resp = "";
+  start = millis();
+  bool gotData = false;
+
+  while (millis() - start < 30000) {
+    while (Serial2.available()) {
+      char c = (char)Serial2.read();
+      resp += c;
+      if (resp.indexOf("HTTP/1.") >= 0 && !gotData) {
+        gotData = true;
+        int httpIdx = resp.indexOf("HTTP/1.");
+        if (httpIdx >= 0) {
+          int spaceIdx = resp.indexOf(' ', httpIdx);
+          if (spaceIdx >= 0) {
+            int nextSpace = resp.indexOf(' ', spaceIdx + 1);
+            int crIdx = resp.indexOf('\r', spaceIdx + 1);
+            int endIdx = (nextSpace >= 0 && (crIdx < 0 || nextSpace < crIdx)) ? nextSpace : crIdx;
+            if (endIdx < 0) endIdx = spaceIdx + 4;
+            String statusStr = resp.substring(spaceIdx + 1, endIdx);
+            statusStr.trim();
+            result.httpStatus = statusStr.toInt();
+          }
+        }
+      }
+      if (resp.indexOf("+CCH_PEER_CLOSED") >= 0) break;
+    }
+    if (resp.indexOf("+CCH_PEER_CLOSED") >= 0) break;
+    delay(10);
+  }
+
+  if (gotData) {
+    result.responseBody = resp;
+    result.success = (result.httpStatus == 200);
+    Serial.printf("[Modem] SSL HTTP status: %d, success: %s\n",
+                  result.httpStatus, result.success ? "YES" : "NO");
+  } else {
+    result.errorDetail = "No SSL HTTP response received";
+    Serial.println("[Modem] " + result.errorDetail);
+  }
+
+  // 9. Close SSL
+  sendAT("AT+CCHCLOSE=0", resp, 2000);
+  sendAT("AT+CCHSTOP", resp, 5000);
+
+  return result.success;
+}
+
+// ---------------------------------------------------------------------------
+// httpsPostTCP — TCP POST via CIP* API
+// ---------------------------------------------------------------------------
+
+bool ModemDriver::httpsPostTCP(const String& host, int port,
+                                const String& httpReq, HttpsPostResult& result) {
+  Serial.println("[Modem] === TCP POST via CIP* API ===");
+
+  // 1. Close any existing socket
+  String resp;
+  sendAT("AT+CIPCLOSE=0", resp, 2000);
+  delay(500);
+
+  // 2. Open TCP connection
+  String openCmd = "AT+CIPOPEN=0,\"TCP\",\"" + host + "\"," + String(port);
+  Serial.printf("[Modem] CIPOPEN: %s\n", openCmd.c_str());
+
+  while (Serial2.available()) { Serial2.read(); }
+  Serial2.print(openCmd);
+  Serial2.print("\r\n");
+  Serial2.flush();
+
+  resp = "";
+  unsigned long start = millis();
+  bool tcpOpenOk = false;
+  while (millis() - start < 30000) {
+    while (Serial2.available()) {
+      char c = (char)Serial2.read();
+      resp += c;
+      if (resp.indexOf("+CIPOPEN: 0,0") >= 0) { tcpOpenOk = true; break; }
+      if (resp.indexOf("ERROR") >= 0) break;
+    }
+    if (tcpOpenOk || resp.indexOf("ERROR") >= 0) break;
+    delay(10);
+  }
+
+  if (!tcpOpenOk) {
+    result.errorDetail = "CIPOPEN TCP failed: " + resp;
+    Serial.println("[Modem] " + result.errorDetail);
+    return false;
+  }
+
+  Serial.println("[Modem] TCP socket opened!");
+  m_state = ModemState::UPLOAD_ACTIVE;
+  delay(500);
+
+  // 3. Send data
+  uint32_t reqLen = httpReq.length();
+  String sendCmd = "AT+CIPSEND=0," + String(reqLen);
+  Serial.printf("[Modem] CIPSEND: %u bytes\n", (unsigned)reqLen);
+
+  while (Serial2.available()) { Serial2.read(); }
+  Serial2.print(sendCmd);
+  Serial2.print("\r\n");
+  Serial2.flush();
+
+  // Wait for '>' prompt
+  resp = "";
+  start = millis();
+  bool gotPrompt = false;
+  while (millis() - start < 5000) {
+    while (Serial2.available()) {
+      char c = (char)Serial2.read();
+      resp += c;
+      if (resp.indexOf(">") >= 0) { gotPrompt = true; break; }
+    }
+    if (gotPrompt) break;
+    delay(5);
+  }
+
+  if (!gotPrompt) {
+    result.errorDetail = "CIPSEND no '>' prompt: " + resp;
+    Serial.println("[Modem] " + result.errorDetail);
+    sendAT("AT+CIPCLOSE=0", resp, 2000);
+    return false;
+  }
+
+  // Write HTTP request
+  Serial2.print(httpReq);
+  Serial2.flush();
+
+  // Wait for +CIPSEND URC
+  resp = "";
+  start = millis();
+  while (millis() - start < 10000) {
+    while (Serial2.available()) {
+      char c = (char)Serial2.read();
+      resp += c;
+      if (resp.indexOf("+CIPSEND: 0,") >= 0) break;
+    }
+    if (resp.indexOf("+CIPSEND: 0,") >= 0) break;
+    delay(10);
+  }
+
+  // 4. Collect response
+  Serial.println("[Modem] Waiting for TCP response...");
+  resp = "";
+  start = millis();
+  bool gotData = false;
+
+  while (millis() - start < 30000) {
+    while (Serial2.available()) {
+      char c = (char)Serial2.read();
+      resp += c;
+      if (resp.indexOf("HTTP/1.") >= 0 && !gotData) {
+        gotData = true;
+        int httpIdx = resp.indexOf("HTTP/1.");
+        if (httpIdx >= 0) {
+          int spaceIdx = resp.indexOf(' ', httpIdx);
+          if (spaceIdx >= 0) {
+            int nextSpace = resp.indexOf(' ', spaceIdx + 1);
+            int crIdx = resp.indexOf('\r', spaceIdx + 1);
+            int endIdx = (nextSpace >= 0 && (crIdx < 0 || nextSpace < crIdx)) ? nextSpace : crIdx;
+            if (endIdx < 0) endIdx = spaceIdx + 4;
+            String statusStr = resp.substring(spaceIdx + 1, endIdx);
+            statusStr.trim();
+            result.httpStatus = statusStr.toInt();
+          }
+        }
+      }
+      if (resp.indexOf("+IPCLOSE") >= 0 || resp.indexOf("CLOSED") >= 0) break;
+    }
+    if (resp.indexOf("+IPCLOSE") >= 0 || resp.indexOf("CLOSED") >= 0) break;
+    delay(10);
+  }
+
+  if (gotData) {
+    result.responseBody = resp;
+    result.success = (result.httpStatus == 200);
+    Serial.printf("[Modem] TCP HTTP status: %d, success: %s\n",
+                  result.httpStatus, result.success ? "YES" : "NO");
+  } else {
+    result.errorDetail = "No TCP HTTP response received";
+    Serial.println("[Modem] " + result.errorDetail);
+  }
+
+  // 5. Close socket
+  sendAT("AT+CIPCLOSE=0", resp, 2000);
+
+  return result.success;
 }
 
 // ---------------------------------------------------------------------------

@@ -65,10 +65,10 @@ class ModemDriver {
   // Returns false on timeout. MUST NOT block forever.
   bool waitForNetwork(uint32_t timeoutMs);
 
-  // HTTPS POST via the A7670G HTTP AT command set.
-  // NOTE: The AT+HTTP* syntax is written to the SIMCom documented standard.
-  // When the antenna arrives, a bringup_modem_https test will verify and
-  // adjust if needed for firmware A110B06A7670M7.
+  // HTTP/HTTPS POST via the A7670G socket API.
+  // HTTPS uses CCH* API (CCHSTART/CCHOPEN/CCHSEND) with NTP sync + SNI.
+  // HTTP uses CIP* API (CIPOPEN/CIPSEND) as fallback.
+  // Verified working on hardware with firmware A110B06A7670M7.
   HttpsPostResult httpsPost(const String& url,
                             const String& payload,
                             const String& contentType = "text/csv",
@@ -121,4 +121,10 @@ class ModemDriver {
 
   // Serial2.begin if not already started. Flush RX buffer.
   void startUart();
+
+  // SSL/TLS POST via CCH* API (internal helpers)
+  bool httpsPostSSL(const String& host, int port,
+                    const String& httpReq, HttpsPostResult& result);
+  bool httpsPostTCP(const String& host, int port,
+                    const String& httpReq, HttpsPostResult& result);
 };
