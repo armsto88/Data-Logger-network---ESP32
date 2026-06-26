@@ -60,17 +60,23 @@ bool UploadQueue::init() {
 // ---------------------------------------------------------------------------
 void UploadQueue::loadCursor() {
   Preferences prefs;
-  if (!prefs.begin(kTxNamespace, true)) {   // read-only
+  // Open read-write so we can remove a stale key left by older firmware.
+  // NVS keys are limited to 15 characters; "last_upload_unix" (17 chars)
+  // exceeds that limit and triggers KEY_TOO_LONG errors on every putUInt()
+  // call in this namespace until it is removed.
+  if (!prefs.begin(kTxNamespace, false)) {   // read-write
     Serial.println("[UQ] NVS begin(\"tx\") failed — cursor defaults to 0");
     return;
   }
   m_cursor.byteOffset    = prefs.getUInt("cursor_offset", 0);
   m_cursor.rowsUploaded   = prefs.getUInt("rows_uploaded", 0);
-  m_cursor.lastUploadUnix = prefs.getUInt("last_upload_unix", 0);
+  m_cursor.lastUploadUnix = prefs.getUInt("last_upload", 0);
   m_cursor.retryCount     = prefs.getUChar("retry_count", 0);
   m_cursor.wakeCounter    = prefs.getUInt("wake_counter", 0);
   // NVS keys are limited to 15 characters; keep this key deliberately short.
   m_cursor.nextAttemptUnix = prefs.getUInt("next_attempt", 0);
+  // Clean up stale key from older firmware (NVS keys max 15 chars).
+  prefs.remove("last_upload_unix");
   prefs.end();
 }
 
@@ -82,7 +88,7 @@ void UploadQueue::saveCursor() {
   }
   prefs.putUInt("cursor_offset", m_cursor.byteOffset);
   prefs.putUInt("rows_uploaded", m_cursor.rowsUploaded);
-  prefs.putUInt("last_upload_unix", m_cursor.lastUploadUnix);
+  prefs.putUInt("last_upload", m_cursor.lastUploadUnix);
   prefs.putUChar("retry_count", m_cursor.retryCount);
   prefs.putUInt("wake_counter", m_cursor.wakeCounter);
   prefs.putUInt("next_attempt", m_cursor.nextAttemptUnix);
@@ -248,10 +254,23 @@ UploadPayload UploadQueue::getNewData(uint32_t maxBytes) {
   payload.rowEstimate = 0;
 
   const uint32_t freeHeap = ESP.getFreeHeap();
-  if (static_cast<uint64_t>(freeHeap) < static_cast<uint64_t>(maxBytes) * 2ULL) {
-    Serial.printf("[UPLOAD] Insufficient heap for payload: free=%u requested=%u\n",
-                  static_cast<unsigned>(freeHeap), static_cast<unsigned>(maxBytes));
-    return payload;
+  const uint32_t requiredHeap = maxBytes + 4096U;
+  uint32_t effectiveMaxBytes = maxBytes;
+  if (freeHeap < requiredHeap) {
+    // Clamp to what the heap can actually support instead of giving up.
+    // 8 KB overhead accounts for the String reserve + 4 KB read buffer +
+    // misc allocations during the read loop.
+    effectiveMaxBytes = (freeHeap > 8192U) ? (freeHeap - 8192U) : 0U;
+    if (effectiveMaxBytes < 1024U) {
+      Serial.printf("[UPLOAD] Insufficient heap for payload after clamp: "
+                    "free=%u requested=%u effective=%u (need >=1024 usable bytes)\n",
+                    static_cast<unsigned>(freeHeap), static_cast<unsigned>(maxBytes),
+                    static_cast<unsigned>(effectiveMaxBytes));
+      return payload;
+    }
+    Serial.printf("[UPLOAD] Heap clamp: maxBytes %u -> %u (free=%u)\n",
+                  static_cast<unsigned>(maxBytes), static_cast<unsigned>(effectiveMaxBytes),
+                  static_cast<unsigned>(freeHeap));
   }
 
   File f = LittleFS.open(kDataFile, "r");
@@ -266,7 +285,7 @@ UploadPayload UploadQueue::getNewData(uint32_t maxBytes) {
     return payload;
   }
 
-  const uint32_t reserveSize = maxBytes + strlen(kUploadCSVHeader) + 258U;
+  const uint32_t reserveSize = effectiveMaxBytes + strlen(kUploadCSVHeader) + 258U;
   if (!payload.csvData.reserve(reserveSize)) {
     Serial.println("[UPLOAD] String allocation failed");
     f.close();
@@ -310,8 +329,8 @@ UploadPayload UploadQueue::getNewData(uint32_t maxBytes) {
     return true;
   };
 
-  while (f.available() && bytesRead < maxBytes) {
-    const uint32_t remaining = maxBytes - bytesRead;
+  while (f.available() && bytesRead < effectiveMaxBytes) {
+    const uint32_t remaining = effectiveMaxBytes - bytesRead;
     const size_t request = remaining < sizeof(buf) ? remaining : sizeof(buf);
     const int count = f.read(buf, request);
     if (count <= 0) break;
@@ -328,8 +347,8 @@ UploadPayload UploadQueue::getNewData(uint32_t maxBytes) {
     bytesRead += static_cast<uint32_t>(count);
   }
 
-  // If maxBytes lands inside a row, consume exactly through the next newline.
-  if (!allocationFailed && bytesRead >= maxBytes &&
+  // If effectiveMaxBytes lands inside a row, consume exactly through the next newline.
+  if (!allocationFailed && bytesRead >= effectiveMaxBytes &&
       (bytesRead == 0 || payload.csvData[payload.csvData.length() - 1] != '\n')) {
     bool foundNewline = false;
     while (f.available() && !foundNewline) {

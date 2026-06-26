@@ -25,6 +25,7 @@
 #include "config/config_server.h"
 #include "config/transmission_settings.h"
 #include "storage/upload_queue.h"
+#include "storage/json_payload.h"
 #include "comms/modem_driver.h"
 #include "protocol.h"
 
@@ -232,6 +233,190 @@ void performModemUpload(const TransmissionSettings& txSettings, uint32_t session
     return;
   }
 
+  // -----------------------------------------------------------------------
+  // JSON upload path (multi-POST loop) — used when txSettings.useJsonUpload
+  // is true.  Falls back to the single-POST CSV path below on build failure.
+  // -----------------------------------------------------------------------
+  if (txSettings.useJsonUpload) {
+    constexpr uint16_t kMaxReadingsPerPost = 100;
+    constexpr uint32_t kJsonChunkBytes     = 16384;  // ~100-130 rows of CSV
+
+    const uint32_t totalPendingRows = uploadQueue.getPendingRows();
+    Serial.printf("[UPLOAD] JSON path: %u pending rows, %u per POST\n",
+                  (unsigned)totalPendingRows, (unsigned)kMaxReadingsPerPost);
+
+    bool anyJsonSuccess = false;
+    bool firstChunk = true;
+    uint32_t nowUnix = getRTCTime();
+
+    // Stats don't change between chunks within the same session, so read
+    // them once before the loop instead of on every iteration (avoids a
+    // full-CSV scan per chunk for large backlogs).
+    const DataLogStats dlStats = readDataLogStats();
+
+    while (uploadQueue.getPendingRows() > 0 && !sessionExpired()) {
+      UploadPayload payload = uploadQueue.getNewData(kJsonChunkBytes);
+      if (payload.byteLength == 0) {
+        Serial.println("[UPLOAD] JSON: no data returned from queue");
+        break;
+      }
+      Serial.printf("[UPLOAD] JSON chunk: %u bytes, ~%u rows\n",
+                    payload.byteLength, payload.rowEstimate);
+
+      // Build the JSON upload context.
+      const uint64_t fsTotal = (uint64_t)LittleFS.totalBytes();
+      const uint64_t fsUsed  = (uint64_t)LittleFS.usedBytes();
+      const UploadCursor cursor = uploadQueue.getCursor();
+
+      JsonUploadContext ctx = {
+        DEVICE_ID,
+        FW_VERSION,
+        FW_BUILD,
+        nowUnix,
+        "scheduled",
+        txSettings,
+        cursor,
+        uploadQueue.getPendingBytes(),
+        uploadQueue.getPendingRows(),
+        fsTotal,
+        fsUsed,
+        dlStats.records,
+        dlStats.csvBytes,
+        dlStats.lastConfirmedSyncIso,
+        gWakeIntervalMin,
+        gSyncIntervalMin,
+        gSyncMode,
+        gSyncDailyHour,
+        gSyncDailyMinute,
+        formatSyncTimeHHMM(gSyncDailyHour, gSyncDailyMinute),
+        computeNextSyncIsoLocal(),
+        readBatteryVoltage(),
+        (cursor.lastUploadUnix > 0 && cursor.retryCount == 0) ? "success"
+          : (cursor.retryCount > 0) ? "failed" : "pending"
+      };
+
+      JsonPayload json = buildJsonUpload(ctx, payload.csvData,
+                                         kMaxReadingsPerPost, firstChunk);
+      if (!json.ok) {
+        // Build failed (heap/parse) — fall back to CSV POST for this chunk.
+        Serial.println("[UPLOAD] JSON build failed — falling back to CSV POST");
+        String url = buildUploadUrl(txSettings);
+        if (url.indexOf('?') >= 0) url += "&action=uploadSync";
+        else url += "?action=uploadSync";
+        HttpsPostResult result = modem.httpsPost(url, payload.csvData,
+                                                 "text/plain", txSettings.authToken);
+        if (result.success) {
+          Serial.printf("[UPLOAD] CSV fallback SUCCESS: HTTP %d, %u bytes\n",
+                        result.httpStatus, payload.byteLength);
+          nowUnix = getRTCTime();
+          uploadQueue.advanceCursor(payload.startOffset + payload.byteLength, nowUnix);
+          uploadQueue.purgeUploaded();
+          uploadQueue.resetRetryCount();
+          anyJsonSuccess = true;
+          firstChunk = false;
+          continue;
+        } else {
+          Serial.printf("[UPLOAD] CSV fallback FAIL: HTTP %d, %s\n",
+                        result.httpStatus, result.errorDetail.c_str());
+          uploadQueue.incrementRetryCount(retryNowUnix, retryCooldownSec);
+          break;
+        }
+      }
+
+      Serial.printf("[UPLOAD] JSON built: %u bytes, %u readings, consumed %u CSV bytes\n",
+                    json.byteLength, (unsigned)json.rowCount, (unsigned)json.csvBytesConsumed);
+
+      // Build URL with action param: uploadSync on first chunk, uploadData after.
+      String url = buildUploadUrl(txSettings);
+      if (url.indexOf('?') >= 0) {
+        url += (firstChunk ? "&action=uploadSync" : "&action=uploadData");
+      } else {
+        url += (firstChunk ? "?action=uploadSync" : "?action=uploadData");
+      }
+
+      if (sessionExpired()) {
+        Serial.println("[WATCHDOG] Session timeout before JSON POST - forcing shutdown");
+        modem.gracefulShutdown();
+        return;
+      }
+
+      Serial.printf("[UPLOAD] POSTing JSON to %s (%u bytes)\n",
+                    url.c_str(), json.byteLength);
+      HttpsPostResult result = modem.httpsPost(url, json.body,
+                                               "application/json", txSettings.authToken);
+
+      if (result.success) {
+        Serial.printf("[UPLOAD] JSON SUCCESS: HTTP %d, %u readings\n",
+                      result.httpStatus, (unsigned)json.rowCount);
+        nowUnix = getRTCTime();
+        uploadQueue.advanceCursor(payload.startOffset + json.csvBytesConsumed, nowUnix);
+        uploadQueue.purgeUploaded();
+        uploadQueue.resetRetryCount();
+        anyJsonSuccess = true;
+        firstChunk = false;
+        // Continue loop for next chunk if more rows remain.
+      } else {
+        Serial.printf("[UPLOAD] JSON FAIL: HTTP %d, %s — not retrying as CSV\n",
+                      result.httpStatus, result.errorDetail.c_str());
+        uploadQueue.incrementRetryCount(retryNowUnix, retryCooldownSec);
+        break;
+      }
+    }
+
+    // If there was no new data but status should still be pushed (e.g.
+    // manual / config-change sync), send a status-only document.
+    if (firstChunk && !sessionExpired()) {
+      Serial.println("[UPLOAD] JSON: no pending rows — sending status-only document");
+      const DataLogStats dlStats = readDataLogStats();
+      const uint64_t fsTotal = (uint64_t)LittleFS.totalBytes();
+      const uint64_t fsUsed  = (uint64_t)LittleFS.usedBytes();
+      const UploadCursor cursor = uploadQueue.getCursor();
+      JsonUploadContext ctx = {
+        DEVICE_ID, FW_VERSION, FW_BUILD, nowUnix, "manual",
+        txSettings, cursor,
+        uploadQueue.getPendingBytes(), uploadQueue.getPendingRows(),
+        fsTotal, fsUsed,
+        dlStats.records, dlStats.csvBytes, dlStats.lastConfirmedSyncIso,
+        gWakeIntervalMin, gSyncIntervalMin, gSyncMode,
+        gSyncDailyHour, gSyncDailyMinute,
+        formatSyncTimeHHMM(gSyncDailyHour, gSyncDailyMinute),
+        computeNextSyncIsoLocal(),
+        readBatteryVoltage(),
+        (cursor.lastUploadUnix > 0 && cursor.retryCount == 0) ? "success"
+          : (cursor.retryCount > 0) ? "failed" : "pending"
+      };
+      JsonPayload json = buildJsonStatusOnly(ctx);
+      if (json.ok) {
+        String url = buildUploadUrl(txSettings);
+        if (url.indexOf('?') >= 0) url += "&action=uploadSync";
+        else url += "?action=uploadSync";
+        HttpsPostResult result = modem.httpsPost(url, json.body,
+                                                 "application/json", txSettings.authToken);
+        if (result.success) {
+          Serial.printf("[UPLOAD] JSON status-only SUCCESS: HTTP %d\n", result.httpStatus);
+          uploadQueue.resetRetryCount();
+          anyJsonSuccess = true;
+        } else {
+          Serial.printf("[UPLOAD] JSON status-only FAIL: HTTP %d, %s\n",
+                        result.httpStatus, result.errorDetail.c_str());
+        }
+      }
+    }
+
+    if (anyJsonSuccess) {
+      uploadQueue.resetRetryCount();
+    }
+
+    // Emergency purge + graceful shutdown.
+    uploadQueue.emergencyPurgeIfFull(80);
+    modem.gracefulShutdown();
+    Serial.println("[UPLOAD] Modem upload sequence complete (JSON path)");
+    return;
+  }
+
+  // -----------------------------------------------------------------------
+  // CSV fallback path (single POST) — existing behaviour, unchanged.
+  // -----------------------------------------------------------------------
   // 3. Get new data from cursor
   UploadPayload payload = uploadQueue.getNewData(txSettings.maxBytesPerSession);
   if (payload.byteLength == 0) {
@@ -319,6 +504,10 @@ void handleSyncWake() {
     uploadQueue.init();
     uploadQueue.emergencyPurgeIfFull(80);
   }
+
+  // Load paired/deployed nodes from NVS so fleet counts and node metadata
+  // are available for the JSON upload payload.
+  loadPairedNodes();
 
   // Init ESP-NOW in sync-only mode
   if (!initEspNowSyncOnly(ESPNOW_CHANNEL)) {
@@ -597,14 +786,14 @@ void handleConfigWake() {
   // Config button is for WAKING only — not for exiting.
   // The SN74LVC2G74 latch bounces unpredictably, so we don't poll it for exit.
   // Exit is via web UI /shutdown route or 10-minute timeout.
-  Serial.println("[CONFIG] Config mode active. Use web UI Shut Down button or wait 10 min.");
+  Serial.println("[CONFIG] Config mode active. Use web UI Resume Sync button or wait 10 min.");
 
   while (true) {
     configServerLoop();
 
     // Exit condition 1: web UI shutdown button
     if (gShutdownRequested) {
-      Serial.println("[CONFIG] Shut down requested via web UI — exiting config mode");
+      Serial.println("[CONFIG] Sync & Power Down requested via web UI — exiting config mode");
       gShutdownRequested = false;
       break;
     }

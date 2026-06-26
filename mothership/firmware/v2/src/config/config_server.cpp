@@ -25,12 +25,12 @@
 // ---------------------------------------------------------------------------
 // Device identification and WiFi
 // ---------------------------------------------------------------------------
-static const char* DEVICE_ID = "001";
+const char* DEVICE_ID = "001";
 static const char* BASE_SSID = "Logger";
 static String ssid = String(BASE_SSID) + String(DEVICE_ID);  // "Logger001"
 static const char* password = "logger123";
-#define FW_VERSION "v1.0.0"
-#define FW_BUILD   __DATE__ " " __TIME__
+const char* FW_VERSION = "v1.0.0";
+const char* FW_BUILD   = __DATE__ " " __TIME__;
 
 // ---------------------------------------------------------------------------
 // Sync globals + NVS
@@ -334,7 +334,7 @@ void saveSyncRuntimeGuardsToNVS() {
 // ---------------------------------------------------------------------------
 // Sync schedule computation
 // ---------------------------------------------------------------------------
-static String formatSyncTimeHHMM(int hh, int mm) {
+String formatSyncTimeHHMM(int hh, int mm) {
   char b[6];
   snprintf(b, sizeof(b), "%02d:%02d", hh, mm);
   return String(b);
@@ -353,7 +353,7 @@ static bool parseHHMM(const String& hhmm, int& outHour, int& outMinute) {
 
 static uint32_t computeNextSyncUnix(uint32_t nowUnix);
 
-static String computeNextSyncIsoLocal() {
+String computeNextSyncIsoLocal() {
   const uint32_t nowUnix = getRTCTimeUnix();
   const uint32_t nextUnix = computeNextSyncUnix(nowUnix);
   DateTime next(nextUnix > 0 ? nextUnix : nowUnix);
@@ -1159,8 +1159,8 @@ static void handleRoot() {
             "<button class='btn' type='button' onclick='toggleInfoPanel()'><svg class='icon' viewBox='0 0 24 24' aria-hidden='true'><path d='M12 2a10 10 0 1010 10A10 10 0 0012 2zm0 4a1.25 1.25 0 11-1.25 1.25A1.25 1.25 0 0112 6zm2 12h-4v-1.8h1.1v-4.2H10v-1.8h3v6h1z'/></svg> INFO</button>"
             "<a href='/download-csv' class='btn btn--success'><svg class='icon' viewBox='0 0 24 24' aria-hidden='true'><path d='M12 3a1 1 0 011 1v8.59l2.3-2.3 1.4 1.42-4.7 4.7-4.7-4.7 1.4-1.42 2.3 2.3V4a1 1 0 011-1zm-7 14h14v2H5v-2z'/></svg> CSV</a>"
             "<a href='/upload' class='btn'><svg class='icon' viewBox='0 0 24 24' aria-hidden='true'><path d='M12 2a10 10 0 100 20 10 10 0 000-20zm-1 14l-4-4 1.4-1.4L11 13.2V7h2v6.2l2.6-2.6L17 12l-4 4z'/></svg> LTE Upload</a>"
-            "<form class='async-form' action='/shutdown' method='POST'>"
-            "<button type='submit' class='btn btn--warn'><svg class='icon' viewBox='0 0 24 24' aria-hidden='true'><path d='M13 3h-2v10h2V3zm4.83 2.17l-1.42 1.42C17.99 7.86 19 9.81 19 12c0 3.87-3.13 7-7 7s-7-3.13-7-7c0-2.19 1.01-4.14 2.58-5.42L6.17 5.17C4.23 6.82 3 9.26 3 12c0 4.97 4.03 9 9 9s9-4.03 9-9c0-2.74-1.23-5.18-3.17-6.83z'/></svg> Shut Down</button>"
+            "<form class='async-form' action='/shutdown' method='POST' style='display:inline-block'>"
+            "<button type='submit' class='btn btn--primary'><svg class='icon' viewBox='0 0 24 24' aria-hidden='true'><path d='M12 4V1L8 5l4 4V6c3.31 0 6 2.69 6 6 0 1.01-.25 1.97-.7 2.8l1.46 1.46C19.54 15.03 20 13.57 20 12c0-4.42-3.58-8-8-8zm0 14c-3.31 0-6-2.69-6-6 0-1.01.25-1.97.7-2.8L5.24 7.74C4.46 8.97 4 10.43 4 12c0 4.42 3.58 8 8 8v3l4-4-4-4v3z'/></svg> Sync &amp; Power Down</button>"
             "</form>"
             "<div id='info-panel' class='subpanel'>"
             "<h3><svg class='icon' viewBox='0 0 24 24' aria-hidden='true'><path d='M12 2a10 10 0 1010 10A10 10 0 0012 2zm0 4a1.25 1.25 0 11-1.25 1.25A1.25 1.25 0 0112 6zm2 12h-4v-1.8h1.1v-4.2H10v-1.8h3v6h1z'/></svg> INFO</h3>"
@@ -2082,6 +2082,7 @@ static void handleSetTransmission() {
   TransmissionSettings prev;
   loadTransmissionSettings(prev);
   tx.uploadPhaseUnix = prev.uploadPhaseUnix;
+  tx.useJsonUpload = prev.useJsonUpload;
 
   saveTransmissionSettings(tx);
   Serial.printf("[UI] Transmission settings saved: enabled=%d url=%s site=%s\n",
@@ -2240,12 +2241,12 @@ static void handleUploadStatus() {
 static void handleShutdown() {
   gShutdownRequested = true;
   if (isAjaxRequest()) {
-    sendAjaxResult(true, "Shutting down — arming alarm and powering off");
+    sendAjaxResult(true, "Sync & power down — arming sync alarm");
     return;
   }
   String html = headCommon("Shutting Down");
-  html += F("<div class='section center'><h3>Shutting Down</h3>"
-            "<p>Arming RTC alarm and powering off...</p>"
+  html += F("<div class='section center'><h3>Sync &amp; Power Down</h3>"
+            "<p>Arming phase-aligned sync alarm and powering off...</p>"
             "<p class='muted'>The board will wake at the next sync time.</p></div>");
   html += footCommon();
   server.send(200, "text/html", html);

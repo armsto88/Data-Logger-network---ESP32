@@ -31,5 +31,15 @@ int computeAutoSyncMin(int wakeMin);
 
 extern volatile bool gShutdownRequested;
 
+// Device identification (defined in config_server.cpp, used by json_payload
+// builder via JsonUploadContext populated in main.cpp).
+extern const char* DEVICE_ID;
+extern const char* FW_VERSION;
+extern const char* FW_BUILD;
+
+// Sync schedule helpers (defined in config_server.cpp).
+String formatSyncTimeHHMM(int hh, int mm);
+String computeNextSyncIsoLocal();
+
 void startConfigServer();
 void configServerLoop();
