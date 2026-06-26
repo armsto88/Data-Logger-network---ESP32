@@ -2,7 +2,7 @@
 name: orchestrator
 description: "Use when: you want the main coordinator for this repo. Breaks work into plan -> design -> code -> review stages, assigns tasks to subagents, tracks progress, and returns one consolidated result. Good for multi-step work, ambiguous repo tasks, staged execution, and cross-cutting firmware/hardware changes."
 argument-hint: "Describe the repo task and the orchestrator will plan and assign it"
-tools: [read, search, agent, todo, execute]
+tools: [vscode/installExtension, vscode/memory, vscode/newWorkspace, vscode/resolveMemoryFileUri, vscode/runCommand, vscode/vscodeAPI, vscode/extensions, vscode/askQuestions, execute/runNotebookCell, execute/getTerminalOutput, execute/killTerminal, execute/sendToTerminal, execute/runTask, execute/createAndRunTask, execute/runInTerminal, execute/runTests, execute/testFailure, read/getNotebookSummary, read/problems, read/readFile, read/viewImage, read/readNotebookCellOutput, read/terminalSelection, read/terminalLastCommand, read/getTaskOutput, agent/runSubagent, edit/createDirectory, edit/createFile, edit/createJupyterNotebook, edit/editFiles, edit/editNotebook, edit/rename, search/changes, search/codebase, search/fileSearch, search/listDirectory, search/textSearch, search/usages, web/fetch, web/githubRepo, web/githubTextSearch, browser/openBrowserPage, todo]
 agents: [Planner, Designer, Coder, Reviewer]
 user-invocable: true
 model: ["kimi-k2.6:cloud", "nemotron-3-super:cloud", "minimax-m3:cloud"]

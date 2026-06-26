@@ -303,8 +303,9 @@ void performModemUpload(const TransmissionSettings& txSettings, uint32_t session
         String url = buildUploadUrl(txSettings);
         if (url.indexOf('?') >= 0) url += "&action=uploadSync";
         else url += "?action=uploadSync";
+        String authHeader = txSettings.apiKey.length() > 0 ? txSettings.apiKey : txSettings.authToken;
         HttpsPostResult result = modem.httpsPost(url, payload.csvData,
-                                                 "text/plain", txSettings.authToken);
+                                                 "text/plain", authHeader);
         if (result.success) {
           Serial.printf("[UPLOAD] CSV fallback SUCCESS: HTTP %d, %u bytes\n",
                         result.httpStatus, payload.byteLength);
@@ -342,8 +343,9 @@ void performModemUpload(const TransmissionSettings& txSettings, uint32_t session
 
       Serial.printf("[UPLOAD] POSTing JSON to %s (%u bytes)\n",
                     url.c_str(), json.byteLength);
+      String authHeader = txSettings.apiKey.length() > 0 ? txSettings.apiKey : txSettings.authToken;
       HttpsPostResult result = modem.httpsPost(url, json.body,
-                                               "application/json", txSettings.authToken);
+                                               "application/json", authHeader);
 
       if (result.success) {
         Serial.printf("[UPLOAD] JSON SUCCESS: HTTP %d, %u readings\n",
@@ -531,7 +533,7 @@ void handleSyncWake() {
 
   unsigned long startMs = millis();
   unsigned long lastBroadcastMs = 0;
-  const unsigned long kMinListenMs = 15000;  // minimum 15s listen
+  const unsigned long kMinListenMs = 45000;  // minimum 45s — allows node to flush full queue
 
   if (millis() - sessionStartMs > kSyncSessionLimitMs) {
     Serial.println("[WATCHDOG] Session timeout before ESP-NOW listen - skipping window");

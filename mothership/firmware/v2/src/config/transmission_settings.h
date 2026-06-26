@@ -30,6 +30,7 @@ struct TransmissionSettings {
   bool     enabled;
   String   endpointUrl;        // Google Cloud Function URL
   String   authToken;          // token appended as ?token=xxx
+  String   apiKey;             // fm_xxxxxxxx API key (sent as Bearer)
   String   siteId;
   String   deploymentId;
   uint16_t uploadIntervalMin;   // 0 = every sync wake

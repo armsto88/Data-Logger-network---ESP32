@@ -14,6 +14,7 @@ void loadTransmissionSettings(TransmissionSettings& s) {
     s.enabled            = DEFAULT_TX_ENABLED;
     s.endpointUrl        = String(DEFAULT_ENDPOINT_URL);
     s.authToken          = String("");
+    s.apiKey             = String("");
     s.siteId             = String("");
     s.deploymentId       = String("");
     s.uploadIntervalMin  = 0;
@@ -41,6 +42,10 @@ void loadTransmissionSettings(TransmissionSettings& s) {
   prefs.getString("token", stringBuf, sizeof(stringBuf));
   stringBuf[sizeof(stringBuf) - 1] = '\0';
   s.authToken = String(stringBuf);
+  memset(stringBuf, 0, sizeof(stringBuf));
+  prefs.getString("api_key", stringBuf, sizeof(stringBuf));
+  stringBuf[sizeof(stringBuf) - 1] = '\0';
+  s.apiKey = String(stringBuf);
   memset(stringBuf, 0, sizeof(stringBuf));
   prefs.getString("site_id", stringBuf, sizeof(stringBuf));
   stringBuf[sizeof(stringBuf) - 1] = '\0';
@@ -99,6 +104,7 @@ void saveTransmissionSettings(const TransmissionSettings& s) {
   prefs.putBool("enabled", s.enabled);
   prefs.putString("url", s.endpointUrl);
   prefs.putString("token", s.authToken);
+  prefs.putString("api_key", s.apiKey);
   prefs.putString("site_id", s.siteId);
   prefs.putString("deploy_id", s.deploymentId);
   prefs.putUShort("upload_min", s.uploadIntervalMin);
@@ -135,6 +141,7 @@ String transmissionSettingsToJson(const TransmissionSettings& s) {
   j += "\"enabled\":" + String(s.enabled ? "true" : "false") + ",";
   j += "\"endpointUrl\":\"" + esc(s.endpointUrl) + "\",";
   j += "\"authToken\":\"" + esc(s.authToken) + "\",";
+  j += "\"apiKey\":\"" + esc(s.apiKey) + "\",";
   j += "\"siteId\":\"" + esc(s.siteId) + "\",";
   j += "\"deploymentId\":\"" + esc(s.deploymentId) + "\",";
   j += "\"uploadIntervalMin\":" + String(s.uploadIntervalMin) + ",";

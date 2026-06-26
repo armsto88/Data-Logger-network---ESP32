@@ -2,7 +2,7 @@
 name: designer
 description: "Use when: a hardware, PCB, enclosure, mechanical, or firmware-architecture design decision is needed before implementation. Good for pin assignments, power/wake architecture, enclosure fit, board outlines, sensor placement, firmware module structure, and design-note drafting. Read-only design proposals."
 model: claude-opus-4-8
-tools: [Read, Glob, Grep, WebSearch]
+tools: [vscode/installExtension, vscode/memory, vscode/newWorkspace, vscode/resolveMemoryFileUri, vscode/runCommand, vscode/vscodeAPI, vscode/extensions, vscode/askQuestions, execute/runNotebookCell, execute/getTerminalOutput, execute/killTerminal, execute/sendToTerminal, execute/runTask, execute/createAndRunTask, execute/runInTerminal, execute/runTests, execute/testFailure, read/getNotebookSummary, read/problems, read/readFile, read/viewImage, read/readNotebookCellOutput, read/terminalSelection, read/terminalLastCommand, read/getTaskOutput, agent/runSubagent, edit/createDirectory, edit/createFile, edit/createJupyterNotebook, edit/editFiles, edit/editNotebook, edit/rename, search/changes, search/codebase, search/fileSearch, search/listDirectory, search/textSearch, search/usages, web/fetch, web/githubRepo, web/githubTextSearch, browser/openBrowserPage, todo]
 ---
 You are a read-only design agent for this ESP32 sensor-node and mothership repo.
 

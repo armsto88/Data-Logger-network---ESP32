@@ -143,23 +143,32 @@ static bool setRTCTime(int year, int month, int day, int hour, int minute, int s
   return true;
 }
 
+static const char* kMonthShort[] = {
+  "", "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+  "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"
+};
+
 static void getRTCTimeString(char* buf, size_t bufLen) {
   uint32_t u = getRTCTime();
   if (u == 0) {
     snprintf(buf, bufLen, "RTC unset");
     return;
   }
-  time_t t = (time_t)u;
-  struct tm* tm = gmtime(&t);
-  snprintf(buf, bufLen, "%02d:%02d:%02d %02d-%02d-%04d",
-           tm->tm_hour, tm->tm_min, tm->tm_sec,
-           tm->tm_mday, tm->tm_mon + 1, tm->tm_year + 1900);
+  DateTime dt(u);
+  uint8_t m = dt.month();
+  if (m < 1) m = 1; if (m > 12) m = 12;
+  // Format: "14:32 · 26 Jun 2026"
+  snprintf(buf, bufLen, "%02d:%02d \xc2\xb7 %02d %s %04d",
+           dt.hour(), dt.minute(), dt.day(), kMonthShort[m], dt.year());
 }
 
 static String formatDateTimeDisplay(const DateTime& dt) {
-  char b[20];
-  snprintf(b, sizeof(b), "%02d:%02d:%02d %02d-%02d-%04d",
-           dt.hour(), dt.minute(), dt.second(), dt.day(), dt.month(), dt.year());
+  char b[24];
+  uint8_t m = dt.month();
+  if (m < 1) m = 1; if (m > 12) m = 12;
+  // Format: "14:32 · 26 Jun 2026"
+  snprintf(b, sizeof(b), "%02d:%02d \xc2\xb7 %02d %s %04d",
+           dt.hour(), dt.minute(), dt.day(), kMonthShort[m], dt.year());
   return String(b);
 }
 
@@ -458,6 +467,23 @@ static String jsonEscapeLocal(const String& in) {
   return out;
 }
 
+static String htmlEscape(const String& s) {
+  String out;
+  out.reserve(s.length());
+  for (size_t i = 0; i < s.length(); ++i) {
+    char c = s.charAt(i);
+    switch (c) {
+      case '&':  out += F("&amp;"); break;
+      case '<':  out += F("&lt;"); break;
+      case '>':  out += F("&gt;"); break;
+      case '"':  out += F("&quot;"); break;
+      case '\'': out += F("&#39;"); break;
+      default:   out += c;
+    }
+  }
+  return out;
+}
+
 static const char* nodeStateToString(int s) {
   switch (s) {
     case UNPAIRED: return "UNPAIRED";
@@ -472,17 +498,17 @@ static const char* nodeStateToString(int s) {
 // ---------------------------------------------------------------------------
 const char COMMON_CSS[] PROGMEM = R"CSS(
 :root{
-  --bg:#f1f2eb; --panel:#ffffff; --text:#4a4a48; --sub:#566246; --border:#d8dad3;
-  --primary:#566246; --success:#a4c2a5; --warn:#566246; --danger:#8b5e5e;
-  --btn-solid:#4F6D7A;
-  --input-bg:#f5f7ef;
-  --input-bg-active:#edf2e2;
+  --bg:#faf8f4; --panel:#ffffff; --text:#4a4640; --sub:#6b665e; --border:#e8e4dc;
+  --primary:#5b7553; --success:#7a9b70; --warn:#c47a5a; --danger:#c45a4a;
+  --btn-solid:#5b7553;
+  --input-bg:#f5f3ee;
+  --input-bg-active:#ede9e2;
   --radius:10px; --sp-1:8px; --sp-2:12px; --sp-3:16px; --sp-4:20px;
   --shadow:0 2px 10px rgba(74,74,72,.12);
 }
 *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
 html{scroll-behavior:smooth}
-html,body{margin:0;padding:0;background:linear-gradient(180deg,#f1f2eb 0%, #d8dad3 100%);color:var(--text);
+html,body{margin:0;padding:0;background:linear-gradient(180deg,#faf8f4 0%, #e8e4dc 100%);color:var(--text);
   font:16px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,system-ui,sans-serif}
 a{color:var(--primary);text-decoration:none}
 :focus-visible{outline:3px solid rgba(33,150,243,.35);outline-offset:2px}
@@ -511,9 +537,9 @@ a{color:var(--primary);text-decoration:none}
 .stats--kpi .stat{padding:14px}
 .stats--kpi .stat strong{font-size:12px;letter-spacing:.02em;text-transform:uppercase}
 .stats--kpi .stat .num{font-size:24px}
-.stats--kpi .stat--deployed-active{background:rgba(164,194,165,.28);border-color:#bcd1bd}
-.stats--kpi .stat--paired-active{background:rgba(225,177,122,.28);border-color:#E1B17A}
-.stats--kpi .stat--unpaired-active{background:rgba(219,22,47,.14);border-color:#DB162F}
+.stats--kpi .stat--deployed-active{background:rgba(122,155,112,.25);border-color:#7a9b70}
+.stats--kpi .stat--paired-active{background:rgba(196,122,90,.25);border-color:#c47a5a}
+.stats--kpi .stat--unpaired-active{background:rgba(196,90,74,.20);border-color:#c45a4a}
 
 /* Lists/cards */
 .list{display:grid;gap:var(--sp-1)}
@@ -556,17 +582,17 @@ a{color:var(--primary);text-decoration:none}
 
 /* Chips */
 .chip{display:inline-block;padding:2px 8px;border-radius:999px;border:1px solid var(--border);font-size:.85rem;color:var(--sub)}
-.chip--state-deployed{border-color:#bcd1bd;background:rgba(164,194,165,.28);color:#2f4f35}
-.chip--state-paired{border-color:#E1B17A;background:rgba(225,177,122,.28);color:#7a4b13}
-.chip--state-unpaired{border-color:#DB162F;background:rgba(219,22,47,.14);color:#7f1020}
+.chip--state-deployed{border-color:#7a9b70;background:rgba(122,155,112,.25);color:#3d5e35}
+.chip--state-paired{border-color:#c47a5a;background:rgba(196,122,90,.25);color:#8a4a2e}
+.chip--state-unpaired{border-color:#c45a4a;background:rgba(196,90,74,.20);color:#7a2a20}
 .chip--link-awake{border-color:#b3e5fc;background:#e1f5fe;color:#01579b}
 .chip--link-asleep{border-color:#e1bee7;background:#f3e5f5;color:#4a148c}
 .chip--link-offline{border-color:#ffcdd2;background:#ffebee;color:#b71c1c}
 .chip--cfg-pending{border-color:#ffe0b2;background:#fff8e1;color:#8a4b00}
 .chip--cfg-ok{border-color:#c8e6c9;background:#f1f8e9;color:#256029}
-.chip--bat-ok{border-color:#bcd1bd;background:rgba(164,194,165,.28);color:#2f4f35}
-.chip--bat-med{border-color:#E1B17A;background:rgba(225,177,122,.28);color:#7a4b13}
-.chip--bat-low{border-color:#DB162F;background:rgba(219,22,47,.14);color:#7f1020}
+.chip--bat-ok{border-color:#7a9b70;background:rgba(122,155,112,.25);color:#3d5e35}
+.chip--bat-med{border-color:#c47a5a;background:rgba(196,122,90,.25);color:#8a4a2e}
+.chip--bat-low{border-color:#c45a4a;background:rgba(196,90,74,.20);color:#7a2a20}
 
 /* Forms */
 .label{display:block;margin:8px 0 6px;color:var(--sub);font-size:.95rem}
@@ -593,14 +619,14 @@ a{color:var(--primary);text-decoration:none}
 .action-choices{display:grid;gap:8px;margin-top:10px}
 .action-choice input{position:absolute;opacity:0;pointer-events:none}
 .action-choice span{display:flex;align-items:center;justify-content:center;min-height:46px;padding:10px 12px;border-radius:8px;border:1px solid var(--border);font-weight:700;cursor:pointer;transition:filter .12s ease, transform .12s ease, box-shadow .12s ease}
-.action-choice--start span{border-color:#bcd1bd;background:#fff;color:#2f4f35}
-.action-choice--stop span{border-color:#E1B17A;background:#fff;color:#7a4b13}
-.action-choice--unpair span{border-color:#DB162F;background:#fff;color:#7f1020}
+.action-choice--start span{border-color:#7a9b70;background:#fff;color:#3d5e35}
+.action-choice--stop span{border-color:#c47a5a;background:#fff;color:#8a4a2e}
+.action-choice--unpair span{border-color:#c45a4a;background:#fff;color:#7a2a20}
 .action-choice span:hover{filter:brightness(.98)}
 .action-choice input:checked + span{box-shadow:0 0 0 2px rgba(79,109,122,.35) inset;transform:translateY(1px)}
-.action-choice--start input:checked + span{background:rgba(164,194,165,.28)}
-.action-choice--stop input:checked + span{background:rgba(225,177,122,.28)}
-.action-choice--unpair input:checked + span{background:rgba(219,22,47,.14)}
+.action-choice--start input:checked + span{background:rgba(122,155,112,.25)}
+.action-choice--stop input:checked + span{background:rgba(196,122,90,.25)}
+.action-choice--unpair input:checked + span{background:rgba(196,90,74,.20)}
 .icon{width:1.2em;height:1.2em;display:inline-block;vertical-align:-0.12em;fill:currentColor}
 .quick-row{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px;margin:0 0 12px}
 .quick-row .btn{margin-top:0;min-height:52px}
@@ -786,6 +812,11 @@ function setCurrentTime(){
   const s=`${z(n.getHours())}:${z(n.getMinutes())}:${z(n.getSeconds())} ${z(n.getDate())}-${z(n.getMonth()+1)}-${n.getFullYear()}`;
   const el=document.getElementById('datetime'); if(el) el.value=s;
 }
+const MONTH_SHORT=['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+function formatHubClock(ms){
+  const dt=new Date(ms);
+  return `${String(dt.getHours()).padStart(2,'0')}:${String(dt.getMinutes()).padStart(2,'0')} \u00b7 ${String(dt.getDate()).padStart(2,'0')} ${MONTH_SHORT[dt.getMonth()]} ${dt.getFullYear()}`;
+}
 function toggleSettings(){
   const panel=document.getElementById('settings-panel');
   if(!panel) return;
@@ -810,28 +841,33 @@ window.addEventListener('DOMContentLoaded', () => {
 });
 
 (function(){
-  const pad = n => String(n).padStart(2,'0');
-  function parseHMSDMY(str){
-    if (!str || str.length < 19) return NaN;
-    const H = +str.slice(0,2), M = +str.slice(3,5), S = +str.slice(6,8);
-    const d = +str.slice(9,11), m = +str.slice(12,14), y = +str.slice(15,19);
-    const dt = new Date(y, m-1, d, H, M, S);
-    return isNaN(dt) ? NaN : dt.getTime();
-  }
-  function formatHMSDMY(ms){
-    const dt = new Date(ms);
-    return `${pad(dt.getHours())}:${pad(dt.getMinutes())}:${pad(dt.getSeconds())} ` +
-           `${pad(dt.getDate())}-${pad(dt.getMonth()+1)}-${dt.getFullYear()}`;
+  function parseHubClock(str){
+    if (!str) return NaN;
+    // Accept "HH:MM · DD Mon YYYY" or legacy "HH:MM:SS DD-MM-YYYY"
+    const m = str.match(/^(\d{2}):(\d{2})(?::(\d{2}))?\s*[\u00b7\-]\s*(\d{1,2})\s+([A-Za-z]{3})\s+(\d{4})$/);
+    if (m){
+      const mon = MONTH_SHORT.indexOf(m[5]);
+      if (mon < 0) return NaN;
+      const dt = new Date(+m[6], mon, +m[4], +m[1], +m[2], m[3] ? +m[3] : 0);
+      return isNaN(dt) ? NaN : dt.getTime();
+    }
+    if (str.length >= 19){
+      const H = +str.slice(0,2), M = +str.slice(3,5), S = +str.slice(6,8);
+      const d = +str.slice(9,11), mo = +str.slice(12,14), y = +str.slice(15,19);
+      const dt = new Date(y, mo-1, d, H, M, S);
+      return isNaN(dt) ? NaN : dt.getTime();
+    }
+    return NaN;
   }
   function startClock(){
     const el = document.getElementById('rtc-now');
     if (!el) return;
     const initial = (el.textContent || '').trim();
-    const rtcMs   = parseHMSDMY(initial);
+    const rtcMs   = parseHubClock(initial);
     const offset  = isNaN(rtcMs) ? 0 : (rtcMs - Date.now());
     function draw(){
       const nowMs = Date.now() + offset;
-      el.textContent = formatHMSDMY(nowMs);
+      el.textContent = formatHubClock(nowMs);
     }
     draw();
     setInterval(draw, 1000);
@@ -1080,17 +1116,17 @@ static String buildDataStatusSectionHtml() {
            "<div class='stat'><strong>CSV size</strong><span class='num' style='font-size:16px'>");
   out += hasFile ? formatBytesUi(fileBytes) : String("n/a");
   out += F("</span></div>"
-           "<div class='stat'><strong>Flash free</strong><span class='num' style='font-size:16px'>");
+           "<div class='stat'><strong>Storage free</strong><span class='num' style='font-size:16px'>");
   out += (totalBytes > 0) ? formatBytesUi(freeBytes) : String("n/a");
   out += F("</span></div></div>");
 
   if (!hasFile) {
-    out += F("<p class='muted'>No datalog.csv file yet.</p>");
+    out += F("<p class='muted'>No data recorded yet.</p>");
   }
 
   if (totalBytes > 0) {
     const uint32_t usedPct = (uint32_t)((usedBytes * 100ULL) / totalBytes);
-    out += F("<p class='muted'><strong>Flash usage:</strong> ");
+    out += F("<p class='muted'><strong>Storage used:</strong> ");
     out += String(usedPct);
     out += F("% used (");
     out += formatBytesUi(usedBytes);
@@ -1099,7 +1135,7 @@ static String buildDataStatusSectionHtml() {
     out += F(")</p>");
   }
 
-  out += F("<p class='muted'><strong>Last confirmed sync:</strong> ");
+  out += F("<p class='muted'><strong>Last collection:</strong> ");
   out += lastConfirmedSync;
   out += F("</p>");
 
@@ -1113,11 +1149,11 @@ static String buildDataStatusSectionHtml() {
     cursor = gUploadQueue.getCursor();
     pendingRows = gUploadQueue.getPendingRows();
   }
-  out += F("<p class='muted'><strong>LTE upload:</strong> ");
+  out += F("<p class='muted'><strong>Cloud upload:</strong> ");
   out += txSettings.enabled ? String("enabled") : String("disabled");
-  out += F(" &nbsp;|&nbsp; <strong>Pending rows:</strong> ");
+  out += F(" &nbsp;|&nbsp; <strong>Readings waiting:</strong> ");
   out += String(pendingRows);
-  out += F(" &nbsp;|&nbsp; <strong>Rows uploaded:</strong> ");
+  out += F(" &nbsp;|&nbsp; <strong>Readings sent:</strong> ");
   out += String(cursor.rowsUploaded);
   if (cursor.lastUploadUnix > 0) {
     DateTime lastUp(cursor.lastUploadUnix);
@@ -1126,7 +1162,7 @@ static String buildDataStatusSectionHtml() {
   }
   out += F("</p>");
 
-  out += F("<p class='muted'>Use the CSV button at the top to export data, or <a href='/upload'>LTE Upload</a> to configure transmission.</p></div>");
+  out += F("<p class='muted'>Use the Export Data page to download a CSV, or <a href='/settings'>Settings</a> to configure cloud upload.</p></div>");
   return out;
 }
 
@@ -1134,7 +1170,7 @@ static String buildDataStatusSectionHtml() {
 // Route handlers
 // ---------------------------------------------------------------------------
 static void handleRoot() {
-  String html = headCommon("ESP32 Data Logger");
+  String html = headCommon("fieldMesh");
 
   char currentTime[24];
   getRTCTimeString(currentTime, sizeof(currentTime));
@@ -1148,80 +1184,16 @@ static void handleRoot() {
     if (node.state == DEPLOYED) deployedNodes++;
   }
 
-  html += F("<div class='top-time'><span class='top-time__label'>Mothership time</span><span id='rtc-now' class='top-time__value'>");
+  // --- Hub time bar ---
+  html += F("<div class='top-time'><span class='top-time__label'>Hub time</span><span id='rtc-now' class='top-time__value'>");
   html += currentTime;
   html += F("</span></div>");
 
-  html += F("<div class='quick-row'>"
-            "<form class='async-form' action='/discover-nodes' method='POST'>"
-            "<button type='submit' class='btn btn--primary'><svg class='icon' viewBox='0 0 24 24' aria-hidden='true'><path d='M12 3c-3.9 0-7.4 1.6-9.9 4.1l1.4 1.4C5.6 6.4 8.7 5 12 5s6.4 1.4 8.5 3.5l1.4-1.4C19.4 4.6 15.9 3 12 3zm0 5c-2.6 0-5 .9-6.9 2.6l1.4 1.4C8 10.5 9.9 10 12 10s4 .5 5.5 2l1.4-1.4C17 8.9 14.6 8 12 8zm0 5c-1.3 0-2.5.5-3.5 1.5l1.4 1.4c.6-.6 1.3-.9 2.1-.9s1.5.3 2.1.9l1.4-1.4c-1-1-2.2-1.5-3.5-1.5zm0 4a2 2 0 100 4 2 2 0 000-4z'/></svg> Discover Nodes</button>"
-            "</form>"
-            "<button class='btn' type='button' onclick='toggleInfoPanel()'><svg class='icon' viewBox='0 0 24 24' aria-hidden='true'><path d='M12 2a10 10 0 1010 10A10 10 0 0012 2zm0 4a1.25 1.25 0 11-1.25 1.25A1.25 1.25 0 0112 6zm2 12h-4v-1.8h1.1v-4.2H10v-1.8h3v6h1z'/></svg> INFO</button>"
-            "<a href='/download-csv' class='btn btn--success'><svg class='icon' viewBox='0 0 24 24' aria-hidden='true'><path d='M12 3a1 1 0 011 1v8.59l2.3-2.3 1.4 1.42-4.7 4.7-4.7-4.7 1.4-1.42 2.3 2.3V4a1 1 0 011-1zm-7 14h14v2H5v-2z'/></svg> CSV</a>"
-            "<a href='/upload' class='btn'><svg class='icon' viewBox='0 0 24 24' aria-hidden='true'><path d='M12 2a10 10 0 100 20 10 10 0 000-20zm-1 14l-4-4 1.4-1.4L11 13.2V7h2v6.2l2.6-2.6L17 12l-4 4z'/></svg> LTE Upload</a>"
-            "<form class='async-form' action='/shutdown' method='POST' style='display:inline-block'>"
-            "<button type='submit' class='btn btn--primary'><svg class='icon' viewBox='0 0 24 24' aria-hidden='true'><path d='M12 4V1L8 5l4 4V6c3.31 0 6 2.69 6 6 0 1.01-.25 1.97-.7 2.8l1.46 1.46C19.54 15.03 20 13.57 20 12c0-4.42-3.58-8-8-8zm0 14c-3.31 0-6-2.69-6-6 0-1.01.25-1.97.7-2.8L5.24 7.74C4.46 8.97 4 10.43 4 12c0 4.42 3.58 8 8 8v3l4-4-4-4v3z'/></svg> Sync &amp; Power Down</button>"
-            "</form>"
-            "<div id='info-panel' class='subpanel'>"
-            "<h3><svg class='icon' viewBox='0 0 24 24' aria-hidden='true'><path d='M12 2a10 10 0 1010 10A10 10 0 0012 2zm0 4a1.25 1.25 0 11-1.25 1.25A1.25 1.25 0 0112 6zm2 12h-4v-1.8h1.1v-4.2H10v-1.8h3v6h1z'/></svg> INFO</h3>"
-            "<div class='help'><strong>Device ID:</strong> ");
-  html += DEVICE_ID;
-  html += F("<br><strong>Firmware:</strong> ");
-  html += FW_VERSION;
-  html += F("<br><strong>Build:</strong> ");
-  html += FW_BUILD;
-  html += F("</div>"
-            "<div class='help'><strong>SSID:</strong> ");
-  html += ssid;
-  html += F("<br><strong>URL:</strong> http://192.168.4.1/"
-            "<br><strong>IP:</strong> 192.168.4.1"
-            "<br><strong>MAC:</strong> ");
-  html += getMothershipsMAC();
-  html += F("</div>"
-            "</div>"
-            "</div>");
-
-  html += F("<div class='section' aria-live='polite'>"
-            "<div id='ui-status' class='help' style='display:none;margin-bottom:10px;border:1px solid var(--border);border-radius:8px;padding:8px 10px'></div>");
-
-  html += F("<div class='stats stats--kpi' style='margin:0 0 12px 0'>"
-              "<div class='stat");
-  if (deployedNodes > 0) html += F(" stat--deployed-active");
-  html += F("'><strong>Deployed</strong><span id='kpi-deployed-num' class='num'>");
-  html += String(deployedNodes);
-  html += F("</span></div>"
-              "<div class='stat");
-  if (pairedNodes.size() > 0) html += F(" stat--paired-active");
-  html += F("'><strong>Paired</strong><span id='kpi-paired-num' class='num'>");
-  html += String(pairedNodes.size());
-  html += F("</span></div>"
-              "<div class='stat");
-  if (unpairedNodes.size() > 0) html += F(" stat--unpaired-active");
-  html += F("'><strong>Unpaired</strong><span id='kpi-unpaired-num' class='num'>");
-  html += String(unpairedNodes.size());
-  html += F("</span></div>"
-            "</div>");
-
-  html += F("<div class='row'>");
-  html += F("<div class='col action-stack'>"
-            "<a href='/nodes' class='btn btn--success' style='margin-top:8px'><svg class='icon' viewBox='0 0 24 24' aria-hidden='true'><path d='M12 2a4 4 0 110 8 4 4 0 010-8zm-7 12a3 3 0 110 6 3 3 0 010-6zm14 0a3 3 0 110 6 3 3 0 010-6zM9.3 9.8l-3 3.9 1.6 1.2 3-3.9-1.6-1.2zm5.4 0l-1.6 1.2 3 3.9 1.6-1.2-3-3.9z'/></svg> Node manager</a>"
-            "</div>");
-  html += F("</div>");
-  html += F("</div>");
-
-  String activeSyncPlan =
-    (gSyncMode == SYNC_MODE_INTERVAL)
-      ? (String("Every ") + String(gSyncIntervalMin) + String(" min"))
-      : (String("Daily @ ") + formatSyncTimeHHMM(gSyncDailyHour, gSyncDailyMinute));
-
-  html += F("<div class='section'>"
-            "<div class='section-head'>"
-            "<h3><svg class='icon' viewBox='0 0 24 24' aria-hidden='true'><circle cx='12' cy='12' r='9' fill='none' stroke='currentColor' stroke-width='2'/><path d='M12 7v5l3 2' fill='none' stroke='currentColor' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'/></svg> Global schedules</h3>"
-            "<button id='settings-btn' class='btn btn--sm' type='button' onclick='toggleSettings()'>SET TIME</button>"
-            "</div>"
-            "<div id='settings-panel' class='subpanel' style='margin-top:0;margin-bottom:12px'>"
-            "<h3>⚙️ SET TIME</h3>"
-            "<p class='muted'>Only needed for initial setup or DS3231 correction.</p>"
+  // --- Set time (collapsed, near the time display) ---
+  html += F("<details style='margin:4px 0 12px 0'>"
+            "<summary style='font-size:14px;color:var(--sub);cursor:pointer;padding:4px 8px'>Set time</summary>"
+            "<div style='margin-top:8px;padding:12px;border:1px solid var(--border);border-radius:8px;background:var(--panel)'>"
+            "<p class='muted' style='margin:0 0 8px 0'>Only needed for initial setup or clock correction.</p>"
             "<form action='/set-time' method='POST'>"
             "<label class='label' for='datetime'><strong>Set new time</strong></label>"
             "<input class='input' id='datetime' name='datetime' type='text' "
@@ -1233,72 +1205,189 @@ static void handleRoot() {
             "<div class='help'>Example: 21:05:00 14-11-2026</div>"
             "</form>"
             "</div>"
-            "<div class='stats' style='margin:0 0 12px 0'>"
-            "<div class='stat'><strong>Node wake</strong><span class='num' style='font-size:16px'>");
-  if (gWakeIntervalMin > 0) {
-    html += String(gWakeIntervalMin);
-    html += F(" min");
-  } else {
-    html += F("Off");
-  }
-  html += F("</span></div>"
-            "<div class='stat'><strong>Auto sync</strong><span class='num' style='font-size:16px'><span id='kpi-active-sync'>");
-  html += activeSyncPlan;
-  html += F("</span></span></div>"
-            "<div class='stat'><strong>Next sync</strong><span class='num' style='font-size:16px'><span id='kpi-next-sync'>");
-  html += computeNextSyncIsoLocal();
-  html += F("</span></span></div>"
-            "</div>"
-            "<div class='row'>"
-            "<div class='col'>"
-              "<button id='global-interval-btn' class='btn btn--warn btn--action' type='button' onclick='toggleGlobalInterval()' style='margin-top:10px'>"
-              "<svg class='icon' viewBox='0 0 24 24' aria-hidden='true'><path d='M12 4V1L8 5l4 4V6c3.3 0 6 2.7 6 6 0 1-.2 1.9-.7 2.7l1.5 1.3A8 8 0 0020 12c0-4.4-3.6-8-8-8zm-6.8.3A8 8 0 004 12c0 4.4 3.6 8 8 8v3l4-4-4-4v3c-3.3 0-6-2.7-6-6 0-1 .2-2 .7-2.8z'/></svg> Node interval"
-              "</button>"
-              "<div id='global-interval-panel' style='display:none;margin-top:10px;padding:10px;border:1px solid var(--border);border-radius:8px;background:#fafafa'>"
-              "<form class='async-form' action='/set-wake-interval' method='POST'>"
-              "<label class='label'><strong>Global interval trigger</strong></label>"
-              "<select class='input' name='interval'>");
+            "</details>");
 
-  html += F("<option value='0'");
-  if (gWakeIntervalMin <= 0) html += F(" selected");
-  html += F(">Off</option>");
-
-  for (size_t i = 0; i < kAllowedCount; ++i) {
-    int v = kAllowedIntervals[i];
-    html += F("<option value='");
-    html += String(v);
-    html += F("'");
-    if (v == gWakeIntervalMin) html += F(" selected");
-    html += F(">");
-    html += String(v);
-    html += F("</option>");
-  }
-
-  html += F("</select>"
-            "<button type='submit' class='btn btn--primary' style='margin-top:8px'>"
-            "Apply global interval</button>"
+  // --- Quick actions: Find New Stations + Manage Stations ---
+  html += F("<div class='section action-stack' style='margin:0 0 12px 0'>"
+            "<form class='async-form' action='/find-stations' method='POST' style='margin:0'>"
+            "<button type='submit' class='btn btn--primary' style='width:100%'><svg class='icon' viewBox='0 0 24 24' aria-hidden='true'><path d='M12 3c-3.9 0-7.4 1.6-9.9 4.1l1.4 1.4C5.6 6.4 8.7 5 12 5s6.4 1.4 8.5 3.5l1.4-1.4C19.4 4.6 15.9 3 12 3zm0 5c-2.6 0-5 .9-6.9 2.6l1.4 1.4C8 10.5 9.9 10 12 10s4 .5 5.5 2l1.4-1.4C17 8.9 14.6 8 12 8zm0 5c-1.3 0-2.5.5-3.5 1.5l1.4 1.4c.6-.6 1.3-.9 2.1-.9s1.5.3 2.1.9l1.4-1.4c-1-1-2.2-1.5-3.5-1.5zm0 4a2 2 0 100 4 2 2 0 000-4z'/></svg> Find New Stations</button>"
             "</form>"
+            "<a href='/stations' class='btn btn--success'><svg class='icon' viewBox='0 0 24 24' aria-hidden='true'><path d='M12 2a4 4 0 110 8 4 4 0 010-8zm-7 12a3 3 0 110 6 3 3 0 010-6zm14 0a3 3 0 110 6 3 3 0 010-6zM9.3 9.8l-3 3.9 1.6 1.2 3-3.9-1.6-1.2zm5.4 0l-1.6 1.2 3 3.9 1.6-1.2-3-3.9z'/></svg> Manage Stations</a>"
             "</div>");
 
-  html += F("<div class='col'>");
-  html += F("<div style='margin-top:10px;padding:10px;border:1px solid var(--border);border-radius:8px;background:#fafafa'>"
-            "<div style='font-size:13px;color:#555;margin-bottom:4px'><strong>Auto-sync</strong></div>");
-  if (gWakeIntervalMin > 0) {
-    html += F("<div style='font-size:13px'>Sync every <strong>");
-    html += String(gSyncIntervalMin);
-    html += F(" min</strong> &nbsp;<span style='font-size:12px;color:#888'>"
-              "(auto: wake &times; ");
-    html += String(kSyncFillK);
-    html += F(" &mdash; ~75% queue fill, 4+ wakes headroom)</span></div>");
-  } else {
-    html += F("<div style='font-size:13px;color:#888'>Set a wake interval to enable auto-sync.</div>");
+  // --- Status cards row: Hub battery + Storage ---
+  {
+    const uint64_t fsTotal = (uint64_t)LittleFS.totalBytes();
+    const uint64_t fsUsed  = (uint64_t)LittleFS.usedBytes();
+    const uint32_t storagePct = (fsTotal > 0) ? (uint32_t)((fsUsed * 100ULL) / fsTotal) : 0;
+    const float hubBatV = readBatteryVoltage();
+    const char* batClass = (hubBatV >= 3.9f) ? "chip--bat-ok"
+                         : (hubBatV >= 3.5f) ? "chip--bat-med"
+                         : "chip--bat-low";
+    const char* batLabel = (hubBatV >= 3.9f) ? "OK"
+                         : (hubBatV >= 3.5f) ? "Medium"
+                         : "Low";
+    char batBuf[10];
+    snprintf(batBuf, sizeof(batBuf), "%.2fV", hubBatV);
+
+    html += F("<div class='stats' style='margin:0 0 12px 0;text-align:left'>");
+    html += F("<div class='stat' style='text-align:left'>"
+              "<strong>Hub battery</strong><br>");
+    html += F("<span class='chip ");
+    html += batClass;
+    html += F("' style='font-size:16px;font-weight:600'>");
+    html += batBuf;
+    html += F("</span> <span class='muted'>");
+    html += batLabel;
+    html += F("</span></div>");
+    html += F("<div class='stat' style='text-align:left'>"
+              "<strong>Storage</strong><br><span class='num' style='font-size:18px'>");
+    html += String(storagePct);
+    html += F("% used</span><br><span class='muted'>");
+    html += (fsTotal > 0) ? formatBytesUi(fsUsed) : String("n/a");
+    html += F("</span></div>");
+    // Third card: last upload time
+    html += F("<div class='stat' style='text-align:left'>"
+              "<strong>Last upload</strong><br><span class='num' style='font-size:14px'>");
+    {
+      UploadCursor cursor = {0,0,0,0,0};
+      if (flashIsReady()) { gUploadQueue.init(); cursor = gUploadQueue.getCursor(); }
+      if (cursor.lastUploadUnix > 0) {
+        DateTime lastUp(cursor.lastUploadUnix);
+        html += formatDateTimeDisplay(lastUp);
+      } else {
+        html += F("Never");
+      }
+    }
+    html += F("</span></div>");
+    html += F("</div>");
   }
+
+  // --- Station KPI tiles ---
+  html += F("<div class='section' aria-live='polite'>"
+            "<div id='ui-status' class='help' style='display:none;margin-bottom:10px;border:1px solid var(--border);border-radius:8px;padding:8px 10px'></div>"
+            "<h3>Stations</h3>"
+            "<div class='stats stats--kpi' style='margin:0 0 12px 0'>"
+              "<div class='stat");
+  if (deployedNodes > 0) html += F(" stat--deployed-active");
+  html += F("'><strong>Active</strong><span id='kpi-deployed-num' class='num'>");
+  html += String(deployedNodes);
+  html += F("</span></div>"
+              "<div class='stat");
+  if (pairedNodes.size() > 0) html += F(" stat--paired-active");
+  html += F("'><strong>Connected</strong><span id='kpi-paired-num' class='num'>");
+  html += String(pairedNodes.size());
+  html += F("</span></div>"
+              "<div class='stat");
+  if (unpairedNodes.size() > 0) html += F(" stat--unpaired-active");
+  html += F("'><strong>New</strong><span id='kpi-unpaired-num' class='num'>");
+  html += String(unpairedNodes.size());
+  html += F("</span></div>"
+            "</div>");
   html += F("</div>");
+
+  // --- Collection schedule ---
+  {
+    html += F("<div class='section'>"
+              "<h3>Collection schedule</h3>"
+              "<div class='stats' style='margin:0 0 12px 0'>"
+              "<div class='stat'><strong>Recording every</strong><span class='num' style='font-size:16px'>");
+    if (gWakeIntervalMin > 0) {
+      html += String(gWakeIntervalMin);
+      html += F(" min");
+    } else {
+      html += F("Off");
+    }
+    html += F("</span></div>"
+              "<div class='stat'><strong>Auto upload</strong><span class='num' style='font-size:16px'>");
+    html += String(gSyncIntervalMin);
+    html += F(" min</span></div>"
+              "<div class='stat'><strong>Next upload</strong><span class='num' style='font-size:16px'><span id='kpi-next-sync'>");
+    html += computeNextSyncIsoLocal();
+    html += F("</span></span></div>"
+              "</div>"
+              "</div>");
+  }
+
+  // --- Cloud upload status ---
+  {
+    TransmissionSettings txSettings;
+    loadTransmissionSettings(txSettings);
+    UploadCursor cursor = {0, 0, 0, 0, 0};
+    if (flashIsReady()) {
+      gUploadQueue.init();
+      cursor = gUploadQueue.getCursor();
+    }
+
+    const char* dotColour = "#6b7280";
+    const char* statusLabel = "Upload off";
+    if (txSettings.enabled) {
+      if (cursor.retryCount > 0) {
+        dotColour = "#c47a5a";
+        statusLabel = "Last upload failed";
+      } else {
+        dotColour = "#7a9b70";
+        statusLabel = "Connected";
+      }
+    }
+
+    html += F("<div class='section'>"
+              "<h3>Cloud upload</h3>"
+              "<p style='margin:4px 0'><span style='display:inline-block;width:12px;height:12px;border-radius:50%;background:");
+    html += dotColour;
+    html += F(";margin-right:8px;vertical-align:middle'></span><strong>");
+    html += statusLabel;
+    html += F("</strong></p>");
+    if (cursor.lastUploadUnix > 0) {
+      DateTime lastUp(cursor.lastUploadUnix);
+      html += F("<p class='muted'>Last upload ");
+      html += formatDateTimeDisplay(lastUp);
+      html += F(" &middot; ");
+      html += String(cursor.rowsUploaded);
+      html += F(" readings sent</p>");
+    } else {
+      html += F("<p class='muted'>No uploads yet &middot; ");
+      html += String(cursor.rowsUploaded);
+      html += F(" readings sent</p>");
+    }
+    html += F("</div>");
+  }
+
+  // --- Navigation buttons ---
+  html += F("<div class='section action-stack'>"
+            "<a href='/settings' class='btn'><svg class='icon' viewBox='0 0 24 24' aria-hidden='true'><path d='M19.14 12.94c.04-.3.06-.61.06-.94 0-.32-.02-.64-.07-.94l2.03-1.58a.49.49 0 00.12-.61l-1.92-3.32a.488.488 0 00-.59-.22l-2.39.96c-.5-.38-1.03-.7-1.62-.94l-.36-2.54a.484.484 0 00-.48-.41h-3.84a.485.485 0 00-.48.41l-.36 2.54c-.59.24-1.13.57-1.62.94l-2.39-.96c-.22-.08-.47 0-.59.22L2.74 8.87c-.12.21-.08.47.12.61l2.03 1.58c-.05.3-.09.63-.09.94s.02.64.07.94l-2.03 1.58a.49.49 0 00-.12.61l1.92 3.32c.12.22.37.29.59.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.05.24.24.41.48.41h3.84c.24 0 .44-.17.47-.41l.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.22.08.47 0 .59-.22l1.92-3.32c.12-.22.07-.47-.12-.61l-2.01-1.58zM12 15.6c-1.98 0-3.6-1.62-3.6-3.6s1.62-3.6 3.6-3.6 3.6 1.62 3.6 3.6-1.62 3.6-3.6 3.6z'/></svg> Settings</a>"
+            "<a href='/export' class='btn'><svg class='icon' viewBox='0 0 24 24' aria-hidden='true'><path d='M12 3a1 1 0 011 1v8.59l2.3-2.3 1.4 1.42-4.7 4.7-4.7-4.7 1.4-1.42 2.3 2.3V4a1 1 0 011-1zm-7 14h14v2H5v-2z'/></svg> Export Data</a>"
+            "</div>");
+  html += F("<div style='margin:16px 0'>"
+            "<form class='async-form' action='/start' method='POST'>"
+            "<button type='submit' class='btn btn--primary' style='width:100%;min-height:56px;font-size:18px;font-weight:700'>"
+            "▶ Finish &amp; Start Recording"
+            "</button>"
+            "</form>"
+            "</div>"
+            "<p class='muted' style='text-align:center;margin-top:6px'>Saves settings, closes the setup network, and begins recording</p>");
+
+  // --- About / Advanced collapsed panel ---
+  html += F("<details style='margin:16px 0'>"
+            "<summary style='font-weight:bold;cursor:pointer;padding:10px;border:1px solid var(--border);border-radius:8px;background:var(--panel)'>About / Advanced</summary>"
+            "<div class='section' style='margin-top:8px'>"
+            "<div class='help'><strong>Device ID:</strong> ");
+  html += DEVICE_ID;
+  html += F("<br><strong>Firmware:</strong> ");
+  html += FW_VERSION;
+  html += F("<br><strong>Build:</strong> ");
+  html += FW_BUILD;
+  html += F("</div>"
+            "<div class='help'><strong>WiFi network:</strong> ");
+  html += ssid;
+  html += F("<br><strong>Portal URL:</strong> http://192.168.4.1/"
+            "<br><strong>Hub address:</strong> ");
+  html += getMothershipsMAC();
+  html += F("<br><strong>Radio channel:</strong> ");
+  html += String(ESPNOW_CHANNEL);
   html += F("</div>"
             "</div>"
-            "</div>");
-
-  html += buildDataStatusSectionHtml();
+            "</details>");
 
   html += footCommon();
   server.send(200, "text/html", html);
@@ -1309,21 +1398,21 @@ static void handleSetTime() {
   int year, mm, dd, hh, mi, ss;
   if (sscanf(dt.c_str(), "%d:%d:%d %d-%d-%d", &hh, &mi, &ss, &dd, &mm, &year) == 6 && year >= 2000) {
     if (setRTCTime(year, mm, dd, hh, mi, ss)) {
-      String html = headCommon("ESP32 Data Logger");
+      String html = headCommon("fieldMesh");
       html += F("<div class='section center'><h3>SUCCESS: RTC Time Updated</h3><p>New time:<br><strong>");
       html += dt;
       html += F("</strong></p><a href='/' class='btn btn--primary'>Back to Main Page</a></div>");
       html += footCommon();
       server.send(200, "text/html", html);
     } else {
-      String html = headCommon("ESP32 Data Logger");
+      String html = headCommon("fieldMesh");
       html += F("<div class='section center'><h3>ERROR: Failed to Set RTC Time</h3><p>Please try again.</p>"
                 "<a href='/' class='btn btn--primary'>Try Again</a></div>");
       html += footCommon();
       server.send(500, "text/html", html);
     }
   } else {
-    String html = headCommon("ESP32 Data Logger");
+    String html = headCommon("fieldMesh");
     html += F("<div class='section center'><h3>WARNING: Invalid Time Format</h3>"
               "<p>Please use the format: HH:MM:SS DD-MM-YYYY</p><p>You entered: <em>");
     html += dt;
@@ -1361,18 +1450,18 @@ static void handleDiscoverNodes() {
   }
 
   if (isAjaxRequest()) {
-    sendAjaxResult(sentAny, sentAny ? "Discovery scan sent (3 bursts). Refreshing list..." : "Discovery scan failed");
+    sendAjaxResult(sentAny, sentAny ? "Scanning for new stations... Refreshing list." : "Scan failed");
     return;
   }
 
-  String html = headCommon("ESP32 Data Logger");
-  html += F("<meta http-equiv='refresh' content='3;url=/'>");
-  html += F("<div class='section center'><h3>🔍 Discovery Broadcast Sent</h3>"
-            "<div class='muted'>Searching for new sensor nodes...</div>"
+  String html = headCommon("fieldMesh");
+  html += F("<meta http-equiv='refresh' content='3;url=/stations'>");
+  html += F("<div class='section center'><h3>Searching for new stations...</h3>"
+            "<div class='muted'>Scanning for stations in pairing mode.</div>"
             "<div style='margin:16px auto;width:40px;height:40px;border-radius:50%;"
             "border:4px solid #eee;border-top-color:#2196F3;animation:spin 1s linear infinite'></div>"
             "<style>@keyframes spin{0%{transform:rotate(0)}100%{transform:rotate(360deg)}}</style>"
-            "<p class='muted'><small>Redirecting back to dashboard in 3 seconds…</small></p></div>");
+            "<p class='muted'><small>Redirecting to Stations in 3 seconds…</small></p></div>");
   html += footCommon();
   server.send(200, "text/html", html);
 }
@@ -1406,23 +1495,23 @@ static void handleSetWakeInterval() {
 
   if (isAjaxRequest()) {
     if (interval > 0) {
-      sendAjaxResult(true, sent ? "Global interval applied to fleet" : "No eligible paired/deployed nodes");
+      sendAjaxResult(true, sent ? "Recording interval applied to all stations" : "No connected or active stations");
     } else {
-      sendAjaxResult(true, "Global interval trigger is OFF");
+      sendAjaxResult(true, "Recording interval is OFF");
     }
     return;
   }
 
   String html = F("<!doctype html><meta name='viewport' content='width=device-width,initial-scale=1'>"
                   "<body style='font-family:sans-serif;padding:20px;text-align:center'>"
-                  "<h3>⏰ Global Wake Interval</h3><p>Selected: ");
+                  "<h3>Recording Interval</h3><p>Selected: ");
   if (interval > 0) {
     html += String(interval);
     html += F(" min.</p><p style='color:#666'>");
-    html += sent ? F("Broadcast applied to eligible nodes.") : F("No eligible paired/deployed nodes.");
+    html += sent ? F("Applied to all connected and active stations.") : F("No connected or active stations.");
     html += F("</p>");
   } else {
-    html += F("OFF.</p><p style='color:#666'>Global interval trigger disabled.</p>");
+    html += F("OFF.</p><p style='color:#666'>Recording interval disabled.</p>");
   }
   html += F("<a href='/' style='display:inline-block;padding:10px 16px;"
             "background:#2196F3;color:#fff;text-decoration:none;border-radius:6px'>Back</a></body>");
@@ -1430,7 +1519,25 @@ static void handleSetWakeInterval() {
 }
 
 static void handleSetSyncMode() {
+  // The Settings page upload-interval form sends preset="mode:value" (e.g.
+  // "interval:18" or "daily:0"). Parse it first; fall back to plain "mode".
+  String preset = server.arg("preset");
   String mode = server.arg("mode");
+  if (preset.length() > 0) {
+    int colonIdx = preset.indexOf(':');
+    if (colonIdx > 0) {
+      String presetMode = preset.substring(0, colonIdx);
+      String presetVal  = preset.substring(colonIdx + 1);
+      if (presetMode == "daily") {
+        gSyncMode = SYNC_MODE_DAILY;
+      } else {
+        gSyncMode = SYNC_MODE_INTERVAL;
+        int minVal = presetVal.toInt();
+        if (minVal > 0) gSyncIntervalMin = minVal;
+      }
+      mode = (gSyncMode == SYNC_MODE_INTERVAL) ? "interval" : "daily";
+    }
+  }
   int newMode = (mode == "interval") ? SYNC_MODE_INTERVAL : SYNC_MODE_DAILY;
   gSyncMode = newMode;
   saveSyncModeToNVS(gSyncMode);
@@ -1455,15 +1562,15 @@ static void handleSetSyncMode() {
   Serial.printf("[UI] Sync mode set to %s\n", syncModeLabel());
 
   if (isAjaxRequest()) {
-    sendAjaxResult(true, String("Sync mode set to ") + syncModeLabel());
+    sendAjaxResult(true, String("Upload schedule set to ") + syncModeLabel());
     return;
   }
 
   String html = F("<!doctype html><meta name='viewport' content='width=device-width,initial-scale=1'>"
                   "<body style='font-family:sans-serif;padding:20px;text-align:center'>"
-                  "<h3>📶 Sync Mode Updated</h3><p>Mode: ");
+                  "<h3>Upload Schedule Updated</h3><p>Mode: ");
   html += syncModeLabel();
-  html += F("</p><p style='color:#666'>Next sync: ");
+  html += F("</p><p style='color:#666'>Next collection: ");
   html += computeNextSyncIsoLocal();
   html += F("</p><a href='/' style='display:inline-block;padding:10px 16px;"
             "background:#2196F3;color:#fff;text-decoration:none;border-radius:6px'>Back</a></body>");
@@ -1481,7 +1588,7 @@ static void handleSetSyncTime() {
     }
     String html = F("<!doctype html><meta name='viewport' content='width=device-width,initial-scale=1'>"
                     "<body style='font-family:sans-serif;padding:20px;text-align:center'>"
-                    "<h3>⚠️ Invalid sync time</h3><p>Please provide HH:MM (24h).</p>"
+                    "<h3>⚠️ Invalid upload time</h3><p>Please provide HH:MM (24h).</p>"
                     "<a href='/' style='display:inline-block;padding:10px 16px;"
                     "background:#2196F3;color:#fff;text-decoration:none;border-radius:6px'>Back</a></body>");
     server.send(400, "text/html", html);
@@ -1513,15 +1620,15 @@ static void handleSetSyncTime() {
   Serial.printf("[UI] Daily sync time set to %02d:%02d\n", gSyncDailyHour, gSyncDailyMinute);
 
   if (isAjaxRequest()) {
-    sendAjaxResult(true, String("Daily sync time set to ") + formatSyncTimeHHMM(gSyncDailyHour, gSyncDailyMinute));
+    sendAjaxResult(true, String("Daily upload time set to ") + formatSyncTimeHHMM(gSyncDailyHour, gSyncDailyMinute));
     return;
   }
 
   String html = F("<!doctype html><meta name='viewport' content='width=device-width,initial-scale=1'>"
                   "<body style='font-family:sans-serif;padding:20px;text-align:center'>"
-                  "<h3>📶 Daily Sync Time Updated</h3><p>New daily sync time: ");
+                  "<h3>Daily Upload Time Updated</h3><p>New daily upload time: ");
   html += formatSyncTimeHHMM(gSyncDailyHour, gSyncDailyMinute);
-  html += F("</p><p style='color:#666'>Next sync: ");
+  html += F("</p><p style='color:#666'>Next collection: ");
   html += computeNextSyncIsoLocal();
   html += F("</p><a href='/' style='display:inline-block;padding:10px 16px;"
             "background:#2196F3;color:#fff;text-decoration:none;border-radius:6px'>Back</a></body>");
@@ -1544,37 +1651,35 @@ static void handleRevertNode() {
     }
   }
 
-  String html = headCommon("ESP32 Data Logger");
+  String html = headCommon("fieldMesh");
   html += F("<div class='section center'>");
   if (found) {
-    html += F("<h3>Node reverted to paired state</h3><p>Node <strong>");
+    html += F("<h3>Station stopped</h3><p>Station <strong>");
     html += nodeId;
-    html += F("</strong> is now marked as paired.</p>");
+    html += F("</strong> is now connected but not active.</p>");
     if (!sentCmd) {
-      html += F("<p class='muted'>Warning: could not send PAIR_NODE command to the node.</p>");
+      html += F("<p class='muted'>Warning: could not send stop command to the station.</p>");
     }
   } else {
-    html += F("<h3>Node not found or not deployed</h3><p>No action taken.</p>");
+    html += F("<h3>Station not found or not active</h3><p>No action taken.</p>");
   }
-  html += F("<a href='/nodes' class='btn btn--primary'>Back to Node manager</a></div>");
+  html += F("<a href='/stations' class='btn btn--primary'>Back to Stations</a></div>");
   html += footCommon();
   server.send(200, "text/html", html);
 }
 
-static void handleNodesPage() {
-  String html = headCommon("Node manager",
-    "<a href='/' class='btn btn--sm'>Back</a><a href='/nodes' class='btn btn--sm'>Refresh</a>");
+static void handleStationsPage() {
+  String html = headCommon("Stations",
+    "<a href='/' class='btn btn--sm'>Back</a><a href='/stations' class='btn btn--sm'>Refresh</a>");
   auto allNodes = getRegisteredNodes();
 
+  html += F("<div id='ui-status' class='help' style='display:none;margin-bottom:10px;border:1px solid var(--border);border-radius:8px;padding:8px 10px'></div>");
   html += F("<div class='section'>");
+  html += F("<h3>Stations</h3>");
 
   if (allNodes.empty()) {
-    html += F("<p class='muted'>No nodes registered yet. Try discovering and pairing first.</p>");
+    html += F("<p class='muted'>No stations yet. Tap “Add New Station” below to get started.</p>");
   } else {
-    html += F("<p class='muted' style='margin:0 0 10px 0'>"
-          "Interval shows the configured target for each node. "
-          "Next wake uses last node contact cadence (est while asleep)."
-          "</p>");
     html += F("<div class='list'>");
 
     for (auto& node : allNodes) {
@@ -1591,46 +1696,30 @@ static void handleNodesPage() {
         : ((isAllowedInterval(gWakeIntervalMin) && gWakeIntervalMin > 0)
             ? gWakeIntervalMin
             : ((observedWakeMin > 0) ? (int)observedWakeMin : 5));
-      const String nextWake = computeNextWakeIsoLocal(nodeIntervalCurrentMin, node.lastSeen, node.isActive);
-      const String nextWakeTime = (nextWake.length() >= 8) ? nextWake.substring(0, 8) : String("n/a");
 
-      String displayId = userId.length() ? userId : node.nodeId;
+      String displayId = name.length() ? name : (userId.length() ? userId : node.nodeId);
 
-      html += F("<a href='/node-config?node_id=");
+      html += F("<a href='/station?id=");
       html += node.nodeId;
       html += F("' class='item item--node'>"
                 "<div class='node-row'>"
                 "<div class='node-main'>"
                 "<strong>");
-      html += displayId;
+      html += htmlEscape(displayId);
       html += F("</strong>");
-      if (name.length()) {
+      if (name.length() && userId.length()) {
         html += F("<span class='muted node-name'>");
-        html += name;
+        html += htmlEscape(userId);
         html += F("</span>");
       }
       html += F("</div>"
-                "<div class='node-timing'>"
-                "<div class='node-timing-cell'>"
-                "<span class='node-timing-label'>Interval</span>"
-                "<span class='chip node-timing-value'>");
-      html += String(nodeIntervalCurrentMin);
-      html += F(" min</span>"
-                "</div>"
-                "<div class='node-timing-cell'>"
-                "<span class='node-timing-label'>Next wake</span>"
-                "<span class='chip node-timing-value'>");
-      html += nextWakeTime;
-      html += F("</span>"
-                "</div>"
-                "</div>"
                 "<div class='node-status'>"
                 "<div class='node-status-cell'>"
-                "<span class='node-timing-label'>Deploy</span>");
+                "<span class='node-timing-label'>Status</span>");
 
-      if (node.state == DEPLOYED) html += F("<span class='chip chip--state-deployed'>Deployed</span>");
-      else if (node.state == PAIRED) html += F("<span class='chip chip--state-paired'>Paired</span>");
-      else html += F("<span class='chip chip--state-unpaired'>Unpaired</span>");
+      if (node.state == DEPLOYED) html += F("<span class='chip chip--state-deployed'>Active</span>");
+      else if (node.state == PAIRED) html += F("<span class='chip chip--state-paired'>Connected</span>");
+      else html += F("<span class='chip chip--state-unpaired'>New</span>");
 
       html += F("</div>"
                 "<div class='node-status-cell'>"
@@ -1653,37 +1742,75 @@ static void handleNodesPage() {
         }
       }
 
-      html += F("</div></div></div></a>");
+      html += F("</div></div>"
+                "<div class='node-timing'>"
+                "<div class='node-timing-cell'>"
+                "<span class='node-timing-label'>Recording</span>"
+                "<span class='chip node-timing-value'>");
+      html += String(nodeIntervalCurrentMin);
+      html += F(" min</span>"
+                "</div>"
+                "<div class='node-timing-cell'>"
+                "<span class='node-timing-label'>Last seen</span>"
+                "<span class='chip node-timing-value'>");
+      if (node.lastSeen > 0) {
+        const uint32_t nowMs = millis();
+        const uint32_t ageMs = (nowMs >= node.lastSeen) ? (nowMs - node.lastSeen) : 0;
+        const uint32_t ageMin = ageMs / 60000UL;
+        html += String(ageMin);
+        html += F(" min ago");
+      } else {
+        html += F("n/a");
+      }
+      html += F("</span>"
+                "</div>"
+                "</div>"
+                "</div></a>");
     }
 
     html += F("</div>");
   }
   html += F("</div>");
 
-  // Auto-reload removed — use manual refresh button instead (better for mobile UX)
+  // --- Add New Station guided panel ---
+  html += F("<div class='section'>"
+            "<details>"
+            "<summary style='font-weight:bold;cursor:pointer'>+ Add New Station</summary>"
+            "<div style='margin-top:12px'>"
+            "<p class='muted'>1. Press the pair button on the station (hold 3 seconds).<br>"
+            "2. Wait for the green light.<br>"
+            "3. Tap “Find New Stations” below.</p>"
+            "<p class='muted'>The station will appear in the list as “New”. Tap it to activate and give it a name.</p>"
+            "<form class='async-form' action='/find-stations' method='POST'>"
+            "<button type='submit' class='btn btn--primary'><svg class='icon' viewBox='0 0 24 24' aria-hidden='true'><path d='M12 3c-3.9 0-7.4 1.6-9.9 4.1l1.4 1.4C5.6 6.4 8.7 5 12 5s6.4 1.4 8.5 3.5l1.4-1.4C19.4 4.6 15.9 3 12 3zm0 5c-2.6 0-5 .9-6.9 2.6l1.4 1.4C8 10.5 9.9 10 12 10s4 .5 5.5 2l1.4-1.4C17 8.9 14.6 8 12 8zm0 5c-1.3 0-2.5.5-3.5 1.5l1.4 1.4c.6-.6 1.3-.9 2.1-.9s1.5.3 2.1.9l1.4-1.4c-1-1-2.2-1.5-3.5-1.5zm0 4a2 2 0 100 4 2 2 0 000-4z'/></svg> Find New Stations</button>"
+            "</form>"
+            "</div>"
+            "</details>"
+            "</div>");
 
   html += footCommon();
   server.send(200, "text/html", html);
 }
 
-static void handleNodeConfigForm() {
-  String nodeId = server.arg("node_id");
+static void handleStationDetail() {
+  String nodeId = server.arg("id");
+  if (nodeId.length() == 0) nodeId = server.arg("node_id");
 
   NodeInfo* target = nullptr;
   for (auto& n : registeredNodes) {
     if (n.nodeId == nodeId) { target = &n; break; }
   }
 
-  String actionsHtml = String("<a href='/nodes' class='btn btn--sm'>Back</a><a href='/node-config?node_id=")
+  String actionsHtml = String("<a href='/stations' class='btn btn--sm'>Back</a><a href='/station?id=")
     + nodeId
     + String("' class='btn btn--sm'>Refresh</a>");
-  String html = headCommon("Configure", actionsHtml);
+  String html = headCommon("Station", actionsHtml);
   html += F("<div class='section'>");
 
   if (!target) {
-    html += F("<h3>Node not found</h3>"
-              "<p class='muted'>No node with that ID is currently registered.</p>"
-              "<a href='/nodes' class='btn btn--primary'>Back to Node manager</a>");
+    html += F("<h3>Station not found</h3>"
+              "<p class='muted'>No station with that ID is currently registered.</p>"
+              "<a href='/stations' class='btn btn--primary'>Back to Stations</a>");
     html += F("</div>");
     html += footCommon();
     server.send(404, "text/html", html);
@@ -1701,31 +1828,52 @@ static void handleNodeConfigForm() {
     ? observedWakeMin
     : (isAllowedInterval(gWakeIntervalMin) ? gWakeIntervalMin : 5);
 
-  html += F("<div class='muted' style='margin:0 0 10px 0'>"
-            "<strong>Node ID:</strong> ");
-  html += (userId.length() ? userId : String("-"));
-  html += F(" &nbsp;|&nbsp; <strong>Name:</strong> ");
-  html += (name.length() ? name : String("-"));
-  html += F(" &nbsp;|&nbsp; <strong>Current active interval:</strong> ");
+  // --- Status header ---
+  html += F("<div class='muted' style='margin:0 0 10px 0'>");
+  if (target->state == DEPLOYED) html += F("<span class='chip chip--state-deployed'>Active</span>");
+  else if (target->state == PAIRED) html += F("<span class='chip chip--state-paired'>Connected</span>");
+  else html += F("<span class='chip chip--state-unpaired'>New</span>");
+  {
+    float batV = target->lastReportedBatV;
+    if (!isnan(batV)) {
+      char batBuf[10];
+      snprintf(batBuf, sizeof(batBuf), "%.2fV", batV);
+      const char* batClass = (batV >= 3.9f) ? "chip--bat-ok"
+                           : (batV >= 3.5f) ? "chip--bat-med"
+                           : "chip--bat-low";
+      html += F(" <span class='chip ");
+      html += batClass;
+      html += F("'>");
+      html += batBuf;
+      html += F("</span>");
+    }
+  }
+  html += F("<br><strong>Recording every</strong> ");
   html += String(activeIntervalMin);
-  html += F(" min</div>");
+  html += F(" min");
+  if (target->lastSeen > 0) {
+    const uint32_t nowMs = millis();
+    const uint32_t ageMs = (nowMs >= target->lastSeen) ? (nowMs - target->lastSeen) : 0;
+    const uint32_t ageMin = ageMs / 60000UL;
+    html += F("<br><strong>Last seen</strong> ");
+    html += String(ageMin);
+    html += F(" min ago");
+  }
+  html += F("</div>");
 
-  html += F("<form action='/node-config' method='POST'>"
+  html += F("<form action='/station' method='POST' onsubmit='return confirmRemove()'>"
             "<input type='hidden' name='node_id' value='");
   html += target->nodeId;
   html += F("'>");
 
   html += F("<div style='margin-bottom:10px;padding:10px;border:1px solid var(--border);border-radius:8px;background:#fafafa'>"
-            "<div><strong>FW ID:</strong> ");
-  html += target->nodeId;
-  html += F("</div>"
-            "<label class='label' style='margin-top:8px'>Notes</label>"
-            "<input class='input' type='text' name='notes' maxlength='180' placeholder='Notes for this node' value='");
-  html += notes;
+            "<label class='label' style='margin-top:0'>Notes</label>"
+            "<input class='input' type='text' name='notes' maxlength='180' placeholder='Notes for this station' value='");
+  html += htmlEscape(notes);
   html += F("'></div>");
 
   if (!isDeployed) {
-    html += F("<label class='label'>Node ID (numeric, e.g. 001)</label>"
+    html += F("<label class='label'>Station ID (numeric, e.g. 001)</label>"
               "<input class='input' type='text' name='user_id' maxlength='3' "
               "placeholder='001' value='");
     html += userId;
@@ -1738,12 +1886,12 @@ static void handleNodeConfigForm() {
   } else {
     html += F("<div style='margin-top:10px;padding:10px;border:1px solid #E1B17A;border-radius:8px;background:#fff8e1'>"
               "<div style='font-weight:700;color:#8a4b00;margin-bottom:6px'>Are you sure?</div>"
-              "<div class='muted' style='margin-bottom:8px'>Changing Node ID/Name on a deployed node can break tracking if used incorrectly.</div>"
+              "<div class='muted' style='margin-bottom:8px'>Changing Station ID/Name on an active station can break tracking if used incorrectly.</div>"
               "<label style='display:flex;gap:8px;align-items:flex-start;margin-bottom:8px'>"
               "<input type='checkbox' name='edit_identity_confirm' value='yes' onchange=\"var en=this.checked;document.getElementById('dep-user-id').disabled=!en;document.getElementById('dep-name').disabled=!en;\">"
-              "<span>I understand and want to edit Node ID/Name for this deployed node.</span>"
+              "<span>I understand and want to edit Station ID/Name for this active station.</span>"
               "</label>"
-              "<label class='label'>Node ID (numeric, e.g. 001)</label>"
+              "<label class='label'>Station ID (numeric, e.g. 001)</label>"
               "<input id='dep-user-id' class='input' type='text' name='user_id' maxlength='3' placeholder='001' disabled value='");
     html += userId;
     html += F("'>"
@@ -1755,27 +1903,29 @@ static void handleNodeConfigForm() {
   }
 
   html += F("<div style='margin-bottom:12px'>"
-            "<label class='label'>Wake interval (minutes)</label>"
+            "<label class='label'>Recording interval (minutes)</label>"
             "<div style='font-size:14px;padding:6px 0'><strong>");
   html += String(gWakeIntervalMin > 0 ? gWakeIntervalMin : 0);
   html += F(" min</strong> &nbsp;<span style='font-size:12px;color:#888'>"
-            "(fleet-global &mdash; change via Node interval on main page)</span></div>");
+            "(applies to all stations &mdash; change in Settings)</span></div>");
   if (gSyncIntervalMin > 0) {
-    html += F("<div style='font-size:12px;color:#555'>Auto-sync every ");
+    html += F("<div style='font-size:12px;color:#555'>Upload every ");
     html += String(gSyncIntervalMin);
     html += F(" min</div>");
   }
   html += F("</div>");
 
   html += F("<div class='action-choices'>"
-              "<label class='action-choice action-choice--start'><input type='radio' name='action' value='start' checked><span>Start / deploy</span></label>"
-              "<label class='action-choice action-choice--stop'><input type='radio' name='action' value='stop'><span>Stop / keep paired</span></label>"
-              "<label class='action-choice action-choice--unpair'><input type='radio' name='action' value='unpair'><span>Unpair / forget</span></label>"
+              "<label class='action-choice'><input type='radio' name='action' value='none' checked><span>No change</span></label>"
+              "<label class='action-choice action-choice--start'><input type='radio' name='action' value='start'><span>Activate</span></label>"
+              "<label class='action-choice action-choice--stop'><input type='radio' name='action' value='stop'><span>Stop Monitoring</span></label>"
+              "<label class='action-choice action-choice--unpair'><input type='radio' name='action' value='unpair'><span>Remove Station</span></label>"
             "</div>"
             "<button type='submit' class='btn btn--success' style='margin-top:12px'>"
-            "Confirm</button>"
+            "Save Changes</button>"
             "</form>");
 
+  html += F("<script>function confirmRemove(){var r=document.querySelector('input[name=action]:checked');if(r&&r.value==='unpair'){return confirm('Remove this station? You will need to re-add it with the pair button.');}return true;}</script>");
   html += F("</div>");
   html += footCommon();
   server.send(200, "text/html", html);
@@ -1835,7 +1985,9 @@ static void handleNodeConfigSave() {
   bool pairOk   = false;
   bool unpairOk = false;
 
-  if (action == "start") {
+  if (action == "none" || action.length() == 0) {
+    // No lifecycle change requested — only name/notes/schedule saved.
+  } else if (action == "start") {
     if (target && target->state == UNPAIRED) {
       pairOk = pairNode(nodeId);
       if (pairOk) {
@@ -1880,43 +2032,41 @@ static void handleNodeConfigSave() {
     target->name   = finalName;
   }
 
-  String actionsHtml = String("<a href='/nodes' class='btn btn--sm'>Back</a><a href='/node-config?node_id=")
+  String actionsHtml = String("<a href='/stations' class='btn btn--sm'>Back</a><a href='/station?id=")
     + nodeId
     + String("' class='btn btn--sm'>Refresh</a>");
-  String html = headCommon("Configure", actionsHtml);
+  String html = headCommon("Station", actionsHtml);
   html += F("<div class='section center'>"
-            "<h3>Node configuration applied</h3>");
+            "<h3>Station settings applied</h3>");
 
   if (!target) {
-    html += F("<p class='muted'>Warning: this node ID is not currently in the registered list.</p>");
+    html += F("<p class='muted'>Warning: this station ID is not currently in the registered list.</p>");
   }
 
-  html += F("<p><strong>Firmware ID:</strong> ");
-  html += nodeId;
-  html += F("<br><strong>Node ID (numeric):</strong> ");
-  html += (finalUserId.length() ? finalUserId : String("-"));
+  html += F("<p><strong>Station ID:</strong> ");
+  html += (finalUserId.length() ? htmlEscape(finalUserId) : String("-"));
   html += F("<br><strong>Name:</strong> ");
-  html += (finalName.length() ? finalName : String("-"));
+  html += (finalName.length() ? htmlEscape(finalName) : String("-"));
   html += F("<br><strong>Notes:</strong> ");
-  html += (finalNotes.length() ? finalNotes : String("-"));
-  html += F("<br><strong>Interval:</strong> ");
+  html += (finalNotes.length() ? htmlEscape(finalNotes) : String("-"));
+  html += F("<br><strong>Recording interval:</strong> ");
   html += String(interval);
   html += F(" min<br><strong>Action:</strong> ");
   html += action;
   html += F("</p>");
 
   html += F("<p class='muted'>"
-            "Schedule broadcast: stored for this node (applies on next wake)"
-            "<br>Pair (if unpaired): ");
+            "Schedule stored for this station (applies on next wake)"
+            "<br>Connect (if new): ");
   html += pairOk ? "OK" : "not requested / failed";
-  html += F("<br>Start / deploy: ");
-  html += deployOk ? "REQUESTED (awaiting node confirmation)" : "not requested / failed";
-  html += F("<br>Stop / revert: ");
+  html += F("<br>Activate: ");
+  html += deployOk ? "REQUESTED (awaiting station confirmation)" : "not requested / failed";
+  html += F("<br>Stop monitoring: ");
   html += revertOk ? "OK" : "not requested / failed";
-  html += F("<br>Unpair / forget: ");
+  html += F("<br>Remove station: ");
   html += unpairOk ? "OK" : "not requested / failed";
   html += F("</p>"
-            "<a href='/nodes' class='btn btn--primary'>Back to Node manager</a>"
+            "<a href='/stations' class='btn btn--primary'>Back to Stations</a>"
             "</div>");
 
   html += footCommon();
@@ -1933,7 +2083,7 @@ static String formatUploadTime(uint32_t unixSec) {
   return formatDateTimeDisplay(dt);
 }
 
-static void handleUploadSettings() {
+static void handleSettings() {
   TransmissionSettings tx;
   loadTransmissionSettings(tx);
 
@@ -1948,118 +2098,189 @@ static void handleUploadSettings() {
   }
   const uint64_t fsTotal = (uint64_t)LittleFS.totalBytes();
   const uint64_t fsUsed  = (uint64_t)LittleFS.usedBytes();
-  const uint32_t flashUsagePct = (fsTotal > 0)
+  const uint32_t storagePct = (fsTotal > 0)
     ? (uint32_t)((fsUsed * 100ULL) / fsTotal) : 0;
 
   String actionsHtml = String("<a href='/' class='btn btn--sm'>Back</a>");
-  String html = headCommon("LTE Upload Settings", actionsHtml);
+  String html = headCommon("Settings", actionsHtml);
 
-  // --- Quick Setup (always visible, minimal) ---
+  html += F("<div id='ui-status' class='help' style='display:none;margin-bottom:10px;border:1px solid var(--border);border-radius:8px;padding:8px 10px'></div>");
+
   html += F("<div class='section'>");
-  html += F("<h3>LTE Upload</h3>");
 
-  html += F("<form class='async-form' action='/set-transmission' method='POST'>");
+  // --- Recording interval presets ---
+  html += F("<h3>Recording interval</h3>"
+            "<p class='muted'>How often each station measures.</p>"
+            "<form class='async-form' action='/set-recording-interval' method='POST'>"
+            "<div class='action-choices'>");
+  static const int kRecordingPresets[] = {1, 5, 10, 30};
+  static const size_t kRecordingPresetCount = sizeof(kRecordingPresets) / sizeof(kRecordingPresets[0]);
+  for (size_t i = 0; i < kRecordingPresetCount; ++i) {
+    int v = kRecordingPresets[i];
+    html += F("<label class='action-choice action-choice--start'><input type='radio' name='interval' value='");
+    html += String(v);
+    html += F("'");
+    if (v == gWakeIntervalMin) html += F(" checked");
+    html += F("><span>");
+    html += String(v);
+    html += F(" min</span></label>");
+  }
+  html += F("</div>"
+            "<button type='submit' class='btn btn--primary' style='margin-top:8px'>Apply</button>"
+            "</form>");
+  html += F("<p class='muted' style='margin-top:6px'>Selected: ");
+  if (gWakeIntervalMin > 0) {
+    html += String(gWakeIntervalMin);
+    html += F(" min");
+  } else {
+    html += F("Off");
+  }
+  html += F("</p>");
+  html += F("</div>");
 
-  // Enabled checkbox (prominent)
+  // --- Cloud connection ---
+  html += F("<div class='section'>");
+  html += F("<h3>Cloud connection</h3>");
+
+  html += F("<form class='async-form' action='/save-settings' method='POST'>");
+
   html += F("<label class='label'><input type='checkbox' name='enabled' value='1'");
   if (tx.enabled) html += F(" checked");
-  html += F("> <strong>Enable LTE upload</strong></label>");
-  html += F("<div class='help'>When enabled, the mothership uploads new data during sync wakes (subject to schedule and battery checks).</div>");
+  html += F("> <strong>Enable cloud upload</strong></label>");
+  html += F("<div class='help'>When enabled, the Hub uploads new data during collection rounds (subject to schedule and battery checks).</div>");
 
-  // Endpoint URL (most important field)
-  html += F("<label class='label' for='url'>Endpoint URL</label>");
-  html += F("<input class='input' id='url' name='url' type='text' placeholder='https://...cloudfunction...'");
-  html += F(" value='");
-  html += jsonEscapeLocal(tx.endpointUrl);
-  html += F("'>");
+  html += F("<label class='label' for='api_key'>API Key</label>");
+  if (tx.apiKey.length() > 0) {
+    html += F("<p class='muted'>API key configured (last 4: ");
+    html += tx.apiKey.substring(tx.apiKey.length() - 4);
+    html += F(")</p>");
+  }
+  html += F("<input class='input' id='api_key' name='api_key' type='password' placeholder='Enter new key to replace' value=''>");
+  html += F("<div class='help'>Leave blank to keep the current key, or enter a new <code>fm_xxxxxxxx</code> API key from the fieldMesh dashboard.</div>");
 
-  // Short status line
-  html += F("<p class='muted'>");
-  html += F("<strong>Status:</strong> ");
-  html += (tx.enabled ? F("enabled") : F("disabled"));
-  html += F(" &middot; <strong>Pending:</strong> ");
-  html += formatBytesUi(pendingBytes);
-  html += F(" &middot; <strong>Last upload:</strong> ");
-  html += formatUploadTime(cursor.lastUploadUnix);
+  html += F("<label class='label' for='qr_string' style='margin-top:10px'>QR code string (optional)</label>");
+  html += F("<input class='input' id='qr_string' name='qr_string' type='text' placeholder='Paste url|key here'>");
+  html += F("<div class='help'>If you have a QR code string of the form <code>url|key</code>, paste it here to set both endpoint and API key at once.</div>");
+
+  html += F("<label class='label' style='margin-top:10px'>Endpoint (read-only)</label>");
+  html += F("<p class='muted' style='word-break:break-all;font-size:13px'>");
+  html += htmlEscape(tx.endpointUrl);
   html += F("</p>");
 
-  html += F("<button type='submit' class='btn btn--primary'>Save</button>");
+  // Cloud status line
+  {
+    const char* dotColour = "#6b7280";
+    const char* statusLabel = "Upload off";
+    if (tx.enabled) {
+      if (tx.apiKey.length() > 0) {
+        if (cursor.retryCount > 0) {
+          dotColour = "#c47a5a";
+          statusLabel = "Last upload failed";
+        } else {
+          dotColour = "#7a9b70";
+          statusLabel = "Connected";
+        }
+      } else {
+        dotColour = "#c47a5a";
+        statusLabel = "Not set up";
+      }
+    }
+    html += F("<p style='margin:8px 0'><span style='display:inline-block;width:12px;height:12px;border-radius:50%;background:");
+    html += dotColour;
+    html += F(";margin-right:8px;vertical-align:middle'></span><strong>");
+    html += statusLabel;
+    html += F("</strong>");
+    if (cursor.lastUploadUnix > 0) {
+      html += F(" &middot; last upload ");
+      html += formatUploadTime(cursor.lastUploadUnix);
+    }
+    html += F("</p>");
+  }
 
-  // --- Advanced Settings (collapsible, hidden by default) ---
+  // --- Advanced settings (collapsed) ---
   html += F("<details style='margin-top:14px'>");
   html += F("<summary style='font-weight:bold;cursor:pointer'>Advanced settings</summary>");
 
-  html += F("<label class='label' for='token' style='margin-top:10px'>Auth token</label>");
-  html += F("<input class='input' id='token' name='token' type='password' placeholder='auth token' value='");
-  html += jsonEscapeLocal(tx.authToken);
-  html += F("'>");
-
-  html += F("<label class='label' for='site_id'>Site ID</label>");
-  html += F("<input class='input' id='site_id' name='site_id' type='text' placeholder='site-001' value='");
-  html += jsonEscapeLocal(tx.siteId);
-  html += F("'>");
-
-  html += F("<label class='label' for='deploy_id'>Deployment ID</label>");
-  html += F("<input class='input' id='deploy_id' name='deploy_id' type='text' placeholder='deploy-001' value='");
-  html += jsonEscapeLocal(tx.deploymentId);
-  html += F("'>");
-
   html += F("<div class='row'>");
-  html += F("<div class='col'><label class='label' for='upload_min'>Upload interval (min, 0=every wake)</label>");
-  html += F("<input class='input' id='upload_min' name='upload_min' type='number' min='0' value='");
-  html += String(tx.uploadIntervalMin);
-  html += F("'></div>");
   html += F("<div class='col'><label class='label' for='min_bat_mv'>Min battery (mV)</label>");
   html += F("<input class='input' id='min_bat_mv' name='min_bat_mv' type='number' min='0' value='");
   html += String(tx.minBatteryMv);
   html += F("'></div>");
-  html += F("</div>");
-
-  html += F("<div class='row'>");
   html += F("<div class='col'><label class='label' for='max_bytes'>Max bytes per session</label>");
   html += F("<input class='input' id='max_bytes' name='max_bytes' type='number' min='0' value='");
   html += String(tx.maxBytesPerSession);
   html += F("'></div>");
+  html += F("</div>");
+
+  html += F("<div class='row'>");
   html += F("<div class='col'><label class='label' for='max_retries'>Max retries per window</label>");
   html += F("<input class='input' id='max_retries' name='max_retries' type='number' min='0' value='");
   html += String(tx.maxRetriesPerWindow);
+  html += F("'></div>");
+  html += F("<div class='col'><label class='label' for='upload_min'>Upload interval (min, 0=every collection)</label>");
+  html += F("<input class='input' id='upload_min' name='upload_min' type='number' min='0' value='");
+  html += String(tx.uploadIntervalMin);
   html += F("'></div>");
   html += F("</div>");
 
   html += F("<label class='label'><input type='checkbox' name='allow_manual' value='1'");
   if (tx.allowManualUpload) html += F(" checked");
   html += F("> <strong>Allow manual upload from this page</strong></label>");
-  html += F("<div class='help'>Manual upload powers on the modem and transmits now. This takes 30-60s and draws extra power (WiFi AP + modem active simultaneously).</div>");
+  html += F("<div class='help'>Manual upload powers on the modem and transmits now. This takes 30-60s and draws extra power.</div>");
+
+  html += F("<p class='muted' style='margin-top:10px'>Legacy fields — leave blank unless advised:</p>");
+
+  html += F("<label class='label' for='token'>Auth token</label>");
+  html += F("<input class='input' id='token' name='token' type='password' placeholder='auth token' value='");
+  html += htmlEscape(tx.authToken);
+  html += F("'>");
+
+  html += F("<label class='label' for='site_id'>Site ID</label>");
+  html += F("<input class='input' id='site_id' name='site_id' type='text' placeholder='site-001' value='");
+  html += htmlEscape(tx.siteId);
+  html += F("'>");
+
+  html += F("<label class='label' for='deploy_id'>Deployment ID</label>");
+  html += F("<input class='input' id='deploy_id' name='deploy_id' type='text' placeholder='deploy-001' value='");
+  html += htmlEscape(tx.deploymentId);
+  html += F("'>");
 
   html += F("</details>");
 
+  html += F("<button type='submit' class='btn btn--primary' style='margin-top:12px'>Save</button>");
   html += F("</form>");
   html += F("</div>");
 
-  // --- Upload status (simplified) ---
-  html += F("<div class='section'><h3>Upload status</h3>");
+  // --- Storage + manual upload status ---
+  html += F("<div class='section'><h3>Storage</h3>");
   html += F("<div class='stats' style='margin:0 0 10px 0'>");
-  html += F("<div class='stat'><strong>Pending</strong><span class='num' style='font-size:16px'>");
-  html += formatBytesUi(pendingBytes);
+  html += F("<div class='stat'><strong>Readings waiting</strong><span class='num' style='font-size:16px'>");
+  html += String(pendingRows);
   html += F("</span></div>");
   html += F("<div class='stat'><strong>Last upload</strong><span class='num' style='font-size:14px'>");
   html += formatUploadTime(cursor.lastUploadUnix);
   html += F("</span></div>");
-  html += F("<div class='stat'><strong>Flash used</strong><span class='num' style='font-size:16px'>");
-  html += String(flashUsagePct);
+  html += F("<div class='stat'><strong>Storage used</strong><span class='num' style='font-size:16px'>");
+  html += String(storagePct);
   html += F("%</span></div></div>");
 
-  // Manual upload button
   if (tx.allowManualUpload) {
     html += F("<form action='/manual-upload' method='POST'>");
     html += F("<input type='hidden' name='ajax' value='1'>");
     html += F("<button type='submit' class='btn btn--warn'>Upload now (30-60s)</button>");
     html += F("</form>");
   } else {
-    html += F("<p class='muted'>Manual upload is disabled in settings.</p>");
+    html += F("<p class='muted'>Manual upload is disabled in advanced settings.</p>");
   }
 
   html += F("</div>");
+
+  // --- Save & Start Monitoring ---
+  html += F("<div class='section action-stack'>"
+            "<form class='async-form' action='/start' method='POST'>"
+            "<button type='submit' class='btn btn--primary'><svg class='icon' viewBox='0 0 24 24' aria-hidden='true'><path d='M8 5v14l11-7z'/></svg> Save &amp; Start Recording</button>"
+            "</form>"
+            "</div>");
 
   html += footCommon();
   server.send(200, "text/html", html);
@@ -2070,7 +2291,24 @@ static void handleSetTransmission() {
   tx.enabled          = server.hasArg("enabled") && server.arg("enabled") == "1";
   tx.endpointUrl      = server.arg("url");
   tx.authToken        = server.arg("token");
+  tx.apiKey           = server.arg("api_key");  // may be blank; preserved below
   tx.siteId           = server.arg("site_id");
+
+  // QR code string: if present and contains '|', split into url|key.
+  String qrString = server.arg("qr_string");
+  qrString.trim();
+  if (qrString.length() > 0) {
+    int pipeIdx = qrString.indexOf('|');
+    if (pipeIdx > 0) {
+      tx.endpointUrl = qrString.substring(0, pipeIdx);
+      tx.apiKey      = qrString.substring(pipeIdx + 1);
+      Serial.printf("[UI] QR string parsed: endpoint set, key length=%u\n",
+                    (unsigned)tx.apiKey.length());
+    } else {
+      // No pipe — treat the whole string as an API key.
+      tx.apiKey = qrString;
+    }
+  }
   tx.deploymentId     = server.arg("deploy_id");
   tx.uploadIntervalMin= (uint16_t)server.arg("upload_min").toInt();
   tx.minBatteryMv     = (uint16_t)server.arg("min_bat_mv").toInt();
@@ -2083,19 +2321,23 @@ static void handleSetTransmission() {
   loadTransmissionSettings(prev);
   tx.uploadPhaseUnix = prev.uploadPhaseUnix;
   tx.useJsonUpload = prev.useJsonUpload;
+  // Keep the previous API key if the form field was left blank (no QR string).
+  if (tx.apiKey.length() == 0 || tx.apiKey.indexOf("\u2022") >= 0) {
+    tx.apiKey = prev.apiKey;
+  }
 
   saveTransmissionSettings(tx);
   Serial.printf("[UI] Transmission settings saved: enabled=%d url=%s site=%s\n",
                 tx.enabled ? 1 : 0, tx.endpointUrl.c_str(), tx.siteId.c_str());
 
   if (isAjaxRequest()) {
-    sendAjaxResult(true, "Transmission settings saved");
+    sendAjaxResult(true, "Settings saved");
     return;
   }
 
-  String html = headCommon("LTE Upload Settings", "<a href='/' class='btn btn--sm'>Back</a>");
+  String html = headCommon("Settings", "<a href='/' class='btn btn--sm'>Back</a>");
   html += F("<div class='section center'><h3>Settings saved</h3>"
-            "<a href='/upload' class='btn btn--primary'>Back to LTE Upload</a></div>");
+            "<a href='/settings' class='btn btn--primary'>Back to Settings</a></div>");
   html += footCommon();
   server.send(200, "text/html", html);
 }
@@ -2109,10 +2351,10 @@ static void handleManualUpload() {
       sendAjaxResult(false, "Manual upload is disabled in settings");
       return;
     }
-    String html = headCommon("LTE Upload", "<a href='/upload' class='btn btn--sm'>Back</a>");
+    String html = headCommon("Settings", "<a href='/settings' class='btn btn--sm'>Back</a>");
     html += F("<div class='section center'><h3>Manual upload disabled</h3>"
-              "<p class='muted'>Enable manual upload in the settings first.</p>"
-              "<a href='/upload' class='btn btn--primary'>Back</a></div>");
+              "<p class='muted'>Enable manual upload in advanced settings first.</p>"
+              "<a href='/settings' class='btn btn--primary'>Back</a></div>");
     html += footCommon();
     server.send(400, "text/html", html);
     return;
@@ -2128,7 +2370,7 @@ static void handleManualUpload() {
   bool ok = false;
 
   if (!flashIsReady()) {
-    resultMsg = "Flash not ready — cannot read data";
+    resultMsg = "Storage not ready — cannot read data";
   } else {
     gUploadQueue.init();
     if (gUploadQueue.getPendingBytes() == 0) {
@@ -2152,7 +2394,8 @@ static void handleManualUpload() {
         } else {
           String url = buildUploadUrl(tx);
           Serial.printf("[UI] Manual upload POST %u bytes to %s\n", payload.byteLength, url.c_str());
-          HttpsPostResult result = modem.httpsPost(url, payload.csvData, "text/csv", tx.authToken);
+          String authHeader = tx.apiKey.length() > 0 ? tx.apiKey : tx.authToken;
+          HttpsPostResult result = modem.httpsPost(url, payload.csvData, "text/csv", authHeader);
           if (result.success && result.httpStatus == 200) {
             uint32_t nowUnix = getRTCTimeUnix();
             gUploadQueue.advanceCursor(payload.startOffset + payload.byteLength, nowUnix);
@@ -2182,10 +2425,10 @@ static void handleManualUpload() {
     return;
   }
 
-  String html = headCommon("LTE Upload", "<a href='/upload' class='btn btn--sm'>Back</a>");
+  String html = headCommon("Settings", "<a href='/settings' class='btn btn--sm'>Back</a>");
   html += F("<div class='section center'><h3>Manual upload</h3><p>");
   html += resultMsg;
-  html += F("</p><a href='/upload' class='btn btn--primary'>Back to LTE Upload</a></div>");
+  html += F("</p><a href='/settings' class='btn btn--primary'>Back to Settings</a></div>");
   html += footCommon();
   server.send(200, "text/html", html);
 }
@@ -2284,6 +2527,7 @@ void startConfigServer() {
   server.on("/mobile/status.php", HTTP_ANY, sendCaptivePortalLanding);
   server.on("/favicon.ico", HTTP_ANY, []() { server.send(204); });
 
+  // --- New canonical routes ---
   server.on("/shutdown", HTTP_POST, handleShutdown);
   server.on("/set-time", HTTP_POST, handleSetTime);
   server.on("/download-csv", HTTP_GET, handleDownloadCSV);
@@ -2295,15 +2539,42 @@ void startConfigServer() {
     server.send(200, "application/json", buildStatusJson());
   });
 
-  server.on("/nodes", HTTP_GET, handleNodesPage);
-  server.on("/node-config", HTTP_GET, handleNodeConfigForm);
-  server.on("/node-config", HTTP_POST, handleNodeConfigSave);
+  server.on("/stations", HTTP_GET, handleStationsPage);
+  server.on("/station", HTTP_GET, handleStationDetail);
+  server.on("/station", HTTP_POST, handleNodeConfigSave);
   server.on("/revert-node", HTTP_POST, handleRevertNode);
 
-  server.on("/upload", HTTP_GET, handleUploadSettings);
+  server.on("/settings", HTTP_GET, handleSettings);
   server.on("/set-transmission", HTTP_POST, handleSetTransmission);
   server.on("/manual-upload", HTTP_POST, handleManualUpload);
   server.on("/upload-status", HTTP_GET, handleUploadStatus);
+
+  // --- Legacy route aliases (backwards compatibility) ---
+  // GET routes redirect to the new canonical paths.
+  server.on("/nodes", HTTP_GET, []() {
+    server.sendHeader("Location", "/stations", true);
+    server.send(302, "text/plain", "");
+  });
+  server.on("/node-config", HTTP_GET, []() {
+    server.sendHeader("Location", "/station", true);
+    server.send(302, "text/plain", "");
+  });
+  server.on("/upload", HTTP_GET, []() {
+    server.sendHeader("Location", "/settings", true);
+    server.send(302, "text/plain", "");
+  });
+  // POST routes keep working on the old paths (clients may still POST here).
+  server.on("/node-config", HTTP_POST, handleNodeConfigSave);
+
+  // --- UI form-action aliases (Field UI form actions) ---
+  server.on("/start", HTTP_POST, handleShutdown);
+  server.on("/find-stations", HTTP_POST, handleDiscoverNodes);
+  server.on("/set-recording-interval", HTTP_POST, handleSetWakeInterval);
+  server.on("/save-settings", HTTP_POST, handleSetTransmission);
+  server.on("/export", HTTP_GET, []() {
+    server.sendHeader("Location", "/download-csv", true);
+    server.send(302, "text/plain", "");
+  });
 
   server.onNotFound(sendCaptivePortalLanding);
   dnsServer.start(53, "*", WiFi.softAPIP());
