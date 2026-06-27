@@ -2,6 +2,7 @@
 #include <Preferences.h>
 #include <WiFi.h>
 #include <esp_now.h>
+#include "time/rtc_alarm.h"  // getRTCTime()
 
 // Node registry + NVS persistence for Mothership V1 config mode.
 // Slim extract from production espnow_manager.cpp.
@@ -247,6 +248,9 @@ void registerNode(const uint8_t* mac,
     }
     existing->nodeType = String(nodeType);
     if (state > existing->state) {
+      if (state == DEPLOYED && existing->state != DEPLOYED) {
+        existing->deployedSinceUnix = getRTCTime();
+      }
       existing->state = state;
       if (state == DEPLOYED) {
         existing->deployPending = false;
@@ -272,6 +276,8 @@ void registerNode(const uint8_t* mac,
   n.wakeIntervalMin      = 0;
   n.lastReportedQueueDepth = 0;
   n.lastReportedBatV     = NAN;
+  n.latitude             = NAN;
+  n.longitude            = NAN;
   n.inferredWakeIntervalMin = 0;
   n.lastNodeTimestamp    = 0;
   n.configVersionApplied = 0;
@@ -283,6 +289,7 @@ void registerNode(const uint8_t* mac,
   n.pendingLastAttemptMs = 0;
   n.lastStateAppliedMs   = 0;
   n.lastAppliedTargetState = PENDING_NONE;
+  n.deployedSinceUnix    = (state == DEPLOYED) ? getRTCTime() : 0;
   n.syncStale = false;
   n.staleMissCount = 0;
   n.lastStaleAssistMs = 0;
@@ -364,6 +371,15 @@ void savePairedNodes() {
     snprintf(key, sizeof(key), "batv%d", idx);
     writeOk = prefs.putFloat(key, isnan(n.lastReportedBatV) ? 0.0f : n.lastReportedBatV) == sizeof(float) && writeOk;
 
+    snprintf(key, sizeof(key), "lat%d", idx);
+    writeOk = prefs.putFloat(key, isnan(n.latitude) ? 0.0f : n.latitude) == sizeof(float) && writeOk;
+
+    snprintf(key, sizeof(key), "lon%d", idx);
+    writeOk = prefs.putFloat(key, isnan(n.longitude) ? 0.0f : n.longitude) == sizeof(float) && writeOk;
+
+    snprintf(key, sizeof(key), "dep%d", idx);
+    writeOk = prefs.putUInt(key, n.deployedSinceUnix) == sizeof(uint32_t) && writeOk;
+
     idx++;
   }
 
@@ -376,7 +392,7 @@ void savePairedNodes() {
   // Stale records above count are harmless, but remove them after the new count
   // is committed so a shrinking registry does not consume NVS indefinitely.
   if (writeOk && oldCount > count) {
-    const char* prefixes[] = {"mac", "id", "typ", "st", "batv"};
+    const char* prefixes[] = {"mac", "id", "typ", "st", "batv", "lat", "lon", "dep"};
     for (int stale = count; stale < oldCount; ++stale) {
       char key[16];
       for (const char* prefix : prefixes) {
@@ -544,6 +560,26 @@ void loadPairedNodes() {
       if (isnan(savedBatV) || isinf(savedBatV)) savedBatV = 0.0f;
     }
 
+    // --- Latitude / longitude (optional) ---
+    snprintf(key, sizeof(key), "lat%d", i);
+    float savedLat = 0.0f;
+    if (prefs.getType(key) == PT_BLOB) {
+      savedLat = prefs.getFloat(key, 0.0f);
+      if (isnan(savedLat) || isinf(savedLat)) savedLat = 0.0f;
+    }
+
+    snprintf(key, sizeof(key), "lon%d", i);
+    float savedLon = 0.0f;
+    if (prefs.getType(key) == PT_BLOB) {
+      savedLon = prefs.getFloat(key, 0.0f);
+      if (isnan(savedLon) || isinf(savedLon)) savedLon = 0.0f;
+    }
+
+    // --- Deployed-since timestamp (optional) ---
+    snprintf(key, sizeof(key), "dep%d", i);
+    uint32_t savedDep = 0;
+    if (prefs.getType(key) == PT_U32) savedDep = prefs.getUInt(key, 0);
+
     // All fields validated — build the NodeInfo record.
     NodeInfo newNode{};
     memcpy(newNode.mac, mac, 6);
@@ -557,6 +593,8 @@ void loadPairedNodes() {
     newNode.wakeIntervalMin      = 0;
     newNode.lastReportedQueueDepth = 0;
     newNode.lastReportedBatV     = (savedBatV > 0.0f) ? savedBatV : NAN;
+    newNode.latitude             = (savedLat != 0.0f) ? savedLat : NAN;
+    newNode.longitude            = (savedLon != 0.0f) ? savedLon : NAN;
     newNode.inferredWakeIntervalMin = 0;
     newNode.lastNodeTimestamp    = 0;
     newNode.configVersionApplied = 0;
@@ -568,6 +606,7 @@ void loadPairedNodes() {
     newNode.pendingLastAttemptMs = 0;
     newNode.lastStateAppliedMs   = 0;
     newNode.lastAppliedTargetState = PENDING_NONE;
+    newNode.deployedSinceUnix    = savedDep;
     newNode.syncStale            = false;
     newNode.staleMissCount       = 0;
     newNode.lastStaleAssistMs    = 0;

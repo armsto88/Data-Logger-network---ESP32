@@ -41,6 +41,8 @@ struct NodeInfo {
   uint8_t   wakeIntervalMin;
   uint8_t   lastReportedQueueDepth;
   float     lastReportedBatV;       // NAN = unknown
+  float     latitude;               // NAN = not set
+  float     longitude;              // NAN = not set
   uint8_t   inferredWakeIntervalMin;
   uint32_t  lastNodeTimestamp;
   uint16_t  configVersionApplied;
@@ -52,6 +54,7 @@ struct NodeInfo {
   uint32_t  pendingLastAttemptMs;
   uint32_t  lastStateAppliedMs;
   NodePendingState lastAppliedTargetState;
+  uint32_t  deployedSinceUnix;    // unix timestamp when state became DEPLOYED (0 = not deployed)
   // Runtime-inference fields kept for struct compatibility; zeroed in config mode.
   bool      syncStale;
   uint8_t   staleMissCount;

@@ -545,6 +545,9 @@ bool deploySelectedNodes(const std::vector<String>& nodeIds) {
         esp_err_t result = esp_now_send(node.mac, (uint8_t*)&deployCmd, sizeof(deployCmd));
         esp_err_t resultBcast = esp_now_send(kBroadcastAddr, (uint8_t*)&deployCmd, sizeof(deployCmd));
 
+        if (node.state != DEPLOYED) {
+          node.deployedSinceUnix = getRTCTime();
+        }
         node.state = DEPLOYED;
         node.deployPending = true;
         anyRequested = true;

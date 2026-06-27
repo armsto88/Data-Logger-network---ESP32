@@ -154,14 +154,9 @@ static bool appendReadingObject(String& json, const String& line, bool& first) {
 
     if (m.hex) {
       // Parse CSV cell as uint16 (auto-detect base: decimal or 0x hex),
-      // emit as "0x%04X" string.
+      // emit as a decimal integer — JSON has no hex literal type.
       unsigned long parsed = strtoul(val.c_str(), nullptr, 0);
-      char buf[8];
-      snprintf(buf, sizeof(buf), "0x%04X",
-               (unsigned int)(parsed & 0xFFFFU));
-      json += "\"";
-      json += buf;
-      json += "\"";
+      json += String((unsigned int)(parsed & 0xFFFFU));
     } else if (m.quoted) {
       json += "\"";
       json += escapeJsonString(val);
@@ -275,6 +270,9 @@ static void appendNodesArray(String& json, const std::vector<NodeInfo>& allNodes
     json += ",\"name\":\"";        json += escapeJsonString(getNodeName(n.nodeId)); json += "\"";
     json += ",\"mac\":\"";         json += formatMac(n.mac); json += "\"";
     json += ",\"state\":\"";       json += nodeStateToString(n.state); json += "\"";
+    if (n.deployedSinceUnix > 0) {
+      json += ",\"deployedSinceUnix\":"; json += String(n.deployedSinceUnix);
+    }
     // lastSeenUnix: approximate from millis()-based lastSeen.
     if (n.lastSeen > 0 && nowUnix > 0) {
       const uint32_t elapsedSec = (millis() - n.lastSeen) / 1000UL;
@@ -295,6 +293,10 @@ static void appendNodesArray(String& json, const std::vector<NodeInfo>& allNodes
     }
     json += ",\"configVersion\":";              json += String((unsigned)n.configVersionApplied);
     json += ",\"notes\":\"";                    json += escapeJsonString(getNodeNotes(n.nodeId)); json += "\"";
+    if (!isnan(n.latitude) && !isnan(n.longitude)) {
+      json += ",\"latitude\":";  json += String(n.latitude, 6);
+      json += ",\"longitude\":"; json += String(n.longitude, 6);
+    }
     json += ",\"isActive\":";                   json += (n.isActive ? "true" : "false");
     json += ",\"deployPending\":";              json += (n.deployPending ? "true" : "false");
     json += ",\"stateChangePending\":";         json += (n.stateChangePending ? "true" : "false");
@@ -323,24 +325,7 @@ static void appendStatusSection(String& json, const JsonUploadContext& ctx) {
   // Dashboard status fields
   json += ",\"batVoltage\":";          json += String(ctx.batVoltage, 2);
 
-
-  // uptime — derived from millis() (time since current wake/boot)
-  uint32_t ms    = millis();
-  uint32_t secs  = ms / 1000UL;
-  uint32_t mins  = secs / 60UL;
-  uint32_t hours = mins / 60UL;
-  uint32_t days  = hours / 24UL;
-  char uptimeBuf[16];
-  if (days > 0) {
-    snprintf(uptimeBuf, sizeof(uptimeBuf), "%ud %uh",
-             (unsigned)days, (unsigned)(hours % 24UL));
-  } else if (hours > 0) {
-    snprintf(uptimeBuf, sizeof(uptimeBuf), "%uh %um",
-             (unsigned)hours, (unsigned)(mins % 60UL));
-  } else {
-    snprintf(uptimeBuf, sizeof(uptimeBuf), "%um", (unsigned)mins);
-  }
-  json += ",\"uptime\":\"";           json += uptimeBuf; json += "\"";
+  json += ",\"projectStarted\":";       json += String(ctx.projectStartedUnix);
 
   json += ",\"lastUploadResult\":\"";  json += escapeJsonString(ctx.lastUploadResult ? ctx.lastUploadResult : "pending"); json += "\"";
 

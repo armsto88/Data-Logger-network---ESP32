@@ -51,11 +51,11 @@ struct JsonUploadContext {
   String syncDailyTimeHHMM;  // pre-formatted "HH:MM"
   String nextSyncLocalIso;   // pre-computed by caller
 
-  // Dashboard status fields (status.batVoltage / uptime /
-  // lastUploadResult).  Populated by main.cpp; uptime is derived from
-  // millis() inside the builder so it is not part of the context.
+  // Dashboard status fields (status.batVoltage /
+  // lastUploadResult).  Populated by main.cpp.
   float       batVoltage;        // mothership battery voltage (volts)
   const char* lastUploadResult;  // "success" | "failed" | "partial" | "pending"
+  uint32_t    projectStartedUnix;  // first-ever boot timestamp (0 = unknown)
 };
 
 // ---------------------------------------------------------------------------

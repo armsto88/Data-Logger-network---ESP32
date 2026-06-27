@@ -24,6 +24,7 @@ void powerInit() {
 
   // Battery ADC
   analogReadResolution(12);
+  analogSetPinAttenuation(PIN_BATTERY_ADC, ADC_11db);  // match node attenuation for full 0-3.3V range
   analogSetAttenuation(ADC_11db);  // 0–3.6 V range
 
   // Modem power enable (start OFF)

@@ -380,7 +380,13 @@ static uint32_t computeNextSyncUnix(uint32_t nowUnix) {
     if (nowUnix < anchorUnix) return anchorUnix;
     const uint32_t elapsedSec = nowUnix - anchorUnix;
     const uint32_t slotsElapsed = elapsedSec / periodSec;
-    return anchorUnix + (slotsElapsed + 1UL) * periodSec;
+    uint32_t next = anchorUnix + (slotsElapsed + 1UL) * periodSec;
+    // Ensure the result is at least one full interval in the future
+    // (during upload phase, the next slot boundary may be very close)
+    while (next <= nowUnix) {
+      next += periodSec;
+    }
+    return next;
   }
 
   DateTime now(nowUnix);
@@ -1184,8 +1190,8 @@ static void handleRoot() {
     if (node.state == DEPLOYED) deployedNodes++;
   }
 
-  // --- Hub time bar ---
-  html += F("<div class='top-time'><span class='top-time__label'>Hub time</span><span id='rtc-now' class='top-time__value'>");
+  // --- Mothership time bar ---
+  html += F("<div class='top-time'><span class='top-time__label'>Mothership time</span><span id='rtc-now' class='top-time__value'>");
   html += currentTime;
   html += F("</span></div>");
 
@@ -1207,15 +1213,15 @@ static void handleRoot() {
             "</div>"
             "</details>");
 
-  // --- Quick actions: Find New Stations + Manage Stations ---
+  // --- Quick actions: Find New Nodes + Manage nodes ---
   html += F("<div class='section action-stack' style='margin:0 0 12px 0'>"
             "<form class='async-form' action='/find-stations' method='POST' style='margin:0'>"
-            "<button type='submit' class='btn btn--primary' style='width:100%'><svg class='icon' viewBox='0 0 24 24' aria-hidden='true'><path d='M12 3c-3.9 0-7.4 1.6-9.9 4.1l1.4 1.4C5.6 6.4 8.7 5 12 5s6.4 1.4 8.5 3.5l1.4-1.4C19.4 4.6 15.9 3 12 3zm0 5c-2.6 0-5 .9-6.9 2.6l1.4 1.4C8 10.5 9.9 10 12 10s4 .5 5.5 2l1.4-1.4C17 8.9 14.6 8 12 8zm0 5c-1.3 0-2.5.5-3.5 1.5l1.4 1.4c.6-.6 1.3-.9 2.1-.9s1.5.3 2.1.9l1.4-1.4c-1-1-2.2-1.5-3.5-1.5zm0 4a2 2 0 100 4 2 2 0 000-4z'/></svg> Find New Stations</button>"
+            "<button type='submit' class='btn btn--primary' style='width:100%'><svg class='icon' viewBox='0 0 24 24' aria-hidden='true'><path d='M12 3c-3.9 0-7.4 1.6-9.9 4.1l1.4 1.4C5.6 6.4 8.7 5 12 5s6.4 1.4 8.5 3.5l1.4-1.4C19.4 4.6 15.9 3 12 3zm0 5c-2.6 0-5 .9-6.9 2.6l1.4 1.4C8 10.5 9.9 10 12 10s4 .5 5.5 2l1.4-1.4C17 8.9 14.6 8 12 8zm0 5c-1.3 0-2.5.5-3.5 1.5l1.4 1.4c.6-.6 1.3-.9 2.1-.9s1.5.3 2.1.9l1.4-1.4c-1-1-2.2-1.5-3.5-1.5zm0 4a2 2 0 100 4 2 2 0 000-4z'/></svg> Find New Nodes</button>"
             "</form>"
-            "<a href='/stations' class='btn btn--success'><svg class='icon' viewBox='0 0 24 24' aria-hidden='true'><path d='M12 2a4 4 0 110 8 4 4 0 010-8zm-7 12a3 3 0 110 6 3 3 0 010-6zm14 0a3 3 0 110 6 3 3 0 010-6zM9.3 9.8l-3 3.9 1.6 1.2 3-3.9-1.6-1.2zm5.4 0l-1.6 1.2 3 3.9 1.6-1.2-3-3.9z'/></svg> Manage Stations</a>"
+            "<a href='/stations' class='btn btn--success'><svg class='icon' viewBox='0 0 24 24' aria-hidden='true'><path d='M12 2a4 4 0 110 8 4 4 0 010-8zm-7 12a3 3 0 110 6 3 3 0 010-6zm14 0a3 3 0 110 6 3 3 0 010-6zM9.3 9.8l-3 3.9 1.6 1.2 3-3.9-1.6-1.2zm5.4 0l-1.6 1.2 3 3.9 1.6-1.2-3-3.9z'/></svg> Manage nodes</a>"
             "</div>");
 
-  // --- Status cards row: Hub battery + Storage ---
+  // --- Status cards row: Mothership battery + Storage ---
   {
     const uint64_t fsTotal = (uint64_t)LittleFS.totalBytes();
     const uint64_t fsUsed  = (uint64_t)LittleFS.usedBytes();
@@ -1232,7 +1238,7 @@ static void handleRoot() {
 
     html += F("<div class='stats' style='margin:0 0 12px 0;text-align:left'>");
     html += F("<div class='stat' style='text-align:left'>"
-              "<strong>Hub battery</strong><br>");
+              "<strong>Mothership battery</strong><br>");
     html += F("<span class='chip ");
     html += batClass;
     html += F("' style='font-size:16px;font-weight:600'>");
@@ -1263,10 +1269,10 @@ static void handleRoot() {
     html += F("</div>");
   }
 
-  // --- Station KPI tiles ---
+  // --- Node KPI tiles ---
   html += F("<div class='section' aria-live='polite'>"
             "<div id='ui-status' class='help' style='display:none;margin-bottom:10px;border:1px solid var(--border);border-radius:8px;padding:8px 10px'></div>"
-            "<h3>Stations</h3>"
+            "<h3>Nodes</h3>"
             "<div class='stats stats--kpi' style='margin:0 0 12px 0'>"
               "<div class='stat");
   if (deployedNodes > 0) html += F(" stat--deployed-active");
@@ -1381,7 +1387,7 @@ static void handleRoot() {
             "<div class='help'><strong>WiFi network:</strong> ");
   html += ssid;
   html += F("<br><strong>Portal URL:</strong> http://192.168.4.1/"
-            "<br><strong>Hub address:</strong> ");
+            "<br><strong>Mothership address:</strong> ");
   html += getMothershipsMAC();
   html += F("<br><strong>Radio channel:</strong> ");
   html += String(ESPNOW_CHANNEL);
@@ -1450,18 +1456,18 @@ static void handleDiscoverNodes() {
   }
 
   if (isAjaxRequest()) {
-    sendAjaxResult(sentAny, sentAny ? "Scanning for new stations... Refreshing list." : "Scan failed");
+    sendAjaxResult(sentAny, sentAny ? "Scanning for new nodes... Refreshing list." : "Scan failed");
     return;
   }
 
   String html = headCommon("fieldMesh");
   html += F("<meta http-equiv='refresh' content='3;url=/stations'>");
-  html += F("<div class='section center'><h3>Searching for new stations...</h3>"
-            "<div class='muted'>Scanning for stations in pairing mode.</div>"
+  html += F("<div class='section center'><h3>Searching for new nodes...</h3>"
+            "<div class='muted'>Scanning for nodes in pairing mode.</div>"
             "<div style='margin:16px auto;width:40px;height:40px;border-radius:50%;"
             "border:4px solid #eee;border-top-color:#2196F3;animation:spin 1s linear infinite'></div>"
             "<style>@keyframes spin{0%{transform:rotate(0)}100%{transform:rotate(360deg)}}</style>"
-            "<p class='muted'><small>Redirecting to Stations in 3 seconds…</small></p></div>");
+            "<p class='muted'><small>Redirecting to Nodes in 3 seconds…</small></p></div>");
   html += footCommon();
   server.send(200, "text/html", html);
 }
@@ -1495,7 +1501,7 @@ static void handleSetWakeInterval() {
 
   if (isAjaxRequest()) {
     if (interval > 0) {
-      sendAjaxResult(true, sent ? "Recording interval applied to all stations" : "No connected or active stations");
+      sendAjaxResult(true, sent ? "Recording interval applied to all nodes" : "No connected or active nodes");
     } else {
       sendAjaxResult(true, "Recording interval is OFF");
     }
@@ -1508,7 +1514,7 @@ static void handleSetWakeInterval() {
   if (interval > 0) {
     html += String(interval);
     html += F(" min.</p><p style='color:#666'>");
-    html += sent ? F("Applied to all connected and active stations.") : F("No connected or active stations.");
+    html += sent ? F("Applied to all connected and active nodes.") : F("No connected or active nodes.");
     html += F("</p>");
   } else {
     html += F("OFF.</p><p style='color:#666'>Recording interval disabled.</p>");
@@ -1654,31 +1660,31 @@ static void handleRevertNode() {
   String html = headCommon("fieldMesh");
   html += F("<div class='section center'>");
   if (found) {
-    html += F("<h3>Station stopped</h3><p>Station <strong>");
+    html += F("<h3>Node stopped</h3><p>Node <strong>");
     html += nodeId;
     html += F("</strong> is now connected but not active.</p>");
     if (!sentCmd) {
-      html += F("<p class='muted'>Warning: could not send stop command to the station.</p>");
+      html += F("<p class='muted'>Warning: could not send stop command to the node.</p>");
     }
   } else {
-    html += F("<h3>Station not found or not active</h3><p>No action taken.</p>");
+    html += F("<h3>Node not found or not active</h3><p>No action taken.</p>");
   }
-  html += F("<a href='/stations' class='btn btn--primary'>Back to Stations</a></div>");
+  html += F("<a href='/stations' class='btn btn--primary'>Back to Nodes</a></div>");
   html += footCommon();
   server.send(200, "text/html", html);
 }
 
 static void handleStationsPage() {
-  String html = headCommon("Stations",
+  String html = headCommon("Nodes",
     "<a href='/' class='btn btn--sm'>Back</a><a href='/stations' class='btn btn--sm'>Refresh</a>");
   auto allNodes = getRegisteredNodes();
 
   html += F("<div id='ui-status' class='help' style='display:none;margin-bottom:10px;border:1px solid var(--border);border-radius:8px;padding:8px 10px'></div>");
   html += F("<div class='section'>");
-  html += F("<h3>Stations</h3>");
+  html += F("<h3>Nodes</h3>");
 
   if (allNodes.empty()) {
-    html += F("<p class='muted'>No stations yet. Tap “Add New Station” below to get started.</p>");
+    html += F("<p class='muted'>No nodes yet. Tap “Add New node” below to get started.</p>");
   } else {
     html += F("<div class='list'>");
 
@@ -1772,17 +1778,17 @@ static void handleStationsPage() {
   }
   html += F("</div>");
 
-  // --- Add New Station guided panel ---
+  // --- Add New node guided panel ---
   html += F("<div class='section'>"
             "<details>"
-            "<summary style='font-weight:bold;cursor:pointer'>+ Add New Station</summary>"
+            "<summary style='font-weight:bold;cursor:pointer'>+ Add New node</summary>"
             "<div style='margin-top:12px'>"
-            "<p class='muted'>1. Press the pair button on the station (hold 3 seconds).<br>"
+            "<p class='muted'>1. Press the pair button on the node (hold 3 seconds).<br>"
             "2. Wait for the green light.<br>"
-            "3. Tap “Find New Stations” below.</p>"
-            "<p class='muted'>The station will appear in the list as “New”. Tap it to activate and give it a name.</p>"
+            "3. Tap “Find New Nodes” below.</p>"
+            "<p class='muted'>The node will appear in the list as “New”. Tap it to activate and give it a name.</p>"
             "<form class='async-form' action='/find-stations' method='POST'>"
-            "<button type='submit' class='btn btn--primary'><svg class='icon' viewBox='0 0 24 24' aria-hidden='true'><path d='M12 3c-3.9 0-7.4 1.6-9.9 4.1l1.4 1.4C5.6 6.4 8.7 5 12 5s6.4 1.4 8.5 3.5l1.4-1.4C19.4 4.6 15.9 3 12 3zm0 5c-2.6 0-5 .9-6.9 2.6l1.4 1.4C8 10.5 9.9 10 12 10s4 .5 5.5 2l1.4-1.4C17 8.9 14.6 8 12 8zm0 5c-1.3 0-2.5.5-3.5 1.5l1.4 1.4c.6-.6 1.3-.9 2.1-.9s1.5.3 2.1.9l1.4-1.4c-1-1-2.2-1.5-3.5-1.5zm0 4a2 2 0 100 4 2 2 0 000-4z'/></svg> Find New Stations</button>"
+            "<button type='submit' class='btn btn--primary'><svg class='icon' viewBox='0 0 24 24' aria-hidden='true'><path d='M12 3c-3.9 0-7.4 1.6-9.9 4.1l1.4 1.4C5.6 6.4 8.7 5 12 5s6.4 1.4 8.5 3.5l1.4-1.4C19.4 4.6 15.9 3 12 3zm0 5c-2.6 0-5 .9-6.9 2.6l1.4 1.4C8 10.5 9.9 10 12 10s4 .5 5.5 2l1.4-1.4C17 8.9 14.6 8 12 8zm0 5c-1.3 0-2.5.5-3.5 1.5l1.4 1.4c.6-.6 1.3-.9 2.1-.9s1.5.3 2.1.9l1.4-1.4c-1-1-2.2-1.5-3.5-1.5zm0 4a2 2 0 100 4 2 2 0 000-4z'/></svg> Find New Nodes</button>"
             "</form>"
             "</div>"
             "</details>"
@@ -1804,13 +1810,13 @@ static void handleStationDetail() {
   String actionsHtml = String("<a href='/stations' class='btn btn--sm'>Back</a><a href='/station?id=")
     + nodeId
     + String("' class='btn btn--sm'>Refresh</a>");
-  String html = headCommon("Station", actionsHtml);
+  String html = headCommon("Node", actionsHtml);
   html += F("<div class='section'>");
 
   if (!target) {
-    html += F("<h3>Station not found</h3>"
-              "<p class='muted'>No station with that ID is currently registered.</p>"
-              "<a href='/stations' class='btn btn--primary'>Back to Stations</a>");
+    html += F("<h3>Node not found</h3>"
+              "<p class='muted'>No node with that ID is currently registered.</p>"
+              "<a href='/stations' class='btn btn--primary'>Back to Nodes</a>");
     html += F("</div>");
     html += footCommon();
     server.send(404, "text/html", html);
@@ -1866,14 +1872,39 @@ static void handleStationDetail() {
   html += target->nodeId;
   html += F("'>");
 
+  // --- Location section (GPS capture + manual entry) ---
+  html += F("<div class='section'>"
+            "<h3>Location</h3>"
+            "<p class='muted'>Stand next to this node and tap \"Use phone GPS\" to capture its location.</p>"
+            "<button type='button' class='btn btn--primary' onclick='captureGPS()'>\xF0\x9F\x93\x8D Use phone GPS</button>"
+            "<div id='gps-status' class='help' style='margin-top:8px'></div>"
+            "<label class='label'>Latitude</label>"
+            "<input class='input' type='text' id='lat' name='lat' placeholder='-27.469771' value='");
+  if (!isnan(target->latitude)) {
+    char latBuf[16];
+    snprintf(latBuf, sizeof(latBuf), "%.6f", target->latitude);
+    html += latBuf;
+  }
+  html += F("'>"
+            "<label class='label'>Longitude</label>"
+            "<input class='input' type='text' id='lon' name='lon' placeholder='153.025124' value='");
+  if (!isnan(target->longitude)) {
+    char lonBuf[16];
+    snprintf(lonBuf, sizeof(lonBuf), "%.6f", target->longitude);
+    html += lonBuf;
+  }
+  html += F("'>"
+            "<a id='view-map' href='#' class='btn' style='display:none;margin-top:8px'>View on map</a>"
+            "</div>");
+
   html += F("<div style='margin-bottom:10px;padding:10px;border:1px solid var(--border);border-radius:8px;background:#fafafa'>"
             "<label class='label' style='margin-top:0'>Notes</label>"
-            "<input class='input' type='text' name='notes' maxlength='180' placeholder='Notes for this station' value='");
+            "<input class='input' type='text' name='notes' maxlength='180' placeholder='Notes for this node' value='");
   html += htmlEscape(notes);
   html += F("'></div>");
 
   if (!isDeployed) {
-    html += F("<label class='label'>Station ID (numeric, e.g. 001)</label>"
+    html += F("<label class='label'>Node ID (numeric, e.g. 001)</label>"
               "<input class='input' type='text' name='user_id' maxlength='3' "
               "placeholder='001' value='");
     html += userId;
@@ -1886,12 +1917,12 @@ static void handleStationDetail() {
   } else {
     html += F("<div style='margin-top:10px;padding:10px;border:1px solid #E1B17A;border-radius:8px;background:#fff8e1'>"
               "<div style='font-weight:700;color:#8a4b00;margin-bottom:6px'>Are you sure?</div>"
-              "<div class='muted' style='margin-bottom:8px'>Changing Station ID/Name on an active station can break tracking if used incorrectly.</div>"
+              "<div class='muted' style='margin-bottom:8px'>Changing Node ID/Name on an active node can break tracking if used incorrectly.</div>"
               "<label style='display:flex;gap:8px;align-items:flex-start;margin-bottom:8px'>"
               "<input type='checkbox' name='edit_identity_confirm' value='yes' onchange=\"var en=this.checked;document.getElementById('dep-user-id').disabled=!en;document.getElementById('dep-name').disabled=!en;\">"
-              "<span>I understand and want to edit Station ID/Name for this active station.</span>"
+              "<span>I understand and want to edit Node ID/Name for this active node.</span>"
               "</label>"
-              "<label class='label'>Station ID (numeric, e.g. 001)</label>"
+              "<label class='label'>Node ID (numeric, e.g. 001)</label>"
               "<input id='dep-user-id' class='input' type='text' name='user_id' maxlength='3' placeholder='001' disabled value='");
     html += userId;
     html += F("'>"
@@ -1907,7 +1938,7 @@ static void handleStationDetail() {
             "<div style='font-size:14px;padding:6px 0'><strong>");
   html += String(gWakeIntervalMin > 0 ? gWakeIntervalMin : 0);
   html += F(" min</strong> &nbsp;<span style='font-size:12px;color:#888'>"
-            "(applies to all stations &mdash; change in Settings)</span></div>");
+            "(applies to all nodes &mdash; change in Settings)</span></div>");
   if (gSyncIntervalMin > 0) {
     html += F("<div style='font-size:12px;color:#555'>Upload every ");
     html += String(gSyncIntervalMin);
@@ -1919,13 +1950,14 @@ static void handleStationDetail() {
               "<label class='action-choice'><input type='radio' name='action' value='none' checked><span>No change</span></label>"
               "<label class='action-choice action-choice--start'><input type='radio' name='action' value='start'><span>Activate</span></label>"
               "<label class='action-choice action-choice--stop'><input type='radio' name='action' value='stop'><span>Stop Monitoring</span></label>"
-              "<label class='action-choice action-choice--unpair'><input type='radio' name='action' value='unpair'><span>Remove Station</span></label>"
+              "<label class='action-choice action-choice--unpair'><input type='radio' name='action' value='unpair'><span>Remove node</span></label>"
             "</div>"
             "<button type='submit' class='btn btn--success' style='margin-top:12px'>"
             "Save Changes</button>"
             "</form>");
 
-  html += F("<script>function confirmRemove(){var r=document.querySelector('input[name=action]:checked');if(r&&r.value==='unpair'){return confirm('Remove this station? You will need to re-add it with the pair button.');}return true;}</script>");
+  html += F("<script>function confirmRemove(){var r=document.querySelector('input[name=action]:checked');if(r&&r.value==='unpair'){return confirm('Remove this node? You will need to re-add it with the pair button.');}return true;}</script>");
+  html += F("<script>function captureGPS(){var status=document.getElementById('gps-status');var btn=event.target;btn.textContent='Getting GPS...';btn.disabled=true;status.textContent='';if(!navigator.geolocation){status.textContent='GPS not available on this device.';btn.textContent='\\xF0\\x9F\\x93\\x8D Use phone GPS';btn.disabled=false;return;}navigator.geolocation.getCurrentPosition(function(pos){var lat=pos.coords.latitude.toFixed(6);var lon=pos.coords.longitude.toFixed(6);var acc=Math.round(pos.coords.accuracy);document.getElementById('lat').value=lat;document.getElementById('lon').value=lon;status.innerHTML='Captured: '+lat+', '+lon+'<br>Accuracy: \\u00B1'+acc+'m'+(acc>50?'<br><strong>Low accuracy \\u2014 try again outdoors.</strong>':' (good)');var mapLink=document.getElementById('view-map');mapLink.href='geo:'+lat+','+lon+'?q='+lat+','+lon;mapLink.style.display='inline-block';btn.textContent='\\xF0\\x9F\\x93\\x8D Use phone GPS';btn.disabled=false;},function(err){status.textContent='GPS error: '+err.message;btn.textContent='\\xF0\\x9F\\x93\\x8D Use phone GPS';btn.disabled=false;},{enableHighAccuracy:true,timeout:15000,maximumAge:0});}</script>");
   html += F("</div>");
   html += footCommon();
   server.send(200, "text/html", html);
@@ -1953,6 +1985,20 @@ static void handleNodeConfigSave() {
   }
   if (server.hasArg("notes")) setNodeNotes(nodeId, notes);
 
+  // --- GPS coordinates (optional) ---
+  if (target) {
+    String latStr = server.arg("lat");
+    String lonStr = server.arg("lon");
+    if (latStr.length() > 0 && lonStr.length() > 0) {
+      float lat = latStr.toFloat();
+      float lon = lonStr.toFloat();
+      if (lat != 0.0f || lon != 0.0f) {
+        target->latitude  = lat;
+        target->longitude = lon;
+      }
+    }
+  }
+
   NodeDesiredConfig dc = getDesiredConfig(nodeId.c_str());
   bool cfgChanged = false;
   uint32_t globalPhaseUnix = gLastSyncBroadcastUnix;
@@ -1976,6 +2022,8 @@ static void handleNodeConfigSave() {
   else if (cfgChanged) { dc.configVersion = (dc.configVersion < 0xFFFFu) ? (dc.configVersion + 1u) : 1u; }
   setDesiredConfig(nodeId.c_str(), dc);
   if (target) target->wakeIntervalMin = (uint8_t)interval;
+  // Persist any updated node fields (name/notes/lat/lon) to NVS.
+  if (target) savePairedNodes();
 
   Serial.printf("[CONFIG] %s interval=%d min desired v%u changed=%d\n",
                 nodeId.c_str(), interval, (unsigned)dc.configVersion, cfgChanged ? 1 : 0);
@@ -2035,15 +2083,15 @@ static void handleNodeConfigSave() {
   String actionsHtml = String("<a href='/stations' class='btn btn--sm'>Back</a><a href='/station?id=")
     + nodeId
     + String("' class='btn btn--sm'>Refresh</a>");
-  String html = headCommon("Station", actionsHtml);
+  String html = headCommon("Node", actionsHtml);
   html += F("<div class='section center'>"
-            "<h3>Station settings applied</h3>");
+            "<h3>Node settings applied</h3>");
 
   if (!target) {
-    html += F("<p class='muted'>Warning: this station ID is not currently in the registered list.</p>");
+    html += F("<p class='muted'>Warning: this node ID is not currently in the registered list.</p>");
   }
 
-  html += F("<p><strong>Station ID:</strong> ");
+  html += F("<p><strong>Node ID:</strong> ");
   html += (finalUserId.length() ? htmlEscape(finalUserId) : String("-"));
   html += F("<br><strong>Name:</strong> ");
   html += (finalName.length() ? htmlEscape(finalName) : String("-"));
@@ -2056,17 +2104,17 @@ static void handleNodeConfigSave() {
   html += F("</p>");
 
   html += F("<p class='muted'>"
-            "Schedule stored for this station (applies on next wake)"
+            "Schedule stored for this node (applies on next wake)"
             "<br>Connect (if new): ");
   html += pairOk ? "OK" : "not requested / failed";
   html += F("<br>Activate: ");
-  html += deployOk ? "REQUESTED (awaiting station confirmation)" : "not requested / failed";
+  html += deployOk ? "REQUESTED (awaiting node confirmation)" : "not requested / failed";
   html += F("<br>Stop monitoring: ");
   html += revertOk ? "OK" : "not requested / failed";
-  html += F("<br>Remove station: ");
+  html += F("<br>Remove node: ");
   html += unpairOk ? "OK" : "not requested / failed";
   html += F("</p>"
-            "<a href='/stations' class='btn btn--primary'>Back to Stations</a>"
+            "<a href='/stations' class='btn btn--primary'>Back to Nodes</a>"
             "</div>");
 
   html += footCommon();
@@ -2110,7 +2158,7 @@ static void handleSettings() {
 
   // --- Recording interval presets ---
   html += F("<h3>Recording interval</h3>"
-            "<p class='muted'>How often each station measures.</p>"
+            "<p class='muted'>How often each node measures.</p>"
             "<form class='async-form' action='/set-recording-interval' method='POST'>"
             "<div class='action-choices'>");
   static const int kRecordingPresets[] = {1, 5, 10, 30};
@@ -2147,7 +2195,7 @@ static void handleSettings() {
   html += F("<label class='label'><input type='checkbox' name='enabled' value='1'");
   if (tx.enabled) html += F(" checked");
   html += F("> <strong>Enable cloud upload</strong></label>");
-  html += F("<div class='help'>When enabled, the Hub uploads new data during collection rounds (subject to schedule and battery checks).</div>");
+  html += F("<div class='help'>When enabled, the Mothership uploads new data during collection rounds (subject to schedule and battery checks).</div>");
 
   html += F("<label class='label' for='api_key'>API Key</label>");
   if (tx.apiKey.length() > 0) {

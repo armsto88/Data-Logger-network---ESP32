@@ -12,6 +12,7 @@
 #include <Arduino.h>
 #include <Wire.h>
 #include <esp_now.h>
+#include <Preferences.h>
 
 #include "system/pins.h"
 #include "system/power.h"
@@ -41,6 +42,10 @@ static constexpr uint32_t kSyncSessionLimitMs = 180000UL;
 // Upload subsystem globals
 // ---------------------------------------------------------------------------
 UploadQueue uploadQueue;
+
+// Project started — first-ever boot timestamp (set once in NVS, never
+// overwritten).  Populated in setup() and passed into JsonUploadContext.
+uint32_t g_projectStartedUnix = 0;
 
 // gSyncIntervalMin is now owned by config_server.cpp (loaded from NVS in
 // config mode).  In sync-wake mode it falls back to the compile-time default
@@ -292,7 +297,8 @@ void performModemUpload(const TransmissionSettings& txSettings, uint32_t session
         computeNextSyncIsoLocal(),
         readBatteryVoltage(),
         (cursor.lastUploadUnix > 0 && cursor.retryCount == 0) ? "success"
-          : (cursor.retryCount > 0) ? "failed" : "pending"
+          : (cursor.retryCount > 0) ? "failed" : "pending",
+        g_projectStartedUnix
       };
 
       JsonPayload json = buildJsonUpload(ctx, payload.csvData,
@@ -385,7 +391,8 @@ void performModemUpload(const TransmissionSettings& txSettings, uint32_t session
         computeNextSyncIsoLocal(),
         readBatteryVoltage(),
         (cursor.lastUploadUnix > 0 && cursor.retryCount == 0) ? "success"
-          : (cursor.retryCount > 0) ? "failed" : "pending"
+          : (cursor.retryCount > 0) ? "failed" : "pending",
+        g_projectStartedUnix
       };
       JsonPayload json = buildJsonStatusOnly(ctx);
       if (json.ok) {
@@ -577,6 +584,10 @@ void handleSyncWake() {
   }
 
   Serial.println("[SYNC] Sync window closed");
+
+  // Persist paired-node state (including freshly reported battery voltages)
+  // to NVS so it survives power-off between sync cycles.
+  savePairedNodes();
 
   // Drain packets already accepted before unregistering the producer.
   EspNowSnapSlot finalSlots[4];
@@ -892,6 +903,28 @@ void setup() {
     }
   } else {
     Serial.println("[BOOT] Warning: RTC unavailable; rescue alarm not armed");
+  }
+
+  // Project started — first-ever boot timestamp.  Stored once in NVS
+  // namespace "tx" under "first_boot" and never overwritten, so it
+  // survives reboots and firmware updates.  Read every boot; only
+  // written when absent (value 0).
+  {
+    Preferences prefs;
+    if (prefs.begin("tx", false)) {
+      uint32_t firstBoot = prefs.getUInt("first_boot", 0);
+      if (firstBoot == 0) {
+        firstBoot = getRTCTime();
+        if (firstBoot > 0) {
+          prefs.putUInt("first_boot", firstBoot);
+          Serial.printf("[BOOT] Project started at unix=%u\n", (unsigned)firstBoot);
+        }
+      }
+      prefs.end();
+      g_projectStartedUnix = firstBoot;
+    } else {
+      Serial.println("[BOOT] Warning: could not open NVS \"tx\" for project-start");
+    }
   }
 
   // Print battery voltage at boot
