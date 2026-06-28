@@ -68,7 +68,17 @@ namespace {
       return;
     }
 
-    int16_t raw0, raw1, raw2, raw3;
+// Ping the ADS1115 before attempting a full 4-channel read. If the ADC is
+  // hung or absent, this returns quickly instead of blocking on the I2C bus
+  // for the full WireRtc timeout on each channel conversion.
+  WireRtc.beginTransmission(0x48);
+  if (WireRtc.endTransmission() != 0) {
+    Serial.println(F("[SOIL] ADS1115 not responding — skipping soil this cycle"));
+    haveSample = false;
+    return;
+  }
+
+  int16_t raw0, raw1, raw2, raw3;
     float   mv0,  mv1,  mv2,  mv3;
 
     bool ok0 = ads.readChannelMv(CH_SOIL1_TEMP,  raw0, mv0); // SOIL1 temperature

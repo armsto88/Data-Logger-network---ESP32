@@ -1,5 +1,6 @@
 // src/sensors.cpp
 #include <Arduino.h>
+#include <Wire.h>
 #include "sensors.h"
 #include "protocol.h"
 #include "sensors_sht41.h"
@@ -7,6 +8,18 @@
 #include "soil_moist_temp.h"
 #include "sensors_ultrasonic_wind.h"
 #include "sensors_aux_i2c.h"
+
+extern TwoWire WireRtc;
+
+namespace {
+// Per-backend I2C read budgets (ms). If a backend exceeds its budget, a
+// warning is logged so a hung sensor is visible without blocking the wake
+// cycle. These are post-hoc safety nets — WireRtc.setTimeOut() handles the
+// per-transaction blocking case.
+constexpr uint32_t SHT41_READ_BUDGET_MS   = 2000UL;
+constexpr uint32_t SPECTRAL_READ_BUDGET_MS = 5000UL;
+constexpr uint32_t SOIL_READ_BUDGET_MS    = 3000UL;
+} // namespace
 
 namespace {
 
@@ -53,6 +66,13 @@ size_t     g_numSensors = 0;
 
 bool initSensors() {
   Serial.println(F("[SENS] initSensors()"));
+
+  // Set a 2-second per-I2C-transaction timeout on the shared bus so a hung
+  // sensor returns an I2C error instead of blocking the wake cycle forever.
+  // Individual sensor backends already check endTransmission()/requestFrom()
+  // return values, so a timeout surfaces as a normal read failure (NaN).
+  WireRtc.setTimeOut(2000);
+  Serial.println(F("[SENS] WireRtc I2C timeout set to 2000ms"));
 
   g_numSensors = 0;
 
@@ -185,19 +205,40 @@ bool readSensor(size_t index, float &outValue) {
   size_t auxCount  = aux_i2c_backend::count();
 
   if (index < shtCount) {
-    return sht41_backend::read(index, outValue);
+    uint32_t t0 = millis();
+    bool ok = sht41_backend::read(index, outValue);
+    uint32_t dt = millis() - t0;
+    if (dt > SHT41_READ_BUDGET_MS) {
+      Serial.printf("[SENS] WARNING: SHT41 read took %lums (budget %lums)\n",
+                    (unsigned long)dt, (unsigned long)SHT41_READ_BUDGET_MS);
+    }
+    return ok;
   }
 
   // PAR backend after SHT41
   size_t parIndex = index - shtCount;
   if (parIndex < parCount) {
-    return par_as7343_backend::read(parIndex, outValue);
+    uint32_t t0 = millis();
+    bool ok = par_as7343_backend::read(parIndex, outValue);
+    uint32_t dt = millis() - t0;
+    if (dt > SPECTRAL_READ_BUDGET_MS) {
+      Serial.printf("[SENS] WARNING: Spectral read took %lums (budget %lums)\n",
+                    (unsigned long)dt, (unsigned long)SPECTRAL_READ_BUDGET_MS);
+    }
+    return ok;
   }
 
   // Soil backend comes after SHT41 and PAR
   size_t soilIndex = index - shtCount - parCount;
   if (soilIndex < soilCount) {
-    return soil_moist_temp_backend::read(soilIndex, outValue);
+    uint32_t t0 = millis();
+    bool ok = soil_moist_temp_backend::read(soilIndex, outValue);
+    uint32_t dt = millis() - t0;
+    if (dt > SOIL_READ_BUDGET_MS) {
+      Serial.printf("[SENS] WARNING: Soil read took %lums (budget %lums)\n",
+                    (unsigned long)dt, (unsigned long)SOIL_READ_BUDGET_MS);
+    }
+    return ok;
   }
 
   // Ultrasonic backend after SHT41, PAR, and soil

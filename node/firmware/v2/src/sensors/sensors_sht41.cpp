@@ -31,6 +31,16 @@ void sampleIfNeeded() {
   }
   delay(2);
 
+  // Ping the SHT4x before attempting a full read. If the sensor is hung or
+  // absent, this returns quickly instead of blocking on the I2C bus for the
+  // full WireRtc timeout on every register access.
+  WireRtc.beginTransmission(SHT4x_DEFAULT_ADDR);
+  if (WireRtc.endTransmission() != 0) {
+    g_haveSample = false;
+    Serial.println(F("[SHT4X] not responding — skipping this cycle"));
+    return;
+  }
+
   sensors_event_t humidity;
   sensors_event_t temp;
   if (!g_sht4.getEvent(&humidity, &temp)) {

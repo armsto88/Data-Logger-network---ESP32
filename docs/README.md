@@ -17,6 +17,7 @@ This folder contains shared/cross-system project notes. Mothership-specific and 
 - [FutureRoadMap.md](FutureRoadMap.md) — project roadmap
 - [FIRMWARE_AND_HARDWARE_NOTES.md](FIRMWARE_AND_HARDWARE_NOTES.md) — integration notes
 - [FIRMWARE_FUNCTIONALITY_FOR_ECOLOGISTS.md](FIRMWARE_FUNCTIONALITY_FOR_ECOLOGISTS.md) — non-technical firmware overview
+- [FIELDMESH_FAQ.md](FIELDMESH_FAQ.md) — frequently asked questions (field deployment, nodes, data, cloud, troubleshooting)
 - [NATIVE_APP_INTEGRATION_V2.md](NATIVE_APP_INTEGRATION_V2.md) — app integration and data schemas
 - [NATIVE_APP_INTEGRATION_STATUS_2026-04-13.md](NATIVE_APP_INTEGRATION_STATUS_2026-04-13.md) — app integration status
 - [NATIVE_APP_FULL_CONCEPT_AND_SCHEMAS.md](NATIVE_APP_FULL_CONCEPT_AND_SCHEMAS.md) — full app concept and data schemas

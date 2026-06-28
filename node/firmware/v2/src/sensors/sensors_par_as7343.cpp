@@ -45,6 +45,17 @@ void sampleIfNeeded() {
   }
   delay(2);
 
+  // Ping the AS7341 before attempting a full read. The Adafruit_AS7341
+  // readAllChannels() path has internal delays and register accesses; if the
+  // sensor is hung or absent, this ping returns quickly instead of burning
+  // the full WireRtc timeout on every register access.
+  WireRtc.beginTransmission(AS7341_I2CADDR_DEFAULT);
+  if (WireRtc.endTransmission() != 0) {
+    g_haveSample = false;
+    Serial.println(F("[PAR] AS734x not responding — skipping spectral this cycle"));
+    return;
+  }
+
   if (!g_par.readAllChannels()) {
     g_haveSample = false;
     Serial.println(F("[PAR] AS734x read failed"));

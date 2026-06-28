@@ -1872,12 +1872,17 @@ static void handleStationDetail() {
   html += target->nodeId;
   html += F("'>");
 
-  // --- Location section (GPS capture + manual entry) ---
+  // --- Location section (manual entry with phone GPS guidance) ---
   html += F("<div class='section'>"
             "<h3>Location</h3>"
-            "<p class='muted'>Stand next to this node and tap \"Use phone GPS\" to capture its location.</p>"
-            "<button type='button' class='btn btn--primary' onclick='captureGPS()'>\xF0\x9F\x93\x8D Use phone GPS</button>"
-            "<div id='gps-status' class='help' style='margin-top:8px'></div>"
+            "<p class='muted'>Find this node's coordinates using your phone's Maps app, then enter them below.</p>"
+            "<div style='margin:8px 0;padding:10px;border:1px solid var(--border);border-radius:8px;background:var(--panel)'>"
+            "<strong>How to get coordinates:</strong><br>"
+            "<span class='muted'>1. Open Google Maps or Apple Maps on your phone<br>"
+            "2. Tap the location dot to centre on your position<br>"
+            "3. Long-press the blue dot → coordinates appear at the top<br>"
+            "4. Copy the latitude and longitude values</span>"
+            "</div>"
             "<label class='label'>Latitude</label>"
             "<input class='input' type='text' id='lat' name='lat' placeholder='-27.469771' value='");
   if (!isnan(target->latitude)) {
@@ -1894,7 +1899,6 @@ static void handleStationDetail() {
     html += lonBuf;
   }
   html += F("'>"
-            "<a id='view-map' href='#' class='btn' style='display:none;margin-top:8px'>View on map</a>"
             "</div>");
 
   html += F("<div style='margin-bottom:10px;padding:10px;border:1px solid var(--border);border-radius:8px;background:#fafafa'>"
@@ -1957,7 +1961,6 @@ static void handleStationDetail() {
             "</form>");
 
   html += F("<script>function confirmRemove(){var r=document.querySelector('input[name=action]:checked');if(r&&r.value==='unpair'){return confirm('Remove this node? You will need to re-add it with the pair button.');}return true;}</script>");
-  html += F("<script>function captureGPS(){var status=document.getElementById('gps-status');var btn=event.target;btn.textContent='Getting GPS...';btn.disabled=true;status.textContent='';if(!navigator.geolocation){status.textContent='GPS not available on this device.';btn.textContent='\\xF0\\x9F\\x93\\x8D Use phone GPS';btn.disabled=false;return;}navigator.geolocation.getCurrentPosition(function(pos){var lat=pos.coords.latitude.toFixed(6);var lon=pos.coords.longitude.toFixed(6);var acc=Math.round(pos.coords.accuracy);document.getElementById('lat').value=lat;document.getElementById('lon').value=lon;status.innerHTML='Captured: '+lat+', '+lon+'<br>Accuracy: \\u00B1'+acc+'m'+(acc>50?'<br><strong>Low accuracy \\u2014 try again outdoors.</strong>':' (good)');var mapLink=document.getElementById('view-map');mapLink.href='geo:'+lat+','+lon+'?q='+lat+','+lon;mapLink.style.display='inline-block';btn.textContent='\\xF0\\x9F\\x93\\x8D Use phone GPS';btn.disabled=false;},function(err){status.textContent='GPS error: '+err.message;btn.textContent='\\xF0\\x9F\\x93\\x8D Use phone GPS';btn.disabled=false;},{enableHighAccuracy:true,timeout:15000,maximumAge:0});}</script>");
   html += F("</div>");
   html += footCommon();
   server.send(200, "text/html", html);

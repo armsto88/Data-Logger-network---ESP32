@@ -907,17 +907,24 @@ void setup() {
 
   // Project started — first-ever boot timestamp.  Stored once in NVS
   // namespace "tx" under "first_boot" and never overwritten, so it
-  // survives reboots and firmware updates.  Read every boot; only
-  // written when absent (value 0).
+  // survives reboots and firmware updates.  Only written when the RTC
+  // has a valid time (after 2020-01-01) to avoid storing a garbage
+  // timestamp from an unsynced RTC.
   {
     Preferences prefs;
     if (prefs.begin("tx", false)) {
       uint32_t firstBoot = prefs.getUInt("first_boot", 0);
       if (firstBoot == 0) {
-        firstBoot = getRTCTime();
-        if (firstBoot > 0) {
+        // RTC not yet synced — defer writing until we have a valid time.
+        // Check again on every boot; once the RTC is set (via config mode
+        // "Set time" or NTP sync), the next boot will capture it.
+        uint32_t nowUnix = getRTCTime();
+        if (nowUnix > 1577836800UL) {  // after 2020-01-01 00:00:00 UTC
+          firstBoot = nowUnix;
           prefs.putUInt("first_boot", firstBoot);
           Serial.printf("[BOOT] Project started at unix=%u\n", (unsigned)firstBoot);
+        } else {
+          Serial.println("[BOOT] RTC not synced — deferring projectStarted write");
         }
       }
       prefs.end();
