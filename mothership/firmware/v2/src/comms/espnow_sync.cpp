@@ -118,6 +118,38 @@ void broadcastSyncWindowOpen() {
   }
 }
 
+void broadcastSyncScheduleNow(int syncIntervalMinutes, uint32_t phaseUnix) {
+  // Hand the new schedule to the fleet while they are awake in this window.
+  // Mirrors broadcastSyncWindowOpen() — reuses the broadcast peer added in
+  // initEspNowSyncOnly(). Nodes apply this via the SET_SYNC_SCHED event and
+  // re-arm A2 to phaseUnix + syncIntervalMinutes.
+  sync_schedule_command_message_t msg = {};
+  strncpy(msg.command, "SET_SYNC_SCHED", sizeof(msg.command) - 1);
+  strncpy(msg.mothership_id, "M001", sizeof(msg.mothership_id) - 1);
+  msg.syncIntervalMinutes = (unsigned long)syncIntervalMinutes;
+  msg.phaseUnix = phaseUnix;
+
+  esp_err_t result = esp_now_send(kBroadcastAddr, reinterpret_cast<const uint8_t*>(&msg), sizeof(msg));
+  Serial.printf("[ESP-NOW] SET_SYNC_SCHED broadcast syncMin=%d phase=%lu -> %s\n",
+                syncIntervalMinutes, (unsigned long)phaseUnix,
+                result == ESP_OK ? "OK" : "FAIL");
+}
+
+void broadcastWakeIntervalNow(int intervalMinutes) {
+  // SET_SYNC_SCHED carries only the sync schedule; the recording/wake interval
+  // is a separate command (SET_SCHEDULE). Broadcast it over the same broadcast
+  // peer so deployed nodes update their A1 (data) alarm. Nodes ignore it when
+  // the interval is unchanged, so broadcasting every window is idempotent.
+  schedule_command_message_t cmd = {};
+  strncpy(cmd.command, "SET_SCHEDULE", sizeof(cmd.command) - 1);
+  strncpy(cmd.mothership_id, "M001", sizeof(cmd.mothership_id) - 1);
+  cmd.intervalMinutes = intervalMinutes;
+
+  esp_err_t result = esp_now_send(kBroadcastAddr, reinterpret_cast<const uint8_t*>(&cmd), sizeof(cmd));
+  Serial.printf("[ESP-NOW] SET_SCHEDULE broadcast interval=%d min -> %s\n",
+                intervalMinutes, result == ESP_OK ? "OK" : "FAIL");
+}
+
 void registerReceiveCallback(EspNowRecvCallback cb) {
   gRecvCallback = cb;
 }

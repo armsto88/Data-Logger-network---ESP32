@@ -13,6 +13,7 @@
 #include <Wire.h>
 #include <esp_now.h>
 #include <Preferences.h>
+#include <WiFi.h>
 
 #include "system/pins.h"
 #include "system/power.h"
@@ -44,7 +45,7 @@ static constexpr uint32_t kSyncSessionLimitMs = 180000UL;
 UploadQueue uploadQueue;
 
 // Project started — first-ever boot timestamp (set once in NVS, never
-// overwritten).  Populated in setup() and passed into JsonUploadContext.
+// overwritten).  Populated in setup() for dashboard/status reporting.
 uint32_t g_projectStartedUnix = 0;
 
 // gSyncIntervalMin is now owned by config_server.cpp (loaded from NVS in
@@ -246,6 +247,12 @@ void performModemUpload(const TransmissionSettings& txSettings, uint32_t session
     constexpr uint16_t kMaxReadingsPerPost = 100;
     constexpr uint32_t kJsonChunkBytes     = 16384;  // ~100-130 rows of CSV
 
+    // Supabase: header-only Bearer auth, JSON array body, no query params.
+    // The legacy Google Apps Script path (apiKey empty) still appends action.
+    const bool isSupabase = txSettings.apiKey.length() > 0;
+    const String authHeader = txSettings.apiKey.length() > 0
+        ? txSettings.apiKey : txSettings.authToken;
+
     const uint32_t totalPendingRows = uploadQueue.getPendingRows();
     Serial.printf("[UPLOAD] JSON path: %u pending rows, %u per POST\n",
                   (unsigned)totalPendingRows, (unsigned)kMaxReadingsPerPost);
@@ -254,10 +261,36 @@ void performModemUpload(const TransmissionSettings& txSettings, uint32_t session
     bool firstChunk = true;
     uint32_t nowUnix = getRTCTime();
 
-    // Stats don't change between chunks within the same session, so read
-    // them once before the loop instead of on every iteration (avoids a
-    // full-CSV scan per chunk for large backlogs).
-    const DataLogStats dlStats = readDataLogStats();
+    // Build the status context once per upload session — the backend stores
+    // it in mothership_status on every POST, so the dashboard sees fresh
+    // battery/flash/fleet/schedule data after each collection.
+    const uint64_t fsTotal = (uint64_t)LittleFS.totalBytes();
+    const uint64_t fsUsed  = (uint64_t)LittleFS.usedBytes();
+    const uint32_t flashPct = (fsTotal > 0)
+      ? (uint32_t)((fsUsed * 100ULL) / fsTotal) : 0;
+    const UploadCursor statusCursor = uploadQueue.getCursor();
+    const auto allNodes = getRegisteredNodes();
+    uint16_t fTotal = 0, fDeployed = 0, fPaired = 0, fUnpaired = 0, fPending = 0;
+    for (const auto& n : allNodes) {
+      fTotal++;
+      if (n.state == DEPLOYED) fDeployed++;
+      else if (n.state == PAIRED) fPaired++;
+      else fUnpaired++;
+      if (n.stateChangePending || n.deployPending) fPending++;
+    }
+    const StatusContext statusCtx = {
+      readBatteryVoltage(), flashPct, fsTotal, fsUsed,
+      "scheduled", computeNextSyncIsoLocal(),
+      gWakeIntervalMin, gSyncIntervalMin,
+      (gSyncMode == SYNC_MODE_INTERVAL) ? "interval" : "daily",
+      fTotal, fDeployed, fPaired, fUnpaired,
+      uploadQueue.getPendingRows(), statusCursor.rowsUploaded,
+      statusCursor.retryCount, statusCursor.lastUploadUnix,
+      FW_VERSION, FW_BUILD, getRTCTime(),
+      WiFi.macAddress(),
+      fPending, txSettings.enabled,
+      uploadQueue.getPendingRows(), (uint64_t)getCSVFileSize(), String("")
+    };
 
     while (uploadQueue.getPendingRows() > 0 && !sessionExpired()) {
       UploadPayload payload = uploadQueue.getNewData(kJsonChunkBytes);
@@ -268,53 +301,35 @@ void performModemUpload(const TransmissionSettings& txSettings, uint32_t session
       Serial.printf("[UPLOAD] JSON chunk: %u bytes, ~%u rows\n",
                     payload.byteLength, payload.rowEstimate);
 
-      // Build the JSON upload context.
-      const uint64_t fsTotal = (uint64_t)LittleFS.totalBytes();
-      const uint64_t fsUsed  = (uint64_t)LittleFS.usedBytes();
-      const UploadCursor cursor = uploadQueue.getCursor();
-
-      JsonUploadContext ctx = {
-        DEVICE_ID,
-        FW_VERSION,
-        FW_BUILD,
-        nowUnix,
-        "scheduled",
-        txSettings,
-        cursor,
-        uploadQueue.getPendingBytes(),
-        uploadQueue.getPendingRows(),
-        fsTotal,
-        fsUsed,
-        dlStats.records,
-        dlStats.csvBytes,
-        dlStats.lastConfirmedSyncIso,
-        gWakeIntervalMin,
-        gSyncIntervalMin,
-        gSyncMode,
-        gSyncDailyHour,
-        gSyncDailyMinute,
-        formatSyncTimeHHMM(gSyncDailyHour, gSyncDailyMinute),
-        computeNextSyncIsoLocal(),
-        readBatteryVoltage(),
-        (cursor.lastUploadUnix > 0 && cursor.retryCount == 0) ? "success"
-          : (cursor.retryCount > 0) ? "failed" : "pending",
-        g_projectStartedUnix
-      };
-
-      JsonPayload json = buildJsonUpload(ctx, payload.csvData,
-                                         kMaxReadingsPerPost, firstChunk);
-      if (!json.ok) {
-        // Build failed (heap/parse) — fall back to CSV POST for this chunk.
-        Serial.println("[UPLOAD] JSON build failed — falling back to CSV POST");
+      // Send the mothership status object only on the FIRST POST of the
+      // session — it doesn't change between chunks, so repeating it on every
+      // chunk just bloats the body and writes mothership_status N times.
+      JsonPayload json = buildJsonUpload(payload.csvData, kMaxReadingsPerPost,
+                                         FW_VERSION, firstChunk ? &statusCtx : nullptr,
+                                         getRTCTime());
+      if (json.ok && json.rowCount == 0 && json.csvBytesConsumed > 0) {
+        // The row(s) in this chunk were malformed and skipped by the builder.
+        // Advance past them (and purge) so the cursor doesn't stall — do NOT
+        // POST or treat as an error.
+        Serial.printf("[UPLOAD] JSON: skipped malformed row(s), advancing %u bytes\n",
+                      (unsigned)json.csvBytesConsumed);
+        nowUnix = getRTCTime();
+        uploadQueue.advanceCursor(payload.startOffset + json.csvBytesConsumed, nowUnix);
+        uploadQueue.purgeUploaded();
+        continue;
+      }
+      if (!json.ok || json.rowCount == 0) {
+        // Build failed (heap) — fall back to a CSV POST for this chunk.
+        Serial.println("[UPLOAD] JSON build failed/empty — falling back to CSV POST");
         String url = buildUploadUrl(txSettings);
-        if (url.indexOf('?') >= 0) url += "&action=uploadSync";
-        else url += "?action=uploadSync";
-        String authHeader = txSettings.apiKey.length() > 0 ? txSettings.apiKey : txSettings.authToken;
+        if (!isSupabase) {
+          url += (url.indexOf('?') >= 0) ? "&action=uploadSync" : "?action=uploadSync";
+        }
         HttpsPostResult result = modem.httpsPost(url, payload.csvData,
-                                                 "text/plain", authHeader);
-        if (result.success) {
-          Serial.printf("[UPLOAD] CSV fallback SUCCESS: HTTP %d, %u bytes\n",
-                        result.httpStatus, payload.byteLength);
+                                                 "text/csv", authHeader);
+        if (result.httpStatus == 200) {
+          Serial.printf("[UPLOAD] CSV fallback SUCCESS: HTTP 200, %u bytes\n",
+                        payload.byteLength);
           nowUnix = getRTCTime();
           uploadQueue.advanceCursor(payload.startOffset + payload.byteLength, nowUnix);
           uploadQueue.purgeUploaded();
@@ -322,8 +337,13 @@ void performModemUpload(const TransmissionSettings& txSettings, uint32_t session
           anyJsonSuccess = true;
           firstChunk = false;
           continue;
+        } else if (result.httpStatus == 400 || result.httpStatus == 401) {
+          Serial.printf("[UPLOAD] CSV fallback non-retryable HTTP %d (%s) — stopping\n",
+                        result.httpStatus,
+                        result.httpStatus == 401 ? "credentials" : "bad payload");
+          break;  // not transient — do not increment retry counter
         } else {
-          Serial.printf("[UPLOAD] CSV fallback FAIL: HTTP %d, %s\n",
+          Serial.printf("[UPLOAD] CSV fallback retryable HTTP %d, %s\n",
                         result.httpStatus, result.errorDetail.c_str());
           uploadQueue.incrementRetryCount(retryNowUnix, retryCooldownSec);
           break;
@@ -333,12 +353,11 @@ void performModemUpload(const TransmissionSettings& txSettings, uint32_t session
       Serial.printf("[UPLOAD] JSON built: %u bytes, %u readings, consumed %u CSV bytes\n",
                     json.byteLength, (unsigned)json.rowCount, (unsigned)json.csvBytesConsumed);
 
-      // Build URL with action param: uploadSync on first chunk, uploadData after.
       String url = buildUploadUrl(txSettings);
-      if (url.indexOf('?') >= 0) {
-        url += (firstChunk ? "&action=uploadSync" : "&action=uploadData");
-      } else {
-        url += (firstChunk ? "?action=uploadSync" : "?action=uploadData");
+      if (!isSupabase) {
+        url += (url.indexOf('?') >= 0)
+            ? (firstChunk ? "&action=uploadSync" : "&action=uploadData")
+            : (firstChunk ? "?action=uploadSync" : "?action=uploadData");
       }
 
       if (sessionExpired()) {
@@ -349,13 +368,12 @@ void performModemUpload(const TransmissionSettings& txSettings, uint32_t session
 
       Serial.printf("[UPLOAD] POSTing JSON to %s (%u bytes)\n",
                     url.c_str(), json.byteLength);
-      String authHeader = txSettings.apiKey.length() > 0 ? txSettings.apiKey : txSettings.authToken;
       HttpsPostResult result = modem.httpsPost(url, json.body,
                                                "application/json", authHeader);
 
-      if (result.success) {
-        Serial.printf("[UPLOAD] JSON SUCCESS: HTTP %d, %u readings\n",
-                      result.httpStatus, (unsigned)json.rowCount);
+      if (result.httpStatus == 200) {
+        Serial.printf("[UPLOAD] JSON SUCCESS: HTTP 200, %u readings\n",
+                      (unsigned)json.rowCount);
         nowUnix = getRTCTime();
         uploadQueue.advanceCursor(payload.startOffset + json.csvBytesConsumed, nowUnix);
         uploadQueue.purgeUploaded();
@@ -363,53 +381,26 @@ void performModemUpload(const TransmissionSettings& txSettings, uint32_t session
         anyJsonSuccess = true;
         firstChunk = false;
         // Continue loop for next chunk if more rows remain.
+      } else if (result.httpStatus == 400 || result.httpStatus == 401) {
+        // Not transient: bad payload or bad credentials.  Do NOT advance the
+        // cursor and do NOT increment the retry counter — retrying won't help.
+        Serial.printf("[UPLOAD] JSON non-retryable HTTP %d (%s) — not advancing cursor, not retrying\n",
+                      result.httpStatus,
+                      result.httpStatus == 401 ? "auth/credential issue" : "bad payload");
+        break;
       } else {
-        Serial.printf("[UPLOAD] JSON FAIL: HTTP %d, %s — not retrying as CSV\n",
+        // 429, 5xx, or transport error (-1): retry with backoff next window.
+        Serial.printf("[UPLOAD] JSON retryable HTTP %d, %s\n",
                       result.httpStatus, result.errorDetail.c_str());
         uploadQueue.incrementRetryCount(retryNowUnix, retryCooldownSec);
         break;
       }
     }
 
-    // If there was no new data but status should still be pushed (e.g.
-    // manual / config-change sync), send a status-only document.
-    if (firstChunk && !sessionExpired()) {
-      Serial.println("[UPLOAD] JSON: no pending rows — sending status-only document");
-      const DataLogStats dlStats = readDataLogStats();
-      const uint64_t fsTotal = (uint64_t)LittleFS.totalBytes();
-      const uint64_t fsUsed  = (uint64_t)LittleFS.usedBytes();
-      const UploadCursor cursor = uploadQueue.getCursor();
-      JsonUploadContext ctx = {
-        DEVICE_ID, FW_VERSION, FW_BUILD, nowUnix, "manual",
-        txSettings, cursor,
-        uploadQueue.getPendingBytes(), uploadQueue.getPendingRows(),
-        fsTotal, fsUsed,
-        dlStats.records, dlStats.csvBytes, dlStats.lastConfirmedSyncIso,
-        gWakeIntervalMin, gSyncIntervalMin, gSyncMode,
-        gSyncDailyHour, gSyncDailyMinute,
-        formatSyncTimeHHMM(gSyncDailyHour, gSyncDailyMinute),
-        computeNextSyncIsoLocal(),
-        readBatteryVoltage(),
-        (cursor.lastUploadUnix > 0 && cursor.retryCount == 0) ? "success"
-          : (cursor.retryCount > 0) ? "failed" : "pending",
-        g_projectStartedUnix
-      };
-      JsonPayload json = buildJsonStatusOnly(ctx);
-      if (json.ok) {
-        String url = buildUploadUrl(txSettings);
-        if (url.indexOf('?') >= 0) url += "&action=uploadSync";
-        else url += "?action=uploadSync";
-        HttpsPostResult result = modem.httpsPost(url, json.body,
-                                                 "application/json", txSettings.authToken);
-        if (result.success) {
-          Serial.printf("[UPLOAD] JSON status-only SUCCESS: HTTP %d\n", result.httpStatus);
-          uploadQueue.resetRetryCount();
-          anyJsonSuccess = true;
-        } else {
-          Serial.printf("[UPLOAD] JSON status-only FAIL: HTTP %d, %s\n",
-                        result.httpStatus, result.errorDetail.c_str());
-        }
-      }
+    // No status-only push for Supabase: an empty array carries no data, so we
+    // simply skip uploading when there are no pending rows.
+    if (firstChunk) {
+      Serial.println("[UPLOAD] JSON: no pending rows — nothing to upload");
     }
 
     if (anyJsonSuccess) {
@@ -486,6 +477,43 @@ void handleSyncWake() {
                 gSyncMode == SYNC_MODE_DAILY ? "daily" : "interval",
                 gSyncDailyHour, gSyncDailyMinute);
 
+  // --- Schedule transition detection (interval mode) -----------------------
+  // If the wake/sync interval changed during config mode, the persisted anchor
+  // still holds the OLD sync interval+phase that the sleeping fleet's A2
+  // alarms are aligned to, and config shutdown armed THIS mothership to that
+  // OLD schedule so it meets the nodes now. The nodes are only awake during
+  // this sync window, so we must hand them the NEW schedule here and then both
+  // sides re-anchor to it (commit happens at the re-arm below). We detect the
+  // transition BEFORE the window by comparing the desired sync interval (from
+  // the NVS wake setting) against the interval stored in the anchor.
+  const int newSyncIntervalMin = gSyncIntervalMin;  // desired (NEW) from NVS wake
+  loadSyncRuntimeGuardsFromNVS();                   // loads OLD anchor into globals
+  const int anchorSyncIntervalMin = gSyncIntervalMin;
+  gSyncIntervalMin = newSyncIntervalMin;            // restore NEW for upload policy
+  const bool scheduleTransitionPending =
+      (gSyncMode == SYNC_MODE_INTERVAL) &&
+      (newSyncIntervalMin > 0) &&
+      (anchorSyncIntervalMin > 0) &&
+      (newSyncIntervalMin != anchorSyncIntervalMin);
+  uint32_t transitionNewPhase = 0;
+  if (scheduleTransitionPending) {
+    // Minute-align the current meeting slot. The SAME value is announced to
+    // the fleet during the window and used for the mothership re-anchor, so
+    // both sides arm to identical slot boundaries regardless of small drift.
+    const uint32_t nowUnix = getRTCTime();
+    transitionNewPhase = (nowUnix / 60UL) * 60UL;
+    // Point the phase anchor at the new slot NOW so any status object built
+    // during this session's upload reports the correct next-sync time. Without
+    // this, nextSyncLocal is computed from the NEW interval but the OLD phase
+    // (the anchor isn't committed until the re-arm below), giving a wrong
+    // displayed time. The re-arm reloads + commits the same transitionNewPhase,
+    // so this early assignment doesn't affect scheduling.
+    gLastSyncBroadcastUnix = transitionNewPhase;
+    Serial.printf("[SYNC] Transition pending: old sync=%d min -> new sync=%d min, new phase=%lu (announcing this window)\n",
+                  anchorSyncIntervalMin, newSyncIntervalMin,
+                  (unsigned long)transitionNewPhase);
+  }
+
   // Init subsystems
   const RtcInitStatus rtcStatus = initRTC();
   if (rtcStatus != RTC_OK) {
@@ -556,6 +584,20 @@ void handleSyncWake() {
     // Re-broadcast sync window marker every 5 seconds
     if (millis() - lastBroadcastMs >= 5000 || lastBroadcastMs == 0) {
       broadcastSyncWindowOpen();
+      // Keep the fleet's RECORDING interval aligned. SET_SYNC_SCHED carries
+      // only the sync schedule, so the wake/recording interval must be pushed
+      // separately (SET_SCHEDULE). Broadcast it EVERY window (not just during a
+      // transition) — nodes apply it only when it differs, so it's idempotent,
+      // and a recording-interval change reaches the fleet on the next sync even
+      // after the sync-schedule transition has already committed.
+      if (gWakeIntervalMin > 0) {
+        broadcastWakeIntervalNow(gWakeIntervalMin);
+      }
+      // During a schedule transition, hand the NEW sync schedule to the fleet
+      // on the same cadence so every node that wakes within the window catches it.
+      if (scheduleTransitionPending) {
+        broadcastSyncScheduleNow(newSyncIntervalMin, transitionNewPhase);
+      }
       lastBroadcastMs = millis();
     }
     EspNowSnapSlot slots[4];
@@ -658,6 +700,36 @@ void handleSyncWake() {
 
   // Re-arm according to the configured schedule mode.
   loadSyncRuntimeGuardsFromNVS();
+
+  // Detect a schedule transition: if the wake interval was changed in
+  // config mode, the anchor still holds the OLD sync interval (used to
+  // wake the mothership at the time the nodes expected).  Now that the
+  // sync window has run and nodes have applied the new desired config,
+  // re-anchor to the NEW schedule so both mothership and nodes converge.
+  const int desiredSyncIntervalMin = computeAutoSyncMin(gWakeIntervalMin);
+  if (gSyncMode == SYNC_MODE_INTERVAL &&
+      desiredSyncIntervalMin > 0 &&
+      gSyncIntervalMin > 0 &&
+      desiredSyncIntervalMin != gSyncIntervalMin) {
+    // Commit the transition. Re-anchor to the SAME minute-aligned phase that
+    // was announced to the fleet (broadcastSyncScheduleNow above) so the
+    // mothership and nodes arm to identical slot boundaries. The nodes applied
+    // this phase via SET_SYNC_SCHED and re-armed A2 to the same boundary.
+    uint32_t newPhase = transitionNewPhase;
+    if (newPhase == 0) {
+      // Defensive fallback if the transition wasn't detected pre-window
+      // (e.g. anchor was missing then). Use the current minute slot.
+      const uint32_t nowUnix = getRTCTime();
+      newPhase = (nowUnix / 60UL) * 60UL;
+    }
+    Serial.printf("[SYNC] Schedule transition commit: %d->%d min, re-anchored phase=%lu\n",
+                  gSyncIntervalMin, desiredSyncIntervalMin,
+                  (unsigned long)newPhase);
+    gLastSyncBroadcastUnix = newPhase;
+    gSyncIntervalMin = desiredSyncIntervalMin;
+    saveSyncRuntimeGuardsToNVS();
+  }
+
   if (gSyncMode == SYNC_MODE_DAILY) {
     if (!armDailyAlarm(gSyncDailyHour, gSyncDailyMinute)) {
       Serial.println("[FATAL] Failed to arm daily alarm - starting bounded recovery");
@@ -821,7 +893,39 @@ void handleConfigWake() {
   }
 
   // 7. Save NVS + re-arm alarm before power-down
-  saveSyncRuntimeGuardsToNVS();
+  // Load the anchor BEFORE saving so we can detect a schedule change.
+  // If the wake interval was changed during config mode, the anchor still
+  // holds the OLD sync interval that the nodes' A2 alarms are armed to.
+  // We must wake at the OLD schedule to meet the nodes, push the new
+  // desired config, then switch to the new schedule at the next sync wake.
+  loadSyncRuntimeGuardsFromNVS();
+  const int anchorSyncIntervalMin = gSyncIntervalMin;  // interval from the loaded anchor
+  const uint32_t anchorPhaseUnix = (uint32_t)gLastSyncBroadcastUnix;
+  const int desiredSyncIntervalMin = computeAutoSyncMin(gWakeIntervalMin);
+  const bool scheduleChangedDuringConfig =
+      (gSyncMode == SYNC_MODE_INTERVAL) &&
+      (desiredSyncIntervalMin != anchorSyncIntervalMin) &&
+      (anchorSyncIntervalMin > 0);
+
+  // Save the OLD interval+phase to the anchor so that:
+  //  (a) this shutdown arms the alarm to the OLD schedule (meet nodes), and
+  //  (b) handleSyncWake at the next wake detects the mismatch between
+  //      the anchor's OLD interval and the NVS wake interval's NEW sync,
+  //      triggering the schedule transition re-anchor.
+  // Do NOT save the new interval here — the transition is completed in
+  // handleSyncWake after the nodes have been contacted.
+  if (scheduleChangedDuringConfig) {
+    Serial.printf("[CONFIG] Schedule changed during config: arming OLD sync %d min phase=%lu to meet nodes (new sync=%d min pending)\n",
+                  anchorSyncIntervalMin, (unsigned long)anchorPhaseUnix,
+                  desiredSyncIntervalMin);
+    // gSyncIntervalMin and gLastSyncBroadcastUnix already hold the OLD
+    // values from loadSyncRuntimeGuardsFromNVS() — save them as-is.
+    saveSyncRuntimeGuardsToNVS();
+  } else {
+    // No schedule change — save normally with the current values.
+    gSyncIntervalMin = desiredSyncIntervalMin;
+    saveSyncRuntimeGuardsToNVS();
+  }
 
   const RtcInitStatus shutdownRtcStatus = initRTC();
   if (shutdownRtcStatus != RTC_ABSENT) {

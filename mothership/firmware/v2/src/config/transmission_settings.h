@@ -17,20 +17,40 @@ static constexpr uint8_t  DEFAULT_MAX_RETRIES    = 3;
 static constexpr bool     DEFAULT_ALLOW_MANUAL   = true;
 static constexpr bool     DEFAULT_USE_JSON       = true;
 
-// Hardcoded default endpoint URL — Google Apps Script web app.  Used when NVS
-// has no URL stored or the stored value is malformed, so users don't have to
-// type the long URL on their phone during initial setup.
+// Hardcoded default endpoint URL — Supabase Edge Function (ingest-fieldmesh).
+// Used when NVS has no URL stored or the stored value is malformed, so users
+// don't have to type the long URL on their phone during initial setup.
 static constexpr const char* DEFAULT_ENDPOINT_URL =
-    "https://script.google.com/macros/s/AKfycbwpvmqXDtS-nmr4L8JwxFo22fJBrKFODYT_i6CAewKjzeHpyyusSnJPlzzflc8gAEvD/exec";
+    "https://unhzttnuayrgqrzeqetz.supabase.co/functions/v1/ingest-fieldmesh";
+
+// Default mothership UUID issued by the backend.  Sent as "mothership_id" in
+// every reading object so Supabase can route data to the correct project.
+// Stored in NVS key "mothership_id" so it can be changed per deployment.
+static constexpr const char* DEFAULT_MOTHERSHIP_ID =
+    "f68a7546-6727-42a0-948f-5eae5f521f66";
+
+// Default project UUID.  The Supabase schema requires "project_id" on every
+// reading.  Stored in NVS key "project_id" so it can be changed per deployment.
+static constexpr const char* DEFAULT_PROJECT_ID =
+    "65a72fab-6014-4159-9198-575d695db66a";
+
+// Default device API key (sent as Authorization: Bearer).  Pre-loaded so the
+// unit can upload without typing the key on a phone.  NOTE: this key should
+// be entered via the Settings page / QR string in production — do NOT commit
+// real API keys to source control.  This empty default forces the user to
+// enter a key on first setup.
+static constexpr const char* DEFAULT_API_KEY = "";
 
 // ---------------------------------------------------------------------------
 // Settings struct
 // ---------------------------------------------------------------------------
 struct TransmissionSettings {
   bool     enabled;
-  String   endpointUrl;        // Google Cloud Function URL
-  String   authToken;          // token appended as ?token=xxx
-  String   apiKey;             // fm_xxxxxxxx API key (sent as Bearer)
+  String   endpointUrl;        // upload endpoint (Supabase ingest function)
+  String   authToken;          // legacy token appended as ?token=xxx
+  String   apiKey;             // device API key (sent as Bearer)
+  String   mothershipId;       // UUID sent as "mothership_id" in each reading
+  String   projectId;          // UUID sent as "project_id" in each reading
   String   siteId;
   String   deploymentId;
   uint16_t uploadIntervalMin;   // 0 = every sync wake

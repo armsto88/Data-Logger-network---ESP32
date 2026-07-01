@@ -14,7 +14,9 @@ void loadTransmissionSettings(TransmissionSettings& s) {
     s.enabled            = DEFAULT_TX_ENABLED;
     s.endpointUrl        = String(DEFAULT_ENDPOINT_URL);
     s.authToken          = String("");
-    s.apiKey             = String("");
+    s.apiKey             = String(DEFAULT_API_KEY);
+    s.mothershipId       = String(DEFAULT_MOTHERSHIP_ID);
+    s.projectId          = String(DEFAULT_PROJECT_ID);
     s.siteId             = String("");
     s.deploymentId       = String("");
     s.uploadIntervalMin  = 0;
@@ -38,6 +40,13 @@ void loadTransmissionSettings(TransmissionSettings& s) {
     s.endpointUrl = String(DEFAULT_ENDPOINT_URL);
     Serial.println("[TX] URL invalid or empty — using hardcoded default");
   }
+  // Migrate units that still have the legacy Google Apps Script URL stored in
+  // NVS over to the Supabase ingest endpoint.  (The corrected value is
+  // persisted on the next settings save.)
+  if (s.endpointUrl.indexOf("script.google.com") >= 0) {
+    s.endpointUrl = String(DEFAULT_ENDPOINT_URL);
+    Serial.println("[TX] Migrated legacy Apps Script URL to Supabase endpoint");
+  }
   memset(stringBuf, 0, sizeof(stringBuf));
   prefs.getString("token", stringBuf, sizeof(stringBuf));
   stringBuf[sizeof(stringBuf) - 1] = '\0';
@@ -46,6 +55,23 @@ void loadTransmissionSettings(TransmissionSettings& s) {
   prefs.getString("api_key", stringBuf, sizeof(stringBuf));
   stringBuf[sizeof(stringBuf) - 1] = '\0';
   s.apiKey = String(stringBuf);
+  if (s.apiKey.length() == 0) {
+    s.apiKey = String(DEFAULT_API_KEY);
+  }
+  memset(stringBuf, 0, sizeof(stringBuf));
+  prefs.getString("mothership_id", stringBuf, sizeof(stringBuf));
+  stringBuf[sizeof(stringBuf) - 1] = '\0';
+  s.mothershipId = String(stringBuf);
+  if (s.mothershipId.length() == 0) {
+    s.mothershipId = String(DEFAULT_MOTHERSHIP_ID);
+  }
+  memset(stringBuf, 0, sizeof(stringBuf));
+  prefs.getString("project_id", stringBuf, sizeof(stringBuf));
+  stringBuf[sizeof(stringBuf) - 1] = '\0';
+  s.projectId = String(stringBuf);
+  if (s.projectId.length() == 0) {
+    s.projectId = String(DEFAULT_PROJECT_ID);
+  }
   memset(stringBuf, 0, sizeof(stringBuf));
   prefs.getString("site_id", stringBuf, sizeof(stringBuf));
   stringBuf[sizeof(stringBuf) - 1] = '\0';
@@ -105,6 +131,8 @@ void saveTransmissionSettings(const TransmissionSettings& s) {
   prefs.putString("url", s.endpointUrl);
   prefs.putString("token", s.authToken);
   prefs.putString("api_key", s.apiKey);
+  prefs.putString("mothership_id", s.mothershipId);
+  prefs.putString("project_id", s.projectId);
   prefs.putString("site_id", s.siteId);
   prefs.putString("deploy_id", s.deploymentId);
   prefs.putUShort("upload_min", s.uploadIntervalMin);
@@ -142,6 +170,8 @@ String transmissionSettingsToJson(const TransmissionSettings& s) {
   j += "\"endpointUrl\":\"" + esc(s.endpointUrl) + "\",";
   j += "\"authToken\":\"" + esc(s.authToken) + "\",";
   j += "\"apiKey\":\"" + esc(s.apiKey) + "\",";
+  j += "\"mothershipId\":\"" + esc(s.mothershipId) + "\",";
+  j += "\"projectId\":\"" + esc(s.projectId) + "\",";
   j += "\"siteId\":\"" + esc(s.siteId) + "\",";
   j += "\"deploymentId\":\"" + esc(s.deploymentId) + "\",";
   j += "\"uploadIntervalMin\":" + String(s.uploadIntervalMin) + ",";
@@ -182,6 +212,12 @@ static String urlEncodeParam(const String& s) {
 String buildUploadUrl(const TransmissionSettings& s) {
   String url = s.endpointUrl;
   if (url.length() == 0) return url;
+
+  // Supabase path: authentication is header-only (Authorization: Bearer
+  // <apiKey>) and the endpoint takes no query params.  When an API key is set
+  // we return the endpoint untouched.  Query params are only appended on the
+  // legacy Google Apps Script path (apiKey empty, authToken set).
+  if (s.apiKey.length() > 0) return url;
 
   // Append query params.  Use ? for the first param, & for the rest.
   char sep = '?';

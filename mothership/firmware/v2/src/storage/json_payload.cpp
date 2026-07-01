@@ -1,77 +1,63 @@
 #include "storage/json_payload.h"
-#include "storage/flash_logger.h"  // flashIsReady()
-#include "config/node_registry.h"
-#include "config/config_server.h"  // SYNC_MODE_INTERVAL / SYNC_MODE_DAILY
-
-#include <LittleFS.h>
-#include <vector>
 
 // ---------------------------------------------------------------------------
-// CSV column index → JSON key mapping
+// CSV column index -> Supabase batch field key
 // ---------------------------------------------------------------------------
-// Order is fixed by kUploadCSVHeader / flash_logger.cpp logDecodedSnapshot():
-//   0  datetime          (string, quoted)
-//   1  nodeId            (string, quoted)
-//   2  seqNum            (uint32, unquoted)
-//   3  sensorPresent     (hex string "0x%04X")
-//   4  qualityFlags      (hex string "0x%04X")
-//   5  configVersion     (uint16, unquoted)
-//   6  batVoltage        (float, omit if nan/empty)
-//   7  airTemp           (float, omit if nan/empty)
-//   8  airHumidity       (float, omit if nan/empty)
-//   9  spectral_415      (float, omit if nan/empty)
-//   10 spectral_445      (float, omit if nan/empty)
-//   11 spectral_480      (float, omit if nan/empty)
-//   12 spectral_515      (float, omit if nan/empty)
-//   13 spectral_555      (float, omit if nan/empty)
-//   14 spectral_590      (float, omit if nan/empty)
-//   15 spectral_630      (float, omit if nan/empty)
-//   16 spectral_680      (float, omit if nan/empty)
-//   17 windSpeed         (float, omit if nan/empty)
-//   18 windDir           (float, omit if nan/empty)
-//   19 soil1Vwc          (float, omit if nan/empty)
-//   20 soil1Temp         (float, omit if nan/empty)
-//   21 soil2Vwc          (float, omit if nan/empty)
-//   22 soil2Temp         (float, omit if nan/empty)
-//   23 aux1              (float, omit if nan/empty)
-//   24 aux2              (float, omit if nan/empty)
+// The Supabase ingest endpoint's canonical batch schema uses field names that
+// are IDENTICAL to our CSV column headers (camelCase, with spectral_NNN keeping
+// underscores), so the mapping is 1:1 — no renaming. project_id / mothership_id
+// are NOT sent (the backend derives them from the device API key).
+//
+// CSV order (kUploadCSVHeader / flash_logger.cpp logDecodedSnapshot()):
+//   0 datetime  1 nodeId  2 seqNum  3 sensorPresent  4 qualityFlags
+//   5 configVersion  6 batVoltage  7 airTemp  8 airHumidity
+//   9-16 spectral_415..spectral_680  17 windSpeed  18 windDir
+//   19 soil1Vwc 20 soil1Temp 21 soil2Vwc 22 soil2Temp  23 aux1  24 aux2
 
 static constexpr int kNumCsvColumns = 25;
+static constexpr uint16_t kMaxReadingsPerPost = 100;  // backend hard limit
+
+enum CellType {
+  CELL_TIMESTAMP,    // ISO 8601 string; CSV omits trailing Z so we append it;
+                     // null if missing/"unknown"
+  CELL_STRING,       // JSON string
+  CELL_INT,          // integer literal straight from the CSV cell
+  CELL_INT_BASE0,    // parse decimal or 0x hex, emit as decimal integer
+  CELL_NUM_NULLABLE, // numeric literal, or JSON null when the cell is nan/empty
+};
 
 struct ColumnMapping {
   int         index;
   const char* key;
-  bool        quoted;   // true = emit as JSON string
-  bool        hex;      // true = format as "0x%04X" string
-  bool        omitOnNan; // true = omit key when value is nan/empty
+  CellType    type;
 };
 
 static const ColumnMapping kColumnMappings[kNumCsvColumns] = {
-  {0,  "datetime",        true,  false, false},
-  {1,  "nodeId",          true,  false, false},
-  {2,  "seqNum",          false, false, false},
-  {3,  "sensorPresent",   true,  true,  false},
-  {4,  "qualityFlags",    true,  true,  false},
-  {5,  "configVersion",   false, false, false},
-  {6,  "batVoltage",      false, false, true},
-  {7,  "airTemp",         false, false, true},
-  {8,  "airHumidity",     false, false, true},
-  {9,  "spectral_415",    false, false, true},
-  {10, "spectral_445",    false, false, true},
-  {11, "spectral_480",    false, false, true},
-  {12, "spectral_515",    false, false, true},
-  {13, "spectral_555",    false, false, true},
-  {14, "spectral_590",    false, false, true},
-  {15, "spectral_630",    false, false, true},
-  {16, "spectral_680",    false, false, true},
-  {17, "windSpeed",       false, false, true},
-  {18, "windDir",         false, false, true},
-  {19, "soil1Vwc",        false, false, true},
-  {20, "soil1Temp",       false, false, true},
-  {21, "soil2Vwc",        false, false, true},
-  {22, "soil2Temp",       false, false, true},
-  {23, "aux1",            false, false, true},
-  {24, "aux2",            false, false, true},
+  {0,  "datetime",       CELL_TIMESTAMP},
+  {1,  "nodeId",         CELL_STRING},
+  {2,  "seqNum",         CELL_INT},
+  {3,  "sensorPresent",  CELL_INT_BASE0},
+  {4,  "qualityFlags",   CELL_INT_BASE0},
+  {5,  "configVersion",  CELL_INT},
+  {6,  "batVoltage",     CELL_NUM_NULLABLE},
+  {7,  "airTemp",        CELL_NUM_NULLABLE},
+  {8,  "airHumidity",    CELL_NUM_NULLABLE},
+  {9,  "spectral_415",   CELL_NUM_NULLABLE},
+  {10, "spectral_445",   CELL_NUM_NULLABLE},
+  {11, "spectral_480",   CELL_NUM_NULLABLE},
+  {12, "spectral_515",   CELL_NUM_NULLABLE},
+  {13, "spectral_555",   CELL_NUM_NULLABLE},
+  {14, "spectral_590",   CELL_NUM_NULLABLE},
+  {15, "spectral_630",   CELL_NUM_NULLABLE},
+  {16, "spectral_680",   CELL_NUM_NULLABLE},
+  {17, "windSpeed",      CELL_NUM_NULLABLE},
+  {18, "windDir",        CELL_NUM_NULLABLE},
+  {19, "soil1Vwc",       CELL_NUM_NULLABLE},
+  {20, "soil1Temp",      CELL_NUM_NULLABLE},
+  {21, "soil2Vwc",       CELL_NUM_NULLABLE},
+  {22, "soil2Temp",      CELL_NUM_NULLABLE},
+  {23, "aux1",           CELL_NUM_NULLABLE},
+  {24, "aux2",           CELL_NUM_NULLABLE},
 };
 
 // ---------------------------------------------------------------------------
@@ -80,7 +66,6 @@ static const ColumnMapping kColumnMappings[kNumCsvColumns] = {
 
 static bool isNanCell(const String& v) {
   if (v.length() == 0) return true;
-  // Case-insensitive compare to "nan"
   if (v.length() != 3) return false;
   return (v[0] == 'n' || v[0] == 'N') &&
          (v[1] == 'a' || v[1] == 'A') &&
@@ -124,7 +109,8 @@ static int splitCsvRow(const String& line, String* fields, int maxFields) {
 // Returns true on success, false on malformed row (skipped by caller).
 // ---------------------------------------------------------------------------
 
-static bool appendReadingObject(String& json, const String& line, bool& first) {
+static bool appendReadingObject(String& json, const String& line, bool& first,
+                                const String& fallbackIso) {
   String fields[kNumCsvColumns];
   const int n = splitCsvRow(line, fields, kNumCsvColumns);
   if (n < 6) {
@@ -143,28 +129,47 @@ static bool appendReadingObject(String& json, const String& line, bool& first) {
     if (m.index >= n) break;  // row shorter than expected — stop here
     const String& val = fields[m.index];
 
-    if (m.omitOnNan && isNanCell(val)) continue;
-
     if (!firstKey) json += ",";
     firstKey = false;
-
     json += "\"";
     json += m.key;
     json += "\":";
 
-    if (m.hex) {
-      // Parse CSV cell as uint16 (auto-detect base: decimal or 0x hex),
-      // emit as a decimal integer — JSON has no hex literal type.
-      unsigned long parsed = strtoul(val.c_str(), nullptr, 0);
-      json += String((unsigned int)(parsed & 0xFFFFU));
-    } else if (m.quoted) {
-      json += "\"";
-      json += escapeJsonString(val);
-      json += "\"";
-    } else {
-      // Numeric — emit unquoted.  For integer fields this is fine; for
-      // floats the CSV already contains a valid numeric literal.
-      json += val;
+    switch (m.type) {
+      case CELL_TIMESTAMP:
+        // CSV stores ISO 8601 UTC without the trailing Z (gmtime); the backend
+        // wants the Z suffix. The backend REJECTS a null datetime (400), so a
+        // row with no node timestamp (logged as "unknown") falls back to the
+        // mothership RTC time instead of null.
+        if (val.length() >= 10 && isDigit(val[0]) && val.indexOf('T') > 0) {
+          json += "\"";
+          json += escapeJsonString(val);
+          json += "Z\"";
+        } else if (fallbackIso.length() > 0) {
+          json += "\"";
+          json += escapeJsonString(fallbackIso);  // already ISO-8601 + Z
+          json += "\"";
+        } else {
+          json += "null";  // RTC also unset — last resort
+        }
+        break;
+      case CELL_STRING:
+        json += "\"";
+        json += escapeJsonString(val);
+        json += "\"";
+        break;
+      case CELL_INT_BASE0: {
+        unsigned long parsed = strtoul(val.c_str(), nullptr, 0);
+        json += String((unsigned int)(parsed & 0xFFFFU));
+        break;
+      }
+      case CELL_INT:
+        json += (val.length() > 0) ? val : String("0");
+        break;
+      case CELL_NUM_NULLABLE:
+        if (isNanCell(val)) json += "null";
+        else json += val;  // CSV already holds a valid numeric literal
+        break;
     }
   }
 
@@ -173,249 +178,14 @@ static bool appendReadingObject(String& json, const String& line, bool& first) {
 }
 
 // ---------------------------------------------------------------------------
-// Meta section
-// ---------------------------------------------------------------------------
-
-static void appendMetaSection(String& json, const JsonUploadContext& ctx,
-                              uint16_t rowCount, bool hasStatus) {
-  json += "\"meta\":{";
-  json += "\"deviceId\":\"";
-  json += escapeJsonString(String(ctx.deviceId ? ctx.deviceId : ""));
-  json += "\",\"firmwareVersion\":\"";
-  json += escapeJsonString(String(ctx.fwVersion ? ctx.fwVersion : ""));
-  json += "\",\"firmwareBuild\":\"";
-  json += escapeJsonString(String(ctx.fwBuild ? ctx.fwBuild : ""));
-  json += "\",\"uploadTimeUnix\":";
-  json += String(ctx.uploadTimeUnix);
-  json += ",\"uploadReason\":\"";
-  json += escapeJsonString(String(ctx.uploadReason ? ctx.uploadReason : "scheduled"));
-  json += "\",\"format\":\"json\"";
-  json += ",\"csvRowsIncluded\":";
-  json += String((unsigned)rowCount);
-  if (hasStatus) {
-    json += ",\"includesStatus\":true";
-  } else {
-    json += ",\"includesStatus\":false";
-  }
-  json += "}";
-}
-
-// ---------------------------------------------------------------------------
-// Fleet + nodes section
-// ---------------------------------------------------------------------------
-
-static const char* nodeStateToString(int s) {
-  switch (s) {
-    case UNPAIRED: return "UNPAIRED";
-    case PAIRED:   return "PAIRED";
-    case DEPLOYED: return "DEPLOYED";
-    default:       return "UNKNOWN";
-  }
-}
-
-static const char* pendingStateToString(NodePendingState s) {
-  switch (s) {
-    case PENDING_NONE:        return "NONE";
-    case PENDING_TO_UNPAIRED: return "UNPAIRED";
-    case PENDING_TO_PAIRED:   return "PAIRED";
-    case PENDING_TO_DEPLOYED: return "DEPLOYED";
-    default:                  return "NONE";
-  }
-}
-
-static String formatMac(const uint8_t mac[6]) {
-  char b[18];
-  snprintf(b, sizeof(b), "%02X:%02X:%02X:%02X:%02X:%02X",
-           mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
-  return String(b);
-}
-
-static void appendFleetSection(String& json, const std::vector<NodeInfo>& allNodes) {
-  size_t deployedCount = 0;
-  size_t pendingCount = 0;
-  size_t pendingToPairedCount = 0;
-  size_t pendingToUnpairedCount = 0;
-  for (const auto& n : allNodes) {
-    if (n.state == DEPLOYED) deployedCount++;
-    if (n.stateChangePending) {
-      pendingCount++;
-      if (n.pendingTargetState == PENDING_TO_PAIRED) pendingToPairedCount++;
-      if (n.pendingTargetState == PENDING_TO_UNPAIRED) pendingToUnpairedCount++;
-    }
-  }
-  const size_t pairedCount = getPairedNodes().size();
-  const size_t unpairedCount = getUnpairedNodes().size();
-
-  json += "\"fleet\":{";
-  json += "\"total\":";       json += String((unsigned)allNodes.size());
-  json += ",\"unpaired\":";   json += String((unsigned)unpairedCount);
-  json += ",\"paired\":";     json += String((unsigned)pairedCount);
-  json += ",\"deployed\":";   json += String((unsigned)deployedCount);
-  json += ",\"pending\":";    json += String((unsigned)pendingCount);
-  json += ",\"pendingToPaired\":";   json += String((unsigned)pendingToPairedCount);
-  json += ",\"pendingToUnpaired\":"; json += String((unsigned)pendingToUnpairedCount);
-  json += "}";
-}
-
-static void appendNodesArray(String& json, const std::vector<NodeInfo>& allNodes,
-                             uint32_t nowUnix) {
-  json += ",\"nodes\":[";
-  bool first = true;
-  for (const auto& n : allNodes) {
-    if (!first) json += ",";
-    first = false;
-    json += "{";
-    json += "\"nodeId\":\"";       json += escapeJsonString(n.nodeId); json += "\"";
-    json += ",\"userId\":\"";      json += escapeJsonString(getNodeUserId(n.nodeId)); json += "\"";
-    json += ",\"name\":\"";        json += escapeJsonString(getNodeName(n.nodeId)); json += "\"";
-    json += ",\"mac\":\"";         json += formatMac(n.mac); json += "\"";
-    json += ",\"state\":\"";       json += nodeStateToString(n.state); json += "\"";
-    if (n.deployedSinceUnix > 0) {
-      json += ",\"deployedSinceUnix\":"; json += String(n.deployedSinceUnix);
-    }
-    // lastSeenUnix: approximate from millis()-based lastSeen.
-    if (n.lastSeen > 0 && nowUnix > 0) {
-      const uint32_t elapsedSec = (millis() - n.lastSeen) / 1000UL;
-      const uint32_t lastSeenUnix = (elapsedSec < nowUnix) ? (nowUnix - elapsedSec) : 0;
-      json += ",\"lastSeenUnix\":"; json += String(lastSeenUnix);
-    } else {
-      json += ",\"lastSeenUnix\":0";
-    }
-    json += ",\"wakeIntervalMin\":";            json += String((unsigned)n.wakeIntervalMin);
-    json += ",\"inferredWakeIntervalMin\":";    json += String((unsigned)n.inferredWakeIntervalMin);
-    json += ",\"lastReportedBatV\":";
-    if (isnan(n.lastReportedBatV)) {
-      json += "null";
-    } else {
-      char b[16];
-      snprintf(b, sizeof(b), "%.2f", n.lastReportedBatV);
-      json += b;
-    }
-    json += ",\"configVersion\":";              json += String((unsigned)n.configVersionApplied);
-    json += ",\"notes\":\"";                    json += escapeJsonString(getNodeNotes(n.nodeId)); json += "\"";
-    if (!isnan(n.latitude) && !isnan(n.longitude)) {
-      json += ",\"latitude\":";  json += String(n.latitude, 6);
-      json += ",\"longitude\":"; json += String(n.longitude, 6);
-    }
-    json += ",\"isActive\":";                   json += (n.isActive ? "true" : "false");
-    json += ",\"deployPending\":";              json += (n.deployPending ? "true" : "false");
-    json += ",\"stateChangePending\":";         json += (n.stateChangePending ? "true" : "false");
-    json += ",\"pendingTargetState\":\"";       json += pendingStateToString(n.pendingTargetState); json += "\"";
-    json += "}";
-  }
-  json += "]";
-}
-
-// ---------------------------------------------------------------------------
-// Status section
-// ---------------------------------------------------------------------------
-
-static void appendStatusSection(String& json, const JsonUploadContext& ctx) {
-  json += "\"status\":{";
-
-  // Top-level sync schedule fields
-  json += "\"rtcUnix\":";               json += String(ctx.uploadTimeUnix);
-  json += ",\"wakeIntervalMinutes\":";  json += String(ctx.wakeIntervalMin);
-  json += ",\"syncIntervalMinutes\":";  json += String(ctx.syncIntervalMin);
-  json += ",\"syncMode\":\"";
-  json += (ctx.syncMode == SYNC_MODE_INTERVAL) ? "interval" : "daily";
-  json += "\",\"syncDailyTime\":\"";    json += escapeJsonString(ctx.syncDailyTimeHHMM); json += "\"";
-  json += ",\"nextSyncLocal\":\"";      json += escapeJsonString(ctx.nextSyncLocalIso); json += "\"";
-
-  // Dashboard status fields
-  json += ",\"batVoltage\":";          json += String(ctx.batVoltage, 2);
-
-  json += ",\"projectStarted\":";       json += String(ctx.projectStartedUnix);
-
-  json += ",\"lastUploadResult\":\"";  json += escapeJsonString(ctx.lastUploadResult ? ctx.lastUploadResult : "pending"); json += "\"";
-
-  // Fleet
-  auto allNodes = getRegisteredNodes();
-  json += ",";
-  appendFleetSection(json, allNodes);
-
-  // Upload subsystem
-  const uint32_t flashUsagePct = (ctx.flashTotalBytes > 0)
-    ? (uint32_t)((ctx.flashUsedBytes * 100ULL) / ctx.flashTotalBytes) : 0;
-  json += ",\"upload\":{";
-  json += "\"enabled\":";          json += (ctx.tx.enabled ? "true" : "false");
-  json += ",\"pendingBytes\":";    json += String(ctx.pendingBytes);
-  json += ",\"pendingRows\":";     json += String(ctx.pendingRows);
-  json += ",\"rowsUploaded\":";    json += String(ctx.cursor.rowsUploaded);
-  json += ",\"lastUploadUnix\":";  json += String(ctx.cursor.lastUploadUnix);
-  json += ",\"retryCount\":";      json += String((unsigned)ctx.cursor.retryCount);
-  json += ",\"flashUsagePct\":";   json += String(flashUsagePct);
-  json += ",\"flashTotalBytes\":"; json += String((unsigned long)ctx.flashTotalBytes);
-  json += ",\"flashUsedBytes\":";  json += String((unsigned long)ctx.flashUsedBytes);
-  json += "}";
-
-  // Transmission settings
-  json += ",\"transmission\":{";
-  json += "\"enabled\":";                json += (ctx.tx.enabled ? "true" : "false");
-  json += ",\"endpointUrl\":\"";         json += escapeJsonString(ctx.tx.endpointUrl); json += "\"";
-  json += ",\"siteId\":\"";              json += escapeJsonString(ctx.tx.siteId); json += "\"";
-  json += ",\"deploymentId\":\"";        json += escapeJsonString(ctx.tx.deploymentId); json += "\"";
-  json += ",\"uploadIntervalMin\":";     json += String(ctx.tx.uploadIntervalMin);
-  json += ",\"minBatteryMv\":";          json += String(ctx.tx.minBatteryMv);
-  json += ",\"maxBytesPerSession\":";    json += String(ctx.tx.maxBytesPerSession);
-  json += ",\"maxRetriesPerWindow\":";   json += String((unsigned)ctx.tx.maxRetriesPerWindow);
-  json += ",\"allowManualUpload\":";     json += (ctx.tx.allowManualUpload ? "true" : "false");
-  json += ",\"useJsonUpload\":";         json += (ctx.tx.useJsonUpload ? "true" : "false");
-  json += "}";
-
-  // DataLog
-  json += ",\"dataLog\":{";
-  json += "\"records\":";          json += String(ctx.dataLogRecords);
-  json += ",\"csvSizeBytes\":";    json += String((unsigned long)ctx.dataLogCsvBytes);
-  json += ",\"lastConfirmedSync\":\""; json += escapeJsonString(ctx.lastConfirmedSyncIso); json += "\"";
-  json += "}";
-
-  // Nodes array
-  appendNodesArray(json, allNodes, ctx.uploadTimeUnix);
-
-  json += "}";
-}
-
-// ---------------------------------------------------------------------------
-// DataLog stats helper — reads /datalog.csv for record count + last row datetime.
-// Called by main.cpp via readDataLogStats() declared in json_payload.h.
-// ---------------------------------------------------------------------------
-
-DataLogStats readDataLogStats() {
-  DataLogStats s;
-  if (!flashIsReady() || !LittleFS.exists("/datalog.csv")) return s;
-  File f = LittleFS.open("/datalog.csv", "r");
-  if (!f) return s;
-  s.csvBytes = (uint64_t)f.size();
-  uint32_t lineNo = 0;
-  String lastDataLine;
-  while (f.available()) {
-    String line = f.readStringUntil('\n');
-    line.trim();
-    if (line.length() == 0) continue;
-    lineNo++;
-    if (lineNo == 1) continue;  // header
-    s.records++;
-    lastDataLine = line;
-  }
-  f.close();
-  if (lastDataLine.length() > 0) {
-    const int comma = lastDataLine.indexOf(',');
-    if (comma > 0) {
-      s.lastConfirmedSyncIso = lastDataLine.substring(0, comma);
-    }
-  }
-  return s;
-}
-
-// ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
 
-JsonPayload buildJsonUpload(const JsonUploadContext& ctx,
-                            const String& csvChunk,
+JsonPayload buildJsonUpload(const String& csvChunk,
                             uint16_t maxReadings,
-                            bool includeStatus) {
+                            const String& fwVersion,
+                            const StatusContext* status,
+                            uint32_t rtcFallbackUnix) {
   JsonPayload result;
   result.body = String();
   result.byteLength = 0;
@@ -423,16 +193,27 @@ JsonPayload buildJsonUpload(const JsonUploadContext& ctx,
   result.ok = false;
   result.csvBytesConsumed = 0;
 
-  // Walk the CSV chunk line by line.  Line 0 is the header — skip it.
-  // Parse up to maxReadings data rows; record the byte offset of the
-  // first un-parsed row so the caller can advance the cursor precisely.
-  uint16_t emitted = 0;
-  uint32_t consumed = 0;
-  bool firstReading = true;
+  if (maxReadings == 0 || maxReadings > kMaxReadingsPerPost) {
+    maxReadings = kMaxReadingsPerPost;  // respect the backend's 100/POST limit
+  }
 
-  // Pre-scan to estimate size for reserve().
-  // Estimate: ~250 bytes per reading + 2048 status overhead.
-  const uint32_t estBytes = (uint32_t)maxReadings * 250U + 2048U;
+  // Pre-format the RTC fallback timestamp (ISO-8601 + Z) used for rows whose
+  // own datetime is missing — the backend rejects null datetimes.
+  String fallbackIso;
+  if (rtcFallbackUnix > 946684800UL) {
+    time_t t = (time_t)rtcFallbackUnix;
+    struct tm tmv;
+    gmtime_r(&t, &tmv);
+    char tb[24];
+    snprintf(tb, sizeof(tb), "%04d-%02d-%02dT%02d:%02d:%02dZ",
+             tmv.tm_year + 1900, tmv.tm_mon + 1, tmv.tm_mday,
+             tmv.tm_hour, tmv.tm_min, tmv.tm_sec);
+    fallbackIso = tb;
+  }
+
+  // Each reading object carries every field (null for missing sensors), so
+  // budget ~600 bytes/reading plus a small wrapper.
+  const uint32_t estBytes = (uint32_t)maxReadings * 600U + 256U;
   if (ESP.getFreeHeap() < estBytes + 8192U) {
     Serial.printf("[JSON] Insufficient heap for build (est=%u free=%u)\n",
                   (unsigned)estBytes, (unsigned)ESP.getFreeHeap());
@@ -440,11 +221,18 @@ JsonPayload buildJsonUpload(const JsonUploadContext& ctx,
   }
 
   String readings;
-  if (!readings.reserve((uint32_t)maxReadings * 220U + 32U)) {
+  if (!readings.reserve((uint32_t)maxReadings * 560U + 32U)) {
     Serial.println("[JSON] readings reserve failed");
     return result;
   }
 
+  // Walk the CSV chunk line by line.  Line 0 is the header — skip it.  Parse up
+  // to maxReadings data rows; record the byte offset of the first un-parsed row
+  // so the caller can advance the cursor precisely. Malformed rows are skipped
+  // (still consumed so the cursor moves past them).
+  uint16_t emitted = 0;
+  uint32_t consumed = 0;
+  bool firstReading = true;
   int lineStart = 0;
   int lineNo = 0;
   const int len = csvChunk.length();
@@ -456,21 +244,19 @@ JsonPayload buildJsonUpload(const JsonUploadContext& ctx,
 
     if (lineNo > 0 && line.length() > 0) {
       if (emitted >= maxReadings) {
-        // Reached the row cap.  Do not consume this row — leave it for
-        // the next chunk.  csvBytesConsumed points at lineStart.
+        // Row cap reached — leave this row for the next chunk.
         break;
       }
-      if (appendReadingObject(readings, line, firstReading)) {
+      if (appendReadingObject(readings, line, firstReading, fallbackIso)) {
         emitted++;
       }
     }
     consumed = (nl >= 0) ? (uint32_t)(nl + 1) : (uint32_t)len;
     lineStart = (nl >= 0) ? (nl + 1) : len;
     if (lineNo == 0) {
-      // The header line is already accounted for by the cursor's
-      // startOffset (which points past the header).  csvBytesConsumed
-      // must count only data-row bytes so the cursor advances by the
-      // exact bytes uploaded, otherwise rows are permanently skipped.
+      // The header line is already accounted for by the cursor's startOffset
+      // (which points past the header). csvBytesConsumed must count only
+      // data-row bytes so the cursor advances by the exact bytes uploaded.
       consumed = 0;
     }
     lineNo++;
@@ -479,44 +265,73 @@ JsonPayload buildJsonUpload(const JsonUploadContext& ctx,
   result.rowCount = emitted;
   result.csvBytesConsumed = consumed;
 
-  // Build the full document.
+  // Wrap readings in the canonical batch document:
+  //   {"readings":[ ... ], "meta":{...}, "status":{...}}
+  // No deviceId in meta (any value -> 403 "different device"); the device and
+  // project are derived from the API key. status{} is included when the
+  // caller provides a StatusContext (every POST from handleSyncWake and
+  // handleManualUpload).
   String& body = result.body;
-  body.reserve(estBytes + 256U);
-  body += "{";
-  appendMetaSection(body, ctx, emitted, includeStatus);
-  if (includeStatus) {
-    body += ",";
-    appendStatusSection(body, ctx);
-  }
-  body += ",\"readings\":[";
+  const uint32_t statusEst = status ? 800U : 0U;  // nested status object
+  body.reserve(readings.length() + fwVersion.length() + 128U + statusEst);
+  body += "{\"readings\":[";
   body += readings;
-  body += "]}";
-
-  result.byteLength = body.length();
-  result.ok = true;
-  return result;
-}
-
-JsonPayload buildJsonStatusOnly(const JsonUploadContext& ctx) {
-  JsonPayload result;
-  result.body = String();
-  result.byteLength = 0;
-  result.rowCount = 0;
-  result.ok = false;
-  result.csvBytesConsumed = 0;
-
-  if (ESP.getFreeHeap() < 4096U) {
-    Serial.println("[JSON] Insufficient heap for status-only build");
-    return result;
+  body += "],\"meta\":{\"firmwareVersion\":\"";
+  body += escapeJsonString(fwVersion);
+  body += "\"";
+  if (status) {
+    // NOTE: deviceId must NOT go in meta — the ingest function rejects any
+    // meta.deviceId with 403 "Credential is registered to a different device"
+    // (verified via dry-run curl). The device is derived from the API key, and
+    // deviceId is carried in the status object below instead. uploadReason in
+    // meta is accepted (200).
+    body += ",\"uploadReason\":\"";
+    body += escapeJsonString(status->uploadReason);
+    body += "\"";
   }
+  body += "}";
+  if (status) {
+    // Nested structure required by the backend RPC schema:
+    //   status.{batVoltage, rtcUnix, deviceId, wake/sync minutes, syncMode,
+    //           nextSyncLocal, fleet{...}, upload{...}, dataLog{...}}
+    char numBuf[24];
+    body += ",\"status\":{\"batVoltage\":";
+    // Guard NaN — dtostrf would emit "nan", which is invalid JSON (400).
+    if (isnan(status->batVoltage)) { body += "null"; }
+    else { dtostrf(status->batVoltage, 1, 2, numBuf); body += numBuf; }
+    body += ",\"rtcUnix\":"; body += String(status->rtcUnix);
+    body += ",\"deviceId\":\""; body += escapeJsonString(status->deviceId); body += "\"";
+    body += ",\"wakeIntervalMinutes\":"; body += String(status->wakeIntervalMinutes);
+    body += ",\"syncIntervalMinutes\":"; body += String(status->syncIntervalMinutes);
+    body += ",\"syncMode\":\""; body += escapeJsonString(status->syncMode); body += "\"";
+    body += ",\"nextSyncLocal\":\""; body += escapeJsonString(status->nextSyncLocal); body += "\"";
 
-  String& body = result.body;
-  body.reserve(2048U);
-  body += "{";
-  appendMetaSection(body, ctx, 0, true);
-  body += ",";
-  appendStatusSection(body, ctx);
-  body += ",\"readings\":[]}";
+    body += ",\"fleet\":{\"total\":"; body += String((unsigned)status->fleetTotal);
+    body += ",\"deployed\":"; body += String((unsigned)status->fleetDeployed);
+    body += ",\"paired\":"; body += String((unsigned)status->fleetPaired);
+    body += ",\"unpaired\":"; body += String((unsigned)status->fleetUnpaired);
+    body += ",\"pending\":"; body += String((unsigned)status->fleetPending);
+    body += "}";
+
+    body += ",\"upload\":{\"flashUsagePct\":"; body += String(status->flashUsagePct);
+    body += ",\"flashTotalBytes\":"; body += String((unsigned long)status->flashTotalBytes);
+    body += ",\"flashUsedBytes\":"; body += String((unsigned long)status->flashUsedBytes);
+    body += ",\"pendingRows\":"; body += String(status->pendingRows);
+    body += ",\"rowsUploaded\":"; body += String(status->rowsUploaded);
+    body += ",\"retryCount\":"; body += String((unsigned)status->retryCount);
+    body += ",\"lastUploadUnix\":"; body += String(status->lastUploadUnix);
+    body += ",\"enabled\":"; body += status->uploadEnabled ? "true" : "false";
+    body += "}";
+
+    body += ",\"dataLog\":{\"records\":"; body += String(status->dataLogRecords);
+    body += ",\"csvSizeBytes\":"; body += String((unsigned long)status->dataLogCsvBytes);
+    body += ",\"lastConfirmedSync\":\""; body += escapeJsonString(status->dataLogLastSync); body += "\"";
+    body += "}";
+
+    body += "}";
+  }
+  body += "}";
+
   result.byteLength = body.length();
   result.ok = true;
   return result;

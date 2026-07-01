@@ -6,6 +6,7 @@
 #include "config/node_registry.h"
 #include "config/transmission_settings.h"
 #include "storage/upload_queue.h"
+#include "storage/json_payload.h"
 #include "comms/modem_driver.h"
 #include "comms/espnow_config.h"
 #include "time/rtc_alarm.h"
@@ -129,6 +130,75 @@ volatile bool gShutdownRequested = false;
 // Upload queue instance for config-mode UI (separate from the sync-wake
 // global in main.cpp, which is only active during a sync wake).
 UploadQueue gUploadQueue;
+
+// ---------------------------------------------------------------------------
+// Non-blocking node-discovery state machine
+// ---------------------------------------------------------------------------
+// Driven from configServerLoop() (the main loop) — NOT the ESP-NOW receive
+// callback. The POST handler only flips gDiscovery.active and returns
+// immediately; broadcasts are scheduled with millis() so the web server, DNS
+// and ESP-NOW callback keep running. Node responses are registered into
+// registeredNodes by the existing onEspNowRecv callback; the browser learns
+// about them by polling /api/live.
+struct DiscoveryUiState {
+  bool     active = false;
+  uint32_t startedMs = 0;
+  uint32_t nextBroadcastMs = 0;
+  uint8_t  broadcastsSent = 0;
+  uint16_t foundAtStart = 0;   // registeredNodes.size() when the scan began
+  uint32_t generation = 0;     // bumps each scan so the UI can detect new scans
+  uint8_t  lastResult = 0;     // 0 idle/running, 1 found, 2 none, 3 failed, 4 timeout
+};
+static DiscoveryUiState gDiscovery;
+static constexpr uint32_t kDiscoveryTimeoutMs      = 8000;
+static constexpr uint32_t kDiscoveryBroadcastGapMs = 1200;
+static constexpr uint8_t  kDiscoveryMaxBroadcasts  = 7;
+
+// Wrap-safe "has now reached/passed deadline?" for millis() timestamps.
+static inline bool timeReached(uint32_t now, uint32_t deadline) {
+  return (int32_t)(now - deadline) >= 0;
+}
+
+static void startDiscovery() {
+  if (gDiscovery.active) return;  // already scanning — ignore re-entry (no overlap)
+  const uint32_t now = millis();
+  gDiscovery.active = true;
+  gDiscovery.startedMs = now;
+  gDiscovery.nextBroadcastMs = now;  // first burst on the next loop tick
+  gDiscovery.broadcastsSent = 0;
+  gDiscovery.foundAtStart = (uint16_t)registeredNodes.size();
+  gDiscovery.generation++;
+  gDiscovery.lastResult = 0;
+  Serial.printf("[DISCOVERY] scan %lu started (nodes=%u)\n",
+                (unsigned long)gDiscovery.generation, (unsigned)gDiscovery.foundAtStart);
+}
+
+static void discoveryTick() {
+  if (!gDiscovery.active) return;
+  const uint32_t now = millis();
+
+  if (gDiscovery.broadcastsSent < kDiscoveryMaxBroadcasts &&
+      timeReached(now, gDiscovery.nextBroadcastMs)) {
+    const bool ok = sendDiscoveryBroadcast();   // single non-blocking esp_now_send (+1 retry)
+    gDiscovery.broadcastsSent++;
+    gDiscovery.nextBroadcastMs = now + kDiscoveryBroadcastGapMs;
+    if (!ok && gDiscovery.broadcastsSent >= kDiscoveryMaxBroadcasts &&
+        registeredNodes.size() == gDiscovery.foundAtStart) {
+      gDiscovery.active = false;
+      gDiscovery.lastResult = 3;  // every broadcast failed and nothing was found
+      Serial.println("[DISCOVERY] failed: broadcasts did not send");
+      return;
+    }
+  }
+
+  if (timeReached(now, gDiscovery.startedMs + kDiscoveryTimeoutMs)) {
+    const int found = (int)registeredNodes.size() - (int)gDiscovery.foundAtStart;
+    gDiscovery.active = false;
+    gDiscovery.lastResult = (found > 0) ? 1 : 2;  // found / none
+    Serial.printf("[DISCOVERY] scan %lu done: %d new node(s)\n",
+                  (unsigned long)gDiscovery.generation, found > 0 ? found : 0);
+  }
+}
 
 // ---------------------------------------------------------------------------
 // RTC helpers (adapt production's rtc_manager API to V1's rtc_alarm.h)
@@ -442,6 +512,75 @@ static bool isAllowedInterval(int interval) {
   return false;
 }
 
+// Non-destructively read the persisted sync anchor's interval — the schedule
+// the sleeping fleet's A2 alarms are currently aligned to. Returns -1 when no
+// valid anchor exists. Does NOT touch sync globals (unlike
+// loadSyncRuntimeGuardsFromNVS), so it is safe to call from page handlers.
+static int readAnchorSyncIntervalMin() {
+  if (!gPrefs.begin("ui", true)) return -1;
+  SyncAnchorRecord a{};
+  SyncAnchorRecord b{};
+  const bool validA = readSyncAnchor(gPrefs, kSyncAnchorA, a) && syncAnchorValid(a);
+  const bool validB = readSyncAnchor(gPrefs, kSyncAnchorB, b) && syncAnchorValid(b);
+  gPrefs.end();
+  if (validA && validB) {
+    return (static_cast<int16_t>(b.generation - a.generation) > 0)
+      ? (int)b.intervalMin : (int)a.intervalMin;
+  }
+  if (validA) return (int)a.intervalMin;
+  if (validB) return (int)b.intervalMin;
+  return -1;
+}
+
+// Next time the mothership wakes on the OLD (current-fleet) schedule — i.e.
+// the moment it will next meet the sleeping nodes and hand over the new
+// schedule. Uses the preserved old phase anchor (gLastSyncBroadcastUnix).
+static uint32_t computeNextOldSlotUnix(int oldIntervalMin) {
+  const uint32_t nowUnix = getRTCTimeUnix();
+  const uint32_t phase = (uint32_t)gLastSyncBroadcastUnix;
+  if (oldIntervalMin <= 0 || phase == 0 || nowUnix <= 946684800UL) return 0;
+  const uint32_t period = (uint32_t)oldIntervalMin * 60UL;
+  if (nowUnix < phase) return phase;
+  const uint32_t slots = (nowUnix - phase) / period;
+  return phase + (slots + 1UL) * period;
+}
+
+// Build a "schedule change pending" banner shown only when the desired sync
+// interval (derived from the wake setting) differs from the anchor the fleet
+// is currently aligned to. The new schedule is delivered to nodes at the next
+// collection on the OLD schedule (see handleSyncWake in main.cpp).
+static String buildScheduleTransitionBanner() {
+  if (gSyncMode != SYNC_MODE_INTERVAL) return String();
+  const int oldSync = readAnchorSyncIntervalMin();
+  const int newSync = computeAutoSyncMin(gWakeIntervalMin);
+  if (oldSync <= 0 || newSync <= 0 || oldSync == newSync) return String();
+
+  const uint32_t handoverUnix = computeNextOldSlotUnix(oldSync);
+
+  String out;
+  out.reserve(700);
+  out += F("<div class='section' style='border-color:#E1B17A;background:#fff8e1'>"
+           "<h3 style='color:#8a4b00'>Schedule change pending</h3>"
+           "<p class='muted'>Active nodes are asleep on the current schedule. They keep "
+           "collecting on it until the next scheduled collection, then switch to the new "
+           "schedule automatically — no node desync.</p>"
+           "<div class='stats' style='margin:0'>"
+           "<div class='stat'><strong>Current (fleet)</strong><span class='num' style='font-size:16px'>");
+  out += String(oldSync);
+  out += F(" min</span></div>"
+           "<div class='stat'><strong>After handover</strong><span class='num' style='font-size:16px'>");
+  out += String(newSync);
+  out += F(" min</span></div>"
+           "<div class='stat'><strong>Handover at</strong><span class='num' style='font-size:14px'>");
+  if (handoverUnix > 0) {
+    out += formatDateTimeDisplay(DateTime(handoverUnix));
+  } else {
+    out += F("next collection");
+  }
+  out += F("</span></div></div></div>");
+  return out;
+}
+
 static String formatBytesUi(uint64_t bytes) {
   char b[24];
   if (bytes < 1024ULL) {
@@ -703,113 +842,308 @@ a{color:var(--primary);text-decoration:none}
 }
 
 @media(min-width:768px){.container{max-width:720px}}
+
+/* --- Responsiveness layer: spinner, loading, discovery, connection --- */
+/* Kept tiny and CSS-only — no images, no external assets (ESP32 flash). */
+.spinner{display:inline-block;width:1em;height:1em;border:2px solid rgba(120,120,120,.3);
+  border-top-color:currentColor;border-radius:50%;animation:fmspin .7s linear infinite;
+  vertical-align:-.15em;margin-right:6px}
+@keyframes fmspin{to{transform:rotate(360deg)}}
+.btn.is-loading{opacity:.9;cursor:progress}
+.btn.is-ok{box-shadow:0 0 0 2px rgba(122,155,112,.6) inset}
+.btn.is-err{box-shadow:0 0 0 2px rgba(196,90,74,.6) inset}
+
+#ui-status.s-ok{border-color:#7a9b70;color:#3d5e35;background:rgba(122,155,112,.12)}
+#ui-status.s-warn{border-color:#c47a5a;color:#8a4b00;background:#fff8e1}
+#ui-status.s-err{border-color:#c45a4a;color:#7a2a20;background:rgba(196,90,74,.10)}
+#ui-status.s-progress{border-color:#4f6d7a;color:#33525c;background:#eef5f8}
+
+.discovery-panel{margin:10px 0;padding:12px;border:1px solid #b3e5fc;border-radius:8px;background:#e8f6fe}
+.discovery-panel .dp-row{display:flex;align-items:center;justify-content:space-between;gap:10px;font-size:.9rem;margin:2px 0}
+.discovery-panel strong{display:inline-flex;align-items:center;color:#01579b}
+.discovery-panel .dp-msg{color:var(--sub);font-size:.82rem;margin-top:6px}
+
+.node-new{animation:fmflash 1.6s ease-out 1}
+@keyframes fmflash{0%{box-shadow:0 0 0 3px #f6d365;background:#fffbe6}70%{background:#fffef6}100%{box-shadow:none}}
+
+.conn-dot{display:inline-flex;align-items:center;gap:5px;font-size:.76rem;color:var(--sub)}
+.conn-dot::before{content:'';width:8px;height:8px;border-radius:50%;background:#7a9b70;flex:none}
+.conn-dot.c-updating::before{background:#4f9bd6}
+.conn-dot.c-warn::before{background:#c47a5a}
+.conn-dot.c-err::before{background:#c45a4a}
 )CSS";
 
 const char COMMON_JS[] PROGMEM = R"JS(
-function showUiStatus(message, ok){
-  const box = document.getElementById('ui-status');
+// Status messages: kind = 'ok' | 'warn' | 'err' | 'progress'. ARIA-live region.
+// Transient (ok/progress) auto-clear; errors persist until replaced.
+function showUiStatus(message, kind){
+  var box = document.getElementById('ui-status');
   if (!box) return;
+  box.className = 'help s-' + (kind || 'ok');
   box.style.display = 'block';
-  box.style.borderColor = ok ? '#16a34a' : '#dc2626';
-  box.style.color = ok ? '#166534' : '#991b1b';
+  box.setAttribute('role','status');
   box.textContent = message;
+  if (box._t){ clearTimeout(box._t); box._t = null; }
+  if (kind === 'ok' || kind === 'progress'){
+    box._t = setTimeout(function(){ box.style.display = 'none'; }, 4000);
+  }
 }
 
 function asFormBody(form){
-  const data = new FormData(form);
+  var data = new FormData(form);
   data.append('ajax', '1');
   return new URLSearchParams(data);
 }
 
-async function refreshKpiCards(){
-  try {
-    const resp = await fetch('/ui-status');
-    if (!resp.ok) return;
-    const status = await resp.json();
+// AbortController may be absent in very old captive-portal webviews — guard it
+// so polling/fetch still works (just without a hard timeout) on those.
+function fmAbort(){ return (typeof AbortController !== 'undefined') ? new AbortController() : null; }
 
-    const fleet = status && status.fleet ? status.fleet : null;
-    if (fleet) {
-      const deployedEl = document.getElementById('kpi-deployed-num');
-      const pairedEl = document.getElementById('kpi-paired-num');
-      const unpairedEl = document.getElementById('kpi-unpaired-num');
-      if (deployedEl) deployedEl.textContent = String(fleet.deployed ?? deployedEl.textContent);
-      if (pairedEl) pairedEl.textContent = String(fleet.paired ?? pairedEl.textContent);
-      if (unpairedEl) unpairedEl.textContent = String(fleet.unpaired ?? unpairedEl.textContent);
-    }
-
-    const modeEl = document.getElementById('kpi-sync-mode');
-    if (modeEl && status && status.syncMode) {
-      modeEl.textContent = (status.syncMode === 'interval') ? 'Interval' : 'Daily';
-    }
-
-    const activeEl = document.getElementById('kpi-active-sync');
-    if (activeEl && status) {
-      if (status.syncMode === 'interval') {
-        activeEl.textContent = 'Every ' + String(status.syncIntervalMinutes || 0) + ' min';
-      } else {
-        activeEl.textContent = 'Daily @ ' + String(status.syncDailyTime || '--:--');
-      }
-    }
-
-    const nextEl = document.getElementById('kpi-next-sync');
-    if (nextEl && status && status.nextSyncLocal) {
-      nextEl.textContent = status.nextSyncLocal;
-    }
-  } catch (_) {}
+// Restrained connection indicator.
+function setConnection(state){
+  var el = document.getElementById('conn-status');
+  if (!el) return;
+  el.className = 'conn-dot' + (state==='updating' ? ' c-updating'
+                            : state==='warn' ? ' c-warn'
+                            : state==='err' ? ' c-err' : '');
+  el.textContent = state==='updating' ? 'Updating…'
+                 : state==='warn' ? 'Connection interrupted'
+                 : state==='err' ? 'Reconnecting…' : 'Connected';
 }
 
-function wireAsyncForms(){
-  const forms = document.querySelectorAll('form.async-form');
-  forms.forEach(form => {
-    form.addEventListener('submit', async (e) => {
-      e.preventDefault();
-      const btn = form.querySelector('button[type="submit"],input[type="submit"]');
-      const original = btn ? (btn.textContent || btn.value) : '';
-      if (btn) {
-        btn.disabled = true;
-        if (btn.tagName === 'INPUT') btn.value = 'Working...';
-        else btn.textContent = 'Working...';
-      }
+// --- Async button loading states (contextual labels + inline spinner) ---
+function btnLabelFor(form, btn){
+  if (btn && btn.getAttribute('data-loading-label')) return btn.getAttribute('data-loading-label');
+  var a = (form && form.getAttribute('action')) || '';
+  if (a.indexOf('find-stations')>=0 || a.indexOf('discover')>=0) return 'Searching…';
+  if (a.indexOf('save')>=0 || a.indexOf('transmission')>=0) return 'Saving…';
+  if (a.indexOf('recording-interval')>=0 || a.indexOf('wake-interval')>=0) return 'Applying…';
+  if (a.indexOf('sync')>=0) return 'Updating…';
+  if (a.indexOf('manual-upload')>=0) return 'Uploading…';
+  if (a.indexOf('start')>=0 || a.indexOf('shutdown')>=0) return 'Starting…';
+  if (a.indexOf('set-time')>=0) return 'Setting time…';
+  return 'Working…';
+}
+function setBtnLoading(btn, label){
+  if (!btn) return;
+  if (btn._orig == null) btn._orig = (btn.tagName==='INPUT') ? btn.value : btn.innerHTML;
+  btn.disabled = true;
+  btn.setAttribute('aria-busy','true');
+  btn.classList.add('is-loading');
+  if (btn.tagName==='INPUT') btn.value = label || 'Working…';
+  else btn.innerHTML = '<span class="spinner" aria-hidden="true"></span>' + (label || 'Working…');
+}
+function clearBtnLoading(btn){
+  if (!btn) return;
+  btn.disabled = false;
+  btn.removeAttribute('aria-busy');
+  btn.classList.remove('is-loading','is-ok','is-err');
+  if (btn._orig != null){
+    if (btn.tagName==='INPUT') btn.value = btn._orig; else btn.innerHTML = btn._orig;
+    btn._orig = null;
+  }
+}
+function flashBtn(btn, ok){
+  if (!btn) return;
+  btn.classList.remove('is-loading');
+  btn.classList.add(ok ? 'is-ok' : 'is-err');
+}
 
-      try {
-        const resp = await fetch(form.action, {
-          method: 'POST',
-          body: asFormBody(form),
-          headers: {'Content-Type': 'application/x-www-form-urlencoded'}
-        });
+// --- Node cards: incremental, XSS-safe (textContent for device strings) ---
+function chipState(state){
+  if (state==='DEPLOYED') return ['chip chip--state-deployed','Active'];
+  if (state==='PAIRED')   return ['chip chip--state-paired','Connected'];
+  return ['chip chip--state-unpaired','New'];
+}
+function chipBatt(v){
+  if (v===null || v===undefined) return ['chip','n/a'];
+  var c = v>=3.9 ? 'chip chip--bat-ok' : v>=3.5 ? 'chip chip--bat-med' : 'chip chip--bat-low';
+  return [c, v.toFixed(2)+'V'];
+}
+function lastSeenTxt(sec){
+  if (sec===null || sec===undefined || sec<0) return 'n/a';
+  return Math.floor(sec/60) + ' min ago';
+}
+function nodeCell(parentClass, labelText, fieldName){
+  var d=document.createElement('div'); d.className=parentClass;
+  var l=document.createElement('span'); l.className='node-timing-label'; l.textContent=labelText;
+  var v=document.createElement('span'); v.setAttribute('data-f', fieldName);
+  d.appendChild(l); d.appendChild(v); return d;
+}
+function applyNodeFields(card, n){
+  var st=chipState(n.state), s=card.querySelector('[data-f="status"]');
+  if (s){ s.className=st[0]; s.textContent=st[1]; }
+  var bt=chipBatt(n.batV), b=card.querySelector('[data-f="batt"]');
+  if (b){ b.className=bt[0]; b.textContent=bt[1]; }
+  var r=card.querySelector('[data-f="rec"]'); if (r){ r.className='chip node-timing-value'; r.textContent=(n.recMin||0)+' min'; }
+  var ls=card.querySelector('[data-f="lastseen"]'); if (ls){ ls.className='chip node-timing-value'; ls.textContent=lastSeenTxt(n.lastSeenSec); }
+  var lbl=card.querySelector('[data-f="label"]'); if (lbl) lbl.textContent = n.label || n.id;
+}
+function nodeCardEl(n){
+  var a=document.createElement('a');
+  a.className='item item--node node-new';
+  a.href='/station?id=' + encodeURIComponent(n.id);
+  a.setAttribute('data-node-id', n.id);
+  var row=document.createElement('div'); row.className='node-row';
+  var main=document.createElement('div'); main.className='node-main';
+  var strong=document.createElement('strong'); strong.setAttribute('data-f','label'); main.appendChild(strong);
+  var status=document.createElement('div'); status.className='node-status';
+  status.appendChild(nodeCell('node-status-cell','Status','status'));
+  status.appendChild(nodeCell('node-status-cell','Battery','batt'));
+  var timing=document.createElement('div'); timing.className='node-timing';
+  timing.appendChild(nodeCell('node-timing-cell','Recording','rec'));
+  timing.appendChild(nodeCell('node-timing-cell','Last seen','lastseen'));
+  row.appendChild(main); row.appendChild(status); row.appendChild(timing);
+  a.appendChild(row); applyNodeFields(a, n); return a;
+}
+function findCard(list, id){
+  var k=list.children;
+  for (var i=0;i<k.length;i++){ if (k[i].getAttribute && k[i].getAttribute('data-node-id')===id) return k[i]; }
+  return null;
+}
+// Update existing cards in place; append new ones (highlighted). We do NOT
+// remove cards that drop out of a poll — a node going briefly silent should not
+// make its card vanish; explicit unpair reloads the page.
+function reconcileNodes(nodes){
+  var list=document.getElementById('node-list');
+  if (!list || !nodes) return;
+  for (var i=0;i<nodes.length;i++){
+    var n=nodes[i], card=findCard(list, n.id);
+    if (!card) list.appendChild(nodeCardEl(n));
+    else applyNodeFields(card, n);
+  }
+  var empty=document.getElementById('node-empty');
+  if (empty) empty.style.display = nodes.length ? 'none' : '';
+}
+function updateKpis(f){
+  var set=function(id,v){ var e=document.getElementById(id); if (e && v!=null) e.textContent=String(v); };
+  set('kpi-deployed-num', f.active);
+  set('kpi-paired-num', f.connected);
+  set('kpi-unpaired-num', f.new);
+}
+function setText(id,v){ var e=document.getElementById(id); if (e) e.textContent=v; }
 
-        const text = await resp.text();
-        let msg = text;
-        let ok = resp.ok;
-        try {
-          const json = JSON.parse(text);
-          ok = !!json.ok;
-          msg = json.message || (ok ? 'Done' : 'Request failed');
-        } catch (_) {}
-
-        showUiStatus(msg, ok);
-
-        if (ok && form.action && form.action.indexOf('/discover-nodes') !== -1) {
-          setTimeout(() => location.reload(), 900);
-        }
-
-        if (ok && form.action && (
-            form.action.indexOf('/set-sync-mode') !== -1 ||
-            form.action.indexOf('/set-sync-time') !== -1 ||
-            form.action.indexOf('/set-wake-interval') !== -1)) {
-          await refreshKpiCards();
-        }
-      } catch (err) {
-        showUiStatus('Request failed: ' + err, false);
-      } finally {
-        if (btn) {
-          btn.disabled = false;
-          if (btn.tagName === 'INPUT') btn.value = original;
-          else btn.textContent = original;
-        }
-      }
+// --- Live poller: one timer, visibility-aware, failure backoff, no overlap ---
+// Polls the RAM-only /api/live endpoint. Cadence adapts: fast during discovery
+// or just after an action, slow when idle, paused when the tab is hidden. This
+// keeps steady-state load on the ESP32 low.
+var FM = {
+  timer:null, inFlight:false, fails:0, lastVersion:-1, discActive:false, fastUntil:0, started:false,
+  IDLE:4000, FAST:650, BUSY_WINDOW:4000,
+  start:function(){
+    if (this.started) return;
+    // Only poll on pages that actually display live data — keeps idle load off
+    // the ESP32 on static form-result pages.
+    if (!document.getElementById('conn-status') && !document.getElementById('node-list') &&
+        !document.getElementById('discovery-panel') && !document.getElementById('kpi-deployed-num')) return;
+    this.started=true;
+    document.addEventListener('visibilitychange', function(){
+      if (document.hidden) FM.clear(); else FM.bump();
     });
-  });
+    this.tick();
+  },
+  clear:function(){ if (this.timer){ clearTimeout(this.timer); this.timer=null; } },
+  delay:function(){
+    if (document.hidden) return 0;
+    if (this.fails>0) return Math.min(8000, 1000*Math.pow(2, this.fails-1));
+    return (this.discActive || Date.now()<this.fastUntil) ? this.FAST : this.IDLE;
+  },
+  schedule:function(){ this.clear(); var d=this.delay(); if (d>0) this.timer=setTimeout(function(){FM.tick();}, d); },
+  bump:function(){ this.fastUntil=Date.now()+this.BUSY_WINDOW; this.clear(); this.tick(); },
+  startDiscoveryUi:function(){ this.discActive=true; var p=document.getElementById('discovery-panel'); if(p) p.hidden=false; this.bump(); },
+  tick:function(){
+    if (this.inFlight || document.hidden){ this.schedule(); return; }
+    this.inFlight=true;
+    if (this.fails===0) setConnection('updating');
+    var ctrl=fmAbort(); var to=ctrl?setTimeout(function(){ctrl.abort();},4000):null;
+    fetch('/api/live', {cache:'no-store', signal:ctrl?ctrl.signal:undefined})
+      .then(function(r){ if(!r.ok) throw new Error('HTTP '+r.status); return r.json(); })
+      .then(function(d){ if(to)clearTimeout(to); FM.fails=0; setConnection('ok'); FM.apply(d); })
+      .catch(function(_){ if(to)clearTimeout(to); FM.fails++; setConnection(FM.fails>2?'err':'warn'); })
+      .then(function(){ FM.inFlight=false; FM.schedule(); });
+  },
+  apply:function(d){
+    var disc = d.discovery || {};
+    if (disc.active){
+      this.discActive=true;
+      var p=document.getElementById('discovery-panel'); if(p){ p.hidden=false; if(p._h){clearTimeout(p._h);p._h=null;} }
+      setText('dp-state','Searching');
+      setText('dp-elapsed', Math.floor((disc.elapsedMs||0)/1000)+'s');
+      setText('dp-found', String(disc.foundThisScan||0));
+      var fb=document.getElementById('find-btn');
+      if (fb && !fb.classList.contains('is-loading')) setBtnLoading(fb,'Searching for nodes…');
+    } else if (this.discActive){
+      this.discActive=false;
+      this.onDiscoveryDone(disc);
+    }
+    if (d.version !== this.lastVersion){
+      this.lastVersion = d.version;
+      if (d.fleet) updateKpis(d.fleet);
+      if (d.nodes) reconcileNodes(d.nodes);
+    }
+  },
+  onDiscoveryDone:function(disc){
+    var found = disc ? (disc.foundThisScan||0) : 0, res = disc ? disc.result : 0;
+    var msg = res===1 ? (found+' new node'+(found===1?'':'s')+' found')
+            : res===2 ? 'No new nodes found'
+            : res===3 ? 'Discovery failed'
+            : res===4 ? 'Discovery timed out' : 'Discovery complete';
+    showUiStatus(msg, res===1?'ok':'warn');
+    setText('dp-state', msg);
+    var fb=document.getElementById('find-btn'); if (fb) clearBtnLoading(fb);
+    var p=document.getElementById('discovery-panel');
+    if (p){ if (p._h) clearTimeout(p._h); p._h=setTimeout(function(){p.hidden=true;p._h=null;}, 4500); }
+    this.lastVersion = -1;  // force one more KPI/node refresh after the scan
+  }
+};
+
+function wireAsyncForms(){
+  var forms = document.querySelectorAll('form.async-form');
+  for (var i=0;i<forms.length;i++){
+    (function(form){
+      if (form._wired) return; form._wired = true;
+      form.addEventListener('submit', function(e){
+        e.preventDefault();
+        var btn = form.querySelector('button[type="submit"],input[type="submit"]');
+        if (btn && btn.disabled) return;  // prevent duplicate submission
+        var action = form.getAttribute('action') || '';
+        var isFind = action.indexOf('find-stations')>=0 || action.indexOf('discover')>=0;
+        setBtnLoading(btn, btnLabelFor(form, btn));
+        if (isFind) FM.startDiscoveryUi();  // immediate panel + fast polling
+
+        var ctrl = fmAbort();
+        var to = ctrl ? setTimeout(function(){ ctrl.abort(); }, 15000) : null;
+        fetch(form.action, {method:'POST', body:asFormBody(form),
+              headers:{'Content-Type':'application/x-www-form-urlencoded'},
+              signal: ctrl?ctrl.signal:undefined})
+          .then(function(r){ return r.text().then(function(t){ return {ok:r.ok, t:t}; }); })
+          .then(function(res){
+            if (to) clearTimeout(to);
+            var ok = res.ok, msg = res.t;
+            try { var j = JSON.parse(res.t); ok = !!j.ok; msg = j.message || (ok?'Done':'Request failed'); } catch(_){}
+            if (isFind){
+              // Discovery now runs server-side; the live poller owns the button,
+              // panel and node list. No full-page reload.
+              showUiStatus(ok ? 'Searching for nodes…' : ('Discovery failed: '+msg), ok?'progress':'err');
+              if (!ok) clearBtnLoading(btn);
+              FM.bump();
+            } else {
+              showUiStatus(msg, ok?'ok':'err');
+              flashBtn(btn, ok);
+              setTimeout(function(){ clearBtnLoading(btn); }, ok?700:1200);
+              FM.bump();  // promptly refresh KPIs/nodes after the action
+            }
+          })
+          .catch(function(err){
+            if (to) clearTimeout(to);
+            var aborted = err && err.name==='AbortError';
+            showUiStatus(aborted ? 'Request timed out — check connection' : ('Request failed: '+err), 'err');
+            if (btn && !isFind){ flashBtn(btn,false); setTimeout(function(){clearBtnLoading(btn);},1200); }
+            else if (isFind) clearBtnLoading(btn);
+          });
+      });
+    })(forms[i]);
+  }
 }
 
 function setCurrentTime(){
@@ -844,6 +1178,7 @@ function toggleInfoPanel(){
 window.addEventListener('DOMContentLoaded', () => {
   setCurrentTime();
   wireAsyncForms();
+  FM.start();   // begin adaptive /api/live polling (drives KPIs, nodes, discovery, connection)
 });
 
 (function(){
@@ -1072,6 +1407,80 @@ static String buildStatusJson() {
 }
 
 // ---------------------------------------------------------------------------
+// Lightweight live-status endpoint (/api/live)
+// ---------------------------------------------------------------------------
+// RAM-only: serialises the node-registry snapshot + discovery state. Unlike
+// buildStatusJson() it must NOT touch LittleFS, NVS or the upload queue,
+// because the browser polls it every ~0.65-4 s. A fingerprint-derived
+// `version` lets the client skip DOM work when nothing changed.
+static uint32_t gLiveVersion = 1;
+static uint32_t gLiveFingerprint = 0;
+
+static String buildLiveJson() {
+  const std::vector<NodeInfo> nodes = getRegisteredNodes();  // snapshot copy (safe read)
+  const uint32_t now = millis();
+
+  uint16_t nNew = 0, nConn = 0, nActive = 0, nPending = 0;
+  uint32_t fp = 2166136261UL ^ (uint32_t)nodes.size();
+  for (const auto& n : nodes) {
+    if (n.state == DEPLOYED) nActive++;
+    else if (n.state == PAIRED) nConn++;
+    else nNew++;
+    if (n.stateChangePending || n.deployPending) nPending++;
+    const uint32_t battCenti = isnan(n.lastReportedBatV) ? 0u : (uint32_t)(n.lastReportedBatV * 100.0f);
+    fp ^= (uint32_t)n.state + ((uint32_t)n.configVersionApplied << 4) +
+          (n.lastSeen / 1000UL) + battCenti +
+          (uint32_t)(n.nodeId.length() * 131U) + (uint32_t)(n.name.length() * 17U);
+    fp *= 16777619UL;  // FNV-style fold — cheap change detector, not a hash guarantee
+  }
+  fp ^= (gDiscovery.generation * 2654435761UL) + (gDiscovery.active ? 1UL : 0UL) +
+        ((uint32_t)gDiscovery.broadcastsSent << 1) + (uint32_t)gDiscovery.lastResult;
+  if (fp != gLiveFingerprint) { gLiveFingerprint = fp; gLiveVersion++; }
+
+  const int found = (int)nodes.size() - (int)gDiscovery.foundAtStart;
+  String j;
+  j.reserve(220 + nodes.size() * 170);
+  j += "{\"version\":";   j += String(gLiveVersion);
+  j += ",\"uptimeMs\":";  j += String(now);
+  j += ",\"discovery\":{\"active\":"; j += gDiscovery.active ? "true" : "false";
+  j += ",\"generation\":";     j += String(gDiscovery.generation);
+  j += ",\"elapsedMs\":";      j += String(gDiscovery.startedMs ? (now - gDiscovery.startedMs) : 0UL);
+  j += ",\"timeoutMs\":";      j += String((uint32_t)kDiscoveryTimeoutMs);
+  j += ",\"broadcastsSent\":"; j += String((unsigned)gDiscovery.broadcastsSent);
+  j += ",\"foundThisScan\":";  j += String(found > 0 ? found : 0);
+  j += ",\"result\":";         j += String((unsigned)gDiscovery.lastResult);
+  j += "}";
+  j += ",\"fleet\":{\"total\":"; j += String((unsigned)nodes.size());
+  j += ",\"new\":";       j += String((unsigned)nNew);
+  j += ",\"connected\":"; j += String((unsigned)nConn);
+  j += ",\"active\":";    j += String((unsigned)nActive);
+  j += ",\"pending\":";   j += String((unsigned)nPending);
+  j += "}";
+  j += ",\"nodes\":[";
+  bool first = true;
+  for (const auto& n : nodes) {
+    if (!first) j += ",";
+    first = false;
+    const String disp = n.name.length() ? n.name : (n.userId.length() ? n.userId : n.nodeId);
+    const uint8_t obs = (n.wakeIntervalMin > 0) ? n.wakeIntervalMin : n.inferredWakeIntervalMin;
+    const int recMin = (obs > 0) ? (int)obs : (gWakeIntervalMin > 0 ? gWakeIntervalMin : 5);
+    j += "{\"id\":\"";     j += jsonEscapeLocal(n.nodeId); j += "\"";
+    j += ",\"label\":\"";  j += jsonEscapeLocal(disp);     j += "\"";
+    j += ",\"userId\":\""; j += jsonEscapeLocal(n.userId); j += "\"";
+    j += ",\"state\":\"";  j += nodeStateToString(n.state); j += "\"";
+    if (n.lastSeen > 0 && now >= n.lastSeen) { j += ",\"lastSeenSec\":"; j += String((now - n.lastSeen) / 1000UL); }
+    else { j += ",\"lastSeenSec\":-1"; }
+    if (isnan(n.lastReportedBatV)) { j += ",\"batV\":null"; }
+    else { char b[12]; snprintf(b, sizeof(b), "%.2f", n.lastReportedBatV); j += ",\"batV\":"; j += b; }
+    j += ",\"recMin\":";  j += String(recMin);
+    j += ",\"pending\":"; j += (n.stateChangePending || n.deployPending) ? "true" : "false";
+    j += "}";
+  }
+  j += "]}";
+  return j;
+}
+
+// ---------------------------------------------------------------------------
 // Data status section (adapted to use flash_logger instead of SD)
 // ---------------------------------------------------------------------------
 static String buildDataStatusSectionHtml() {
@@ -1216,10 +1625,19 @@ static void handleRoot() {
   // --- Quick actions: Find New Nodes + Manage nodes ---
   html += F("<div class='section action-stack' style='margin:0 0 12px 0'>"
             "<form class='async-form' action='/find-stations' method='POST' style='margin:0'>"
-            "<button type='submit' class='btn btn--primary' style='width:100%'><svg class='icon' viewBox='0 0 24 24' aria-hidden='true'><path d='M12 3c-3.9 0-7.4 1.6-9.9 4.1l1.4 1.4C5.6 6.4 8.7 5 12 5s6.4 1.4 8.5 3.5l1.4-1.4C19.4 4.6 15.9 3 12 3zm0 5c-2.6 0-5 .9-6.9 2.6l1.4 1.4C8 10.5 9.9 10 12 10s4 .5 5.5 2l1.4-1.4C17 8.9 14.6 8 12 8zm0 5c-1.3 0-2.5.5-3.5 1.5l1.4 1.4c.6-.6 1.3-.9 2.1-.9s1.5.3 2.1.9l1.4-1.4c-1-1-2.2-1.5-3.5-1.5zm0 4a2 2 0 100 4 2 2 0 000-4z'/></svg> Find New Nodes</button>"
+            "<button type='submit' id='find-btn' data-loading-label='Searching for nodes…' class='btn btn--primary' style='width:100%'><svg class='icon' viewBox='0 0 24 24' aria-hidden='true'><path d='M12 3c-3.9 0-7.4 1.6-9.9 4.1l1.4 1.4C5.6 6.4 8.7 5 12 5s6.4 1.4 8.5 3.5l1.4-1.4C19.4 4.6 15.9 3 12 3zm0 5c-2.6 0-5 .9-6.9 2.6l1.4 1.4C8 10.5 9.9 10 12 10s4 .5 5.5 2l1.4-1.4C17 8.9 14.6 8 12 8zm0 5c-1.3 0-2.5.5-3.5 1.5l1.4 1.4c.6-.6 1.3-.9 2.1-.9s1.5.3 2.1.9l1.4-1.4c-1-1-2.2-1.5-3.5-1.5zm0 4a2 2 0 100 4 2 2 0 000-4z'/></svg> Find New Nodes</button>"
             "</form>"
             "<a href='/stations' class='btn btn--success'><svg class='icon' viewBox='0 0 24 24' aria-hidden='true'><path d='M12 2a4 4 0 110 8 4 4 0 010-8zm-7 12a3 3 0 110 6 3 3 0 010-6zm14 0a3 3 0 110 6 3 3 0 010-6zM9.3 9.8l-3 3.9 1.6 1.2 3-3.9-1.6-1.2zm5.4 0l-1.6 1.2 3 3.9 1.6-1.2-3-3.9z'/></svg> Manage nodes</a>"
             "</div>");
+
+  // Discovery progress panel (hidden until a scan starts) + connection pill.
+  html += F("<div id='discovery-panel' class='discovery-panel' hidden>"
+            "<div class='dp-row'><strong><span class='spinner' aria-hidden='true'></span>"
+            "<span id='dp-state'>Searching</span></strong>"
+            "<span>Elapsed <span id='dp-elapsed'>0s</span></span></div>"
+            "<div class='dp-row'><span>New nodes this scan: <strong id='dp-found'>0</strong></span></div>"
+            "<div class='dp-msg'>Keep new nodes powered on and in pairing mode.</div></div>");
+  html += F("<div style='text-align:right;margin:-4px 0 8px'><span id='conn-status' class='conn-dot'>Connected</span></div>");
 
   // --- Status cards row: Mothership battery + Storage ---
   {
@@ -1291,6 +1709,9 @@ static void handleRoot() {
   html += F("</span></div>"
             "</div>");
   html += F("</div>");
+
+  // --- Schedule change pending (only rendered during a transition) ---
+  html += buildScheduleTransitionBanner();
 
   // --- Collection schedule ---
   {
@@ -1447,27 +1868,34 @@ static void handleDownloadCSV() {
 }
 
 static void handleDiscoverNodes() {
-  Serial.println("[DISCOVER] Starting node discovery...");
-  const uint8_t kDiscoveryBursts = 3;
-  bool sentAny = false;
-  for (uint8_t i = 0; i < kDiscoveryBursts; ++i) {
-    sentAny = sendDiscoveryBroadcast() || sentAny;
-    if (i + 1 < kDiscoveryBursts) delay(150);
-  }
+  // Non-blocking: flip the discovery state machine on and return immediately.
+  // configServerLoop() schedules the broadcasts with millis(); the browser
+  // tracks progress + results via /api/live. A second request while a scan is
+  // already running is a no-op (startDiscovery ignores re-entry) and just
+  // reports the current scan — no overlapping scans.
+  const bool wasActive = gDiscovery.active;
+  startDiscovery();
 
   if (isAjaxRequest()) {
-    sendAjaxResult(sentAny, sentAny ? "Scanning for new nodes... Refreshing list." : "Scan failed");
+    String b;
+    b.reserve(112);
+    b += "{\"ok\":true,\"active\":true,\"generation\":";
+    b += String(gDiscovery.generation);
+    b += wasActive ? ",\"message\":\"Scan already running\"}"
+                   : ",\"message\":\"Searching for nodes\"}";
+    server.sendHeader("Cache-Control", "no-store");
+    server.send(200, "application/json", b);
     return;
   }
 
+  // JS-disabled fallback: a meta-refresh to the Nodes page after the discovery
+  // window so non-script browsers still see the results.
   String html = headCommon("fieldMesh");
-  html += F("<meta http-equiv='refresh' content='3;url=/stations'>");
-  html += F("<div class='section center'><h3>Searching for new nodes...</h3>"
-            "<div class='muted'>Scanning for nodes in pairing mode.</div>"
-            "<div style='margin:16px auto;width:40px;height:40px;border-radius:50%;"
-            "border:4px solid #eee;border-top-color:#2196F3;animation:spin 1s linear infinite'></div>"
-            "<style>@keyframes spin{0%{transform:rotate(0)}100%{transform:rotate(360deg)}}</style>"
-            "<p class='muted'><small>Redirecting to Nodes in 3 seconds…</small></p></div>");
+  html += F("<meta http-equiv='refresh' content='9;url=/stations'>");
+  html += F("<div class='section center'><h3>Searching for new nodes…</h3>"
+            "<div class='muted'>Keep new nodes powered on and in pairing mode.</div>"
+            "<div class='spinner' style='width:36px;height:36px;border-width:4px;margin:16px auto;color:#5b7553'></div>"
+            "<p class='muted'><small>Redirecting to Nodes shortly…</small></p></div>");
   html += footCommon();
   server.send(200, "text/html", html);
 }
@@ -1483,21 +1911,98 @@ static void handleSetWakeInterval() {
   gSyncIntervalMin = computeAutoSyncMin(gWakeIntervalMin);
   saveWakeIntervalToNVS(interval);
 
+  // CRITICAL: Do NOT reset gLastSyncBroadcastUnix here.
+  //
+  // The nodes are asleep with their A2 alarms armed to the OLD sync
+  // schedule.  If we reset the phase anchor now, the mothership will
+  // wake at a different time than the nodes expect and the fleet
+  // desyncs — the nodes never hear the SYNC_WINDOW_OPEN marker and
+  // their queued data carries forward indefinitely.
+  //
+  // Strategy:
+  //  1. Keep the OLD anchor in gLastSyncBroadcastUnix so the mothership
+  //     wakes at the time the nodes expect (config shutdown arms with
+  //     the old interval+phase — see main.cpp handleConfigWake).
+  //  2. Compute the next OLD-schedule sync slot — that's the moment
+  //     the mothership and nodes will next meet.  Use that timestamp
+  //     as the NEW schedule's phase anchor.
+  //  3. Push the new wakeIntervalMin, syncIntervalMin, and the new
+  //     syncPhaseUnix to each node's desired config.  When the node
+  //     wakes at the old time and receives CONFIG_SNAPSHOT, it applies
+  //     the new schedule and re-arms A2 to newInterval + newPhase.
+  //  4. The mothership does the same at handleSyncWake re-arm time
+  //     (schedule transition detection in main.cpp).
+  //
+  // Both mothership and nodes converge on the new schedule starting
+  // from the same anchor point.
+  const uint32_t oldPhaseUnix = (uint32_t)gLastSyncBroadcastUnix;
+  const uint16_t newSyncMin = (gSyncMode == SYNC_MODE_INTERVAL)
+    ? (uint16_t)gSyncIntervalMin : 0u;
+
+  // Compute the next sync slot on the OLD schedule — this is when the
+  // mothership and nodes will next meet.  Use it as the new anchor.
+  uint32_t transitionPhaseUnix = 0;
+  if (gSyncMode == SYNC_MODE_INTERVAL && oldPhaseUnix > 0) {
+    // Temporarily compute using the old interval (still in the anchor)
+    // to find the next old-schedule slot. gSyncIntervalMin was already
+    // overwritten with the NEW value above, so read the OLD interval straight
+    // from the persisted anchor (this opens/closes gPrefs itself — the earlier
+    // code read gPrefs while it was closed, silently yielding 0).
+    const int oldAnchorInterval = readAnchorSyncIntervalMin();
+    if (oldAnchorInterval > 0) {
+      const uint32_t oldPeriodSec = (uint32_t)oldAnchorInterval * 60UL;
+      const uint32_t nowUnix = getRTCTimeUnix();
+      if (nowUnix < oldPhaseUnix) {
+        transitionPhaseUnix = oldPhaseUnix;
+      } else {
+        const uint32_t elapsed = nowUnix - oldPhaseUnix;
+        const uint32_t slots = elapsed / oldPeriodSec;
+        transitionPhaseUnix = oldPhaseUnix + (slots + 1UL) * oldPeriodSec;
+      }
+      // Minute-align for DS3231 Alarm2
+      transitionPhaseUnix -= (transitionPhaseUnix % 60UL);
+    }
+  }
+  if (transitionPhaseUnix == 0) {
+    // Fallback: use the next sync slot computed with current globals.
+    // This is less precise but safe if the anchor was missing.
+    transitionPhaseUnix = computeNextSyncUnix(getRTCTimeUnix());
+  }
+
   bool sent = false;
   if (interval > 0) {
     sent = broadcastWakeInterval(interval);
     for (const auto& node : registeredNodes) {
       if (node.state == PAIRED || node.state == DEPLOYED) {
         NodeDesiredConfig dc = getDesiredConfig(node.nodeId.c_str());
-        dc.wakeIntervalMin = (uint8_t)interval;
-        dc.configVersion   = (dc.configVersion < 0xFFFFu) ? (dc.configVersion + 1u) : 1u;
-        setDesiredConfig(node.nodeId.c_str(), dc);
+        bool cfgChanged = false;
+        if (dc.wakeIntervalMin != (uint8_t)interval) {
+          dc.wakeIntervalMin = (uint8_t)interval;
+          cfgChanged = true;
+        }
+        if (dc.syncIntervalMin != newSyncMin) {
+          dc.syncIntervalMin = newSyncMin;
+          cfgChanged = true;
+        }
+        // Push the transition phase anchor so the node re-arms A2 to
+        // the new schedule at the same moment the mothership does.
+        if (dc.syncPhaseUnix != transitionPhaseUnix) {
+          dc.syncPhaseUnix = transitionPhaseUnix;
+          cfgChanged = true;
+        }
+        if (dc.configVersion == 0) { dc.configVersion = 1; cfgChanged = true; }
+        else if (cfgChanged) {
+          dc.configVersion = (dc.configVersion < 0xFFFFu) ? (dc.configVersion + 1u) : 1u;
+        }
+        if (cfgChanged) setDesiredConfig(node.nodeId.c_str(), dc);
       }
     }
   }
 
-  Serial.printf("[UI] Global wake interval set to %d min (broadcast=%s)\n",
-                interval, sent ? "yes" : "no");
+  Serial.printf("[UI] Global wake interval set to %d min sync=%d min transitionPhase=%lu (old phase=%lu preserved, broadcast=%s)\n",
+                interval, gSyncIntervalMin,
+                (unsigned long)transitionPhaseUnix,
+                (unsigned long)oldPhaseUnix, sent ? "yes" : "no");
 
   if (isAjaxRequest()) {
     if (interval > 0) {
@@ -1547,25 +2052,35 @@ static void handleSetSyncMode() {
   int newMode = (mode == "interval") ? SYNC_MODE_INTERVAL : SYNC_MODE_DAILY;
   gSyncMode = newMode;
   saveSyncModeToNVS(gSyncMode);
-  gLastSyncBroadcastEpochDay = -1;
-  gLastSyncBroadcastMs = 0;
-  gLastSyncBroadcastUnix = 0;
-  gLastSyncIntervalSlot = -1;
-  saveSyncRuntimeGuardsToNVS();
 
-  const uint32_t modePhaseUnix = computeNextSyncUnix(getRTCTimeUnix());
+  // Handover pattern (see handleSetWakeInterval): do NOT wipe
+  // gLastSyncBroadcastUnix or overwrite the anchor. The deployed fleet is
+  // asleep on the OLD schedule; preserving the old anchor in NVS is what makes
+  // the mothership wake at the time the nodes expect. It meets them at the next
+  // OLD-schedule slot and hands over the new schedule via the SET_SYNC_SCHED
+  // broadcast during that sync window (handleSyncWake). Wiping the anchor here
+  // would arm the mothership to a fresh slot the sleeping fleet never hears —
+  // desyncing them even in interval mode.
+  const int oldAnchorInterval = readAnchorSyncIntervalMin();
+  uint32_t transitionPhaseUnix = (oldAnchorInterval > 0)
+      ? computeNextOldSlotUnix(oldAnchorInterval) : 0;
+  if (transitionPhaseUnix == 0) transitionPhaseUnix = computeNextSyncUnix(getRTCTimeUnix());
+
   const uint16_t modeSyncMin = (gSyncMode == SYNC_MODE_INTERVAL) ? (uint16_t)gSyncIntervalMin : 0u;
+  // Best-effort desired-config push (authoritative delivery is the
+  // SET_SYNC_SCHED broadcast during the next sync window).
   for (const auto& node : registeredNodes) {
     NodeDesiredConfig dc = getDesiredConfig(node.nodeId.c_str());
     bool changed = false;
     if (dc.syncIntervalMin != modeSyncMin) { dc.syncIntervalMin = modeSyncMin; changed = true; }
-    if (dc.syncPhaseUnix != modePhaseUnix) { dc.syncPhaseUnix = modePhaseUnix; changed = true; }
+    if (dc.syncPhaseUnix != transitionPhaseUnix) { dc.syncPhaseUnix = transitionPhaseUnix; changed = true; }
     if (dc.configVersion == 0) { dc.configVersion = 1; changed = true; }
     else if (changed) { dc.configVersion = (dc.configVersion < 0xFFFFu) ? (dc.configVersion + 1u) : 1u; }
     if (changed) setDesiredConfig(node.nodeId.c_str(), dc);
   }
 
-  Serial.printf("[UI] Sync mode set to %s\n", syncModeLabel());
+  Serial.printf("[UI] Sync mode set to %s (anchor preserved, transitionPhase=%lu)\n",
+                syncModeLabel(), (unsigned long)transitionPhaseUnix);
 
   if (isAjaxRequest()) {
     sendAjaxResult(true, String("Upload schedule set to ") + syncModeLabel());
@@ -1604,19 +2119,21 @@ static void handleSetSyncTime() {
   gSyncDailyHour = hh;
   gSyncDailyMinute = mm;
   saveDailySyncTimeToNVS(hh, mm);
-  gLastSyncBroadcastEpochDay = -1;
-  gLastSyncBroadcastMs = 0;
-  gLastSyncBroadcastUnix = 0;
-  gLastSyncIntervalSlot = -1;
-  saveSyncRuntimeGuardsToNVS();
 
+  // Handover pattern: preserve the old anchor (do NOT wipe
+  // gLastSyncBroadcastUnix). The previous code wiped it unconditionally, which
+  // would desync an interval-mode fleet even though this handler only changes
+  // the daily time. Only push desired config in daily mode.
   if (gSyncMode == SYNC_MODE_DAILY) {
-    const uint32_t dailyPhaseUnix = computeNextSyncUnix(getRTCTimeUnix());
+    const int oldAnchorInterval = readAnchorSyncIntervalMin();
+    uint32_t transitionPhaseUnix = (oldAnchorInterval > 0)
+        ? computeNextOldSlotUnix(oldAnchorInterval) : 0;
+    if (transitionPhaseUnix == 0) transitionPhaseUnix = computeNextSyncUnix(getRTCTimeUnix());
     for (const auto& node : registeredNodes) {
       NodeDesiredConfig dc = getDesiredConfig(node.nodeId.c_str());
       bool changed = false;
       if (dc.syncIntervalMin != 0u) { dc.syncIntervalMin = 0u; changed = true; }
-      if (dc.syncPhaseUnix != dailyPhaseUnix) { dc.syncPhaseUnix = dailyPhaseUnix; changed = true; }
+      if (dc.syncPhaseUnix != transitionPhaseUnix) { dc.syncPhaseUnix = transitionPhaseUnix; changed = true; }
       if (dc.configVersion == 0) { dc.configVersion = 1; changed = true; }
       else if (changed) { dc.configVersion = (dc.configVersion < 0xFFFFu) ? (dc.configVersion + 1u) : 1u; }
       if (changed) setDesiredConfig(node.nodeId.c_str(), dc);
@@ -1680,102 +2197,95 @@ static void handleStationsPage() {
   auto allNodes = getRegisteredNodes();
 
   html += F("<div id='ui-status' class='help' style='display:none;margin-bottom:10px;border:1px solid var(--border);border-radius:8px;padding:8px 10px'></div>");
+  html += F("<div style='text-align:right;margin:0 0 6px'><span id='conn-status' class='conn-dot'>Connected</span></div>");
+  html += F("<div id='discovery-panel' class='discovery-panel' hidden>"
+            "<div class='dp-row'><strong><span class='spinner' aria-hidden='true'></span>"
+            "<span id='dp-state'>Searching</span></strong>"
+            "<span>Elapsed <span id='dp-elapsed'>0s</span></span></div>"
+            "<div class='dp-row'><span>New nodes this scan: <strong id='dp-found'>0</strong></span></div>"
+            "<div class='dp-msg'>Keep new nodes powered on and in pairing mode.</div></div>");
   html += F("<div class='section'>");
   html += F("<h3>Nodes</h3>");
 
-  if (allNodes.empty()) {
-    html += F("<p class='muted'>No nodes yet. Tap “Add New node” below to get started.</p>");
-  } else {
-    html += F("<div class='list'>");
+  // Empty-state hint (kept in the DOM, hidden by JS once nodes appear live).
+  html += F("<p class='muted' id='node-empty'");
+  if (!allNodes.empty()) html += F(" style='display:none'");
+  html += F(">No nodes yet. Tap “Add New node” below, then “Find New Nodes”.</p>");
 
-    for (auto& node : allNodes) {
-      String userId = node.userId;
-      String name   = node.name;
-      if (userId.isEmpty()) userId = getNodeUserId(node.nodeId);
-      if (name.isEmpty())   name   = getNodeName(node.nodeId);
-      NodeDesiredConfig nodeDesired = getDesiredConfig(node.nodeId.c_str());
-      uint8_t observedWakeMin = (node.wakeIntervalMin > 0)
-        ? node.wakeIntervalMin
-        : node.inferredWakeIntervalMin;
-      int nodeIntervalCurrentMin = (nodeDesired.wakeIntervalMin > 0)
-        ? (int)nodeDesired.wakeIntervalMin
-        : ((isAllowedInterval(gWakeIntervalMin) && gWakeIntervalMin > 0)
-            ? gWakeIntervalMin
-            : ((observedWakeMin > 0) ? (int)observedWakeMin : 5));
+  // Node list. data-node-id + data-f hooks let the live poller update cards in
+  // place and append newly discovered ones without a full-page reload.
+  html += F("<div class='list' id='node-list'>");
+  for (auto& node : allNodes) {
+    String userId = node.userId;
+    String name   = node.name;
+    if (userId.isEmpty()) userId = getNodeUserId(node.nodeId);
+    if (name.isEmpty())   name   = getNodeName(node.nodeId);
+    NodeDesiredConfig nodeDesired = getDesiredConfig(node.nodeId.c_str());
+    uint8_t observedWakeMin = (node.wakeIntervalMin > 0)
+      ? node.wakeIntervalMin
+      : node.inferredWakeIntervalMin;
+    int nodeIntervalCurrentMin = (nodeDesired.wakeIntervalMin > 0)
+      ? (int)nodeDesired.wakeIntervalMin
+      : ((isAllowedInterval(gWakeIntervalMin) && gWakeIntervalMin > 0)
+          ? gWakeIntervalMin
+          : ((observedWakeMin > 0) ? (int)observedWakeMin : 5));
 
-      String displayId = name.length() ? name : (userId.length() ? userId : node.nodeId);
+    String displayId = name.length() ? name : (userId.length() ? userId : node.nodeId);
 
-      html += F("<a href='/station?id=");
-      html += node.nodeId;
-      html += F("' class='item item--node'>"
-                "<div class='node-row'>"
-                "<div class='node-main'>"
-                "<strong>");
-      html += htmlEscape(displayId);
-      html += F("</strong>");
-      if (name.length() && userId.length()) {
-        html += F("<span class='muted node-name'>");
-        html += htmlEscape(userId);
-        html += F("</span>");
-      }
-      html += F("</div>"
-                "<div class='node-status'>"
-                "<div class='node-status-cell'>"
-                "<span class='node-timing-label'>Status</span>");
+    const char* stCls = (node.state == DEPLOYED) ? "chip chip--state-deployed"
+                       : (node.state == PAIRED)   ? "chip chip--state-paired"
+                       : "chip chip--state-unpaired";
+    const char* stTxt = (node.state == DEPLOYED) ? "Active"
+                       : (node.state == PAIRED)   ? "Connected" : "New";
 
-      if (node.state == DEPLOYED) html += F("<span class='chip chip--state-deployed'>Active</span>");
-      else if (node.state == PAIRED) html += F("<span class='chip chip--state-paired'>Connected</span>");
-      else html += F("<span class='chip chip--state-unpaired'>New</span>");
-
-      html += F("</div>"
-                "<div class='node-status-cell'>"
-                "<span class='node-timing-label'>Battery</span>");
-      {
-        float batV = node.lastReportedBatV;
-        if (isnan(batV)) {
-          html += F("<span class='chip'>n/a</span>");
-        } else {
-          char batBuf[10];
-          snprintf(batBuf, sizeof(batBuf), "%.2fV", batV);
-          const char* batClass = (batV >= 3.9f) ? "chip--bat-ok"
-                               : (batV >= 3.5f) ? "chip--bat-med"
-                               : "chip--bat-low";
-          html += F("<span class='chip ");
-          html += batClass;
-          html += F("'>");
-          html += batBuf;
-          html += F("</span>");
-        }
-      }
-
-      html += F("</div></div>"
-                "<div class='node-timing'>"
-                "<div class='node-timing-cell'>"
-                "<span class='node-timing-label'>Recording</span>"
-                "<span class='chip node-timing-value'>");
-      html += String(nodeIntervalCurrentMin);
-      html += F(" min</span>"
-                "</div>"
-                "<div class='node-timing-cell'>"
-                "<span class='node-timing-label'>Last seen</span>"
-                "<span class='chip node-timing-value'>");
-      if (node.lastSeen > 0) {
-        const uint32_t nowMs = millis();
-        const uint32_t ageMs = (nowMs >= node.lastSeen) ? (nowMs - node.lastSeen) : 0;
-        const uint32_t ageMin = ageMs / 60000UL;
-        html += String(ageMin);
-        html += F(" min ago");
-      } else {
-        html += F("n/a");
-      }
-      html += F("</span>"
-                "</div>"
-                "</div>"
-                "</div></a>");
+    String battCls = F("chip");
+    String battTxt = F("n/a");
+    if (!isnan(node.lastReportedBatV)) {
+      char bb[10];
+      snprintf(bb, sizeof(bb), "%.2fV", node.lastReportedBatV);
+      battTxt = bb;
+      battCls = (node.lastReportedBatV >= 3.9f) ? F("chip chip--bat-ok")
+              : (node.lastReportedBatV >= 3.5f) ? F("chip chip--bat-med")
+              : F("chip chip--bat-low");
     }
 
-    html += F("</div>");
+    String seenTxt = F("n/a");
+    if (node.lastSeen > 0) {
+      const uint32_t nowMs = millis();
+      const uint32_t ageMin = ((nowMs >= node.lastSeen) ? (nowMs - node.lastSeen) : 0) / 60000UL;
+      seenTxt = String(ageMin) + F(" min ago");
+    }
+
+    html += F("<a href='/station?id=");
+    html += node.nodeId;
+    html += F("' class='item item--node' data-node-id='");
+    html += htmlEscape(node.nodeId);
+    html += F("'><div class='node-row'>"
+              "<div class='node-main'><strong data-f='label'>");
+    html += htmlEscape(displayId);
+    html += F("</strong>");
+    if (name.length() && userId.length()) {
+      html += F("<span class='muted node-name'>");
+      html += htmlEscape(userId);
+      html += F("</span>");
+    }
+    html += F("</div><div class='node-status'>"
+              "<div class='node-status-cell'><span class='node-timing-label'>Status</span>"
+              "<span class='");
+    html += stCls; html += F("' data-f='status'>"); html += stTxt; html += F("</span></div>"
+              "<div class='node-status-cell'><span class='node-timing-label'>Battery</span>"
+              "<span class='");
+    html += battCls; html += F("' data-f='batt'>"); html += battTxt; html += F("</span></div>"
+              "</div><div class='node-timing'>"
+              "<div class='node-timing-cell'><span class='node-timing-label'>Recording</span>"
+              "<span class='chip node-timing-value' data-f='rec'>");
+    html += String(nodeIntervalCurrentMin); html += F(" min</span></div>"
+              "<div class='node-timing-cell'><span class='node-timing-label'>Last seen</span>"
+              "<span class='chip node-timing-value' data-f='lastseen'>");
+    html += seenTxt;
+    html += F("</span></div></div></div></a>");
   }
+  html += F("</div>");
   html += F("</div>");
 
   // --- Add New node guided panel ---
@@ -1788,7 +2298,7 @@ static void handleStationsPage() {
             "3. Tap “Find New Nodes” below.</p>"
             "<p class='muted'>The node will appear in the list as “New”. Tap it to activate and give it a name.</p>"
             "<form class='async-form' action='/find-stations' method='POST'>"
-            "<button type='submit' class='btn btn--primary'><svg class='icon' viewBox='0 0 24 24' aria-hidden='true'><path d='M12 3c-3.9 0-7.4 1.6-9.9 4.1l1.4 1.4C5.6 6.4 8.7 5 12 5s6.4 1.4 8.5 3.5l1.4-1.4C19.4 4.6 15.9 3 12 3zm0 5c-2.6 0-5 .9-6.9 2.6l1.4 1.4C8 10.5 9.9 10 12 10s4 .5 5.5 2l1.4-1.4C17 8.9 14.6 8 12 8zm0 5c-1.3 0-2.5.5-3.5 1.5l1.4 1.4c.6-.6 1.3-.9 2.1-.9s1.5.3 2.1.9l1.4-1.4c-1-1-2.2-1.5-3.5-1.5zm0 4a2 2 0 100 4 2 2 0 000-4z'/></svg> Find New Nodes</button>"
+            "<button type='submit' id='find-btn' data-loading-label='Searching for nodes…' class='btn btn--primary'><svg class='icon' viewBox='0 0 24 24' aria-hidden='true'><path d='M12 3c-3.9 0-7.4 1.6-9.9 4.1l1.4 1.4C5.6 6.4 8.7 5 12 5s6.4 1.4 8.5 3.5l1.4-1.4C19.4 4.6 15.9 3 12 3zm0 5c-2.6 0-5 .9-6.9 2.6l1.4 1.4C8 10.5 9.9 10 12 10s4 .5 5.5 2l1.4-1.4C17 8.9 14.6 8 12 8zm0 5c-1.3 0-2.5.5-3.5 1.5l1.4 1.4c.6-.6 1.3-.9 2.1-.9s1.5.3 2.1.9l1.4-1.4c-1-1-2.2-1.5-3.5-1.5zm0 4a2 2 0 100 4 2 2 0 000-4z'/></svg> Find New Nodes</button>"
             "</form>"
             "</div>"
             "</details>"
@@ -2157,6 +2667,9 @@ static void handleSettings() {
 
   html += F("<div id='ui-status' class='help' style='display:none;margin-bottom:10px;border:1px solid var(--border);border-radius:8px;padding:8px 10px'></div>");
 
+  // --- Schedule change pending (only rendered during a transition) ---
+  html += buildScheduleTransitionBanner();
+
   html += F("<div class='section'>");
 
   // --- Recording interval presets ---
@@ -2216,6 +2729,21 @@ static void handleSettings() {
   html += F("<label class='label' style='margin-top:10px'>Endpoint (read-only)</label>");
   html += F("<p class='muted' style='word-break:break-all;font-size:13px'>");
   html += htmlEscape(tx.endpointUrl);
+  html += F("</p>");
+
+  // Device identity — the backend team needs the MAC to issue an API key, and
+  // the mothership_id is what routes this device's data in Supabase.
+  html += F("<label class='label' style='margin-top:10px'>Device MAC (give to backend for API key)</label>");
+  html += F("<p class='muted' style='font-size:13px'>");
+  html += htmlEscape(WiFi.macAddress());
+  html += F("</p>");
+  html += F("<label class='label'>Mothership ID</label>");
+  html += F("<p class='muted' style='word-break:break-all;font-size:13px'>");
+  html += htmlEscape(tx.mothershipId);
+  html += F("</p>");
+  html += F("<label class='label'>Project ID</label>");
+  html += F("<p class='muted' style='word-break:break-all;font-size:13px'>");
+  html += htmlEscape(tx.projectId);
   html += F("</p>");
 
   // Cloud status line
@@ -2372,6 +2900,8 @@ static void handleSetTransmission() {
   loadTransmissionSettings(prev);
   tx.uploadPhaseUnix = prev.uploadPhaseUnix;
   tx.useJsonUpload = prev.useJsonUpload;
+  tx.mothershipId = prev.mothershipId;  // not editable via this form yet
+  tx.projectId = prev.projectId;        // not editable via this form yet
   // Keep the previous API key if the form field was left blank (no QR string).
   if (tx.apiKey.length() == 0 || tx.apiKey.indexOf("\u2022") >= 0) {
     tx.apiKey = prev.apiKey;
@@ -2437,33 +2967,98 @@ static void handleManualUpload() {
         resultMsg = "Network registration failed/timeout (antenna connected?)";
         modem.gracefulShutdown();
       } else {
-        UploadPayload payload = gUploadQueue.getNewData(tx.maxBytesPerSession);
-        if (payload.byteLength == 0) {
-          resultMsg = "No new data to upload";
-          ok = true;
-          modem.gracefulShutdown();
-        } else {
-          String url = buildUploadUrl(tx);
-          Serial.printf("[UI] Manual upload POST %u bytes to %s\n", payload.byteLength, url.c_str());
-          String authHeader = tx.apiKey.length() > 0 ? tx.apiKey : tx.authToken;
-          HttpsPostResult result = modem.httpsPost(url, payload.csvData, "text/csv", authHeader);
-          if (result.success && result.httpStatus == 200) {
-            uint32_t nowUnix = getRTCTimeUnix();
-            gUploadQueue.advanceCursor(payload.startOffset + payload.byteLength, nowUnix);
+        // Batch upload: up to 100 readings per POST. Loop a bounded number of
+        // POSTs per click so a manual upload drains a useful amount without
+        // tying up config mode indefinitely.
+        const String authHeader = tx.apiKey.length() > 0 ? tx.apiKey : tx.authToken;
+        const String url = buildUploadUrl(tx);
+        const int kMaxManualPosts = 6;   // up to ~600 readings per click
+        int posts = 0;
+        int sent = 0;
+        bool stop = false;
+        String lastErr;
+
+        // Build status context for manual uploads.
+        const uint64_t fsTotal = (uint64_t)LittleFS.totalBytes();
+        const uint64_t fsUsed  = (uint64_t)LittleFS.usedBytes();
+        const uint32_t flashPct = (fsTotal > 0)
+          ? (uint32_t)((fsUsed * 100ULL) / fsTotal) : 0;
+        const UploadCursor manCursor = gUploadQueue.getCursor();
+        const auto allNodes = getRegisteredNodes();
+        uint16_t mTotal = 0, mDeployed = 0, mPaired = 0, mUnpaired = 0, mPending = 0;
+        for (const auto& n : allNodes) {
+          mTotal++;
+          if (n.state == DEPLOYED) mDeployed++;
+          else if (n.state == PAIRED) mPaired++;
+          else mUnpaired++;
+          if (n.stateChangePending || n.deployPending) mPending++;
+        }
+        const StatusContext manStatusCtx = {
+          readBatteryVoltage(), flashPct, fsTotal, fsUsed,
+          "manual", computeNextSyncIsoLocal(),
+          gWakeIntervalMin, gSyncIntervalMin,
+          (gSyncMode == SYNC_MODE_INTERVAL) ? "interval" : "daily",
+          mTotal, mDeployed, mPaired, mUnpaired,
+          gUploadQueue.getPendingRows(), manCursor.rowsUploaded,
+          manCursor.retryCount, manCursor.lastUploadUnix,
+          FW_VERSION, FW_BUILD, getRTCTimeUnix(),
+          WiFi.macAddress(),
+          mPending, tx.enabled,
+          gUploadQueue.getPendingRows(), (uint64_t)getCSVFileSize(), String("")
+        };
+
+        while (posts < kMaxManualPosts && gUploadQueue.getPendingRows() > 0 && !stop) {
+          UploadPayload payload = gUploadQueue.getNewData(16384);
+          if (payload.byteLength == 0) break;
+
+          // Status object only on the first POST of this click (it doesn't
+          // change between chunks). posts increments after a POST, so it stays
+          // 0 until the first real POST; malformed-skip iterations don't POST.
+          JsonPayload json = buildJsonUpload(payload.csvData, 100, FW_VERSION,
+                                             (posts == 0) ? &manStatusCtx : nullptr,
+                                             getRTCTimeUnix());
+          if (json.ok && json.rowCount == 0 && json.csvBytesConsumed > 0) {
+            // Malformed row(s) skipped by the builder — advance past them and
+            // keep going, don't POST or error out.
+            gUploadQueue.advanceCursor(payload.startOffset + json.csvBytesConsumed, getRTCTimeUnix());
+            gUploadQueue.purgeUploaded();
+            continue;
+          }
+          if (!json.ok || json.rowCount == 0) { lastErr = "JSON build failed (heap?)"; break; }
+
+          HttpsPostResult result = modem.httpsPost(url, json.body, "application/json", authHeader);
+          posts++;
+          if (result.httpStatus == 200) {
+            gUploadQueue.advanceCursor(payload.startOffset + json.csvBytesConsumed, getRTCTimeUnix());
             gUploadQueue.purgeUploaded();
             gUploadQueue.resetRetryCount();
-            char buf[64];
-            snprintf(buf, sizeof(buf), "Upload OK: HTTP 200, %u bytes", payload.byteLength);
-            resultMsg = String(buf);
-            ok = true;
+            sent += json.rowCount;
+          } else if (result.httpStatus == 401 || result.httpStatus == 400) {
+            char buf[80];
+            snprintf(buf, sizeof(buf), "HTTP %d (%s)",
+                     result.httpStatus, result.httpStatus == 401 ? "unauthorized" : "bad request");
+            lastErr = String(buf);
+            stop = true;  // not transient — don't increment retry counter
           } else {
-            char buf[96];
-            snprintf(buf, sizeof(buf), "Upload failed: HTTP %d, %s",
-                     result.httpStatus, result.errorDetail.c_str());
-            resultMsg = String(buf);
+            char buf[80];
+            snprintf(buf, sizeof(buf), "HTTP %d, %s", result.httpStatus, result.errorDetail.c_str());
+            lastErr = String(buf);
             gUploadQueue.incrementRetryCount();
+            stop = true;
           }
-          modem.gracefulShutdown();
+        }
+        modem.gracefulShutdown();
+
+        if (sent > 0 && lastErr.length() == 0) {
+          char buf[64];
+          snprintf(buf, sizeof(buf), "Upload OK: %d reading%s sent", sent, sent == 1 ? "" : "s");
+          resultMsg = String(buf); ok = true;
+        } else if (sent > 0) {
+          char buf[96];
+          snprintf(buf, sizeof(buf), "Sent %d then stopped: %s", sent, lastErr.c_str());
+          resultMsg = String(buf); ok = true;
+        } else {
+          resultMsg = String("Upload failed: ") + (lastErr.length() ? lastErr : String("no readings sent"));
         }
       }
     }
@@ -2589,6 +3184,12 @@ void startConfigServer() {
   server.on("/ui-status", HTTP_GET, []() {
     server.send(200, "application/json", buildStatusJson());
   });
+  // Lightweight RAM-only live status — polled frequently by the UI. Marked
+  // no-store so captive-portal browsers never serve a stale fleet snapshot.
+  server.on("/api/live", HTTP_GET, []() {
+    server.sendHeader("Cache-Control", "no-store, no-cache, must-revalidate");
+    server.send(200, "application/json", buildLiveJson());
+  });
 
   server.on("/stations", HTTP_GET, handleStationsPage);
   server.on("/station", HTTP_GET, handleStationDetail);
@@ -2642,4 +3243,5 @@ void configServerLoop() {
   dnsServer.processNextRequest();
   server.handleClient();
   espnowConfigPoll();
+  discoveryTick();   // non-blocking: schedules discovery broadcasts via millis()
 }

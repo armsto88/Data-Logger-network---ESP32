@@ -18,6 +18,17 @@ struct EspNowSnapSlot {
 
 bool initEspNowSyncOnly(int channel);
 void broadcastSyncWindowOpen();
+// Announce a new sync schedule (SET_SYNC_SCHED) to the fleet over the
+// broadcast peer during a sync window. Used to hand a changed schedule to
+// sleeping nodes at the moment they are awake on the OLD schedule.
+void broadcastSyncScheduleNow(int syncIntervalMinutes, uint32_t phaseUnix);
+
+// Announce the recording/wake interval (SET_SCHEDULE) to the fleet over the
+// broadcast peer during a sync window. SET_SYNC_SCHED does NOT carry the wake
+// interval, so this must be broadcast separately for a recording-interval
+// change to reach deployed nodes. Nodes apply it only when it differs, so it
+// is safe to broadcast every window.
+void broadcastWakeIntervalNow(int intervalMinutes);
 void registerReceiveCallback(EspNowRecvCallback cb);
 void espnowSyncLoop();
 void initSnapQueue(int depth);

@@ -392,11 +392,17 @@ HttpsPostResult ModemDriver::httpsPost(const String& url,
     posted = httpsPostSSL(host, port, httpReq, result);
   }
 
-  if (!posted) {
-    Serial.println("[Modem] SSL failed or not requested, trying TCP...");
-    // For TCP fallback, use port 80 if original was 443
+  // Only fall back to plaintext TCP when SSL produced NO HTTP response at all
+  // (transport failure: httpStatus stays <= 0). A real HTTP status — even a
+  // 4xx/5xx like 401 — is authoritative and must NOT be retried in clear text
+  // on port 80 (that would leak the payload and mask the real status code).
+  if (!posted && result.httpStatus <= 0) {
+    Serial.println("[Modem] SSL got no HTTP response, trying TCP...");
     int tcpPort = useSSL ? 80 : port;
     posted = httpsPostTCP(host, tcpPort, httpReq, result);
+  } else if (!posted) {
+    Serial.printf("[Modem] SSL returned HTTP %d — not falling back to plaintext\n",
+                  result.httpStatus);
   }
 
   // 5. Cleanup
