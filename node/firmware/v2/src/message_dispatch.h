@@ -16,7 +16,11 @@ enum class IncomingMessageType : uint8_t {
   SYNC_WINDOW_OPEN,
   TIME_SYNC,
   CONFIG_SNAPSHOT,
-  SNAPSHOT_ACK
+  SNAPSHOT_ACK,
+  NODE_CONFIG,
+  SYNC_SESSION,
+  DUMP_GRANT,
+  SYNC_RELEASE
 };
 
 const char* incomingMessageTypeName(IncomingMessageType type);
@@ -34,4 +38,3 @@ bool incomingMessageHasValidTarget(IncomingMessageType type,
 bool incomingMessageTextFieldsTerminated(IncomingMessageType type,
                                          const uint8_t* data,
                                          size_t len);
-

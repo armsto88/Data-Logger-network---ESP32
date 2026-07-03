@@ -186,6 +186,37 @@ String transmissionSettingsToJson(const TransmissionSettings& s) {
 }
 
 // ---------------------------------------------------------------------------
+// buildTransmissionStatusJson — status.transmission{} for the upload payload
+// ---------------------------------------------------------------------------
+String buildTransmissionStatusJson(const TransmissionSettings& s) {
+  auto esc = [](const String& v) -> String {
+    String out;
+    out.reserve(v.length() + 8);
+    for (size_t i = 0; i < v.length(); i++) {
+      char c = v[i];
+      if (c == '"' || c == '\\') { out += '\\'; out += c; }
+      else { out += c; }
+    }
+    return out;
+  };
+
+  String j;
+  j.reserve(384);
+  j += "{";
+  j += "\"endpointUrl\":\"" + esc(s.endpointUrl) + "\",";
+  j += "\"siteId\":\"" + esc(s.siteId) + "\",";
+  j += "\"deploymentId\":\"" + esc(s.deploymentId) + "\",";
+  j += "\"uploadIntervalMin\":" + String(s.uploadIntervalMin) + ",";
+  j += "\"minBatteryMv\":" + String(s.minBatteryMv) + ",";
+  j += "\"maxBytesPerSession\":" + String(s.maxBytesPerSession) + ",";
+  j += "\"maxRetriesPerWindow\":" + String(s.maxRetriesPerWindow) + ",";
+  j += "\"allowManualUpload\":" + String(s.allowManualUpload ? "true" : "false") + ",";
+  j += "\"useJsonUpload\":" + String(s.useJsonUpload ? "true" : "false");
+  j += "}";
+  return j;
+}
+
+// ---------------------------------------------------------------------------
 // buildUploadUrl
 // ---------------------------------------------------------------------------
 static String urlEncodeParam(const String& s) {

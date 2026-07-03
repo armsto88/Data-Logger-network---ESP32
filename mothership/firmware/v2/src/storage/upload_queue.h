@@ -64,7 +64,10 @@ class UploadQueue {
   // Advance the cursor after a successful upload.
   // newOffset  — byte offset of the first un-uploaded byte.
   // timestampUnix — RTC timestamp to store as lastUploadUnix (0 if unknown).
-  bool advanceCursor(uint32_t newOffset, uint32_t timestampUnix);
+  // rowsUploadedDelta — rows actually uploaded in this chunk; added to the
+  //   cumulative rowsUploaded counter (0 for malformed-skip advances).
+  bool advanceCursor(uint32_t newOffset, uint32_t timestampUnix,
+                     uint32_t rowsUploadedDelta = 0);
 
   // Streaming rewrite: keep only the un-uploaded portion of /datalog.csv.
   // Writes header + rows from cursor to EOF into /datalog_tmp.csv, then

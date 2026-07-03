@@ -16,8 +16,27 @@ struct EspNowSnapSlot {
   node_snapshot_t snap;
 };
 
+struct SyncHelloSlot {
+  uint8_t mac[6];
+  node_hello_message_t hello;
+};
+
+struct SyncDoneSlot {
+  uint8_t mac[6];
+  dump_done_message_t done;
+};
+
+struct SyncReleaseAckSlot {
+  uint8_t mac[6];
+  sync_release_ack_message_t ack;
+};
+
 bool initEspNowSyncOnly(int channel);
 void broadcastSyncWindowOpen();
+bool broadcastSyncSessionOpen(const sync_session_open_message_t& open);
+bool sendDumpGrant(const uint8_t* mac, const dump_grant_message_t& grant);
+bool sendSyncRelease(const uint8_t* mac, const sync_release_message_t& release);
+bool sendSnapshotAckNow(const uint8_t* mac, const snapshot_ack_t& ack);
 // Announce a new sync schedule (SET_SYNC_SCHED) to the fleet over the
 // broadcast peer during a sync window. Used to hand a changed schedule to
 // sleeping nodes at the moment they are awake on the OLD schedule.
@@ -29,9 +48,26 @@ void broadcastSyncScheduleNow(int syncIntervalMinutes, uint32_t phaseUnix);
 // change to reach deployed nodes. Nodes apply it only when it differs, so it
 // is safe to broadcast every window.
 void broadcastWakeIntervalNow(int intervalMinutes);
+
+// Unified declarative NODE_CONFIG broadcast (server -> node). Carries the
+// target node's desired state (schedule + targetState + monotonic version).
+// Broadcast every sync window per node; nodes apply only a strictly newer
+// version and ACK via CONFIG_ACK. Supersedes SET_SCHEDULE + SET_SYNC_SCHED +
+// UNPAIR_NODE for deployed nodes.
+void broadcastNodeConfigNow(const node_config_message_t& cfg);
+
 void registerReceiveCallback(EspNowRecvCallback cb);
 void espnowSyncLoop();
 void initSnapQueue(int depth);
 int drainSnapQueue(EspNowSnapSlot* outSlots, int maxSlots);
 uint32_t getSnapDropCount();
+int drainSyncHellos(SyncHelloSlot* out, int maxItems);
+int drainDumpDone(SyncDoneSlot* out, int maxItems);
+int drainReleaseAcks(SyncReleaseAckSlot* out, int maxItems);
+
+// CONFIG_ACK collection — nodes ACK an applied/UNPAIRED NODE_CONFIG during the
+// sync window. The receive callback enqueues them; handleSyncWake drains and
+// reconciles (converge deployed nodes, confirm+remove unpaired nodes).
+int drainConfigAcks(config_apply_ack_message_t* out, int maxAcks);
+
 void deinitEspNowSync();

@@ -102,6 +102,26 @@ typedef struct sync_schedule_command_message {
     char mothership_id[16];
 } sync_schedule_command_message_t;
 
+// Unified declarative node config (server -> node), broadcast every sync window.
+// Supersedes SET_SCHEDULE + SET_SYNC_SCHED + UNPAIR_NODE for DEPLOYED nodes: the
+// mothership holds each node's desired state and re-broadcasts it until the
+// node's echoed configVersion (in snapshots) matches. Idempotent — the node
+// applies only a strictly newer configVersion. targetState folds unpair/undeploy
+// in (0=UNPAIRED wipe, 2=DEPLOYED apply schedule). See FIELDMESH_NODE_CONFIG_PROTOCOL.md.
+typedef struct node_config_message {
+    char     command[16];       // "NODE_CONFIG"
+    char     nodeId[16];        // target node (broadcast-safe; node matches its own NODE_ID)
+    char     mothership_id[16];
+    uint16_t configVersion;     // monotonic desired version
+    uint8_t  targetState;       // 0=UNPAIRED, 1=PAIRED, 2=DEPLOYED
+    uint8_t  wakeIntervalMin;   // 1,5,10,20,30,60
+    uint16_t syncIntervalMin;   // sync cadence (minutes)
+    uint16_t sensorMask;        // expected/configured sensors — SNAP_PRESENT_* bits
+                                // + NODE_SENSOR_MASK_VALID. 0 = auto (legacy: an
+                                // older mothership sends 0 -> node auto-detects).
+    uint32_t syncPhaseUnix;     // sync anchor (unix seconds)
+} node_config_message_t;
+
 // ===== Pull-handshake messages (Phase 2) =====
 
 // Node -> Mothership: sent at start of each wake cycle (before data flush)
@@ -164,6 +184,63 @@ typedef struct snapshot_ack {
     uint8_t  protocolVersion;   // NODE_PROTOCOL_VERSION
     uint16_t reserved;
 } snapshot_ack_t;
+
+// ===== Coordinated sync-session messages =====
+//
+// A sync wake is a bounded mothership-controlled pull session:
+//   SYNC_SESSION -> jittered NODE_HELLO roster -> DUMP_GRANT chunks ->
+//   DUMP_DONE -> SYNC_RELEASE -> RELEASE_ACK.
+// sessionId/grantId make delayed packets from an earlier wake harmless.
+
+typedef struct __attribute__((packed)) sync_session_open_message {
+    char     command[16];       // "SYNC_SESSION"
+    uint32_t sessionId;         // unique for this mothership wake
+    uint16_t joinWindowMs;      // time allowed for jittered NODE_HELLO replies
+    uint16_t sessionWindowSec;  // total bounded radio session
+    char     mothership_id[16];
+} sync_session_open_message_t;
+
+typedef struct __attribute__((packed)) dump_grant_message {
+    char     command[16];       // "DUMP_GRANT"
+    char     nodeId[16];        // only this node may transmit snapshots
+    uint32_t sessionId;
+    uint16_t grantId;
+    uint8_t  maxRecords;        // fairness quota for this round
+    uint8_t  reserved;
+    uint16_t grantWindowMs;     // node must stop before this expires
+    uint16_t reserved2;
+} dump_grant_message_t;
+
+typedef struct __attribute__((packed)) dump_done_message {
+    char     command[16];       // "DUMP_DONE"
+    char     nodeId[16];
+    uint32_t sessionId;
+    uint16_t grantId;
+    uint8_t  sentRecords;
+    uint8_t  remainingRecords;
+    uint8_t  status;            // 0=quota/empty, 1=send/ACK failure, 2=deadline
+    uint8_t  reserved;
+} dump_done_message_t;
+
+typedef struct __attribute__((packed)) sync_release_message {
+    char     command[16];       // "SYNC_RELEASE"
+    char     nodeId[16];
+    uint32_t sessionId;
+    uint32_t mothershipUnix;    // final clock synchronization
+    uint32_t syncPhaseUnix;     // active/new rendezvous phase
+    uint16_t syncIntervalMin;   // active/new rendezvous interval
+    uint8_t  legacyGraceCycles; // old rendezvous cycles still being serviced
+    uint8_t  flags;             // bit0=schedule transition active
+} sync_release_message_t;
+
+typedef struct __attribute__((packed)) sync_release_ack_message {
+    char     command[16];       // "RELEASE_ACK"
+    char     nodeId[16];
+    uint32_t sessionId;
+    uint16_t appliedSyncIntervalMin;
+    uint8_t  scheduleApplied;   // 1 only after RTC/config persistence succeeds
+    uint8_t  remainingRecords;
+} sync_release_ack_message_t;
 
 // Optional: RNT-compatible pairing struct
 typedef struct rnt_pairing_t {
@@ -234,6 +311,51 @@ typedef struct rnt_pairing_t {
 #define SNAP_PRESENT_AUX2        (1u << 7)
 #define SNAP_PRESENT_BAT_V       (1u << 8)
 
+// ===== Configured ("expected") sensor mask — node_config_message_t::sensorMask =====
+//
+// The operator selects, per node, which sensors are installed. That selection is
+// broadcast in NODE_CONFIG (version-gated), persisted in node NVS, and used to:
+//   * gate registration of PASSIVE (non-self-identifying) sensors on the node, and
+//   * let the mothership flag a configured sensor that stops reporting as a FAULT
+//     instead of silently disappearing.
+// The sensor bits reuse the SNAP_PRESENT_* layout so a config mask and a snapshot's
+// sensorPresent are directly comparable.
+//
+// NODE_SENSOR_MASK_VALID distinguishes "explicitly configured" (bit set — the mask
+// is authoritative, including the case where the operator turned everything off)
+// from "unset / legacy" (mask == 0 — the node auto-detects every backend, and an
+// older mothership that sends 0 in this field stays fully compatible).
+#define NODE_SENSOR_MASK_VALID   (1u << 15)
+
+// Passive capability bits: sensors the node cannot probe for on the bus, so they
+// are only registered/read when the configured mask enables them. The remaining
+// bits (AIR_TEMP/AIR_RH/SPECTRAL) are self-identifying I2C parts that are always
+// auto-detected regardless of the mask.
+#define NODE_SENSOR_PASSIVE_BITS \
+    (SNAP_PRESENT_WIND | SNAP_PRESENT_SOIL1 | SNAP_PRESENT_SOIL2 | \
+     SNAP_PRESENT_AUX1 | SNAP_PRESENT_AUX2)
+
+// Map a SENSOR_ID_* channel to its SNAP_PRESENT_* capability bit (0 = unmapped).
+// Shared so node registration gating and mothership fault detection agree on the
+// mapping from a stable channel id to a configurable capability.
+inline uint16_t snapPresentBitForSensorId(uint16_t sensorId) {
+  switch (sensorId) {
+    case SENSOR_ID_AIR_TEMP:     return SNAP_PRESENT_AIR_TEMP;
+    case SENSOR_ID_AIR_RH:       return SNAP_PRESENT_AIR_RH;
+    case SENSOR_ID_SPECTRAL_415: case SENSOR_ID_SPECTRAL_445:
+    case SENSOR_ID_SPECTRAL_480: case SENSOR_ID_SPECTRAL_515:
+    case SENSOR_ID_SPECTRAL_555: case SENSOR_ID_SPECTRAL_590:
+    case SENSOR_ID_SPECTRAL_630: case SENSOR_ID_SPECTRAL_680:
+      return SNAP_PRESENT_SPECTRAL;
+    case SENSOR_ID_WIND_SPEED:   case SENSOR_ID_WIND_DIR:  return SNAP_PRESENT_WIND;
+    case SENSOR_ID_SOIL1_VWC:    case SENSOR_ID_SOIL1_TEMP: return SNAP_PRESENT_SOIL1;
+    case SENSOR_ID_SOIL2_VWC:    case SENSOR_ID_SOIL2_TEMP: return SNAP_PRESENT_SOIL2;
+    case SENSOR_ID_AUX1:         return SNAP_PRESENT_AUX1;
+    case SENSOR_ID_AUX2:         return SNAP_PRESENT_AUX2;
+    default:                     return 0;
+  }
+}
+
 typedef struct __attribute__((packed)) node_snapshot {
     char     command[16];       // "NODE_SNAPSHOT"              16
     char     nodeId[16];        // e.g. "ENV_94E38C"            16
@@ -262,9 +384,15 @@ static_assert(sizeof(pairing_command_t) == 52, "pairing_command_t size mismatch"
 static_assert(sizeof(config_snapshot_message_t) == 52, "config_snapshot_message_t size mismatch");
 static_assert(sizeof(deployment_command_t) == 88, "deployment_command_t size mismatch");
 static_assert(sizeof(unpair_command_t) == 48, "unpair_command_t size mismatch");
+static_assert(sizeof(node_config_message_t) == 60, "node_config_message_t size mismatch");
 static_assert(sizeof(time_sync_response_t) == 56, "time_sync_response_t size mismatch");
 static_assert(sizeof(config_apply_ack_message_t) == 40, "config_apply_ack_message_t size mismatch");
 static_assert(sizeof(snapshot_ack_t) == 40, "snapshot_ack_t size mismatch");
+static_assert(sizeof(sync_session_open_message_t) == 40, "sync_session_open_message_t size mismatch");
+static_assert(sizeof(dump_grant_message_t) == 44, "dump_grant_message_t size mismatch");
+static_assert(sizeof(dump_done_message_t) == 42, "dump_done_message_t size mismatch");
+static_assert(sizeof(sync_release_message_t) == 48, "sync_release_message_t size mismatch");
+static_assert(sizeof(sync_release_ack_message_t) == 40, "sync_release_ack_message_t size mismatch");
 #define SENSOR_ID_AUX2          3002
 
 // Maximum number of sensor readings in a V2 snapshot.

@@ -46,6 +46,24 @@ struct HttpsPostResult {
 };
 
 // ---------------------------------------------------------------------------
+// Modem diagnostics — link-quality / identity snapshot for the status payload.
+// Populated by getDiagnostics() while the modem is registered.  Values that
+// could not be read are left at their "unknown" sentinel (0 dBm / 99 BER / "").
+// ---------------------------------------------------------------------------
+
+struct ModemDiagnostics {
+  String imei;          // AT+CGSN
+  String iccid;         // AT+CICCID (SIM identity)
+  int    rssiDbm;       // AT+CSQ, converted to dBm (0 = unknown)
+  int    ber;           // AT+CSQ bit-error-rate class (99 = unknown)
+  int    rsrpDbm;       // AT+CESQ LTE RSRP in dBm (0 = unknown)
+  int    rsrqDb;        // AT+CESQ LTE RSRQ in dB  (0 = unknown)
+  String operatorName;  // AT+COPS? registered operator
+  String accessTech;    // "LTE"/"GSM"/"WCDMA"/... from COPS/CPSI
+  String cpsi;          // raw +CPSI: line (band, cell ID, TAC, freq)
+};
+
+// ---------------------------------------------------------------------------
 // ModemDriver
 // ---------------------------------------------------------------------------
 
@@ -90,6 +108,11 @@ class ModemDriver {
   // AT+CSQ -> rssi (99 = no signal).
   int getSignalQuality();
 
+  // Populate a ModemDiagnostics snapshot (CSQ, CESQ, COPS, CICCID, CPSI, IMEI).
+  // Call while registered.  Best-effort: unreadable fields keep their sentinels.
+  // Returns true if the AT interface responded at all.
+  bool getDiagnostics(ModemDiagnostics& out);
+
   // Quick AT check, returns true if OK within 2000 ms.
   bool isResponsive();
 
@@ -128,3 +151,7 @@ class ModemDriver {
   bool httpsPostTCP(const String& host, int port,
                     const String& httpReq, HttpsPostResult& result);
 };
+
+// Serialise a ModemDiagnostics snapshot as the status.modem{} JSON object.
+// regTimeMs = milliseconds spent in network registration this session.
+String modemDiagnosticsToJson(const ModemDiagnostics& d, uint32_t regTimeMs);

@@ -34,8 +34,8 @@
  *
  * WH-SP-WS01 CALIBRATION
  * ──────────────────────
- *   V = 0.085 × f + 0.1   (m/s, f in Hz)
- *   V_kmh = V_ms × 3.6    (km/h)
+ *   1 contact closure per second = 2.4 km/h  ->  V = 0.6667 × f  (m/s, f in Hz)
+ *   V_kmh = V_ms × 3.6 = 2.4 × f              (km/h)
  *
  *   Starting threshold: ~0.5–0.8 m/s
  *   Max measurable:     ~30 m/s
@@ -100,11 +100,11 @@
 // ── Calibration constants ─────────────────────────────────────────────────
 
 #ifndef REED_WIND_FACTOR
-#define REED_WIND_FACTOR 0.085f   // m/s per Hz
+#define REED_WIND_FACTOR 0.6667f  // m/s per Hz (WH-SP-WS01: 1 Hz = 2.4 km/h)
 #endif
 
 #ifndef REED_WIND_OFFSET
-#define REED_WIND_OFFSET 0.1f     // m/s offset
+#define REED_WIND_OFFSET 0.0f     // m/s offset (linear, no offset)
 #endif
 
 #ifndef REED_DEBOUNCE_MS

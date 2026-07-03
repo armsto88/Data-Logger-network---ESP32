@@ -55,6 +55,12 @@ struct NodeInfo {
   uint32_t  lastStateAppliedMs;
   NodePendingState lastAppliedTargetState;
   uint32_t  deployedSinceUnix;    // unix timestamp when state became DEPLOYED (0 = not deployed)
+  bool      recordingPaused;      // standby: deployed but recording paused (UI status)
+  // Configured "expected" sensors + fault tracking (SNAP_PRESENT_* capability bits).
+  uint16_t  expectedSensorMask;   // sensors the operator marked installed (no VALID bit)
+  uint16_t  lastSensorPresent;    // sensorPresent from the most recent snapshot
+  uint16_t  sensorMissPrev;       // expected & ~present from the previous snapshot (debounce)
+  uint16_t  sensorFaultMask;      // configured sensors absent >=2 consecutive snapshots
   // Runtime-inference fields kept for struct compatibility; zeroed in config mode.
   bool      syncStale;
   uint8_t   staleMissCount;
@@ -66,7 +72,15 @@ struct NodeDesiredConfig {
   uint8_t  wakeIntervalMin;
   uint16_t syncIntervalMin;
   uint32_t syncPhaseUnix;
+  uint8_t  targetState;     // desired NodeState: 2=DEPLOYED (default), 0=UNPAIRED
+  uint16_t sensorMask;      // configured sensors: SNAP_PRESENT_* bits + NODE_SENSOR_MASK_VALID
+                            // (0 = unset/auto; the node then auto-detects everything)
 };
+
+// Update a registered node's cached expected-sensor mask (RAM only) so snapshot
+// fault detection doesn't touch NVS in the hot path. Pass the raw capability
+// bits (NODE_SENSOR_MASK_VALID stripped). No-op if the node isn't registered.
+void setNodeExpectedSensorMask(const char* nodeId, uint16_t capabilityBits);
 
 // -----------------------------------------------------------------------------
 // Registry queries
@@ -79,6 +93,12 @@ std::vector<NodeInfo> getUnpairedNodes();
 std::vector<NodeInfo> getPairedNodes();
 NodeState getNodeState(const char* nodeId);
 String    getMothershipsMAC();
+
+// Build the status.nodes[] JSON array for the Supabase upload payload.
+// nowUnix: mothership RTC time (unix seconds), used to convert each node's
+// millis-based lastSeen into an absolute lastSeenUnix.  Returns "[]" when the
+// registry is empty.  Field names/casing match the backend spec exactly.
+String buildNodesStatusJson(uint32_t nowUnix);
 
 // -----------------------------------------------------------------------------
 // Persistence (NVS)

@@ -29,7 +29,8 @@ struct __attribute__((packed)) StoredNodeConfig {
   uint32_t lastTimeSyncUnix;
   uint32_t lastSyncSlot;
   uint16_t appliedConfigVersion;
-  uint16_t reserved;
+  uint8_t  recordingPaused;   // standby flag (was part of 'reserved')
+  uint8_t  reserved;
 };
 
 static uint32_t g_generation = 0;
@@ -98,6 +99,7 @@ StoredNodeConfig toStored(const NodeConfigStoreRecord& record, uint32_t generati
   out.lastTimeSyncUnix = record.lastTimeSyncUnix;
   out.lastSyncSlot = record.lastSyncSlot;
   out.appliedConfigVersion = record.appliedConfigVersion;
+  out.recordingPaused = record.recordingPaused ? 1 : 0;
   out.checksum = checksumFor(out);
   return out;
 }
@@ -116,6 +118,7 @@ NodeConfigStoreRecord fromStored(const StoredNodeConfig& stored) {
   out.lastTimeSyncUnix = stored.lastTimeSyncUnix;
   out.lastSyncSlot = stored.lastSyncSlot;
   out.appliedConfigVersion = stored.appliedConfigVersion;
+  out.recordingPaused = stored.recordingPaused != 0;
   return out;
 }
 
@@ -255,6 +258,22 @@ bool nodeConfigStoreSave(const NodeConfigStoreRecord& record) {
   g_activeSlot = nextSlot;
   g_loaded = true;
   return true;
+}
+
+uint16_t nodeSensorMaskLoad() {
+  Preferences prefs;
+  if (!prefs.begin(kNamespace, true)) return 0;
+  const uint16_t mask = prefs.getUShort("sensMask", 0);
+  prefs.end();
+  return mask;
+}
+
+bool nodeSensorMaskSave(uint16_t mask) {
+  Preferences prefs;
+  if (!prefs.begin(kNamespace, false)) return false;
+  const size_t written = prefs.putUShort("sensMask", mask);
+  prefs.end();
+  return written == sizeof(mask);
 }
 
 #ifdef NODE_CONFIG_STORE_TESTING

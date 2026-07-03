@@ -105,6 +105,47 @@ void setup() {
                                         sizeof(unpair),
                                         "ENV_OTHER"));
 
+  sync_session_open_message_t session{};
+  strncpy(session.command, "SYNC_SESSION", sizeof(session.command) - 1);
+  strncpy(session.mothership_id, "M001", sizeof(session.mothership_id) - 1);
+  session.sessionId = 1234;
+  session.joinWindowMs = 12000;
+  session.sessionWindowSec = 90;
+  report("SYNC_SESSION classified",
+         classifyIncomingMessage(reinterpret_cast<uint8_t*>(&session), sizeof(session)) ==
+             IncomingMessageType::SYNC_SESSION);
+
+  dump_grant_message_t grant{};
+  strncpy(grant.command, "DUMP_GRANT", sizeof(grant.command) - 1);
+  strncpy(grant.nodeId, "ENV_TEST", sizeof(grant.nodeId) - 1);
+  grant.sessionId = 1234;
+  grant.grantId = 2;
+  grant.maxRecords = 4;
+  grant.grantWindowMs = 9000;
+  report("DUMP_GRANT classified and targeted",
+         classifyIncomingMessage(reinterpret_cast<uint8_t*>(&grant), sizeof(grant)) ==
+             IncomingMessageType::DUMP_GRANT &&
+         incomingMessageHasValidTarget(IncomingMessageType::DUMP_GRANT,
+                                       reinterpret_cast<uint8_t*>(&grant),
+                                       sizeof(grant), "ENV_TEST"));
+  report("wrong-target DUMP_GRANT rejected",
+         !incomingMessageHasValidTarget(IncomingMessageType::DUMP_GRANT,
+                                        reinterpret_cast<uint8_t*>(&grant),
+                                        sizeof(grant), "ENV_OTHER"));
+
+  sync_release_message_t release{};
+  strncpy(release.command, "SYNC_RELEASE", sizeof(release.command) - 1);
+  strncpy(release.nodeId, "ENV_TEST", sizeof(release.nodeId) - 1);
+  release.sessionId = 1234;
+  release.syncIntervalMin = 90;
+  release.syncPhaseUnix = 1800000000UL;
+  report("SYNC_RELEASE classified and targeted",
+         classifyIncomingMessage(reinterpret_cast<uint8_t*>(&release), sizeof(release)) ==
+             IncomingMessageType::SYNC_RELEASE &&
+         incomingMessageHasValidTarget(IncomingMessageType::SYNC_RELEASE,
+                                       reinterpret_cast<uint8_t*>(&release),
+                                       sizeof(release), "ENV_TEST"));
+
   Serial.printf("RESULT: %s\n", g_pass ? "PASS" : "FAIL");
 }
 

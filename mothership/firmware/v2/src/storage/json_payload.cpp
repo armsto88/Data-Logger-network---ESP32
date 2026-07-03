@@ -272,8 +272,13 @@ JsonPayload buildJsonUpload(const String& csvChunk,
   // caller provides a StatusContext (every POST from handleSyncWake and
   // handleManualUpload).
   String& body = result.body;
-  const uint32_t statusEst = status ? 800U : 0U;  // nested status object
-  body.reserve(readings.length() + fwVersion.length() + 128U + statusEst);
+  // Nested status object: scalar fields (~900B) + the pre-built nodes[] and
+  // transmission{} strings, whose size scales with the fleet.
+  const uint32_t statusEst = status
+      ? 900U + status->nodesJson.length() + status->transmissionJson.length()
+        + status->modemJson.length() + status->diagnosticsJson.length()
+      : 0U;
+  body.reserve(readings.length() + fwVersion.length() + 160U + statusEst);
   body += "{\"readings\":[";
   body += readings;
   body += "],\"meta\":{\"firmwareVersion\":\"";
@@ -283,8 +288,13 @@ JsonPayload buildJsonUpload(const String& csvChunk,
     // NOTE: deviceId must NOT go in meta — the ingest function rejects any
     // meta.deviceId with 403 "Credential is registered to a different device"
     // (verified via dry-run curl). The device is derived from the API key, and
-    // deviceId is carried in the status object below instead. uploadReason in
-    // meta is accepted (200).
+    // deviceId is carried in the status object below instead. The rest of meta
+    // (firmwareBuild, uploadTimeUnix, uploadReason) is accepted and feeds the
+    // sync_sessions / mothership_status rows.
+    body += ",\"firmwareBuild\":\"";
+    body += escapeJsonString(status->firmwareBuild ? status->firmwareBuild : "");
+    body += "\",\"uploadTimeUnix\":";
+    body += String(status->rtcUnix);
     body += ",\"uploadReason\":\"";
     body += escapeJsonString(status->uploadReason);
     body += "\"";
@@ -304,18 +314,28 @@ JsonPayload buildJsonUpload(const String& csvChunk,
     body += ",\"wakeIntervalMinutes\":"; body += String(status->wakeIntervalMinutes);
     body += ",\"syncIntervalMinutes\":"; body += String(status->syncIntervalMinutes);
     body += ",\"syncMode\":\""; body += escapeJsonString(status->syncMode); body += "\"";
+    body += ",\"syncDailyTime\":\""; body += escapeJsonString(status->syncDailyTime); body += "\"";
     body += ",\"nextSyncLocal\":\""; body += escapeJsonString(status->nextSyncLocal); body += "\"";
+
+    // status.nodes[] — pre-built by the caller (node_registry::buildNodesStatusJson).
+    // This is what populates the backend "nodes" table.
+    body += ",\"nodes\":";
+    body += status->nodesJson.length() ? status->nodesJson : String("[]");
 
     body += ",\"fleet\":{\"total\":"; body += String((unsigned)status->fleetTotal);
     body += ",\"deployed\":"; body += String((unsigned)status->fleetDeployed);
     body += ",\"paired\":"; body += String((unsigned)status->fleetPaired);
     body += ",\"unpaired\":"; body += String((unsigned)status->fleetUnpaired);
     body += ",\"pending\":"; body += String((unsigned)status->fleetPending);
+    body += ",\"paused\":"; body += String((unsigned)status->fleetPaused);
     body += "}";
 
+    // Flash fields stay nested in upload.* (backend-confirmed shape, not a
+    // separate status.flash{}).
     body += ",\"upload\":{\"flashUsagePct\":"; body += String(status->flashUsagePct);
     body += ",\"flashTotalBytes\":"; body += String((unsigned long)status->flashTotalBytes);
     body += ",\"flashUsedBytes\":"; body += String((unsigned long)status->flashUsedBytes);
+    body += ",\"pendingBytes\":"; body += String(status->pendingBytes);
     body += ",\"pendingRows\":"; body += String(status->pendingRows);
     body += ",\"rowsUploaded\":"; body += String(status->rowsUploaded);
     body += ",\"retryCount\":"; body += String((unsigned)status->retryCount);
@@ -327,6 +347,31 @@ JsonPayload buildJsonUpload(const String& csvChunk,
     body += ",\"csvSizeBytes\":"; body += String((unsigned long)status->dataLogCsvBytes);
     body += ",\"lastConfirmedSync\":\""; body += escapeJsonString(status->dataLogLastSync); body += "\"";
     body += "}";
+
+    body += ",\"projectStarted\":"; body += String(status->projectStartedUnix);
+    body += ",\"lastUploadResult\":\"";
+    body += escapeJsonString(status->lastUploadResult ? status->lastUploadResult : "");
+    body += "\"";
+
+    // status.transmission{} — pre-built (no secrets). Creates/updates the
+    // backend mothership_config row when present.
+    if (status->transmissionJson.length()) {
+      body += ",\"transmission\":";
+      body += status->transmissionJson;
+    }
+
+    // status.modem{} — LTE link quality + modem identity (this session).
+    if (status->modemJson.length()) {
+      body += ",\"modem\":";
+      body += status->modemJson;
+    }
+
+    // status.diagnostics{} — mothership system health (reset reason, boot
+    // count, heap, snapshot-queue drops, session timing).
+    if (status->diagnosticsJson.length()) {
+      body += ",\"diagnostics\":";
+      body += status->diagnosticsJson;
+    }
 
     body += "}";
   }

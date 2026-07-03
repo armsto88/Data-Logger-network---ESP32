@@ -16,7 +16,11 @@ enum class NodeEventType : uint8_t {
   SYNC_WINDOW_OPEN,
   TIME_SYNC,
   CONFIG_SNAPSHOT,
-  SNAPSHOT_ACK
+  SNAPSHOT_ACK,
+  NODE_CONFIG,
+  SYNC_SESSION,
+  DUMP_GRANT,
+  SYNC_RELEASE
 };
 
 struct NodeEvent {
@@ -35,6 +39,10 @@ struct NodeEvent {
     time_sync_response_t timeSync;
     config_snapshot_message_t configSnapshot;
     snapshot_ack_t snapshotAck;
+    node_config_message_t nodeConfig;
+    sync_session_open_message_t syncSession;
+    dump_grant_message_t dumpGrant;
+    sync_release_message_t syncRelease;
   } payload;
 };
 
@@ -56,4 +64,3 @@ bool nodeEventsPending();
 uint32_t nodeEventQueueDepth();
 NodeEventCounters getNodeEventCounters();
 void noteInvalidNodePacket();
-

@@ -80,6 +80,32 @@ void setup() {
   report("received counter", c.callbackEventsReceived == 2);
   report("drop counter", c.callbackEventsDropped == 1);
 
+  resetNodeEventQueueForTest();
+  report("session queue re-init", initNodeEventQueue(3));
+  sync_session_open_message_t session{};
+  strncpy(session.command, "SYNC_SESSION", sizeof(session.command) - 1);
+  strncpy(session.mothership_id, "M001", sizeof(session.mothership_id) - 1);
+  session.sessionId = 44;
+  dump_grant_message_t grant{};
+  strncpy(grant.command, "DUMP_GRANT", sizeof(grant.command) - 1);
+  strncpy(grant.nodeId, "ENV_TEST", sizeof(grant.nodeId) - 1);
+  grant.sessionId = 44;
+  grant.grantId = 7;
+  report("enqueue SYNC_SESSION",
+         enqueueValidatedNodeEvent(macA, IncomingMessageType::SYNC_SESSION,
+                                   reinterpret_cast<uint8_t*>(&session), sizeof(session), 444));
+  report("enqueue DUMP_GRANT",
+         enqueueValidatedNodeEvent(macA, IncomingMessageType::DUMP_GRANT,
+                                   reinterpret_cast<uint8_t*>(&grant), sizeof(grant), 555));
+  NodeEvent sessionEvent{};
+  NodeEvent grantEvent{};
+  report("pop SYNC_SESSION",
+         popNodeEvent(sessionEvent) && sessionEvent.type == NodeEventType::SYNC_SESSION &&
+         sessionEvent.payload.syncSession.sessionId == 44);
+  report("pop DUMP_GRANT",
+         popNodeEvent(grantEvent) && grantEvent.type == NodeEventType::DUMP_GRANT &&
+         grantEvent.payload.dumpGrant.grantId == 7);
+
   Serial.printf("RESULT: %s\n", g_pass ? "PASS" : "FAIL");
 }
 
@@ -91,4 +117,3 @@ void loop() {
   }
   delay(250);
 }
-

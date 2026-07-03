@@ -165,8 +165,21 @@ NodeDesiredConfig getDesiredConfig(const char* nodeId) {
   cfg.wakeIntervalMin = prefs.getUChar((key + "w").c_str(), 0);
   cfg.syncIntervalMin = prefs.getUShort((key + "s").c_str(), 15);
   cfg.syncPhaseUnix   = prefs.getULong((key + "p").c_str(), 0);
+  // Default DEPLOYED (2) so pre-existing nodes keep running (no accidental unpair).
+  cfg.targetState     = prefs.getUChar((key + "t").c_str(), 2);
+  cfg.sensorMask      = prefs.getUShort((key + "m").c_str(), 0);  // 0 = auto
   prefs.end();
   return cfg;
+}
+
+void setNodeExpectedSensorMask(const char* nodeId, uint16_t capabilityBits) {
+  if (!nodeId) return;
+  for (auto& n : registeredNodes) {
+    if (strncmp(n.nodeId.c_str(), nodeId, 16) == 0) {
+      n.expectedSensorMask = capabilityBits;
+      return;
+    }
+  }
 }
 
 void setDesiredConfig(const char* nodeId, const NodeDesiredConfig& cfg) {
@@ -180,6 +193,8 @@ void setDesiredConfig(const char* nodeId, const NodeDesiredConfig& cfg) {
   prefs.putUChar((key + "w").c_str(), cfg.wakeIntervalMin);
   prefs.putUShort((key + "s").c_str(), cfg.syncIntervalMin);
   prefs.putULong((key + "p").c_str(), cfg.syncPhaseUnix);
+  prefs.putUChar((key + "t").c_str(), cfg.targetState);
+  prefs.putUShort((key + "m").c_str(), cfg.sensorMask);
   prefs.end();
 }
 
@@ -380,6 +395,9 @@ void savePairedNodes() {
     snprintf(key, sizeof(key), "dep%d", idx);
     writeOk = prefs.putUInt(key, n.deployedSinceUnix) == sizeof(uint32_t) && writeOk;
 
+    snprintf(key, sizeof(key), "pau%d", idx);
+    writeOk = prefs.putUChar(key, n.recordingPaused ? 1 : 0) == sizeof(uint8_t) && writeOk;
+
     idx++;
   }
 
@@ -392,7 +410,7 @@ void savePairedNodes() {
   // Stale records above count are harmless, but remove them after the new count
   // is committed so a shrinking registry does not consume NVS indefinitely.
   if (writeOk && oldCount > count) {
-    const char* prefixes[] = {"mac", "id", "typ", "st", "batv", "lat", "lon", "dep"};
+    const char* prefixes[] = {"mac", "id", "typ", "st", "batv", "lat", "lon", "dep", "pau"};
     for (int stale = count; stale < oldCount; ++stale) {
       char key[16];
       for (const char* prefix : prefixes) {
@@ -580,6 +598,11 @@ void loadPairedNodes() {
     uint32_t savedDep = 0;
     if (prefs.getType(key) == PT_U32) savedDep = prefs.getUInt(key, 0);
 
+    // --- Recording-paused / standby flag (optional) ---
+    snprintf(key, sizeof(key), "pau%d", i);
+    bool savedPaused = false;
+    if (prefs.getType(key) == PT_U8) savedPaused = prefs.getUChar(key, 0) != 0;
+
     // All fields validated — build the NodeInfo record.
     NodeInfo newNode{};
     memcpy(newNode.mac, mac, 6);
@@ -607,6 +630,7 @@ void loadPairedNodes() {
     newNode.lastStateAppliedMs   = 0;
     newNode.lastAppliedTargetState = PENDING_NONE;
     newNode.deployedSinceUnix    = savedDep;
+    newNode.recordingPaused      = savedPaused;
     newNode.syncStale            = false;
     newNode.staleMissCount       = 0;
     newNode.lastStaleAssistMs    = 0;
@@ -643,4 +667,82 @@ void loadPairedNodes() {
   } else {
     Serial.printf("[REG] Load complete: %d restored, %d skipped\n", restored, skipped);
   }
+}
+
+// -----------------------------------------------------------------------------
+// status.nodes[] JSON builder (Supabase upload payload)
+// -----------------------------------------------------------------------------
+
+static const char* pendingTargetToStr(NodePendingState p) {
+  switch (p) {
+    case PENDING_TO_UNPAIRED: return "UNPAIRED";
+    case PENDING_TO_PAIRED:   return "PAIRED";
+    case PENDING_TO_DEPLOYED: return "DEPLOYED";
+    default:                  return "NONE";
+  }
+}
+
+static String jsonEscapeStr(const String& v) {
+  String out;
+  out.reserve(v.length() + 8);
+  for (size_t i = 0; i < v.length(); i++) {
+    char c = v[i];
+    if (c == '"' || c == '\\') { out += '\\'; out += c; }
+    else if (c == '\n') { out += "\\n"; }
+    else if (c == '\r') { out += "\\r"; }
+    else if (c == '\t') { out += "\\t"; }
+    else { out += c; }
+  }
+  return out;
+}
+
+String buildNodesStatusJson(uint32_t nowUnix) {
+  String out = "[";
+  char nb[16];
+  bool first = true;
+  for (const auto& n : registeredNodes) {
+    if (!first) out += ",";
+    first = false;
+
+    // Convert the node's millis-based lastSeen into an absolute unix time.
+    uint32_t lastSeenUnix = 0;
+    if (n.lastSeen > 0 && nowUnix > 0) {
+      uint32_t ageSec = (millis() - n.lastSeen) / 1000UL;
+      lastSeenUnix = (ageSec < nowUnix) ? (nowUnix - ageSec) : 0;
+    }
+
+    out += "{\"nodeId\":\"";  out += jsonEscapeStr(n.nodeId);            out += "\"";
+    out += ",\"userId\":\"";  out += jsonEscapeStr(getNodeUserId(n.nodeId)); out += "\"";
+    out += ",\"name\":\"";    out += jsonEscapeStr(getNodeName(n.nodeId));   out += "\"";
+    out += ",\"mac\":\"";     out += macToStr(n.mac);                    out += "\"";
+    out += ",\"state\":\"";   out += stateToStr(n.state);                out += "\"";
+    out += ",\"lastSeenUnix\":";            out += String(lastSeenUnix);
+    out += ",\"wakeIntervalMin\":";         out += String((unsigned)n.wakeIntervalMin);
+    out += ",\"inferredWakeIntervalMin\":"; out += String((unsigned)n.inferredWakeIntervalMin);
+    out += ",\"lastReportedBatV\":";
+    if (isnan(n.lastReportedBatV)) { out += "null"; }
+    else { dtostrf(n.lastReportedBatV, 1, 2, nb); out += nb; }
+    out += ",\"configVersion\":"; out += String((unsigned)n.configVersionApplied);
+    out += ",\"notes\":\"";   out += jsonEscapeStr(getNodeNotes(n.nodeId)); out += "\"";
+    out += ",\"isActive\":";           out += n.isActive ? "true" : "false";
+    out += ",\"deployPending\":";       out += n.deployPending ? "true" : "false";
+    out += ",\"stateChangePending\":";  out += n.stateChangePending ? "true" : "false";
+    out += ",\"pendingTargetState\":\""; out += pendingTargetToStr(n.pendingTargetState); out += "\"";
+    out += ",\"latitude\":";
+    if (isnan(n.latitude)) { out += "null"; }
+    else { dtostrf(n.latitude, 1, 5, nb); out += nb; }
+    out += ",\"longitude\":";
+    if (isnan(n.longitude)) { out += "null"; }
+    else { dtostrf(n.longitude, 1, 5, nb); out += nb; }
+    out += ",\"deployedSinceUnix\":"; out += String(n.deployedSinceUnix);
+    out += ",\"recordingPaused\":";   out += n.recordingPaused ? "true" : "false";
+    // Configured-sensor state: which sensors the operator marked installed, what
+    // reported this cycle, and which configured sensors are faulted (missing).
+    out += ",\"expectedSensorMask\":"; out += String((unsigned)n.expectedSensorMask);
+    out += ",\"sensorPresentMask\":";  out += String((unsigned)n.lastSensorPresent);
+    out += ",\"sensorFaultMask\":";    out += String((unsigned)n.sensorFaultMask);
+    out += "}";
+  }
+  out += "]";
+  return out;
 }

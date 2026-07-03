@@ -728,6 +728,7 @@ a{color:var(--primary);text-decoration:none}
 /* Chips */
 .chip{display:inline-block;padding:2px 8px;border-radius:999px;border:1px solid var(--border);font-size:.85rem;color:var(--sub)}
 .chip--state-deployed{border-color:#7a9b70;background:rgba(122,155,112,.25);color:#3d5e35}
+.chip--state-paused{border-color:#5a7fc4;background:rgba(90,127,196,.20);color:#233a6b}
 .chip--state-paired{border-color:#c47a5a;background:rgba(196,122,90,.25);color:#8a4a2e}
 .chip--state-unpaired{border-color:#c45a4a;background:rgba(196,90,74,.20);color:#7a2a20}
 .chip--link-awake{border-color:#b3e5fc;background:#e1f5fe;color:#01579b}
@@ -871,9 +872,46 @@ a{color:var(--primary);text-decoration:none}
 .conn-dot.c-updating::before{background:#4f9bd6}
 .conn-dot.c-warn::before{background:#c47a5a}
 .conn-dot.c-err::before{background:#c45a4a}
+
+/* Full-screen loading overlay — shown during page navigation + form submits */
+.fm-load-overlay{position:fixed;inset:0;background:rgba(250,249,246,.6);display:none;
+  align-items:center;justify-content:center;z-index:9999}
+.fm-load-overlay.show{display:flex}
+.fm-load-box{display:flex;flex-direction:column;align-items:center;gap:12px;padding:20px 26px;
+  background:#fff;border:1px solid var(--border);border-radius:14px;box-shadow:0 10px 34px rgba(0,0,0,.16);
+  color:var(--sub);font-size:.92rem}
+.fm-load-box .spinner{width:2em;height:2em;border-width:3px;margin:0;color:#7a9b70}
 )CSS";
 
 const char COMMON_JS[] PROGMEM = R"JS(
+// Full-screen loading overlay for page navigations + (non-async) form submits.
+// Makes the ESP32's page-render/transfer gap feel responsive instead of relying
+// on the browser's tiny built-in spinner. Async forms manage their own UI.
+(function(){
+  function ov(){ return document.getElementById('fm-load'); }
+  function show(msg){ var o=ov(); if(!o) return; var m=document.getElementById('fm-load-msg');
+    if(m && msg) m.textContent=msg; o.classList.add('show'); }
+  function hide(){ var o=ov(); if(o) o.classList.remove('show'); }
+  window.fmShowLoading=show; window.fmHideLoading=hide;
+  document.addEventListener('click', function(e){
+    var t=e.target; while(t && t.nodeType!==1) t=t.parentNode;
+    var a = (t && t.closest) ? t.closest('a') : null;
+    if(!a) return;
+    if(a.target==='_blank' || a.hasAttribute('download')) return;
+    if(e.metaKey||e.ctrlKey||e.shiftKey||e.button) return;
+    var href=a.getAttribute('href')||'';
+    if(!href || href.charAt(0)==='#' || href.lastIndexOf('javascript:',0)===0) return;
+    show('Loading…');
+  }, true);
+  document.addEventListener('submit', function(e){
+    var f=e.target;
+    if(f && f.classList && f.classList.contains('async-form')) return;  // handles own UI
+    show('Working…');
+  }, true);
+  window.addEventListener('pageshow', hide);   // incl. bfcache back/forward
+  document.addEventListener('DOMContentLoaded', hide);
+})();
+
 // Status messages: kind = 'ok' | 'warn' | 'err' | 'progress'. ARIA-live region.
 // Transient (ok/progress) auto-clear; errors persist until replaced.
 function showUiStatus(message, kind){
@@ -950,8 +988,9 @@ function flashBtn(btn, ok){
 }
 
 // --- Node cards: incremental, XSS-safe (textContent for device strings) ---
-function chipState(state){
-  if (state==='DEPLOYED') return ['chip chip--state-deployed','Active'];
+function chipState(state, paused){
+  if (state==='DEPLOYED') return paused ? ['chip chip--state-paused','Paused']
+                                        : ['chip chip--state-deployed','Active'];
   if (state==='PAIRED')   return ['chip chip--state-paired','Connected'];
   return ['chip chip--state-unpaired','New'];
 }
@@ -971,7 +1010,7 @@ function nodeCell(parentClass, labelText, fieldName){
   d.appendChild(l); d.appendChild(v); return d;
 }
 function applyNodeFields(card, n){
-  var st=chipState(n.state), s=card.querySelector('[data-f="status"]');
+  var st=chipState(n.state, n.paused), s=card.querySelector('[data-f="status"]');
   if (s){ s.className=st[0]; s.textContent=st[1]; }
   var bt=chipBatt(n.batV), b=card.querySelector('[data-f="batt"]');
   if (b){ b.className=bt[0]; b.textContent=bt[1]; }
@@ -1261,7 +1300,10 @@ static String headCommon(const String& title, const String& actionsHtml = String
   h += F("<meta charset='UTF-8'><meta name='viewport' content='width=device-width, initial-scale=1'>");
   h += F("<style>"); h += FPSTR(COMMON_CSS); h += F("</style>");
   h += F("<script>"); h += FPSTR(COMMON_JS);  h += F("</script>");
-  h += F("</head><body><div class='container'>");
+  h += F("</head><body>");
+  h += F("<div id='fm-load' class='fm-load-overlay'><div class='fm-load-box'>"
+         "<span class='spinner'></span><span id='fm-load-msg'>Loading&hellip;</span></div></div>");
+  h += F("<div class='container'>");
   h += F("<div class='header'>");
   h += F("<div class='header-top'>");
   h += F("<div class='h1'>"); h += title; h += F("</div>");
@@ -1429,8 +1471,9 @@ static String buildLiveJson() {
     if (n.stateChangePending || n.deployPending) nPending++;
     const uint32_t battCenti = isnan(n.lastReportedBatV) ? 0u : (uint32_t)(n.lastReportedBatV * 100.0f);
     fp ^= (uint32_t)n.state + ((uint32_t)n.configVersionApplied << 4) +
-          (n.lastSeen / 1000UL) + battCenti +
-          (uint32_t)(n.nodeId.length() * 131U) + (uint32_t)(n.name.length() * 17U);
+          (n.lastSeen / 1000UL) + battCenti + (n.recordingPaused ? 97U : 0U) +
+          (uint32_t)(n.nodeId.length() * 131U) + (uint32_t)(n.name.length() * 17U) +
+          ((uint32_t)n.expectedSensorMask << 9) + ((uint32_t)n.sensorFaultMask << 20);
     fp *= 16777619UL;  // FNV-style fold — cheap change detector, not a hash guarantee
   }
   fp ^= (gDiscovery.generation * 2654435761UL) + (gDiscovery.active ? 1UL : 0UL) +
@@ -1473,7 +1516,13 @@ static String buildLiveJson() {
     if (isnan(n.lastReportedBatV)) { j += ",\"batV\":null"; }
     else { char b[12]; snprintf(b, sizeof(b), "%.2f", n.lastReportedBatV); j += ",\"batV\":"; j += b; }
     j += ",\"recMin\":";  j += String(recMin);
+    j += ",\"paused\":";  j += n.recordingPaused ? "true" : "false";
     j += ",\"pending\":"; j += (n.stateChangePending || n.deployPending) ? "true" : "false";
+    // Configured-sensor state for the deployment UI: which sensors are marked
+    // installed, what reported last cycle, and which configured ones are faulted.
+    j += ",\"expectedSensorMask\":"; j += String((unsigned)n.expectedSensorMask);
+    j += ",\"sensorPresentMask\":";  j += String((unsigned)n.lastSensorPresent);
+    j += ",\"sensorFaultMask\":";    j += String((unsigned)n.sensorFaultMask);
     j += "}";
   }
   j += "]}";
@@ -2232,10 +2281,13 @@ static void handleStationsPage() {
 
     String displayId = name.length() ? name : (userId.length() ? userId : node.nodeId);
 
-    const char* stCls = (node.state == DEPLOYED) ? "chip chip--state-deployed"
+    const bool nodePaused = (node.state == DEPLOYED) && node.recordingPaused;
+    const char* stCls = nodePaused ? "chip chip--state-paused"
+                       : (node.state == DEPLOYED) ? "chip chip--state-deployed"
                        : (node.state == PAIRED)   ? "chip chip--state-paired"
                        : "chip chip--state-unpaired";
-    const char* stTxt = (node.state == DEPLOYED) ? "Active"
+    const char* stTxt = nodePaused ? "Paused"
+                       : (node.state == DEPLOYED) ? "Active"
                        : (node.state == PAIRED)   ? "Connected" : "New";
 
     String battCls = F("chip");
@@ -2346,7 +2398,10 @@ static void handleStationDetail() {
 
   // --- Status header ---
   html += F("<div class='muted' style='margin:0 0 10px 0'>");
-  if (target->state == DEPLOYED) html += F("<span class='chip chip--state-deployed'>Active</span>");
+  if (target->state == DEPLOYED) {
+    if (target->recordingPaused) html += F("<span class='chip chip--state-paused'>Paused</span>");
+    else html += F("<span class='chip chip--state-deployed'>Active</span>");
+  }
   else if (target->state == PAIRED) html += F("<span class='chip chip--state-paired'>Connected</span>");
   else html += F("<span class='chip chip--state-unpaired'>New</span>");
   {
@@ -2461,12 +2516,23 @@ static void handleStationDetail() {
   html += F("</div>");
 
   html += F("<div class='action-choices'>"
-              "<label class='action-choice'><input type='radio' name='action' value='none' checked><span>No change</span></label>"
-              "<label class='action-choice action-choice--start'><input type='radio' name='action' value='start'><span>Activate</span></label>"
-              "<label class='action-choice action-choice--stop'><input type='radio' name='action' value='stop'><span>Stop Monitoring</span></label>"
-              "<label class='action-choice action-choice--unpair'><input type='radio' name='action' value='unpair'><span>Remove node</span></label>"
-            "</div>"
-            "<button type='submit' class='btn btn--success' style='margin-top:12px'>"
+              "<label class='action-choice'><input type='radio' name='action' value='none' checked><span>No change</span></label>");
+  if (!isDeployed) {
+    // New / Connected node — the in-hand deploy path.
+    html += F("<label class='action-choice action-choice--start'><input type='radio' name='action' value='start'><span>Deploy (start recording)</span></label>");
+  } else if (target->recordingPaused) {
+    // Paused deployed node — resume remotely at the next sync.
+    html += F("<label class='action-choice action-choice--start'><input type='radio' name='action' value='resume'><span>Resume recording</span></label>");
+  } else {
+    // Active deployed node — pause (standby) remotely at the next sync.
+    html += F("<label class='action-choice action-choice--stop'><input type='radio' name='action' value='pause'><span>Pause recording</span></label>");
+  }
+  html += F("<label class='action-choice action-choice--unpair'><input type='radio' name='action' value='unpair'><span>Remove node</span></label>"
+            "</div>");
+  if (isDeployed) {
+    html += F("<div class='muted' style='font-size:12px;margin-top:6px'>Pause/Resume/Remove are delivered at the node&rsquo;s next sync check-in.</div>");
+  }
+  html += F("<button type='submit' class='btn btn--success' style='margin-top:12px'>"
             "Save Changes</button>"
             "</form>");
 
@@ -2545,6 +2611,8 @@ static void handleNodeConfigSave() {
   bool revertOk = false;
   bool pairOk   = false;
   bool unpairOk = false;
+  bool pauseOk  = false;
+  bool resumeOk = false;
 
   if (action == "none" || action.length() == 0) {
     // No lifecycle change requested — only name/notes/schedule saved.
@@ -2568,18 +2636,67 @@ static void handleNodeConfigSave() {
       revertOk = pairNode(nodeId);
       Serial.printf("[CONFIG] %s stop -> PAIRED: %s\n", nodeId.c_str(), revertOk ? "OK" : "FAIL");
     }
+  } else if (action == "pause") {
+    // Standby: stop recording but keep the node deployed + syncing (remotely
+    // resumable). Deferred via the sync-window NODE_CONFIG reconcile, same as
+    // unpair — a deployed node is asleep now.
+    if (target && target->state == DEPLOYED) {
+      NodeDesiredConfig du = getDesiredConfig(nodeId.c_str());
+      du.targetState = 3;  // STANDBY
+      du.configVersion = (du.configVersion < 0xFFFFu) ? (du.configVersion + 1u) : 1u;
+      setDesiredConfig(nodeId.c_str(), du);
+      target->recordingPaused = true;
+      target->stateChangePending = true;
+      savePairedNodes();
+      pauseOk = true;
+      Serial.printf("[CONFIG] %s pause SCHEDULED: desired v%u STANDBY at next sync\n",
+                    nodeId.c_str(), (unsigned)du.configVersion);
+    }
+  } else if (action == "resume") {
+    if (target && target->state == DEPLOYED) {
+      NodeDesiredConfig du = getDesiredConfig(nodeId.c_str());
+      du.targetState = 2;  // DEPLOYED / ACTIVE
+      du.configVersion = (du.configVersion < 0xFFFFu) ? (du.configVersion + 1u) : 1u;
+      setDesiredConfig(nodeId.c_str(), du);
+      target->recordingPaused = false;
+      target->stateChangePending = true;
+      savePairedNodes();
+      resumeOk = true;
+      Serial.printf("[CONFIG] %s resume SCHEDULED: desired v%u ACTIVE at next sync\n",
+                    nodeId.c_str(), (unsigned)du.configVersion);
+    }
   } else if (action == "unpair") {
     if (target) {
-      bool sent  = sendUnpairToNode(nodeId);
-      bool local = unpairNode(nodeId);
-      unpairOk = sent && local;
-      setNodeUserId(nodeId, "");
-      setNodeName(nodeId, "");
-      setNodeNotes(nodeId, "");
-      target->userId = "";
-      target->name   = "";
-      Serial.printf("[CONFIG] %s unpair -> send=%s local=%s\n",
-                    nodeId.c_str(), sent ? "OK" : "FAIL", local ? "OK" : "FAIL");
+      if (target->state == DEPLOYED) {
+        // Deferred unpair: a deployed node is asleep now and only reachable in
+        // its sync window. Record the desired UNPAIRED state (durable, version
+        // bumped) and KEEP the node in the registry. The sync-window reconcile
+        // broadcasts NODE_CONFIG(UNPAIRED); the node ACKs and is removed then.
+        // Do NOT send imperatively or delete locally (that orphaned the node).
+        NodeDesiredConfig du = getDesiredConfig(nodeId.c_str());
+        du.targetState = 0;  // UNPAIRED
+        du.configVersion = (du.configVersion < 0xFFFFu) ? (du.configVersion + 1u) : 1u;
+        setDesiredConfig(nodeId.c_str(), du);
+        target->stateChangePending = true;
+        target->pendingTargetState = PENDING_TO_UNPAIRED;
+        savePairedNodes();
+        unpairOk = true;  // scheduled — completes at next sync
+        Serial.printf("[CONFIG] %s unpair SCHEDULED (deployed): desired v%u UNPAIRED at next sync\n",
+                      nodeId.c_str(), (unsigned)du.configVersion);
+      } else {
+        // Awake node (unpaired/paired, still listening in config mode): the
+        // immediate command works because the node is not asleep.
+        bool sent  = sendUnpairToNode(nodeId);
+        bool local = unpairNode(nodeId);
+        unpairOk = sent && local;
+        setNodeUserId(nodeId, "");
+        setNodeName(nodeId, "");
+        setNodeNotes(nodeId, "");
+        target->userId = "";
+        target->name   = "";
+        Serial.printf("[CONFIG] %s unpair -> send=%s local=%s\n",
+                      nodeId.c_str(), sent ? "OK" : "FAIL", local ? "OK" : "FAIL");
+      }
     }
   }
 
@@ -2617,15 +2734,16 @@ static void handleNodeConfigSave() {
   html += F("</p>");
 
   html += F("<p class='muted'>"
-            "Schedule stored for this node (applies on next wake)"
-            "<br>Connect (if new): ");
-  html += pairOk ? "OK" : "not requested / failed";
-  html += F("<br>Activate: ");
-  html += deployOk ? "REQUESTED (awaiting node confirmation)" : "not requested / failed";
-  html += F("<br>Stop monitoring: ");
-  html += revertOk ? "OK" : "not requested / failed";
-  html += F("<br>Remove node: ");
-  html += unpairOk ? "OK" : "not requested / failed";
+            "Schedule stored for this node (applies on next wake)");
+  if (pairOk)   html += F("<br>Connect: OK");
+  if (deployOk) html += F("<br>Deploy: REQUESTED (awaiting node confirmation)");
+  if (revertOk) html += F("<br>Stop monitoring: OK");
+  if (pauseOk)  html += F("<br>Pause: SCHEDULED &mdash; the node stops recording at its next sync check-in (stays deployed &amp; resumable)");
+  if (resumeOk) html += F("<br>Resume: SCHEDULED &mdash; the node resumes recording at its next sync check-in");
+  if (unpairOk) html += F("<br>Remove node: SCHEDULED &mdash; completes when the node confirms at its next sync");
+  if (!pairOk && !deployOk && !revertOk && !pauseOk && !resumeOk && !unpairOk) {
+    html += F("<br>No lifecycle change requested.");
+  }
   html += F("</p>"
             "<a href='/stations' class='btn btn--primary'>Back to Nodes</a>"
             "</div>");
@@ -2961,6 +3079,9 @@ static void handleManualUpload() {
       ModemDriver modem;
       modem.init();
 
+      // Resting battery reading, before the modem rail loads it down.
+      const float manRestingBatV = readBatteryVoltage();
+      const uint32_t manSessionStartMs = millis();
       if (!modem.powerOn()) {
         resultMsg = "Modem power-on failed";
       } else if (!modem.waitForNetwork(60000)) {
@@ -2985,26 +3106,62 @@ static void handleManualUpload() {
           ? (uint32_t)((fsUsed * 100ULL) / fsTotal) : 0;
         const UploadCursor manCursor = gUploadQueue.getCursor();
         const auto allNodes = getRegisteredNodes();
-        uint16_t mTotal = 0, mDeployed = 0, mPaired = 0, mUnpaired = 0, mPending = 0;
+        uint16_t mTotal = 0, mDeployed = 0, mPaired = 0, mUnpaired = 0, mPending = 0, mPaused = 0;
         for (const auto& n : allNodes) {
           mTotal++;
           if (n.state == DEPLOYED) mDeployed++;
           else if (n.state == PAIRED) mPaired++;
           else mUnpaired++;
           if (n.stateChangePending || n.deployPending) mPending++;
+          if (n.state == DEPLOYED && n.recordingPaused) mPaused++;
         }
+        extern uint32_t g_projectStartedUnix;  // defined in main.cpp
+        extern String   g_resetReasonStr;      // defined in main.cpp
+        extern uint32_t g_bootCount;           // defined in main.cpp
+        const uint32_t manNowUnix = getRTCTimeUnix();
+        const char* manLastResult =
+            (manCursor.lastUploadUnix > 0 && manCursor.retryCount == 0) ? "success"
+            : (manCursor.retryCount > 0) ? "failed" : "pending";
+
+        // Radio link quality + modem identity (queried live while registered).
+        ModemDiagnostics manDiag;
+        modem.getDiagnostics(manDiag);
+        // 0xFFFFFFFF = "not tracked" -> emitted as null (manual path doesn't
+        // time registration).
+        const String manModemJson = modemDiagnosticsToJson(manDiag, 0xFFFFFFFFUL);
+        const float manLoadedBatV = readBatteryVoltage();  // under modem load
+        const String manDiagJson =
+            String("{\"resetReason\":\"") + g_resetReasonStr +
+            "\",\"bootCount\":" + String(g_bootCount) +
+            ",\"freeHeap\":" + String((unsigned)ESP.getFreeHeap()) +
+            ",\"minFreeHeap\":" + String((unsigned)ESP.getMinFreeHeap()) +
+            ",\"snapQueueDropped\":0" +
+            ",\"batLoadedV\":" +
+            (isnan(manLoadedBatV) ? String("null") : String(manLoadedBatV, 2)) +
+            ",\"sessionMs\":" + String((unsigned)(millis() - manSessionStartMs)) + "}";
+
         const StatusContext manStatusCtx = {
-          readBatteryVoltage(), flashPct, fsTotal, fsUsed,
+          manRestingBatV, flashPct, fsTotal, fsUsed,
           "manual", computeNextSyncIsoLocal(),
           gWakeIntervalMin, gSyncIntervalMin,
           (gSyncMode == SYNC_MODE_INTERVAL) ? "interval" : "daily",
           mTotal, mDeployed, mPaired, mUnpaired,
           gUploadQueue.getPendingRows(), manCursor.rowsUploaded,
           manCursor.retryCount, manCursor.lastUploadUnix,
-          FW_VERSION, FW_BUILD, getRTCTimeUnix(),
+          FW_VERSION, FW_BUILD, manNowUnix,
           WiFi.macAddress(),
           mPending, tx.enabled,
-          gUploadQueue.getPendingRows(), (uint64_t)getCSVFileSize(), String("")
+          gUploadQueue.getPendingRows(), (uint64_t)getCSVFileSize(), String(""),
+          buildNodesStatusJson(manNowUnix),
+          buildTransmissionStatusJson(tx),
+          (gSyncMode == SYNC_MODE_DAILY)
+              ? formatSyncTimeHHMM(gSyncDailyHour, gSyncDailyMinute) : String(""),
+          gUploadQueue.getPendingBytes(),
+          g_projectStartedUnix,
+          manLastResult,
+          manModemJson,
+          manDiagJson,
+          mPaused
         };
 
         while (posts < kMaxManualPosts && gUploadQueue.getPendingRows() > 0 && !stop) {
@@ -3029,7 +3186,8 @@ static void handleManualUpload() {
           HttpsPostResult result = modem.httpsPost(url, json.body, "application/json", authHeader);
           posts++;
           if (result.httpStatus == 200) {
-            gUploadQueue.advanceCursor(payload.startOffset + json.csvBytesConsumed, getRTCTimeUnix());
+            gUploadQueue.advanceCursor(payload.startOffset + json.csvBytesConsumed, getRTCTimeUnix(),
+                                       json.rowCount);
             gUploadQueue.purgeUploaded();
             gUploadQueue.resetRetryCount();
             sent += json.rowCount;
@@ -3141,6 +3299,51 @@ static void handleShutdown() {
   server.send(200, "text/html", html);
 }
 
+// POST /set-node-sensors — set a node's configured ("expected") sensor set.
+// Args: node_id, mask (integer bitmask of SNAP_PRESENT_* capability bits the
+// operator marked installed; VALID bit is added in firmware). Bumps the node's
+// desired configVersion so the selection is delivered + reconciled via NODE_CONFIG
+// during the next sync window, and refreshes the RAM cache used for fault display.
+static void handleSetNodeSensors() {
+  String nodeId = server.arg("node_id");
+  if (nodeId.length() == 0 || !server.hasArg("mask")) {
+    server.send(400, "application/json",
+                "{\"ok\":false,\"error\":\"node_id and mask required\"}");
+    return;
+  }
+  // Keep only the 9 defined capability bits (SNAP_PRESENT_AIR_TEMP..BAT_V).
+  const uint16_t capBits = (uint16_t)((uint32_t)server.arg("mask").toInt() & 0x01FFu);
+  // Always authoritative: even an all-off selection is a deliberate config, so
+  // the node stops auto-registering passive sensors. (0 without VALID = auto.)
+  const uint16_t storedMask = (uint16_t)(capBits | NODE_SENSOR_MASK_VALID);
+
+  NodeInfo* target = nullptr;
+  for (auto& n : registeredNodes) {
+    if (n.nodeId == nodeId) { target = &n; break; }
+  }
+  if (!target) {
+    server.send(404, "application/json", "{\"ok\":false,\"error\":\"unknown node\"}");
+    return;
+  }
+
+  NodeDesiredConfig dc = getDesiredConfig(nodeId.c_str());
+  if (dc.sensorMask != storedMask) {
+    dc.sensorMask = storedMask;
+    dc.configVersion = (dc.configVersion == 0) ? 1u
+                     : (dc.configVersion < 0xFFFFu ? dc.configVersion + 1u : 1u);
+    setDesiredConfig(nodeId.c_str(), dc);
+  }
+  setNodeExpectedSensorMask(nodeId.c_str(), capBits);
+
+  Serial.printf("[CONFIG] %s sensor mask -> 0x%04X desired v%u\n",
+                nodeId.c_str(), (unsigned)storedMask, (unsigned)dc.configVersion);
+
+  String resp = String("{\"ok\":true,\"nodeId\":\"") + nodeId +
+                "\",\"sensorMask\":" + String((unsigned)capBits) +
+                ",\"configVersion\":" + String((unsigned)dc.configVersion) + "}";
+  server.send(200, "application/json", resp);
+}
+
 void startConfigServer() {
   // WiFi AP + STA (AP for web UI, STA for ESP-NOW on same channel).
   // ESP-NOW was already initialised by initEspNowConfig() before this call.
@@ -3194,6 +3397,7 @@ void startConfigServer() {
   server.on("/stations", HTTP_GET, handleStationsPage);
   server.on("/station", HTTP_GET, handleStationDetail);
   server.on("/station", HTTP_POST, handleNodeConfigSave);
+  server.on("/set-node-sensors", HTTP_POST, handleSetNodeSensors);
   server.on("/revert-node", HTTP_POST, handleRevertNode);
 
   server.on("/settings", HTTP_GET, handleSettings);

@@ -15,12 +15,109 @@ static volatile bool gSyncWindowOpen = false;
 static QueueHandle_t gSnapQueue = nullptr;
 static int gSnapQueueDepth = 8;
 static volatile uint32_t gSnapDropCount = 0;
+// CONFIG_ACK queue — small; nodes ACK an applied/UNPAIRED NODE_CONFIG.
+static QueueHandle_t gAckQueue = nullptr;
+static constexpr int kAckQueueDepth = 8;
+static QueueHandle_t gHelloQueue = nullptr;
+static QueueHandle_t gDoneQueue = nullptr;
+static QueueHandle_t gReleaseAckQueue = nullptr;
+static constexpr int kControlQueueDepth = 32;
+
+static volatile bool gControlSendActive = false;
+static volatile bool gControlSendComplete = false;
+static volatile esp_now_send_status_t gControlSendStatus = ESP_NOW_SEND_FAIL;
+static uint8_t gControlExpectedMac[6] = {0};
 
 // Broadcast address for ESP-NOW
 static constexpr uint8_t kBroadcastAddr[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 
+static void onEspNowSend(const uint8_t* mac, esp_now_send_status_t status) {
+  if (!gControlSendActive || !mac || memcmp(mac, gControlExpectedMac, 6) != 0) return;
+  gControlSendStatus = status;
+  gControlSendComplete = true;
+}
+
+static bool ensureSyncPeer(const uint8_t* mac) {
+  if (!mac) return false;
+  esp_now_peer_info_t peer{};
+  memcpy(peer.peer_addr, mac, 6);
+  peer.channel = static_cast<uint8_t>(gChannel);
+  peer.ifidx = WIFI_IF_STA;
+  peer.encrypt = false;
+  esp_err_t added = esp_now_add_peer(&peer);
+  return added == ESP_OK || added == ESP_ERR_ESPNOW_EXIST;
+}
+
+static bool sendControlPacket(const uint8_t* mac, const void* packet, size_t len) {
+  if (!mac || !packet || len == 0 || !ensureSyncPeer(mac)) return false;
+  for (uint8_t attempt = 1; attempt <= 3; ++attempt) {
+    memcpy(gControlExpectedMac, mac, 6);
+    gControlSendComplete = false;
+    gControlSendStatus = ESP_NOW_SEND_FAIL;
+    gControlSendActive = true;
+    esp_err_t queued = esp_now_send(mac, reinterpret_cast<const uint8_t*>(packet), len);
+    if (queued == ESP_OK) {
+      const uint32_t started = millis();
+      while (!gControlSendComplete && (uint32_t)(millis() - started) < 350UL) {
+        delay(1);
+      }
+    }
+    const bool delivered = queued == ESP_OK && gControlSendComplete &&
+                           gControlSendStatus == ESP_NOW_SEND_SUCCESS;
+    gControlSendActive = false;
+    if (delivered) return true;
+    delay(25UL * attempt);
+  }
+  return false;
+}
+
 // Internal receive handler (ESP-IDF 4.4 API: mac_addr, data, len)
 static void onEspNowRecv(const uint8_t* mac_addr, const uint8_t* data, int len) {
+  if (gHelloQueue && mac_addr && data &&
+      len == static_cast<int>(sizeof(node_hello_message_t)) &&
+      strncmp(reinterpret_cast<const char*>(data), "NODE_HELLO", 10) == 0) {
+    SyncHelloSlot slot{};
+    memcpy(slot.mac, mac_addr, sizeof(slot.mac));
+    memcpy(&slot.hello, data, sizeof(slot.hello));
+    xQueueSendToBack(gHelloQueue, &slot, 0);
+    return;
+  }
+
+  if (gDoneQueue && mac_addr && data &&
+      len == static_cast<int>(sizeof(dump_done_message_t)) &&
+      strncmp(reinterpret_cast<const char*>(data), "DUMP_DONE", 10) == 0) {
+    SyncDoneSlot slot{};
+    memcpy(slot.mac, mac_addr, sizeof(slot.mac));
+    memcpy(&slot.done, data, sizeof(slot.done));
+    xQueueSendToBack(gDoneQueue, &slot, 0);
+    return;
+  }
+
+  if (gReleaseAckQueue && mac_addr && data &&
+      len == static_cast<int>(sizeof(sync_release_ack_message_t)) &&
+      strncmp(reinterpret_cast<const char*>(data), "RELEASE_ACK", 12) == 0) {
+    SyncReleaseAckSlot slot{};
+    memcpy(slot.mac, mac_addr, sizeof(slot.mac));
+    memcpy(&slot.ack, data, sizeof(slot.ack));
+    xQueueSendToBack(gReleaseAckQueue, &slot, 0);
+    return;
+  }
+
+  // CONFIG_ACK — a node confirming it applied (or is unpairing on) a NODE_CONFIG.
+  // Enqueue for handleSyncWake to reconcile. Same drop-oldest policy as snapshots.
+  if (gAckQueue && mac_addr && data &&
+      len == static_cast<int>(sizeof(config_apply_ack_message_t)) &&
+      strncmp(reinterpret_cast<const char*>(data), "CONFIG_ACK", 10) == 0) {
+    config_apply_ack_message_t ack{};
+    memcpy(&ack, data, sizeof(ack));
+    if (xQueueSendToBack(gAckQueue, &ack, 0) != pdTRUE) {
+      config_apply_ack_message_t discard{};
+      xQueueReceive(gAckQueue, &discard, 0);
+      xQueueSendToBack(gAckQueue, &ack, 0);
+    }
+    return;
+  }
+
   if (gSnapQueue && mac_addr && data) {
     // V2 snapshot (NODE_SNAPSHOT2) — variable length.
     if (isV2Snapshot(data, len)) {
@@ -87,6 +184,10 @@ bool initEspNowSyncOnly(int channel) {
     Serial.println("[ESP-NOW] Register recv callback failed");
     return false;
   }
+  if (esp_now_register_send_cb(onEspNowSend) != ESP_OK) {
+    Serial.println("[ESP-NOW] Register send callback failed");
+    return false;
+  }
 
   // Add broadcast peer so we can send sync window announcements
   esp_now_peer_info_t peerInfo = {};
@@ -109,13 +210,33 @@ void broadcastSyncWindowOpen() {
   msg.syncIntervalMinutes = 0;
   msg.phaseUnix = 0;
 
-  esp_err_t result = esp_now_send(kBroadcastAddr, reinterpret_cast<const uint8_t*>(&msg), sizeof(msg));
-  if (result == ESP_OK) {
+  const bool delivered = sendControlPacket(kBroadcastAddr, &msg, sizeof(msg));
+  if (delivered) {
     Serial.println("[ESP-NOW] SYNC_WINDOW_OPEN broadcast sent");
     gSyncWindowOpen = true;
   } else {
-    Serial.printf("[ESP-NOW] SYNC_WINDOW_OPEN broadcast failed: %d\n", result);
+    Serial.println("[ESP-NOW] SYNC_WINDOW_OPEN broadcast failed");
   }
+}
+
+bool broadcastSyncSessionOpen(const sync_session_open_message_t& open) {
+  const bool ok = sendControlPacket(kBroadcastAddr, &open, sizeof(open));
+  Serial.printf("[ESP-NOW] SYNC_SESSION id=%lu join=%ums window=%us -> %s\n",
+                (unsigned long)open.sessionId, (unsigned)open.joinWindowMs,
+                (unsigned)open.sessionWindowSec, ok ? "OK" : "FAIL");
+  return ok;
+}
+
+bool sendDumpGrant(const uint8_t* mac, const dump_grant_message_t& grant) {
+  return sendControlPacket(mac, &grant, sizeof(grant));
+}
+
+bool sendSyncRelease(const uint8_t* mac, const sync_release_message_t& release) {
+  return sendControlPacket(mac, &release, sizeof(release));
+}
+
+bool sendSnapshotAckNow(const uint8_t* mac, const snapshot_ack_t& ack) {
+  return sendControlPacket(mac, &ack, sizeof(ack));
 }
 
 void broadcastSyncScheduleNow(int syncIntervalMinutes, uint32_t phaseUnix) {
@@ -129,10 +250,10 @@ void broadcastSyncScheduleNow(int syncIntervalMinutes, uint32_t phaseUnix) {
   msg.syncIntervalMinutes = (unsigned long)syncIntervalMinutes;
   msg.phaseUnix = phaseUnix;
 
-  esp_err_t result = esp_now_send(kBroadcastAddr, reinterpret_cast<const uint8_t*>(&msg), sizeof(msg));
+  const bool result = sendControlPacket(kBroadcastAddr, &msg, sizeof(msg));
   Serial.printf("[ESP-NOW] SET_SYNC_SCHED broadcast syncMin=%d phase=%lu -> %s\n",
                 syncIntervalMinutes, (unsigned long)phaseUnix,
-                result == ESP_OK ? "OK" : "FAIL");
+                result ? "OK" : "FAIL");
 }
 
 void broadcastWakeIntervalNow(int intervalMinutes) {
@@ -145,9 +266,19 @@ void broadcastWakeIntervalNow(int intervalMinutes) {
   strncpy(cmd.mothership_id, "M001", sizeof(cmd.mothership_id) - 1);
   cmd.intervalMinutes = intervalMinutes;
 
-  esp_err_t result = esp_now_send(kBroadcastAddr, reinterpret_cast<const uint8_t*>(&cmd), sizeof(cmd));
+  const bool result = sendControlPacket(kBroadcastAddr, &cmd, sizeof(cmd));
   Serial.printf("[ESP-NOW] SET_SCHEDULE broadcast interval=%d min -> %s\n",
-                intervalMinutes, result == ESP_OK ? "OK" : "FAIL");
+                intervalMinutes, result ? "OK" : "FAIL");
+}
+
+void broadcastNodeConfigNow(const node_config_message_t& cfg) {
+  // Broadcast the target node's desired state over the broadcast peer. Only the
+  // addressed node (cfg.nodeId) acts on it; others validate the target and drop.
+  const bool result = sendControlPacket(kBroadcastAddr, &cfg, sizeof(cfg));
+  Serial.printf("[ESP-NOW] NODE_CONFIG -> %.15s v%u target=%u wake=%u syncMin=%u -> %s\n",
+                cfg.nodeId, (unsigned)cfg.configVersion, (unsigned)cfg.targetState,
+                (unsigned)cfg.wakeIntervalMin, (unsigned)cfg.syncIntervalMin,
+                result ? "OK" : "FAIL");
 }
 
 void registerReceiveCallback(EspNowRecvCallback cb) {
@@ -175,6 +306,57 @@ void initSnapQueue(int depth) {
   } else {
     Serial.printf("[ESP-NOW] Snapshot queue ready (depth=%d)\n", gSnapQueueDepth);
   }
+
+  // CONFIG_ACK queue — created alongside the snapshot queue for the sync window.
+  if (gAckQueue) {
+    vQueueDelete(gAckQueue);
+    gAckQueue = nullptr;
+  }
+  gAckQueue = xQueueCreate(kAckQueueDepth, sizeof(config_apply_ack_message_t));
+  if (!gAckQueue) {
+    Serial.println("[ESP-NOW] CONFIG_ACK queue allocation failed");
+  }
+
+  if (gHelloQueue) vQueueDelete(gHelloQueue);
+  if (gDoneQueue) vQueueDelete(gDoneQueue);
+  if (gReleaseAckQueue) vQueueDelete(gReleaseAckQueue);
+  gHelloQueue = xQueueCreate(kControlQueueDepth, sizeof(SyncHelloSlot));
+  gDoneQueue = xQueueCreate(kControlQueueDepth, sizeof(SyncDoneSlot));
+  gReleaseAckQueue = xQueueCreate(kControlQueueDepth, sizeof(SyncReleaseAckSlot));
+  if (!gHelloQueue || !gDoneQueue || !gReleaseAckQueue) {
+    Serial.println("[ESP-NOW] coordinated sync queue allocation failed");
+  }
+}
+
+int drainSyncHellos(SyncHelloSlot* out, int maxItems) {
+  if (!gHelloQueue || !out || maxItems <= 0) return 0;
+  int count = 0;
+  while (count < maxItems && xQueueReceive(gHelloQueue, &out[count], 0) == pdTRUE) ++count;
+  return count;
+}
+
+int drainDumpDone(SyncDoneSlot* out, int maxItems) {
+  if (!gDoneQueue || !out || maxItems <= 0) return 0;
+  int count = 0;
+  while (count < maxItems && xQueueReceive(gDoneQueue, &out[count], 0) == pdTRUE) ++count;
+  return count;
+}
+
+int drainReleaseAcks(SyncReleaseAckSlot* out, int maxItems) {
+  if (!gReleaseAckQueue || !out || maxItems <= 0) return 0;
+  int count = 0;
+  while (count < maxItems && xQueueReceive(gReleaseAckQueue, &out[count], 0) == pdTRUE) ++count;
+  return count;
+}
+
+int drainConfigAcks(config_apply_ack_message_t* out, int maxAcks) {
+  if (!gAckQueue || !out || maxAcks <= 0) return 0;
+  int drained = 0;
+  while (drained < maxAcks &&
+         xQueueReceive(gAckQueue, &out[drained], 0) == pdTRUE) {
+    ++drained;
+  }
+  return drained;
 }
 
 int drainSnapQueue(EspNowSnapSlot* outSlots, int maxSlots) {
@@ -198,6 +380,22 @@ void deinitEspNowSync() {
   if (gSnapQueue) {
     vQueueDelete(gSnapQueue);
     gSnapQueue = nullptr;
+  }
+  if (gAckQueue) {
+    vQueueDelete(gAckQueue);
+    gAckQueue = nullptr;
+  }
+  if (gHelloQueue) {
+    vQueueDelete(gHelloQueue);
+    gHelloQueue = nullptr;
+  }
+  if (gDoneQueue) {
+    vQueueDelete(gDoneQueue);
+    gDoneQueue = nullptr;
+  }
+  if (gReleaseAckQueue) {
+    vQueueDelete(gReleaseAckQueue);
+    gReleaseAckQueue = nullptr;
   }
   gRecvCallback = nullptr;
   gSyncWindowOpen = false;

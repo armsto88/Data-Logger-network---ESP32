@@ -35,11 +35,10 @@ static constexpr const char* DEFAULT_PROJECT_ID =
     "65a72fab-6014-4159-9198-575d695db66a";
 
 // Default device API key (sent as Authorization: Bearer).  Pre-loaded so the
-// unit can upload without typing the key on a phone.  NOTE: this key should
-// be entered via the Settings page / QR string in production — do NOT commit
-// real API keys to source control.  This empty default forces the user to
-// enter a key on first setup.
-static constexpr const char* DEFAULT_API_KEY = "";
+// unit can upload without typing the key on a phone.  A key entered via the
+// Settings page / QR string overrides this.
+static constexpr const char* DEFAULT_API_KEY =
+    "fm_bkyd_001_b3d189ae-8b1a-4c2a-8dc8-2b6730d90567";
 
 // ---------------------------------------------------------------------------
 // Settings struct
@@ -74,6 +73,11 @@ void saveTransmissionSettings(const TransmissionSettings& s);
 
 // Serialise settings as JSON for the web UI.
 String transmissionSettingsToJson(const TransmissionSettings& s);
+
+// Serialise the subset of settings the backend wants in status.transmission.
+// Excludes secrets (apiKey/authToken) and server-derived IDs
+// (mothershipId/projectId) — only the 9 fields the ingest schema stores.
+String buildTransmissionStatusJson(const TransmissionSettings& s);
 
 // Build the full upload URL: endpointUrl + ?token=xxx&siteId=yyy&deploymentId=zzz
 String buildUploadUrl(const TransmissionSettings& s);

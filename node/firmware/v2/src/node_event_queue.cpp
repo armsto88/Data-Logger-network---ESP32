@@ -23,6 +23,10 @@ NodeEventType toNodeEventType(IncomingMessageType type) {
     case IncomingMessageType::TIME_SYNC:         return NodeEventType::TIME_SYNC;
     case IncomingMessageType::CONFIG_SNAPSHOT:   return NodeEventType::CONFIG_SNAPSHOT;
     case IncomingMessageType::SNAPSHOT_ACK:      return NodeEventType::SNAPSHOT_ACK;
+    case IncomingMessageType::NODE_CONFIG:       return NodeEventType::NODE_CONFIG;
+    case IncomingMessageType::SYNC_SESSION:      return NodeEventType::SYNC_SESSION;
+    case IncomingMessageType::DUMP_GRANT:        return NodeEventType::DUMP_GRANT;
+    case IncomingMessageType::SYNC_RELEASE:      return NodeEventType::SYNC_RELEASE;
     case IncomingMessageType::INVALID:
     default:                                     return NodeEventType::DISCOVERY_RESPONSE;
   }
@@ -81,6 +85,23 @@ void forceTermination(NodeEvent& ev) {
       ev.payload.snapshotAck.command[sizeof(ev.payload.snapshotAck.command) - 1] = '\0';
       ev.payload.snapshotAck.nodeId[sizeof(ev.payload.snapshotAck.nodeId) - 1] = '\0';
       break;
+    case NodeEventType::NODE_CONFIG:
+      ev.payload.nodeConfig.command[sizeof(ev.payload.nodeConfig.command) - 1] = '\0';
+      ev.payload.nodeConfig.nodeId[sizeof(ev.payload.nodeConfig.nodeId) - 1] = '\0';
+      ev.payload.nodeConfig.mothership_id[sizeof(ev.payload.nodeConfig.mothership_id) - 1] = '\0';
+      break;
+    case NodeEventType::SYNC_SESSION:
+      ev.payload.syncSession.command[sizeof(ev.payload.syncSession.command) - 1] = '\0';
+      ev.payload.syncSession.mothership_id[sizeof(ev.payload.syncSession.mothership_id) - 1] = '\0';
+      break;
+    case NodeEventType::DUMP_GRANT:
+      ev.payload.dumpGrant.command[sizeof(ev.payload.dumpGrant.command) - 1] = '\0';
+      ev.payload.dumpGrant.nodeId[sizeof(ev.payload.dumpGrant.nodeId) - 1] = '\0';
+      break;
+    case NodeEventType::SYNC_RELEASE:
+      ev.payload.syncRelease.command[sizeof(ev.payload.syncRelease.command) - 1] = '\0';
+      ev.payload.syncRelease.nodeId[sizeof(ev.payload.syncRelease.nodeId) - 1] = '\0';
+      break;
   }
 }
 
@@ -130,6 +151,22 @@ bool copyPayload(NodeEvent& ev, IncomingMessageType type, const uint8_t* data, s
     case IncomingMessageType::SNAPSHOT_ACK:
       if (len != sizeof(snapshot_ack_t)) return false;
       copyPacket(ev.payload.snapshotAck, data);
+      break;
+    case IncomingMessageType::NODE_CONFIG:
+      if (len != sizeof(node_config_message_t)) return false;
+      copyPacket(ev.payload.nodeConfig, data);
+      break;
+    case IncomingMessageType::SYNC_SESSION:
+      if (len != sizeof(sync_session_open_message_t)) return false;
+      copyPacket(ev.payload.syncSession, data);
+      break;
+    case IncomingMessageType::DUMP_GRANT:
+      if (len != sizeof(dump_grant_message_t)) return false;
+      copyPacket(ev.payload.dumpGrant, data);
+      break;
+    case IncomingMessageType::SYNC_RELEASE:
+      if (len != sizeof(sync_release_message_t)) return false;
+      copyPacket(ev.payload.syncRelease, data);
       break;
     case IncomingMessageType::INVALID:
     default:

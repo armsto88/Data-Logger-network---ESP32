@@ -35,15 +35,25 @@ struct StatusContext {
   uint32_t rowsUploaded;        // status.upload.rowsUploaded
   uint8_t  retryCount;          // status.upload.retryCount
   uint32_t lastUploadUnix;      // status.upload.lastUploadUnix
-  const char* firmwareVersion;  // (carried for meta; not emitted in status)
-  const char* firmwareBuild;    // (unused in status now)
-  uint32_t rtcUnix;             // status.rtcUnix
+  const char* firmwareVersion;  // meta.firmwareVersion
+  const char* firmwareBuild;    // meta.firmwareBuild
+  uint32_t rtcUnix;             // status.rtcUnix (also meta.uploadTimeUnix)
   String   deviceId;            // status.deviceId (MAC string)
   uint16_t fleetPending;        // status.fleet.pending
   bool     uploadEnabled;       // status.upload.enabled
   uint32_t dataLogRecords;      // status.dataLog.records
   uint64_t dataLogCsvBytes;     // status.dataLog.csvSizeBytes
   String   dataLogLastSync;     // status.dataLog.lastConfirmedSync
+  // --- Extended fields (full backend spec) ---
+  String   nodesJson;           // status.nodes[] — pre-built "[...]" array
+  String   transmissionJson;    // status.transmission{} — pre-built "{...}"
+  String   syncDailyTime;       // status.syncDailyTime ("HH:MM", "" in interval mode)
+  uint32_t pendingBytes;        // status.upload.pendingBytes
+  uint32_t projectStartedUnix;  // status.projectStarted (0 = unknown)
+  const char* lastUploadResult; // status.lastUploadResult ("success"/"failed"/"pending")
+  String   modemJson;           // status.modem{} — pre-built "{...}" ("" = omit)
+  String   diagnosticsJson;     // status.diagnostics{} — pre-built "{...}" ("" = omit)
+  uint16_t fleetPaused;         // status.fleet.paused (deployed nodes in standby)
 };
 
 // ---------------------------------------------------------------------------

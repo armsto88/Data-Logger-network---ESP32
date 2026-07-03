@@ -12,6 +12,7 @@
 #include <Arduino.h>
 #include <Wire.h>
 #include <esp_now.h>
+#include <esp_system.h>  // esp_reset_reason()
 #include <Preferences.h>
 #include <WiFi.h>
 
@@ -31,13 +32,24 @@
 #include "comms/modem_driver.h"
 #include "protocol.h"
 
+// Enlarge the Arduino loop task stack (default 8 KB). The sync-wake upload
+// builds the full status+JSON payload (nodes[], modem diagnostics, transmission,
+// etc.) while handleSyncWake's large frame — snapshot buffers, node-config
+// vector, ACK array — is still live beneath it, which overflowed the 8 KB
+// stack and reset the board mid-upload. 16 KB gives comfortable headroom
+// (RAM usage is ~14%). Must be at global scope.
+SET_LOOP_TASK_STACK_SIZE(16 * 1024);
+
 // ---------------------------------------------------------------------------
 // Configuration
 // ---------------------------------------------------------------------------
 #ifndef DEFAULT_SYNC_INTERVAL_MIN
 #define DEFAULT_SYNC_INTERVAL_MIN 60
 #endif
-static constexpr uint32_t kSyncSessionLimitMs = 180000UL;
+// Total sync-wake budget (ESP-NOW listen window + modem upload). Raised from
+// 180 s so that when a node is missing and the ESP-NOW window runs its full
+// 120 s, the modem still has ~180 s to power on, register and upload.
+static constexpr uint32_t kSyncSessionLimitMs = 300000UL;  // 5 min
 
 // ---------------------------------------------------------------------------
 // Upload subsystem globals
@@ -47,6 +59,12 @@ UploadQueue uploadQueue;
 // Project started — first-ever boot timestamp (set once in NVS, never
 // overwritten).  Populated in setup() for dashboard/status reporting.
 uint32_t g_projectStartedUnix = 0;
+
+// Boot diagnostics — captured once in setup(), reported in status.diagnostics.
+// g_resetReasonStr is the human-readable esp_reset_reason(); g_bootCount is a
+// monotonic power-on counter persisted in NVS namespace "diag".
+String   g_resetReasonStr = "UNKNOWN";
+uint32_t g_bootCount = 0;
 
 // gSyncIntervalMin is now owned by config_server.cpp (loaded from NVS in
 // config mode).  In sync-wake mode it falls back to the compile-time default
@@ -98,19 +116,6 @@ static void boundedRetryAndShutdown(const char* context) {
 // ---------------------------------------------------------------------------
 // ESP-NOW snapshot processing (main task only)
 // ---------------------------------------------------------------------------
-static bool ensureSnapshotAckPeer(const uint8_t* mac) {
-  if (!mac) return false;
-
-  esp_now_peer_info_t peer{};
-  memcpy(peer.peer_addr, mac, 6);
-  peer.channel = ESPNOW_CHANNEL;
-  peer.ifidx = WIFI_IF_STA;
-  peer.encrypt = false;
-
-  esp_err_t addResult = esp_now_add_peer(&peer);
-  return addResult == ESP_OK || addResult == ESP_ERR_ESPNOW_EXIST;
-}
-
 static void sendSnapshotAck(const uint8_t* mac, const DecodedSnapshot& decoded, bool persisted) {
   if (!mac) return;
 
@@ -121,18 +126,12 @@ static void sendSnapshotAck(const uint8_t* mac, const DecodedSnapshot& decoded, 
   ack.persisted = persisted ? 1 : 0;
   ack.protocolVersion = decoded.protocolVersion;
 
-  if (!ensureSnapshotAckPeer(mac)) {
-    Serial.printf("[SNAP-ACK] peer add failed for %.15s seq=%lu\n",
-                  decoded.nodeId, static_cast<unsigned long>(decoded.seqNum));
-    return;
-  }
-
-  esp_err_t sendResult = esp_now_send(mac, reinterpret_cast<const uint8_t*>(&ack), sizeof(ack));
+  const bool sendResult = sendSnapshotAckNow(mac, ack);
   Serial.printf("[SNAP-ACK] %.15s seq=%lu persisted=%u proto=%u send=%s\n",
                 ack.nodeId, static_cast<unsigned long>(ack.seqNum),
                 static_cast<unsigned>(ack.persisted),
                 (unsigned)ack.protocolVersion,
-                sendResult == ESP_OK ? "OK" : esp_err_to_name(sendResult));
+                sendResult ? "OK" : "FAIL");
 }
 
 void processSnapshot(const DecodedSnapshot& decoded, const uint8_t* mac) {
@@ -175,6 +174,23 @@ void processSnapshot(const DecodedSnapshot& decoded, const uint8_t* mac) {
       if (decoded.configVersion > 0 && decoded.configVersion > n.configVersionApplied) {
         n.configVersionApplied = decoded.configVersion;
       }
+      // Configured-sensor fault detection. A configured sensor whose channel is
+      // absent from this snapshot (node emits a reading only on a successful
+      // read) faults after two consecutive misses, so a single transient read
+      // doesn't flap the dashboard. expectedSensorMask holds capability bits only.
+      {
+        const uint16_t present  = decoded.sensorPresent;
+        const uint16_t expected = n.expectedSensorMask;  // capability bits, no VALID
+        const uint16_t missNow  = (uint16_t)(expected & ~present);
+        n.sensorFaultMask   = (uint16_t)(missNow & n.sensorMissPrev);
+        n.sensorMissPrev    = missNow;
+        n.lastSensorPresent = present;
+        if (n.sensorFaultMask) {
+          Serial.printf("[SNAP] %.15s sensor fault mask=0x%04X (expected=0x%04X present=0x%04X)\n",
+                        decoded.nodeId, (unsigned)n.sensorFaultMask,
+                        (unsigned)expected, (unsigned)present);
+        }
+      }
       break;
     }
   }
@@ -192,6 +208,312 @@ void processSnapshot(const node_snapshot_t* snap, const uint8_t* mac) {
   processSnapshot(decoded, mac);
 }
 
+struct ActiveSyncNode {
+  uint8_t mac[6] = {0};
+  char nodeId[16] = {0};
+  uint8_t queueDepth = 0;
+  uint8_t failedGrants = 0;
+  bool released = false;
+  bool releaseConfirmed = false;
+};
+
+struct LegacyRendezvousState {
+  bool active = false;
+  uint16_t intervalMin = 0;
+  uint32_t phaseUnix = 0;
+  uint8_t remainingCycles = 0;
+};
+
+static LegacyRendezvousState loadLegacyRendezvousState() {
+  LegacyRendezvousState state{};
+  Preferences prefs;
+  if (!prefs.begin("sync_grace", true)) return state;
+  state.active = prefs.getBool("active", false);
+  state.intervalMin = prefs.getUShort("old_min", 0);
+  state.phaseUnix = prefs.getULong("old_phase", 0);
+  state.remainingCycles = prefs.getUChar("remaining", 0);
+  prefs.end();
+  if (state.intervalMin == 0 || state.phaseUnix < 1704067200UL ||
+      state.remainingCycles == 0) {
+    state = {};
+  }
+  return state;
+}
+
+static void saveLegacyRendezvousState(const LegacyRendezvousState& state) {
+  Preferences prefs;
+  if (!prefs.begin("sync_grace", false)) return;
+  prefs.putBool("active", state.active && state.remainingCycles > 0);
+  prefs.putUShort("old_min", state.intervalMin);
+  prefs.putULong("old_phase", state.phaseUnix);
+  prefs.putUChar("remaining", state.remainingCycles);
+  prefs.end();
+}
+
+static bool wakeMatchesRendezvous(uint32_t nowUnix, uint16_t intervalMin,
+                                  uint32_t phaseUnix) {
+  if (intervalMin == 0 || phaseUnix == 0 || nowUnix < phaseUnix) return false;
+  const uint32_t period = (uint32_t)intervalMin * 60UL;
+  const uint32_t remainder = (nowUnix - phaseUnix) % period;
+  return remainder <= 120UL || (period - remainder) <= 120UL;
+}
+
+static uint32_t nextRendezvousUnix(uint32_t nowUnix, uint16_t intervalMin,
+                                   uint32_t phaseUnix) {
+  if (intervalMin == 0) return UINT32_MAX;
+  const uint32_t period = (uint32_t)intervalMin * 60UL;
+  if (phaseUnix == 0) return nowUnix + period;
+  if (nowUnix < phaseUnix) return phaseUnix;
+  const uint32_t slots = (nowUnix - phaseUnix) / period;
+  return phaseUnix + (slots + 1UL) * period;
+}
+
+static void drainAndPersistSnapshots() {
+  EspNowSnapSlot slots[8];
+  int drained = 0;
+  do {
+    drained = drainSnapQueue(slots, 8);
+    for (int i = 0; i < drained; ++i) {
+      processSnapshot(&slots[i].snap, slots[i].mac);
+    }
+  } while (drained > 0);
+}
+
+static int findActiveSyncNode(const std::vector<ActiveSyncNode>& nodes,
+                              const uint8_t* mac, const char* nodeId) {
+  for (size_t i = 0; i < nodes.size(); ++i) {
+    if ((mac && memcmp(nodes[i].mac, mac, 6) == 0) ||
+        (nodeId && strncmp(nodes[i].nodeId, nodeId, sizeof(nodes[i].nodeId)) == 0)) {
+      return (int)i;
+    }
+  }
+  return -1;
+}
+
+static void runCoordinatedSyncWindow(
+    uint32_t sessionStartMs, bool& sessionTimedOut,
+    const std::vector<node_config_message_t>& nodeCfgs,
+    uint16_t activeSyncMin, uint32_t activeSyncPhase,
+    uint8_t legacyGraceCycles) {
+  static constexpr uint32_t kJoinWindowMs = 12000UL;
+  static constexpr uint32_t kCoordinatedWindowMs = 105000UL;
+  static constexpr uint16_t kGrantWindowMs = 9000U;
+  static constexpr uint8_t kGrantQuota = 4;
+
+  int deployedCount = 0;
+  for (const auto& node : registeredNodes) {
+    if (node.state == DEPLOYED) deployedCount++;
+  }
+
+  const uint32_t syncStartMs = millis();
+  const uint32_t syncBudgetMs = (uint32_t)SYNC_WINDOW_MS < kCoordinatedWindowMs
+      ? (uint32_t)SYNC_WINDOW_MS : kCoordinatedWindowMs;
+  const uint32_t syncDeadlineMs = syncStartMs + syncBudgetMs;
+  uint32_t sessionId = getRTCTime() ^ esp_random();
+  if (sessionId == 0) sessionId = 1;
+
+  sync_session_open_message_t sessionOpen{};
+  strncpy(sessionOpen.command, "SYNC_SESSION", sizeof(sessionOpen.command) - 1);
+  sessionOpen.sessionId = sessionId;
+  sessionOpen.joinWindowMs = (uint16_t)kJoinWindowMs;
+  // Nodes start their local timer when they hear a beacon, possibly near the
+  // end of rendezvous. Leave a 15 s release margin beyond our grant deadline.
+  sessionOpen.sessionWindowSec = (uint16_t)((syncBudgetMs + 15000UL) / 1000UL);
+  strncpy(sessionOpen.mothership_id, "M001", sizeof(sessionOpen.mothership_id) - 1);
+
+  std::vector<ActiveSyncNode> responders;
+  auto collectHellos = [&]() {
+    SyncHelloSlot hellos[8];
+    int count = 0;
+    do {
+      count = drainSyncHellos(hellos, 8);
+      for (int i = 0; i < count; ++i) {
+        hellos[i].hello.nodeId[sizeof(hellos[i].hello.nodeId) - 1] = '\0';
+        bool authorized = false;
+        for (const auto& registered : registeredNodes) {
+          if (registered.state == DEPLOYED &&
+              memcmp(registered.mac, hellos[i].mac, 6) == 0 &&
+              registered.nodeId == String(hellos[i].hello.nodeId)) {
+            authorized = true;
+            break;
+          }
+        }
+        if (!authorized) {
+          Serial.printf("[SYNC] ignored HELLO from unregistered/mismatched node %.15s\n",
+                        hellos[i].hello.nodeId);
+          continue;
+        }
+        int existing = findActiveSyncNode(responders, hellos[i].mac,
+                                          hellos[i].hello.nodeId);
+        if (existing < 0) {
+          ActiveSyncNode responder{};
+          memcpy(responder.mac, hellos[i].mac, 6);
+          strncpy(responder.nodeId, hellos[i].hello.nodeId,
+                  sizeof(responder.nodeId) - 1);
+          responder.queueDepth = hellos[i].hello.queueDepth;
+          responders.push_back(responder);
+          Serial.printf("[SYNC] roster +%.15s queue=%u\n", responder.nodeId,
+                        (unsigned)responder.queueDepth);
+        } else {
+          responders[(size_t)existing].queueDepth = hellos[i].hello.queueDepth;
+        }
+      }
+    } while (count > 0);
+  };
+
+  if (millis() - sessionStartMs > kSyncSessionLimitMs) {
+    Serial.println("[WATCHDOG] Session timeout before ESP-NOW rendezvous");
+    sessionTimedOut = true;
+    return;
+  }
+
+  // Bounded rendezvous. Control/config frames are paced by the ESP-NOW send
+  // callback; no node receives permission to dump during this collection phase.
+  uint32_t lastBeaconMs = 0;
+  uint32_t lastConfigBurstMs = 0;
+  while ((uint32_t)(millis() - syncStartMs) < kJoinWindowMs) {
+    const uint32_t nowMs = millis();
+    if (lastBeaconMs == 0 || (uint32_t)(nowMs - lastBeaconMs) >= 1000UL) {
+      broadcastSyncWindowOpen();  // rolling-upgrade compatibility
+      broadcastSyncSessionOpen(sessionOpen);
+      lastBeaconMs = millis();
+    }
+    if (lastConfigBurstMs == 0 || (uint32_t)(nowMs - lastConfigBurstMs) >= 6000UL) {
+      for (const auto& cfg : nodeCfgs) broadcastNodeConfigNow(cfg);
+      // Repeat the active schedule at every rendezvous. A node waking on an old
+      // grace slot therefore gets another migration opportunity.
+      broadcastSyncScheduleNow(activeSyncMin, activeSyncPhase);
+      lastConfigBurstMs = millis();
+    }
+    collectHellos();
+    drainAndPersistSnapshots();
+    delay(5);
+  }
+
+  collectHellos();
+  Serial.printf("[SYNC] rendezvous closed: responders=%u deployed=%d\n",
+                (unsigned)responders.size(), deployedCount);
+
+  auto releaseNode = [&](ActiveSyncNode& responder) {
+    if (responder.released) return;
+    sync_release_message_t release{};
+    strncpy(release.command, "SYNC_RELEASE", sizeof(release.command) - 1);
+    strncpy(release.nodeId, responder.nodeId, sizeof(release.nodeId) - 1);
+    release.sessionId = sessionId;
+    release.mothershipUnix = getRTCTime();
+    release.syncPhaseUnix = activeSyncPhase;
+    release.syncIntervalMin = activeSyncMin;
+    release.legacyGraceCycles = legacyGraceCycles;
+    release.flags = legacyGraceCycles > 0 ? 0x01 : 0x00;
+    responder.released = sendSyncRelease(responder.mac, release);
+
+    const uint32_t ackDeadlineMs = millis() + 1200UL;
+    while (responder.released && !responder.releaseConfirmed &&
+           (int32_t)(ackDeadlineMs - millis()) > 0) {
+      drainAndPersistSnapshots();
+      SyncReleaseAckSlot ackSlots[8];
+      const int ackCount = drainReleaseAcks(ackSlots, 8);
+      for (int i = 0; i < ackCount; ++i) {
+        if (ackSlots[i].ack.sessionId == sessionId &&
+            memcmp(ackSlots[i].mac, responder.mac, 6) == 0) {
+          responder.releaseConfirmed = ackSlots[i].ack.scheduleApplied == 1;
+          responder.queueDepth = ackSlots[i].ack.remainingRecords;
+        }
+      }
+      delay(5);
+    }
+    Serial.printf("[SYNC] release node=%.15s sent=%u confirmed=%u remaining=%u\n",
+                  responder.nodeId, responder.released ? 1 : 0,
+                  responder.releaseConfirmed ? 1 : 0,
+                  (unsigned)responder.queueDepth);
+    // The ESP-NOW peer table is limited. Peers are re-added on demand for a
+    // later grace/session wake, so release the slot immediately.
+    esp_now_del_peer(responder.mac);
+  };
+
+  // Empty nodes can be clock/schedule synchronized and released immediately.
+  for (auto& responder : responders) {
+    if (responder.queueDepth == 0) releaseNode(responder);
+  }
+
+  uint32_t releaseReserveMs = 3000UL + (uint32_t)responders.size() * 1600UL;
+  if (releaseReserveMs > 30000UL) releaseReserveMs = 30000UL;
+  const uint32_t grantStopMs = syncDeadlineMs - releaseReserveMs;
+
+  uint16_t nextGrantId = 1;
+  bool madeProgress = true;
+  while (madeProgress && (int32_t)(grantStopMs - millis()) > 0) {
+    madeProgress = false;
+    for (auto& responder : responders) {
+      if (responder.released || responder.queueDepth == 0 ||
+          responder.failedGrants >= 2 ||
+          (int32_t)(grantStopMs - millis()) <= (int32_t)kGrantWindowMs) {
+        continue;
+      }
+
+      dump_grant_message_t grant{};
+      strncpy(grant.command, "DUMP_GRANT", sizeof(grant.command) - 1);
+      strncpy(grant.nodeId, responder.nodeId, sizeof(grant.nodeId) - 1);
+      grant.sessionId = sessionId;
+      grant.grantId = nextGrantId++;
+      grant.maxRecords = kGrantQuota;
+      grant.grantWindowMs = kGrantWindowMs;
+      if (!sendDumpGrant(responder.mac, grant)) {
+        responder.failedGrants++;
+        Serial.printf("[SYNC] grant send failed node=%.15s failures=%u\n",
+                      responder.nodeId, (unsigned)responder.failedGrants);
+        continue;
+      }
+
+      Serial.printf("[SYNC] grant node=%.15s id=%u quota=%u reportedQueue=%u\n",
+                    responder.nodeId, (unsigned)grant.grantId,
+                    (unsigned)grant.maxRecords, (unsigned)responder.queueDepth);
+      const uint32_t grantDeadlineMs = millis() + kGrantWindowMs + 1200UL;
+      bool doneMatched = false;
+      while (!doneMatched && (int32_t)(grantDeadlineMs - millis()) > 0 &&
+             (int32_t)(grantStopMs - millis()) > 0) {
+        drainAndPersistSnapshots();
+        SyncDoneSlot doneSlots[8];
+        const int doneCount = drainDumpDone(doneSlots, 8);
+        for (int i = 0; i < doneCount; ++i) {
+          if (doneSlots[i].done.sessionId == sessionId &&
+              doneSlots[i].done.grantId == grant.grantId &&
+              memcmp(doneSlots[i].mac, responder.mac, 6) == 0) {
+            responder.queueDepth = doneSlots[i].done.remainingRecords;
+            doneMatched = true;
+            madeProgress = madeProgress || doneSlots[i].done.sentRecords > 0;
+            Serial.printf("[SYNC] done node=%.15s sent=%u remaining=%u status=%u\n",
+                          responder.nodeId,
+                          (unsigned)doneSlots[i].done.sentRecords,
+                          (unsigned)doneSlots[i].done.remainingRecords,
+                          (unsigned)doneSlots[i].done.status);
+          }
+        }
+        delay(5);
+      }
+      drainAndPersistSnapshots();
+      if (!doneMatched) {
+        responder.failedGrants++;
+        Serial.printf("[SYNC] grant timeout node=%.15s failures=%u\n",
+                      responder.nodeId, (unsigned)responder.failedGrants);
+      } else if (responder.queueDepth == 0) {
+        releaseNode(responder);
+      }
+      if (!responder.released) esp_now_del_peer(responder.mac);
+    }
+  }
+
+  // Release every responder individually, even with backlog remaining. The
+  // node keeps unsent records but still receives time and the active schedule.
+  for (auto& responder : responders) {
+    releaseNode(responder);
+  }
+
+  drainAndPersistSnapshots();
+  Serial.printf("[SYNC] coordinated window complete: responders=%u drops=%lu\n",
+                (unsigned)responders.size(), (unsigned long)getSnapDropCount());
+}
+
 // ---------------------------------------------------------------------------
 // Modem upload sequence (called from handleSyncWake when txSettings.enabled)
 // ---------------------------------------------------------------------------
@@ -203,6 +525,12 @@ void performModemUpload(const TransmissionSettings& txSettings, uint32_t session
       txSettings.uploadIntervalMin :
       static_cast<uint32_t>(gSyncIntervalMin > 0 ? gSyncIntervalMin : DEFAULT_SYNC_INTERVAL_MIN);
   const uint32_t retryCooldownSec = retryIntervalMin * 60UL;
+
+  // Sample the battery at REST, before the modem rail comes up.  The A7670G
+  // draws heavy (amp-level) current during TX, sagging the rail, so a reading
+  // taken mid-upload badly understates the true state of charge.  status.batV
+  // uses this; the loaded reading is captured later as diagnostics.batLoadedV.
+  const float restingBatV = readBatteryVoltage();
 
   ModemDriver modem;
   modem.init();
@@ -226,12 +554,14 @@ void performModemUpload(const TransmissionSettings& txSettings, uint32_t session
 
   // 2. Wait for network registration (60s timeout — will fail without antenna)
   Serial.println("[UPLOAD] Waiting for network registration (60s timeout)...");
+  const uint32_t regStartMs = millis();
   if (!modem.waitForNetwork(60000)) {
     Serial.println("[UPLOAD] Network registration failed/timeout — skipping upload");
     modem.gracefulShutdown();
     uploadQueue.incrementRetryCount(retryNowUnix, retryCooldownSec);
     return;
   }
+  const uint32_t regTimeMs = millis() - regStartMs;
   Serial.println("[UPLOAD] Network registered");
   if (sessionExpired()) {
     Serial.println("[WATCHDOG] Session timeout after network registration - forcing shutdown");
@@ -270,16 +600,38 @@ void performModemUpload(const TransmissionSettings& txSettings, uint32_t session
       ? (uint32_t)((fsUsed * 100ULL) / fsTotal) : 0;
     const UploadCursor statusCursor = uploadQueue.getCursor();
     const auto allNodes = getRegisteredNodes();
-    uint16_t fTotal = 0, fDeployed = 0, fPaired = 0, fUnpaired = 0, fPending = 0;
+    uint16_t fTotal = 0, fDeployed = 0, fPaired = 0, fUnpaired = 0, fPending = 0, fPaused = 0;
     for (const auto& n : allNodes) {
       fTotal++;
       if (n.state == DEPLOYED) fDeployed++;
       else if (n.state == PAIRED) fPaired++;
       else fUnpaired++;
       if (n.stateChangePending || n.deployPending) fPending++;
+      if (n.state == DEPLOYED && n.recordingPaused) fPaused++;
     }
+    const char* statusLastResult =
+        (statusCursor.lastUploadUnix > 0 && statusCursor.retryCount == 0) ? "success"
+        : (statusCursor.retryCount > 0) ? "failed" : "pending";
+
+    // Radio link quality + modem identity (queried live while registered).
+    ModemDiagnostics mdiag;
+    modem.getDiagnostics(mdiag);
+    const String modemJson = modemDiagnosticsToJson(mdiag, regTimeMs);
+    // Mothership system health. batLoadedV is sampled NOW (modem on) — the
+    // sag vs status.batVoltage (resting) is a battery/regulator health signal.
+    const float loadedBatV = readBatteryVoltage();
+    const String diagJson =
+        String("{\"resetReason\":\"") + g_resetReasonStr +
+        "\",\"bootCount\":" + String(g_bootCount) +
+        ",\"freeHeap\":" + String((unsigned)ESP.getFreeHeap()) +
+        ",\"minFreeHeap\":" + String((unsigned)ESP.getMinFreeHeap()) +
+        ",\"snapQueueDropped\":" + String((unsigned)getSnapDropCount()) +
+        ",\"batLoadedV\":" +
+        (isnan(loadedBatV) ? String("null") : String(loadedBatV, 2)) +
+        ",\"sessionMs\":" + String((unsigned)(millis() - sessionStartMs)) + "}";
+
     const StatusContext statusCtx = {
-      readBatteryVoltage(), flashPct, fsTotal, fsUsed,
+      restingBatV, flashPct, fsTotal, fsUsed,
       "scheduled", computeNextSyncIsoLocal(),
       gWakeIntervalMin, gSyncIntervalMin,
       (gSyncMode == SYNC_MODE_INTERVAL) ? "interval" : "daily",
@@ -289,7 +641,17 @@ void performModemUpload(const TransmissionSettings& txSettings, uint32_t session
       FW_VERSION, FW_BUILD, getRTCTime(),
       WiFi.macAddress(),
       fPending, txSettings.enabled,
-      uploadQueue.getPendingRows(), (uint64_t)getCSVFileSize(), String("")
+      uploadQueue.getPendingRows(), (uint64_t)getCSVFileSize(), String(""),
+      buildNodesStatusJson(nowUnix),
+      buildTransmissionStatusJson(txSettings),
+      (gSyncMode == SYNC_MODE_DAILY)
+          ? formatSyncTimeHHMM(gSyncDailyHour, gSyncDailyMinute) : String(""),
+      uploadQueue.getPendingBytes(),
+      g_projectStartedUnix,
+      statusLastResult,
+      modemJson,
+      diagJson,
+      fPaused
     };
 
     while (uploadQueue.getPendingRows() > 0 && !sessionExpired()) {
@@ -331,7 +693,8 @@ void performModemUpload(const TransmissionSettings& txSettings, uint32_t session
           Serial.printf("[UPLOAD] CSV fallback SUCCESS: HTTP 200, %u bytes\n",
                         payload.byteLength);
           nowUnix = getRTCTime();
-          uploadQueue.advanceCursor(payload.startOffset + payload.byteLength, nowUnix);
+          uploadQueue.advanceCursor(payload.startOffset + payload.byteLength, nowUnix,
+                                    payload.rowEstimate);
           uploadQueue.purgeUploaded();
           uploadQueue.resetRetryCount();
           anyJsonSuccess = true;
@@ -375,7 +738,8 @@ void performModemUpload(const TransmissionSettings& txSettings, uint32_t session
         Serial.printf("[UPLOAD] JSON SUCCESS: HTTP 200, %u readings\n",
                       (unsigned)json.rowCount);
         nowUnix = getRTCTime();
-        uploadQueue.advanceCursor(payload.startOffset + json.csvBytesConsumed, nowUnix);
+        uploadQueue.advanceCursor(payload.startOffset + json.csvBytesConsumed, nowUnix,
+                                  json.rowCount);
         uploadQueue.purgeUploaded();
         uploadQueue.resetRetryCount();
         anyJsonSuccess = true;
@@ -442,7 +806,8 @@ void performModemUpload(const TransmissionSettings& txSettings, uint32_t session
   if (result.success) {
     Serial.printf("[UPLOAD] SUCCESS: HTTP %d, %u bytes uploaded\n", result.httpStatus, payload.byteLength);
     uint32_t nowUnix = getRTCTime();
-    uploadQueue.advanceCursor(payload.startOffset + payload.byteLength, nowUnix);
+    uploadQueue.advanceCursor(payload.startOffset + payload.byteLength, nowUnix,
+                              payload.rowEstimate);
     uploadQueue.purgeUploaded();
     uploadQueue.resetRetryCount();
   } else {
@@ -489,6 +854,7 @@ void handleSyncWake() {
   const int newSyncIntervalMin = gSyncIntervalMin;  // desired (NEW) from NVS wake
   loadSyncRuntimeGuardsFromNVS();                   // loads OLD anchor into globals
   const int anchorSyncIntervalMin = gSyncIntervalMin;
+  const uint32_t anchorSyncPhaseUnix = (uint32_t)gLastSyncBroadcastUnix;
   gSyncIntervalMin = newSyncIntervalMin;            // restore NEW for upload policy
   const bool scheduleTransitionPending =
       (gSyncMode == SYNC_MODE_INTERVAL) &&
@@ -524,6 +890,37 @@ void handleSyncWake() {
     return;
   }
 
+  LegacyRendezvousState legacyRendezvous = loadLegacyRendezvousState();
+  if (legacyRendezvous.active &&
+      wakeMatchesRendezvous(getRTCTime(), legacyRendezvous.intervalMin,
+                            legacyRendezvous.phaseUnix)) {
+    if (legacyRendezvous.remainingCycles > 0) legacyRendezvous.remainingCycles--;
+    legacyRendezvous.active = legacyRendezvous.remainingCycles > 0;
+    saveLegacyRendezvousState(legacyRendezvous);
+    Serial.printf("[SYNC] legacy rendezvous serviced; remaining old cycles=%u\n",
+                  (unsigned)legacyRendezvous.remainingCycles);
+  }
+
+  if (scheduleTransitionPending) {
+    // The old schedule is now an explicit persisted recovery path, so it is
+    // safe to commit the new active anchor BEFORE radio handover. If power is
+    // lost mid-session, the mothership still wakes on both schedules.
+    legacyRendezvous.active = anchorSyncIntervalMin > 0 &&
+                              anchorSyncPhaseUnix >= 1704067200UL;
+    legacyRendezvous.intervalMin = (uint16_t)anchorSyncIntervalMin;
+    legacyRendezvous.phaseUnix = anchorSyncPhaseUnix;
+    legacyRendezvous.remainingCycles = legacyRendezvous.active ? 3U : 0U;
+    saveLegacyRendezvousState(legacyRendezvous);
+
+    gSyncIntervalMin = newSyncIntervalMin;
+    gLastSyncBroadcastUnix = transitionNewPhase;
+    saveSyncRuntimeGuardsToNVS();
+    Serial.printf("[SYNC] transition persisted before handover: active=%dmin phase=%lu old=%umin grace=%u\n",
+                  newSyncIntervalMin, (unsigned long)transitionNewPhase,
+                  (unsigned)legacyRendezvous.intervalMin,
+                  (unsigned)legacyRendezvous.remainingCycles);
+  }
+
   if (!initSD()) {
     Serial.println("[WARN] SD card init failed — continuing with flash if available");
   } else {
@@ -550,7 +947,7 @@ void handleSyncWake() {
   if (!initEspNowSyncOnly(ESPNOW_CHANNEL)) {
     Serial.println("[WARN] ESP-NOW init failed — sync window will be empty");
   }
-  initSnapQueue(8);
+  initSnapQueue(32);
 
   // Listen for node data for SYNC_WINDOW_MS
   // Broadcast SYNC_WINDOW_OPEN repeatedly every 5 seconds so nodes that wake
@@ -566,64 +963,54 @@ void handleSyncWake() {
 
   Serial.printf("[SYNC] Listening for %d ms (deployed nodes: %d)...\n", SYNC_WINDOW_MS, deployedCount);
 
-  unsigned long startMs = millis();
-  unsigned long lastBroadcastMs = 0;
-  const unsigned long kMinListenMs = 45000;  // minimum 45s — allows node to flush full queue
-
-  if (millis() - sessionStartMs > kSyncSessionLimitMs) {
-    Serial.println("[WATCHDOG] Session timeout before ESP-NOW listen - skipping window");
-    sessionTimedOut = true;
+  // Build the per-node NODE_CONFIG broadcasts once for this window. Each carries
+  // the node's durable desired state (recording interval + targetState +
+  // monotonic version). Nodes apply only a strictly newer version and ACK via
+  // CONFIG_ACK, so re-broadcasting every cadence tick is idempotent. This is the
+  // unified declarative delivery that replaces the old SET_SCHEDULE broadcast;
+  // the SYNC schedule still rides the SET_SYNC_SCHED transition handover below.
+  std::vector<node_config_message_t> nodeCfgs;
+  for (const auto& n : registeredNodes) {
+    NodeDesiredConfig dc = getDesiredConfig(n.nodeId.c_str());
+    // Broadcast to deployed nodes and to any node pending unpair.
+    if (n.state != DEPLOYED && dc.targetState != 0 /*UNPAIRED*/) continue;
+    node_config_message_t cfg{};
+    strncpy(cfg.command, "NODE_CONFIG", sizeof(cfg.command) - 1);
+    strncpy(cfg.nodeId, n.nodeId.c_str(), sizeof(cfg.nodeId) - 1);
+    strncpy(cfg.mothership_id, "M001", sizeof(cfg.mothership_id) - 1);
+    cfg.configVersion   = dc.configVersion;
+    cfg.targetState     = dc.targetState;   // 2=DEPLOYED, 0=UNPAIRED
+    cfg.wakeIntervalMin = dc.wakeIntervalMin ? dc.wakeIntervalMin
+                                             : (uint8_t)gWakeIntervalMin;
+    cfg.syncIntervalMin = (uint16_t)(gSyncIntervalMin > 0 ? gSyncIntervalMin : 15);
+    cfg.syncPhaseUnix   = 0;   // sync (A2) is governed by SET_SYNC_SCHED, not this
+    cfg.sensorMask      = dc.sensorMask;  // 0 = auto; else SNAP_PRESENT_* + VALID bit
+    // Refresh the RAM cache used by snapshot fault detection (strip the VALID bit
+    // to leave just the capability bits) so faults reflect the current selection.
+    setNodeExpectedSensorMask(n.nodeId.c_str(),
+        (dc.sensorMask & NODE_SENSOR_MASK_VALID)
+            ? (uint16_t)(dc.sensorMask & ~NODE_SENSOR_MASK_VALID) : 0);
+    nodeCfgs.push_back(cfg);
   }
+  Serial.printf("[SYNC] NODE_CONFIG broadcasts prepared: %u node(s)\n",
+                (unsigned)nodeCfgs.size());
 
-  while (!sessionTimedOut && millis() - startMs < SYNC_WINDOW_MS) {
-    if (millis() - sessionStartMs > kSyncSessionLimitMs) {
-      Serial.println("[WATCHDOG] Session timeout during ESP-NOW listen");
-      sessionTimedOut = true;
-      break;
-    }
-    // Re-broadcast sync window marker every 5 seconds
-    if (millis() - lastBroadcastMs >= 5000 || lastBroadcastMs == 0) {
-      broadcastSyncWindowOpen();
-      // Keep the fleet's RECORDING interval aligned. SET_SYNC_SCHED carries
-      // only the sync schedule, so the wake/recording interval must be pushed
-      // separately (SET_SCHEDULE). Broadcast it EVERY window (not just during a
-      // transition) — nodes apply it only when it differs, so it's idempotent,
-      // and a recording-interval change reaches the fleet on the next sync even
-      // after the sync-schedule transition has already committed.
-      if (gWakeIntervalMin > 0) {
-        broadcastWakeIntervalNow(gWakeIntervalMin);
-      }
-      // During a schedule transition, hand the NEW sync schedule to the fleet
-      // on the same cadence so every node that wakes within the window catches it.
-      if (scheduleTransitionPending) {
-        broadcastSyncScheduleNow(newSyncIntervalMin, transitionNewPhase);
-      }
-      lastBroadcastMs = millis();
-    }
-    EspNowSnapSlot slots[4];
-    int drained = drainSnapQueue(slots, 4);
-    for (int i = 0; i < drained; ++i) {
-      processSnapshot(&slots[i].snap, slots[i].mac);
-    }
-
-    // Check if all deployed nodes have synced (after minimum listen time)
-    if (deployedCount > 0 && (millis() - startMs) >= kMinListenMs) {
-      int syncedCount = 0;
-      for (const auto& n : registeredNodes) {
-        // A node is considered synced if it was seen recently (within this sync window)
-        if (n.state == DEPLOYED && n.isActive && (millis() - n.lastSeen) < kMinListenMs) {
-          syncedCount++;
-        }
-      }
-      if (syncedCount >= deployedCount) {
-        Serial.printf("[SYNC] All %d deployed nodes synced — shutting down early (after %lu ms)\n",
-                      syncedCount, millis() - startMs);
-        break;
-      }
-    }
-
-    delay(10);
+  const uint16_t activeSyncMin = (gSyncMode == SYNC_MODE_DAILY)
+      ? 0U
+      : (uint16_t)(newSyncIntervalMin > 0
+          ? newSyncIntervalMin : DEFAULT_SYNC_INTERVAL_MIN);
+  uint32_t activeSyncPhase = scheduleTransitionPending
+      ? transitionNewPhase : (uint32_t)gLastSyncBroadcastUnix;
+  if (gSyncMode == SYNC_MODE_DAILY && activeSyncPhase < 1704067200UL) {
+    DateTime now(getRTCTime());
+    activeSyncPhase = DateTime(now.year(), now.month(), now.day(),
+                               gSyncDailyHour, gSyncDailyMinute, 0).unixtime();
   }
+  const uint8_t releaseGraceCycles = scheduleTransitionPending
+      ? 3U : legacyRendezvous.remainingCycles;
+  runCoordinatedSyncWindow(sessionStartMs, sessionTimedOut, nodeCfgs,
+                           activeSyncMin, activeSyncPhase,
+                           releaseGraceCycles);
 
   Serial.println("[SYNC] Sync window closed");
 
@@ -640,6 +1027,55 @@ void handleSyncWake() {
       processSnapshot(&finalSlots[i].snap, finalSlots[i].mac);
     }
   } while (finalDrained > 0);
+
+  // --- NODE_CONFIG reconcile: process CONFIG_ACKs collected this window ---
+  // A node ACKs after applying a NODE_CONFIG. An UNPAIRED ack (version matched)
+  // is positive confirmation the node has wiped, so we remove it now — never on
+  // absence, so a node on a flaky link is never orphaned. A DEPLOYED ack just
+  // confirms convergence (the snapshot's configVersion echo also tracks this).
+  {
+    config_apply_ack_message_t acks[8];
+    const int nAcks = drainConfigAcks(acks, 8);
+    for (int i = 0; i < nAcks; ++i) {
+      const String ackNodeId = String(acks[i].nodeId);
+      NodeDesiredConfig dc = getDesiredConfig(ackNodeId.c_str());
+      if (dc.targetState == 0 /*UNPAIRED*/ && acks[i].ok == 1 &&
+          acks[i].appliedVersion >= dc.configVersion) {
+        Serial.printf("[SYNC] CONFIG_ACK unpair confirmed: %s v%u — removing node\n",
+                      ackNodeId.c_str(), (unsigned)acks[i].appliedVersion);
+        for (auto it = registeredNodes.begin(); it != registeredNodes.end(); ++it) {
+          if (it->nodeId == ackNodeId) {
+            esp_now_del_peer(it->mac);
+            registeredNodes.erase(it);
+            break;
+          }
+        }
+        // Reset desired config so a future re-pair of this ID is not auto-unpaired.
+        NodeDesiredConfig reset{};
+        reset.configVersion = 0; reset.wakeIntervalMin = 0;
+        reset.syncIntervalMin = 15; reset.syncPhaseUnix = 0; reset.targetState = 2;
+        setDesiredConfig(ackNodeId.c_str(), reset);
+        setNodeUserId(ackNodeId, ""); setNodeName(ackNodeId, ""); setNodeNotes(ackNodeId, "");
+        savePairedNodes();
+      } else if (acks[i].ok == 1 && acks[i].appliedVersion >= dc.configVersion) {
+        // Deployed/standby converged — reflect the confirmed recording state and
+        // clear the pending flag for the UI.
+        const bool nowPaused = (dc.targetState == 3 /*STANDBY*/);
+        for (auto& n : registeredNodes) {
+          if (n.nodeId == ackNodeId) {
+            n.recordingPaused = nowPaused;
+            n.stateChangePending = false;
+            n.pendingTargetState = PENDING_NONE;
+            break;
+          }
+        }
+        Serial.printf("[SYNC] CONFIG_ACK converged: %s v%u (%s)\n",
+                      ackNodeId.c_str(), (unsigned)acks[i].appliedVersion,
+                      nowPaused ? "STANDBY" : "ACTIVE");
+      }
+    }
+    if (nAcks > 0) savePairedNodes();  // persist confirmed paused/active state
+  }
 
   // Stop the WiFi-task producer before upload or purge code touches files.
   deinitEspNowSync();
@@ -711,6 +1147,8 @@ void handleSyncWake() {
       desiredSyncIntervalMin > 0 &&
       gSyncIntervalMin > 0 &&
       desiredSyncIntervalMin != gSyncIntervalMin) {
+    const uint16_t oldIntervalMin = (uint16_t)gSyncIntervalMin;
+    const uint32_t oldPhaseUnix = anchorSyncPhaseUnix;
     // Commit the transition. Re-anchor to the SAME minute-aligned phase that
     // was announced to the fleet (broadcastSyncScheduleNow above) so the
     // mothership and nodes arm to identical slot boundaries. The nodes applied
@@ -728,6 +1166,19 @@ void handleSyncWake() {
     gLastSyncBroadcastUnix = newPhase;
     gSyncIntervalMin = desiredSyncIntervalMin;
     saveSyncRuntimeGuardsToNVS();
+
+    // Keep three future appointments on the old cadence. This state is
+    // persisted independently of the active anchor so a reboot cannot strand
+    // a node that missed the first schedule handover.
+    legacyRendezvous.active = oldIntervalMin > 0 && oldPhaseUnix >= 1704067200UL;
+    legacyRendezvous.intervalMin = oldIntervalMin;
+    legacyRendezvous.phaseUnix = oldPhaseUnix;
+    legacyRendezvous.remainingCycles = legacyRendezvous.active ? 3U : 0U;
+    saveLegacyRendezvousState(legacyRendezvous);
+    Serial.printf("[SYNC] legacy rendezvous grace started: old=%umin phase=%lu cycles=%u\n",
+                  (unsigned)legacyRendezvous.intervalMin,
+                  (unsigned long)legacyRendezvous.phaseUnix,
+                  (unsigned)legacyRendezvous.remainingCycles);
   }
 
   if (gSyncMode == SYNC_MODE_DAILY) {
@@ -737,9 +1188,26 @@ void handleSyncWake() {
       return;
     }
   } else {
-    const int syncInterval = (gSyncIntervalMin > 0) ?
-                             gSyncIntervalMin : DEFAULT_SYNC_INTERVAL_MIN;
-    const uint32_t phaseUnix = static_cast<uint32_t>(gLastSyncBroadcastUnix);
+    int syncInterval = (gSyncIntervalMin > 0) ?
+                       gSyncIntervalMin : DEFAULT_SYNC_INTERVAL_MIN;
+    uint32_t phaseUnix = static_cast<uint32_t>(gLastSyncBroadcastUnix);
+    if (legacyRendezvous.active && legacyRendezvous.remainingCycles > 0) {
+      const uint32_t nowUnix = getRTCTime();
+      const uint32_t nextActive = nextRendezvousUnix(nowUnix,
+          (uint16_t)syncInterval, phaseUnix);
+      const uint32_t nextLegacy = nextRendezvousUnix(nowUnix,
+          legacyRendezvous.intervalMin, legacyRendezvous.phaseUnix);
+      if (nextLegacy < nextActive) {
+        syncInterval = legacyRendezvous.intervalMin;
+        phaseUnix = legacyRendezvous.phaseUnix;
+        Serial.printf("[SYNC] next alarm uses OLD rendezvous (%umin); %u grace cycles remain\n",
+                      (unsigned)legacyRendezvous.intervalMin,
+                      (unsigned)legacyRendezvous.remainingCycles);
+      } else {
+        Serial.printf("[SYNC] next alarm uses active rendezvous (%dmin); old grace still armed logically\n",
+                      syncInterval);
+      }
+    }
     if (!armNextSyncAlarmPhase(syncInterval, phaseUnix)) {
       Serial.println("[FATAL] Failed to arm next sync alarm - starting bounded recovery");
       boundedRetryAndShutdown("Sync alarm arm failed");
@@ -864,14 +1332,14 @@ void handleConfigWake() {
   Serial.println("[CFG-DBG] Step 10 done: startConfigServer");
   Serial.flush();
 
-  // Config server loop — exit from the web UI or on the 10-minute timeout.
+  // Config server loop — exit from the web UI or on the config timeout.
   unsigned long configStartMs = millis();
-  const unsigned long kConfigTimeoutMs = 10UL * 60UL * 1000UL;  // 10 min
+  const unsigned long kConfigTimeoutMs = 30UL * 60UL * 1000UL;  // 30 min
 
   // Config button is for WAKING only — not for exiting.
   // The SN74LVC2G74 latch bounces unpredictably, so we don't poll it for exit.
   // Exit is via web UI /shutdown route or 10-minute timeout.
-  Serial.println("[CONFIG] Config mode active. Use web UI Resume Sync button or wait 10 min.");
+  Serial.println("[CONFIG] Config mode active. Use web UI Resume Sync button or wait 30 min.");
 
   while (true) {
     configServerLoop();
@@ -883,9 +1351,9 @@ void handleConfigWake() {
       break;
     }
 
-    // Exit condition 2: 10-minute timeout
+    // Exit condition 2: config timeout
     if (millis() - configStartMs > kConfigTimeoutMs) {
-      Serial.println("[CONFIG] 10-min timeout reached — exiting config mode");
+      Serial.println("[CONFIG] config timeout reached — exiting config mode");
       break;
     }
 
@@ -1036,6 +1504,33 @@ void setup() {
     } else {
       Serial.println("[BOOT] Warning: could not open NVS \"tx\" for project-start");
     }
+  }
+
+  // Boot diagnostics — reset reason + monotonic boot counter.  Cheap early-
+  // warning signal: repeated BROWNOUT/WDT resets point at power/regulator or
+  // firmware-hang problems that are otherwise invisible from the dashboard.
+  {
+    switch (esp_reset_reason()) {
+      case ESP_RST_POWERON:   g_resetReasonStr = "POWERON";   break;
+      case ESP_RST_EXT:       g_resetReasonStr = "EXT";       break;
+      case ESP_RST_SW:        g_resetReasonStr = "SW";        break;
+      case ESP_RST_PANIC:     g_resetReasonStr = "PANIC";     break;
+      case ESP_RST_INT_WDT:   g_resetReasonStr = "INT_WDT";   break;
+      case ESP_RST_TASK_WDT:  g_resetReasonStr = "TASK_WDT";  break;
+      case ESP_RST_WDT:       g_resetReasonStr = "WDT";       break;
+      case ESP_RST_DEEPSLEEP: g_resetReasonStr = "DEEPSLEEP"; break;
+      case ESP_RST_BROWNOUT:  g_resetReasonStr = "BROWNOUT";  break;
+      case ESP_RST_SDIO:      g_resetReasonStr = "SDIO";      break;
+      default:                g_resetReasonStr = "UNKNOWN";   break;
+    }
+    Preferences dprefs;
+    if (dprefs.begin("diag", false)) {
+      g_bootCount = dprefs.getUInt("boot_count", 0) + 1;
+      dprefs.putUInt("boot_count", g_bootCount);
+      dprefs.end();
+    }
+    Serial.printf("[BOOT] Reset reason=%s bootCount=%u\n",
+                  g_resetReasonStr.c_str(), (unsigned)g_bootCount);
   }
 
   // Print battery voltage at boot

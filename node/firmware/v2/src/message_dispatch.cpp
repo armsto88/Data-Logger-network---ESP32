@@ -64,6 +64,10 @@ const char* incomingMessageTypeName(IncomingMessageType type) {
     case IncomingMessageType::TIME_SYNC:         return "TIME_SYNC";
     case IncomingMessageType::CONFIG_SNAPSHOT:   return "CONFIG_SNAPSHOT";
     case IncomingMessageType::SNAPSHOT_ACK:      return "SNAPSHOT_ACK";
+    case IncomingMessageType::NODE_CONFIG:       return "NODE_CONFIG";
+    case IncomingMessageType::SYNC_SESSION:      return "SYNC_SESSION";
+    case IncomingMessageType::DUMP_GRANT:        return "DUMP_GRANT";
+    case IncomingMessageType::SYNC_RELEASE:      return "SYNC_RELEASE";
     case IncomingMessageType::INVALID:
     default:                                     return "INVALID";
   }
@@ -135,6 +139,26 @@ IncomingMessageType classifyIncomingMessage(const uint8_t* data, size_t len) {
         ? IncomingMessageType::SNAPSHOT_ACK
         : IncomingMessageType::INVALID;
   }
+  if (strcmp(command, "NODE_CONFIG") == 0) {
+    return exactSize<node_config_message_t>(len)
+        ? IncomingMessageType::NODE_CONFIG
+        : IncomingMessageType::INVALID;
+  }
+  if (strcmp(command, "SYNC_SESSION") == 0) {
+    return exactSize<sync_session_open_message_t>(len)
+        ? IncomingMessageType::SYNC_SESSION
+        : IncomingMessageType::INVALID;
+  }
+  if (strcmp(command, "DUMP_GRANT") == 0) {
+    return exactSize<dump_grant_message_t>(len)
+        ? IncomingMessageType::DUMP_GRANT
+        : IncomingMessageType::INVALID;
+  }
+  if (strcmp(command, "SYNC_RELEASE") == 0) {
+    return exactSize<sync_release_message_t>(len)
+        ? IncomingMessageType::SYNC_RELEASE
+        : IncomingMessageType::INVALID;
+  }
 
   return IncomingMessageType::INVALID;
 }
@@ -169,9 +193,23 @@ bool incomingMessageHasValidTarget(IncomingMessageType type,
       const auto* p = asPacket<unpair_command_t>(data, len);
       return p && targetMatches(p->nodeId, sizeof(p->nodeId), nodeId);
     }
+    case IncomingMessageType::NODE_CONFIG: {
+      // Broadcast-safe: only the addressed node acts on it.
+      const auto* p = asPacket<node_config_message_t>(data, len);
+      return p && targetMatches(p->nodeId, sizeof(p->nodeId), nodeId);
+    }
+    case IncomingMessageType::DUMP_GRANT: {
+      const auto* p = asPacket<dump_grant_message_t>(data, len);
+      return p && targetMatches(p->nodeId, sizeof(p->nodeId), nodeId);
+    }
+    case IncomingMessageType::SYNC_RELEASE: {
+      const auto* p = asPacket<sync_release_message_t>(data, len);
+      return p && targetMatches(p->nodeId, sizeof(p->nodeId), nodeId);
+    }
     case IncomingMessageType::SET_SCHEDULE:
     case IncomingMessageType::SET_SYNC_SCHED:
     case IncomingMessageType::SYNC_WINDOW_OPEN:
+    case IncomingMessageType::SYNC_SESSION:
     case IncomingMessageType::TIME_SYNC:
     case IncomingMessageType::CONFIG_SNAPSHOT:
       return true;
@@ -240,6 +278,27 @@ bool incomingMessageTextFieldsTerminated(IncomingMessageType type,
     }
     case IncomingMessageType::SNAPSHOT_ACK: {
       const auto* p = asPacket<snapshot_ack_t>(data, len);
+      return p && hasNullWithin(p->command, sizeof(p->command)) &&
+             hasNullWithin(p->nodeId, sizeof(p->nodeId));
+    }
+    case IncomingMessageType::NODE_CONFIG: {
+      const auto* p = asPacket<node_config_message_t>(data, len);
+      return p && hasNullWithin(p->command, sizeof(p->command)) &&
+             hasNullWithin(p->nodeId, sizeof(p->nodeId)) &&
+             hasNullWithin(p->mothership_id, sizeof(p->mothership_id));
+    }
+    case IncomingMessageType::SYNC_SESSION: {
+      const auto* p = asPacket<sync_session_open_message_t>(data, len);
+      return p && hasNullWithin(p->command, sizeof(p->command)) &&
+             hasNullWithin(p->mothership_id, sizeof(p->mothership_id));
+    }
+    case IncomingMessageType::DUMP_GRANT: {
+      const auto* p = asPacket<dump_grant_message_t>(data, len);
+      return p && hasNullWithin(p->command, sizeof(p->command)) &&
+             hasNullWithin(p->nodeId, sizeof(p->nodeId));
+    }
+    case IncomingMessageType::SYNC_RELEASE: {
+      const auto* p = asPacket<sync_release_message_t>(data, len);
       return p && hasNullWithin(p->command, sizeof(p->command)) &&
              hasNullWithin(p->nodeId, sizeof(p->nodeId));
     }

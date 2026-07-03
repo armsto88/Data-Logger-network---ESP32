@@ -170,6 +170,27 @@ void setup() {
   failed++;
   #endif
 
+  // Test 8: coordinated sync-session wire layouts
+  {
+    bool ok = sizeof(sync_session_open_message_t) == 40 &&
+              sizeof(dump_grant_message_t) == 44 &&
+              sizeof(dump_done_message_t) == 42 &&
+              sizeof(sync_release_message_t) == 48 &&
+              sizeof(sync_release_ack_message_t) == 40;
+    if (ok) {
+      Serial.println("[PASS] coordinated sync message sizes are stable");
+      passed++;
+    } else {
+      Serial.printf("[FAIL] sync sizes open=%u grant=%u done=%u release=%u ack=%u\n",
+                    (unsigned)sizeof(sync_session_open_message_t),
+                    (unsigned)sizeof(dump_grant_message_t),
+                    (unsigned)sizeof(dump_done_message_t),
+                    (unsigned)sizeof(sync_release_message_t),
+                    (unsigned)sizeof(sync_release_ack_message_t));
+      failed++;
+    }
+  }
+
   // Summary
   Serial.println();
   Serial.printf("=== Results: %d passed, %d failed ===\n", passed, failed);

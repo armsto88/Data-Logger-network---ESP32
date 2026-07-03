@@ -394,19 +394,18 @@ UploadPayload UploadQueue::getNewData(uint32_t maxBytes) {
 // ---------------------------------------------------------------------------
 // advanceCursor
 // ---------------------------------------------------------------------------
-bool UploadQueue::advanceCursor(uint32_t newOffset, uint32_t timestampUnix) {
+bool UploadQueue::advanceCursor(uint32_t newOffset, uint32_t timestampUnix,
+                                uint32_t rowsUploadedDelta) {
   m_cursor.byteOffset    = newOffset;
   m_cursor.lastUploadUnix = timestampUnix;
-  // Count rows in the just-uploaded chunk for bookkeeping.
-  // (rowEstimate is provided by the caller via getNewData; we don't recount
-  //  here to avoid re-reading the file.  rowsUploaded is updated by the
-  //  caller if needed — but we can increment by the pending rows delta.)
-  // For simplicity, increment rowsUploaded by the number of rows between
-  // the old and new offset.
-  // Caller should set rowsUploaded if exact tracking is needed.
+  // Accumulate the rows actually uploaded (the caller passes the chunk's row
+  // count; malformed-skip advances pass 0). This is what the "N readings sent"
+  // status reflects.
+  m_cursor.rowsUploaded += rowsUploadedDelta;
   saveCursor();
-  Serial.printf("[UQ] advanceCursor: offset=%u ts=%u\n",
-                (unsigned)newOffset, (unsigned)timestampUnix);
+  Serial.printf("[UQ] advanceCursor: offset=%u ts=%u rows+=%u total=%u\n",
+                (unsigned)newOffset, (unsigned)timestampUnix,
+                (unsigned)rowsUploadedDelta, (unsigned)m_cursor.rowsUploaded);
   return true;
 }
 

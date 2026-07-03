@@ -121,6 +121,41 @@ RTC_DS3231 rtc;
 #define SYNC_STALE_RECOVERY_WINDOW_MS 12000UL
 #endif
 
+#ifndef NODE_SYNC_HELLO_JITTER_MS
+#define NODE_SYNC_HELLO_JITTER_MS 1800UL
+#endif
+
+#ifndef NODE_SNAPSHOT_RETRY_COUNT
+#define NODE_SNAPSHOT_RETRY_COUNT 3
+#endif
+
+#ifndef NODE_SNAPSHOT_ACK_TIMEOUT_MS
+#define NODE_SNAPSHOT_ACK_TIMEOUT_MS 900UL
+#endif
+
+// ---------------------------------------------------------------------------
+// Hardware-timer watchdog — reboots the node if the main loop hangs (e.g. an
+// I2C bus stall leaving a Wire read blocked forever, which was leaving nodes
+// "hung on" and draining the battery). Fed in loop() and inside the long
+// blocking spots (sensor sampling, sync listen/flush). A genuine forever-hang
+// stops feeding it; after NODE_WDT_TIMEOUT_S the timer ISR resets the board,
+// which re-boots and re-arms its alarms. Self-contained (no ESP-IDF task-WDT
+// reconfigure needed).
+#ifndef NODE_WDT_TIMEOUT_S
+#define NODE_WDT_TIMEOUT_S 120
+#endif
+static hw_timer_t* g_wdtTimer = nullptr;
+static void ARDUINO_ISR_ATTR onNodeWatchdogTimeout() { esp_restart(); }
+static inline void feedWatchdog() { if (g_wdtTimer) timerWrite(g_wdtTimer, 0); }
+static void initWatchdog() {
+  g_wdtTimer = timerBegin(3, 80, true);  // timer 3, /80 prescaler -> 1 MHz (1 us tick)
+  if (!g_wdtTimer) { Serial.println("[WDT] timer alloc failed"); return; }
+  timerAttachInterrupt(g_wdtTimer, &onNodeWatchdogTimeout, true);
+  timerAlarmWrite(g_wdtTimer, (uint64_t)NODE_WDT_TIMEOUT_S * 1000000ULL, false);  // one-shot
+  timerAlarmEnable(g_wdtTimer);
+  Serial.printf("[WDT] hardware watchdog armed (%ds)\n", NODE_WDT_TIMEOUT_S);
+}
+
 #if ENABLE_POWER_HOLD_CONTROL && (PWR_HOLD_PIN >= 0)
 static const uint8_t kPwrHoldOnLevel  = PWR_HOLD_ACTIVE_HIGH ? HIGH : LOW;
 static const uint8_t kPwrHoldOffLevel = PWR_HOLD_ACTIVE_HIGH ? LOW  : HIGH;
@@ -215,24 +250,24 @@ static void processPowerCut() {
 
   delay(20);
 
-  // If hardware hold-gate does not actually cut power, force deep sleep as a fallback.
-  const uint32_t fallbackWaitStart = millis();
-  while ((millis() - fallbackWaitStart) < (uint32_t)PWR_HOLD_FALLBACK_SLEEP_DELAY_MS) {
+  // No deep-sleep fallback. The only wake path is the DS3231 alarm driving the
+  // FET gate that switches VSYS on, so releasing PWR_HOLD MUST cut power — the
+  // board is expected to lose power within this wait. An esp_deep_sleep + ext0
+  // fallback would be wrong here: ext0 was configured on RTC_INT_PIN (GPIO4),
+  // but GPIO4 is the RX_EN_N/reed net, not the RTC — it could wake on a reed
+  // pulse and would never wake on the alarm. If power somehow does not drop
+  // (hardware fault), keep the hold released and spin rather than sleeping.
+  const uint32_t offWaitStart = millis();
+  while ((millis() - offWaitStart) < (uint32_t)PWR_HOLD_FALLBACK_SLEEP_DELAY_MS) {
     delay(10);
   }
 
-  Serial.println("[PWR_HOLD] still alive after hold release -> deep sleep fallback");
-  esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL);
-#if defined(RTC_INT_PIN) && (RTC_INT_PIN >= 0)
-  esp_err_t wakeCfg = esp_sleep_enable_ext0_wakeup((gpio_num_t)RTC_INT_PIN, 0);
-  Serial.printf("[PWR_HOLD] deep sleep wake via RTC_INT pin=%d level=0: %s\n",
-                RTC_INT_PIN,
-                (wakeCfg == ESP_OK) ? "OK" : esp_err_to_name(wakeCfg));
-#endif
-  Serial.println("[PWR_HOLD] entering deep sleep now");
-  esp_deep_sleep_start();
-
+  Serial.println("[PWR_HOLD] still alive after hold release -> holding off (no deep-sleep fallback)");
+  pinMode(PWR_HOLD_PIN, OUTPUT);
+  digitalWrite(PWR_HOLD_PIN, kPwrHoldOffLevel);
   while (true) {
+    feedWatchdog();  // reached only when USB holds the rail up — don't reboot-churn
+    digitalWrite(PWR_HOLD_PIN, kPwrHoldOffLevel);
     delay(1000);
   }
 #endif
@@ -467,6 +502,18 @@ static bool enableAndVerifyAlarmInterrupts(uint8_t& controlRegOut) {
   return (controlRegOut & 0b00000111) == 0b00000111;
 }
 
+// Standby variant: INTCN + A2IE only (A1IE cleared) — sync wakes, no recording.
+static bool enableAndVerifyAlarm2Only(uint8_t& controlRegOut) {
+  uint8_t ctrl = 0;
+  if (!readDS3231RegChecked(0x0E, ctrl)) return false;
+  ctrl |= 0b00000110;             // INTCN + A2IE
+  ctrl &= (uint8_t)~0b00000001;   // A1IE off
+  if (!writeDS3231RegChecked(0x0E, ctrl)) return false;
+  if (!readDS3231RegChecked(0x0E, controlRegOut)) return false;
+  return (controlRegOut & 0b00000110) == 0b00000110 &&
+         (controlRegOut & 0b00000001) == 0;
+}
+
 static bool clearAndVerifyAlarmFlags(uint8_t& statusRegOut) {
   uint8_t status = 0;
   if (!readDS3231RegChecked(0x0F, status)) return false;
@@ -633,6 +680,10 @@ uint16_t  g_syncIntervalMin = 15;
 uint32_t  g_syncPhaseUnix = 0;
 uint32_t  g_lastSyncSlot = 0xFFFFFFFFUL;
 uint16_t  g_appliedConfigVersion = 0;
+// Standby: node stays DEPLOYED and keeps its sync (A2) check-ins, but does not
+// arm the recording alarm (A1) or take samples. Persisted so it survives the
+// power-cycle that happens at every wake. Cleared on resume/unpair.
+bool      g_recordingPaused = false;
 
 static bool g_rescueModeActive = false;
 static uint32_t g_lastRescueBeaconMs = 0;
@@ -692,7 +743,16 @@ static uint8_t g_pendingDeployAckMac[6];
 static volatile bool g_pendingConfigSnapshot = false;
 static config_snapshot_message_t g_pendingConfigSnapshotData;
 static uint8_t g_pendingConfigSnapshotMac[6];
+static volatile bool g_pendingNodeConfig = false;
+static node_config_message_t g_pendingNodeConfigData;
+static uint8_t g_pendingNodeConfigMac[6];
 static volatile bool g_pendingPersistConfig = false;
+static volatile bool g_syncSessionOpenPending = false;
+static sync_session_open_message_t g_syncSessionOpenData;
+static volatile bool g_dumpGrantPending = false;
+static dump_grant_message_t g_dumpGrantData;
+static volatile bool g_syncReleasePending = false;
+static sync_release_message_t g_syncReleaseData;
 
 static bool waitForSendDelivery(uint32_t timeoutMs) {
   const uint32_t start = millis();
@@ -834,6 +894,7 @@ static bool persistNodeConfig(uint16_t candidateConfigVersion = 0,
   record.lastSyncSlot = g_lastSyncSlot;
   record.appliedConfigVersion =
       useCandidateConfigVersion ? candidateConfigVersion : g_appliedConfigVersion;
+  record.recordingPaused = g_recordingPaused;
 
   const bool ok = nodeConfigStoreSave(record);
   Serial.printf("[CFG] %s state=%u deployed=%d rtcSynced=%d cfgV=%u wake=%u sync=%u phase=%lu\n",
@@ -861,6 +922,7 @@ static void loadNodeConfig() {
     g_syncPhaseUnix = 0;
     g_lastSyncSlot = 0xFFFFFFFFUL;
     g_appliedConfigVersion = 0;
+    g_recordingPaused = false;
     memset(mothershipMAC, 0, sizeof(mothershipMAC));
     return;
   }
@@ -879,12 +941,14 @@ static void loadNodeConfig() {
   lastTimeSyncUnix = record.lastTimeSyncUnix;
   g_lastSyncSlot = record.lastSyncSlot;
   g_appliedConfigVersion = record.appliedConfigVersion;
+  g_recordingPaused = record.recordingPaused;
 
-  Serial.printf("[CFG] loaded status=%u state=%u rtcSynced=%d deployed=%d interval=%u syncMin=%u syncPhase=%lu syncSlot=%lu cfgV=%u\n",
+  Serial.printf("[CFG] loaded status=%u state=%u rtcSynced=%d deployed=%d interval=%u syncMin=%u syncPhase=%lu syncSlot=%lu cfgV=%u paused=%d\n",
                 (unsigned)loadStatus,
                 (unsigned)nodeState, rtcSynced, deployedFlag, g_intervalMin,
                 (unsigned)g_syncIntervalMin, (unsigned long)g_syncPhaseUnix,
-                (unsigned long)g_lastSyncSlot, (unsigned)g_appliedConfigVersion);
+                (unsigned long)g_lastSyncSlot, (unsigned)g_appliedConfigVersion,
+                g_recordingPaused ? 1 : 0);
 
   if (lastTimeSyncUnix > 0) {
     DateTime ls(lastTimeSyncUnix);
@@ -903,7 +967,7 @@ static void sendTimeSyncRequest();
 static void sendDiscoveryRequest();
 static void sendPairingRequest();
 static void sendNodeStatusUpdate(const char* reason = nullptr);
-static void sendNodeHello();
+static void sendNodeHello(bool broadcastFallback = true);
 static uint16_t getNodeConfigVersion();
 static void setNodeConfigVersion(uint16_t v);
 static bool updateRescueBootStreak(uint32_t nowUnix);
@@ -914,7 +978,14 @@ static bool ensureEspNowPeer(const uint8_t* mac);
 static void shutdownEspNow();
 static bool shouldSyncAt(uint32_t unixNow);
 static void captureSensorsToQueue();
-static void flushQueuedToMothership(uint32_t deadlineMs = 0);
+struct QueueFlushResult {
+  uint8_t sentRecords = 0;
+  uint8_t status = 0;  // 0=quota/empty, 1=send/ACK failure, 2=deadline
+};
+static QueueFlushResult flushQueuedToMothership(uint32_t deadlineMs = 0,
+                                                 uint8_t maxRecords = 0xFF,
+                                                 bool requireDurableAck = false,
+                                                 bool shutdownAfter = true);
 static void runStaleSyncRecoveryIfNeeded();
 static bool armDeploymentWakeAlarms(DateTime* nextDataOut = nullptr, DateTime* nextSyncOut = nullptr);
 static void finalizeWakeAndSleep(const char* reason);
@@ -1131,27 +1202,34 @@ static void captureSensorsToQueue() {
   }
 }
 
-static void flushQueuedToMothership(uint32_t deadlineMs) {
+static QueueFlushResult flushQueuedToMothership(uint32_t deadlineMs,
+                                                 uint8_t maxRecords,
+                                                 bool requireDurableAck,
+                                                 bool shutdownAfter) {
+  QueueFlushResult result{};
   if (!hasMothershipMAC()) {
     Serial.println("⚠️ flush skipped: no mothership MAC");
-    return;
+    result.status = 1;
+    return result;
   }
 
   if (!bringupEspNow()) {
     Serial.println("❌ flush skipped: ESP-NOW bringup failed");
-    return;
+    result.status = 1;
+    return result;
   }
 
-  size_t sent = 0;
-  while (local_queue::count() > 0) {
+  while (local_queue::count() > 0 && result.sentRecords < maxRecords) {
     if (deadlineMs != 0) {
       int32_t msLeft = (int32_t)(deadlineMs - millis());
       if (msLeft <= 0) {
         Serial.println("⏱️ flush deadline reached; keeping remaining queue for next sync window");
+        result.status = 2;
         break;
       }
-      if (msLeft < 250) {
+      if (msLeft < (int32_t)(NODE_SNAPSHOT_ACK_TIMEOUT_MS + 100UL)) {
         Serial.printf("⏱️ flush stopping with %ldms left; preserving queue\n", (long)msLeft);
+        result.status = 2;
         break;
       }
     }
@@ -1170,59 +1248,93 @@ static void flushQueuedToMothership(uint32_t deadlineMs) {
     // Tag with current config version at send time so mothership can track it.
     snap2->configVersion = (uint16_t)getNodeConfigVersion();
 
-    g_waitingSnapshotAck = false;
-    g_snapshotAckMatched = false;
-    g_snapshotAckPersisted = false;
-    g_expectedSnapshotAckSeq = seqNum;
+    bool delivered = false;
+    bool deadlineHit = false;
+    const uint8_t attempts = requireDurableAck ? NODE_SNAPSHOT_RETRY_COUNT : 1;
+    for (uint8_t attempt = 1; attempt <= attempts && !delivered; ++attempt) {
+      if (deadlineMs != 0 &&
+          (int32_t)(deadlineMs - millis()) <=
+              (int32_t)(NODE_SNAPSHOT_ACK_TIMEOUT_MS + 450UL)) {
+        deadlineHit = true;
+        break;
+      }
+      // Arm ACK matching BEFORE esp_now_send(). The mothership can persist and
+      // reply before the link-layer send callback is serviced.
+      g_snapshotAckMatched = false;
+      g_snapshotAckPersisted = false;
+      g_expectedSnapshotAckSeq = seqNum;
+      g_waitingSnapshotAck = requireDurableAck;
 
-    SendResult send = sendEspNowAndWait(mothershipMAC, snapBuf, snapLen, 250);
-    if (send.queueResult != ESP_OK) {
-      Serial.printf("❌ queue flush send failed at seq=%lu: %s\n",
-                    (unsigned long)seqNum,
-                    esp_err_to_name(send.queueResult));
+      SendResult send = sendEspNowAndWait(mothershipMAC, snapBuf, snapLen, 350);
+      const bool linkDelivered = send.queueResult == ESP_OK &&
+                                 send.callbackReceived &&
+                                 send.deliveryStatus == ESP_NOW_SEND_SUCCESS;
+      if (!linkDelivered) {
+        Serial.printf("[DUMP] seq=%lu attempt=%u/%u link failure queue=%s status=%d\n",
+                      (unsigned long)seqNum, (unsigned)attempt, (unsigned)attempts,
+                      esp_err_to_name(send.queueResult), (int)send.deliveryStatus);
+      } else if (!requireDurableAck) {
+        delivered = true;
+      } else {
+        const uint32_t ackStart = millis();
+        while ((uint32_t)(millis() - ackStart) < NODE_SNAPSHOT_ACK_TIMEOUT_MS &&
+               (deadlineMs == 0 || (int32_t)(deadlineMs - millis()) > 0)) {
+          feedWatchdog();
+          serviceNodeEvents(8);
+          if (g_snapshotAckMatched && g_snapshotAckPersisted) break;
+          delay(5);
+        }
+        delivered = g_snapshotAckMatched && g_snapshotAckPersisted;
+        if (!delivered) {
+          if (deadlineMs != 0 && (int32_t)(deadlineMs - millis()) <= 0) {
+            deadlineHit = true;
+          }
+          Serial.printf("[DUMP] seq=%lu attempt=%u/%u durable ACK timeout\n",
+                        (unsigned long)seqNum, (unsigned)attempt, (unsigned)attempts);
+        }
+      }
+      g_waitingSnapshotAck = false;
+
+      if (!delivered && attempt < attempts) {
+        const size_t nodeIdLen = strlen(NODE_ID);
+        const uint8_t tail = nodeIdLen ? (uint8_t)NODE_ID[nodeIdLen - 1] : 0;
+        const uint32_t backoffMs = 45UL * attempt +
+            (((uint8_t)NODE_ID[0] + tail) % 71U);
+        const uint32_t backoffStart = millis();
+        while ((uint32_t)(millis() - backoffStart) < backoffMs) {
+          if (deadlineMs != 0 && (int32_t)(deadlineMs - millis()) <= 0) {
+            deadlineHit = true;
+            break;
+          }
+          serviceNodeEvents(4);
+          delay(5);
+        }
+      }
+    }
+
+    if (!delivered) {
+      result.status = deadlineHit ? 2 : 1;
+      Serial.printf("[DUMP] retaining seq=%lu after retries\n", (unsigned long)seqNum);
       break;
     }
-
-    if (!send.callbackReceived || send.deliveryStatus != ESP_NOW_SEND_SUCCESS) {
-      Serial.printf("❌ queue flush delivery not confirmed at seq=%lu (status=%d)\n",
-                    (unsigned long)seqNum,
-                    (int)send.deliveryStatus);
-      break;
-    }
-
-#if NODE_REQUIRE_DURABLE_SNAPSHOT_ACK
-    g_waitingSnapshotAck = true;
-    const uint32_t ackStart = millis();
-    while ((uint32_t)(millis() - ackStart) < 750UL) {
-      serviceNodeEvents(8);
-      if (g_snapshotAckMatched) break;
-      delay(5);
-    }
-    g_waitingSnapshotAck = false;
-    if (!g_snapshotAckMatched || !g_snapshotAckPersisted) {
-      Serial.printf("[ACK] durable SNAPSHOT_ACK missing for seq=%lu; retaining queue head\n",
-                    (unsigned long)seqNum);
-      break;
-    }
-#else
-    Serial.println("[ACK] legacy mode: popping after verified ESP-NOW link delivery");
-#endif
 
     if (!local_queue::pop()) {
       Serial.println("❌ queue pop failed after send");
+      result.status = 1;
       break;
     }
-    sent++;
+    result.sentRecords++;
     delay(5);
   }
 
   Serial.printf("📤 queue flush done: sent=%u pending=%u\n",
-                (unsigned)sent,
+                (unsigned)result.sentRecords,
                 (unsigned)local_queue::count());
 
-  if (currentNodeState() == STATE_DEPLOYED) {
+  if (shutdownAfter && currentNodeState() == STATE_DEPLOYED) {
     shutdownEspNow();
   }
+  return result;
 }
 
 static void onDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
@@ -1259,6 +1371,10 @@ static void onDataReceived(const uint8_t *mac, const uint8_t *incomingData, int 
       type == IncomingMessageType::SYNC_WINDOW_OPEN ||
       type == IncomingMessageType::TIME_SYNC ||
       type == IncomingMessageType::CONFIG_SNAPSHOT ||
+      type == IncomingMessageType::NODE_CONFIG ||
+      type == IncomingMessageType::SYNC_SESSION ||
+      type == IncomingMessageType::DUMP_GRANT ||
+      type == IncomingMessageType::SYNC_RELEASE ||
       type == IncomingMessageType::SNAPSHOT_ACK;
 
   if (operational && hasMothershipMAC() && memcmp(mac, mothershipMAC, 6) != 0) {
@@ -1312,7 +1428,8 @@ static bool hasCriticalPendingWork() {
   if (g_eventApplyActive || nodeEventsPending()) return true;
   if (g_pendingTimeSync || g_pendingPairNode || g_pendingPairingResponse ||
       g_pendingUnpair || g_pendingDeploy || g_pendingDeployAck ||
-      g_pendingConfigSnapshot || g_pendingPersistConfig ||
+      g_pendingConfigSnapshot || g_pendingNodeConfig || g_pendingPersistConfig ||
+      g_syncSessionOpenPending || g_dumpGrantPending || g_syncReleasePending ||
       g_deployBootstrapPending || g_rearmAlarmsPending) {
     return true;
   }
@@ -1452,6 +1569,44 @@ static void serviceNodeEvents(uint32_t maxEvents) {
                sizeof(g_pendingConfigSnapshotData));
         memcpy(g_pendingConfigSnapshotMac, ev.senderMac, 6);
         g_pendingConfigSnapshot = true;
+        break;
+
+      case NodeEventType::NODE_CONFIG:
+        // Unified declarative config. Delivers the RECORDING (wake) interval and
+        // targetState (unpair). The SYNC schedule stays on the SET_SYNC_SCHED
+        // handover path (live phase negotiation), so NODE_CONFIG does not touch
+        // A2. A non-zero wake must be a valid interval; 0 means "no wake change".
+        if (ev.payload.nodeConfig.targetState == 2 /*DEPLOYED*/ &&
+            ev.payload.nodeConfig.wakeIntervalMin != 0 &&
+            !validWakeInterval(ev.payload.nodeConfig.wakeIntervalMin)) {
+          Serial.printf("[EVENT] NODE_CONFIG rejected: invalid wake=%u\n",
+                        (unsigned)ev.payload.nodeConfig.wakeIntervalMin);
+          break;
+        }
+        memcpy(&g_pendingNodeConfigData, &ev.payload.nodeConfig,
+               sizeof(g_pendingNodeConfigData));
+        memcpy(g_pendingNodeConfigMac, ev.senderMac, 6);
+        g_pendingNodeConfig = true;
+        break;
+
+      case NodeEventType::SYNC_SESSION:
+        memcpy(&g_syncSessionOpenData, &ev.payload.syncSession,
+               sizeof(g_syncSessionOpenData));
+        g_syncSessionOpenPending = true;
+        Serial.printf("[SYNC] session open id=%lu join=%ums window=%us\n",
+                      (unsigned long)g_syncSessionOpenData.sessionId,
+                      (unsigned)g_syncSessionOpenData.joinWindowMs,
+                      (unsigned)g_syncSessionOpenData.sessionWindowSec);
+        break;
+
+      case NodeEventType::DUMP_GRANT:
+        memcpy(&g_dumpGrantData, &ev.payload.dumpGrant, sizeof(g_dumpGrantData));
+        g_dumpGrantPending = true;
+        break;
+
+      case NodeEventType::SYNC_RELEASE:
+        memcpy(&g_syncReleaseData, &ev.payload.syncRelease, sizeof(g_syncReleaseData));
+        g_syncReleasePending = true;
         break;
 
       case NodeEventType::SNAPSHOT_ACK:
@@ -1691,7 +1846,7 @@ static void setNodeConfigVersion(uint16_t v) {
 }
 
 // Send NODE_HELLO to mothership at top of each wake cycle (before data flush)
-static void sendNodeHello() {
+static void sendNodeHello(bool broadcastFallback) {
   if (!hasMothershipMAC()) return;
   if (!bringupEspNow()) return;
   static const uint8_t broadcastAddress[6] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
@@ -1707,22 +1862,26 @@ static void sendNodeHello() {
 
   // Send direct first, then broadcast fallback to improve contact probability.
   esp_err_t resDirect = sendEspNowAndWait(mothershipMAC, &hello, sizeof(hello), 250).queueResult;
-  esp_err_t resBcast = sendEspNowAndWait(broadcastAddress, &hello, sizeof(hello), 250).queueResult;
+  esp_err_t resBcast = ESP_OK;
+  if (broadcastFallback) {
+    resBcast = sendEspNowAndWait(broadcastAddress, &hello, sizeof(hello), 250).queueResult;
+  }
 
   Serial.printf("👋 NODE_HELLO sent: cfgV=%u wakeMin=%u qDepth=%u : direct=%s bcast=%s\n",
                 hello.configVersion, hello.wakeIntervalMin, hello.queueDepth,
                 resDirect == ESP_OK ? "OK" : esp_err_to_name(resDirect),
-                resBcast == ESP_OK ? "OK" : esp_err_to_name(resBcast));
+                broadcastFallback ? (resBcast == ESP_OK ? "OK" : esp_err_to_name(resBcast)) : "SKIP");
   if ((uint32_t)POST_WAKE_WINDOW_MS > 0) {
     g_postWakeWindowUntilMs = millis() + (uint32_t)POST_WAKE_WINDOW_MS;
   }
 }
 static bool armDeploymentWakeAlarms(DateTime* nextDataOut, DateTime* nextSyncOut) {
-  Serial.printf("[ARM] syncMode=%s syncMin=%u phase=%lu wakeMin=%u\n",
+  Serial.printf("[ARM] syncMode=%s syncMin=%u phase=%lu wakeMin=%u paused=%d\n",
                 (g_syncIntervalMin == 0) ? "daily" : "interval",
                 (unsigned)g_syncIntervalMin,
                 (unsigned long)g_syncPhaseUnix,
-                (unsigned)g_intervalMin);
+                (unsigned)g_intervalMin,
+                g_recordingPaused ? 1 : 0);
   g_alarmWakeVerified = false;
   if (!g_rtcReady || !rtcSynced) {
     Serial.println("[ARM] refused: RTC not ready/synced");
@@ -1731,8 +1890,18 @@ static bool armDeploymentWakeAlarms(DateTime* nextDataOut, DateTime* nextSyncOut
 
   AlarmBytes expected{};
   AlarmArmResult result{};
-  result.alarm1Written = ds3231ArmNextInNMinutes(g_intervalMin, nextDataOut, &expected);
-  result.alarm1Verified = result.alarm1Written && verifyAlarm1Bytes(expected.a1);
+  if (g_recordingPaused) {
+    // Standby: do NOT arm the recording alarm (A1) — only the sync alarm (A2),
+    // so the node keeps checking in but takes no samples. A1 is treated as
+    // "intentionally not armed" and its interrupt is forced off.
+    ds3231DisableAlarmInterrupt();
+    result.alarm1Written = true;
+    result.alarm1Verified = true;
+    if (nextDataOut) *nextDataOut = DateTime((uint32_t)0);
+  } else {
+    result.alarm1Written = ds3231ArmNextInNMinutes(g_intervalMin, nextDataOut, &expected);
+    result.alarm1Verified = result.alarm1Written && verifyAlarm1Bytes(expected.a1);
+  }
 
   result.alarm2Written = ds3231ArmSyncWake(g_syncIntervalMin, g_syncPhaseUnix,
                                            SYNC_PRE_WAKE_SEC, nextSyncOut,
@@ -1740,7 +1909,9 @@ static bool armDeploymentWakeAlarms(DateTime* nextDataOut, DateTime* nextSyncOut
   result.alarm2Verified = result.alarm2Written && verifyAlarm2Bytes(expected.a2);
 
   if (result.alarm1Verified && result.alarm2Verified) {
-    result.controlVerified = enableAndVerifyAlarmInterrupts(result.controlReg);
+    result.controlVerified = g_recordingPaused
+        ? enableAndVerifyAlarm2Only(result.controlReg)
+        : enableAndVerifyAlarmInterrupts(result.controlReg);
   }
   if (result.controlVerified) {
     result.flagsCleared = clearAndVerifyAlarmFlags(result.statusReg);
@@ -1829,6 +2000,72 @@ static void finalizeWakeAndSleep(const char* reason) {
 
 
 
+static uint32_t coordinatedHelloJitterMs(uint32_t sessionId) {
+  uint32_t hash = 2166136261UL ^ sessionId;
+  for (const char* p = NODE_ID; *p; ++p) {
+    hash ^= (uint8_t)*p;
+    hash *= 16777619UL;
+  }
+  return NODE_SYNC_HELLO_JITTER_MS ? (hash % NODE_SYNC_HELLO_JITTER_MS) : 0;
+}
+
+static void sendDumpDone(uint32_t sessionId, uint16_t grantId,
+                         const QueueFlushResult& flush) {
+  dump_done_message_t done{};
+  strcpy(done.command, "DUMP_DONE");
+  strncpy(done.nodeId, NODE_ID, sizeof(done.nodeId) - 1);
+  done.sessionId = sessionId;
+  done.grantId = grantId;
+  done.sentRecords = flush.sentRecords;
+  done.remainingRecords = (uint8_t)min((int)local_queue::count(), 255);
+  done.status = flush.status;
+
+  // DUMP_DONE is idempotent. Send twice with spacing so a lost control frame
+  // does not consume the entire grant timeout at the mothership.
+  for (uint8_t attempt = 0; attempt < 2; ++attempt) {
+    sendEspNowAndWait(mothershipMAC, &done, sizeof(done), 350);
+    if (attempt == 0) delay(35);
+  }
+  Serial.printf("[SYNC] DUMP_DONE session=%lu grant=%u sent=%u remaining=%u status=%u\n",
+                (unsigned long)sessionId, (unsigned)grantId,
+                (unsigned)done.sentRecords, (unsigned)done.remainingRecords,
+                (unsigned)done.status);
+}
+
+static bool applySyncReleaseAndAck(const sync_release_message_t& release) {
+  bool applied = validSyncScheduleValue(release.syncIntervalMin,
+                                        release.syncPhaseUnix);
+  if (applied && release.mothershipUnix >= 1704067200UL) {
+    rtc.adjust(DateTime(release.mothershipUnix));
+    rtcSynced = true;
+    g_rtcPowerLost = false;
+    lastTimeSyncUnix = release.mothershipUnix;
+    g_syncIntervalMin = release.syncIntervalMin;
+    g_syncPhaseUnix = release.syncPhaseUnix;
+    g_lastSyncSlot = 0xFFFFFFFFUL;
+    applied = persistNodeConfig();
+  } else {
+    applied = false;
+  }
+
+  sync_release_ack_message_t ack{};
+  strcpy(ack.command, "RELEASE_ACK");
+  strncpy(ack.nodeId, NODE_ID, sizeof(ack.nodeId) - 1);
+  ack.sessionId = release.sessionId;
+  ack.appliedSyncIntervalMin = applied ? g_syncIntervalMin : 0;
+  ack.scheduleApplied = applied ? 1 : 0;
+  ack.remainingRecords = (uint8_t)min((int)local_queue::count(), 255);
+  for (uint8_t attempt = 0; attempt < 2; ++attempt) {
+    sendEspNowAndWait(mothershipMAC, &ack, sizeof(ack), 350);
+    if (attempt == 0) delay(35);
+  }
+  Serial.printf("[SYNC] RELEASE_ACK session=%lu applied=%u sync=%u phase=%lu remaining=%u grace=%u\n",
+                (unsigned long)release.sessionId, applied ? 1 : 0,
+                (unsigned)g_syncIntervalMin, (unsigned long)g_syncPhaseUnix,
+                (unsigned)ack.remainingRecords, (unsigned)release.legacyGraceCycles);
+  return applied;
+}
+
 // -------------------- Per-alarm handler --------------------
 static void handleRtcWakeEvents(bool dataWake, bool syncWake) {
   DateTime fired = rtc.now();
@@ -1843,20 +2080,39 @@ static void handleRtcWakeEvents(bool dataWake, bool syncWake) {
     return;
   }
 
+  // Arm the next wake alarms BEFORE the hang-prone sensor/sync work, so a stall
+  // in captureSensors / sync flush can never leave the DS3231 without a future
+  // alarm (which is what left a node dark). finalizeWakeAndSleep re-arms with
+  // fresh times at the end; this is the guaranteed safety net. (Honours standby:
+  // armDeploymentWakeAlarms arms A2-only when g_recordingPaused.)
+  {
+    DateTime nd, ns;
+    armDeploymentWakeAlarms(&nd, &ns);
+  }
+
   if (dataWake) {
     clearDS3231_A1F();
-    Serial.println("🧾 Data wake: sample locally (radio remains off)");
-    captureSensorsToQueue();
-    Serial.printf("🧾 Data wake complete; pending queue=%u\n", (unsigned)local_queue::count());
-    runStaleSyncRecoveryIfNeeded();
+    if (g_recordingPaused) {
+      // Standby: never sample. A1 should not be armed while paused, but guard
+      // against a stray flag so a paused node truly records nothing.
+      Serial.println("⏸️ Data wake ignored — recording paused (standby)");
+    } else {
+      Serial.println("🧾 Data wake: sample locally (radio remains off)");
+      feedWatchdog();  // sensor sampling (incl. 10 s wind) is a long blocking op
+      captureSensorsToQueue();
+      Serial.printf("🧾 Data wake complete; pending queue=%u\n", (unsigned)local_queue::count());
+      runStaleSyncRecoveryIfNeeded();
+    }
   }
 
   if (syncWake) {
     clearDS3231_A2F();
-    Serial.println("📶 Sync wake: enabling radio + listening for mothership sync burst");
+    Serial.println("📶 Sync wake: joining coordinated mothership session");
     g_syncWindowMarkerMs = 0;
+    g_syncSessionOpenPending = false;
+    g_dumpGrantPending = false;
+    g_syncReleasePending = false;
     if (bringupEspNow()) {
-      sendNodeHello();
       const uint32_t nowUnix = rtc.now().unixtime();
       const uint32_t targetSyncUnix = nextSyncSlotUnix(nowUnix);
       const uint32_t baseListenSec = ((uint32_t)SYNC_LISTEN_WINDOW_MS + 999UL) / 1000UL;
@@ -1886,21 +2142,111 @@ static void handleRtcWakeEvents(bool dataWake, bool syncWake) {
                     (unsigned long)SYNC_MARKER_GRACE_SEC);
 
       const uint32_t windowStart = millis();
-      while (rtc.now().unixtime() < listenUntilUnix) {
+      const uint32_t legacyFallbackAtMs = windowStart + 2500UL;
+      while (rtc.now().unixtime() < listenUntilUnix && !g_syncSessionOpenPending) {
+        feedWatchdog();
         serviceNodeEvents(8);
-        if (g_syncWindowMarkerMs != 0) break;
-        delay(50);
+        if (g_syncWindowMarkerMs != 0 &&
+            (int32_t)(millis() - legacyFallbackAtMs) >= 0) {
+          break;
+        }
+        delay(20);
       }
 
-      if (g_syncWindowMarkerMs != 0) {
+      if (g_syncSessionOpenPending) {
+        const sync_session_open_message_t session = g_syncSessionOpenData;
+        g_syncSessionOpenPending = false;
+        const uint32_t sessionWindowSec = session.sessionWindowSec < 15U
+            ? 15UL : (uint32_t)session.sessionWindowSec;
+        const uint32_t sessionDeadlineMs = millis() + sessionWindowSec * 1000UL;
+
+        // Stable node/session jitter spreads HELLO responses without needing a
+        // synchronized random source.
+        const uint32_t helloDelayMs = coordinatedHelloJitterMs(session.sessionId);
+        const uint32_t helloAtMs = millis() + helloDelayMs;
+        while ((int32_t)(helloAtMs - millis()) > 0) {
+          feedWatchdog();
+          serviceNodeEvents(8);
+          delay(5);
+        }
+        sendNodeHello(false);
+        uint32_t nextHelloRetryMs = millis() + 1800UL;
+        uint16_t lastGrantId = 0;
+        bool released = false;
+
+        while ((int32_t)(sessionDeadlineMs - millis()) > 0 && !released) {
+          feedWatchdog();
+          serviceNodeEvents(12);
+          // SYNC_SESSION is repeated during rendezvous; the first accepted
+          // session owns this wake, so later copies are just beacons.
+          g_syncSessionOpenPending = false;
+
+          if (g_syncReleasePending) {
+            const sync_release_message_t release = g_syncReleaseData;
+            g_syncReleasePending = false;
+            if (release.sessionId == session.sessionId) {
+              applySyncReleaseAndAck(release);
+              released = true;
+              break;
+            }
+          }
+
+          if (g_dumpGrantPending) {
+            const dump_grant_message_t grant = g_dumpGrantData;
+            g_dumpGrantPending = false;
+            if (grant.sessionId != session.sessionId || grant.grantId <= lastGrantId) {
+              delay(5);
+              continue;
+            }
+            lastGrantId = grant.grantId;
+            const uint32_t requestedWindow = grant.grantWindowMs < 1500U
+                ? 1500UL : (uint32_t)grant.grantWindowMs;
+            const uint32_t requestedDeadlineMs = millis() + requestedWindow;
+            const uint32_t grantDeadlineMs =
+                (int32_t)(sessionDeadlineMs - requestedDeadlineMs) < 0
+                    ? sessionDeadlineMs : requestedDeadlineMs;
+            Serial.printf("[SYNC] grant=%u quota=%u window=%ums queue=%u\n",
+                          (unsigned)grant.grantId, (unsigned)grant.maxRecords,
+                          (unsigned)grant.grantWindowMs,
+                          (unsigned)local_queue::count());
+            QueueFlushResult flush = flushQueuedToMothership(
+                grantDeadlineMs, grant.maxRecords ? grant.maxRecords : 1, true, false);
+            sendDumpDone(session.sessionId, grant.grantId, flush);
+            nextHelloRetryMs = sessionDeadlineMs;  // roster already confirmed by a grant
+          }
+
+          // Until granted, repeat HELLO at a low rate in case the first unicast
+          // was lost. Once granted, the mothership owns further scheduling.
+          if (lastGrantId == 0 && (int32_t)(millis() - nextHelloRetryMs) >= 0) {
+            sendNodeHello(false);
+            nextHelloRetryMs = millis() + 1800UL;
+          }
+          delay(10);
+        }
+
+        if (!released) {
+          Serial.printf("[SYNC] session %lu ended without RELEASE; queue retained=%u\n",
+                        (unsigned long)session.sessionId,
+                        (unsigned)local_queue::count());
+        }
+        g_syncSessionOpenPending = false;
+        g_dumpGrantPending = false;
+        g_syncReleasePending = false;
+        shutdownEspNow();
+      } else if (g_syncWindowMarkerMs != 0) {
+        // Rolling-upgrade fallback: an older V2 mothership knows only the
+        // marker protocol. Jitter reduces its original all-at-once burst.
         const uint32_t markerMs = g_syncWindowMarkerMs;
         const uint32_t markerDelay = (markerMs >= windowStart) ? (markerMs - windowStart) : 0;
         uint32_t flushDeadline = windowStart + (uint32_t)SYNC_LISTEN_WINDOW_MS;
         if ((uint32_t)SYNC_LISTEN_WINDOW_MS > 2000UL) {
           flushDeadline -= 2000UL;
         }
-        Serial.printf("📶 Sync marker seen after %lums -> flushing queue\n",
-                      (unsigned long)markerDelay);
+        const uint32_t legacyJitter = coordinatedHelloJitterMs(markerMs);
+        delay(legacyJitter);
+        Serial.printf("📶 Legacy sync marker after %lums; jitter=%lums -> fallback flush\n",
+                      (unsigned long)markerDelay,
+                      (unsigned long)legacyJitter);
         flushQueuedToMothership(flushDeadline);
       } else {
         Serial.println("⚠️ Sync marker not seen in listen window; flush skipped this cycle");
@@ -1965,6 +2311,10 @@ void setup() {
 
   Serial.begin(115200);
   delay(2000);
+
+  // Arm the watchdog before any hang-prone work (I2C init, sensor init, sync).
+  initWatchdog();
+
   bool rtcReady = false;
   if (!initNodeEventQueue(NODE_EVENT_QUEUE_DEPTH)) {
     Serial.println("[EVENT] node event queue allocation failed");
@@ -2063,6 +2413,10 @@ void setup() {
     Serial.println("⚠️ ESP-NOW bringup failed in setup");
   }
 
+  // Load the configured "expected" sensor mask before initSensors() so passive
+  // sensors are gated by the operator's selection. 0 = auto-detect everything.
+  g_expectedSensorMask = nodeSensorMaskLoad();
+
   // Initialise all sensors (SHT41, PAR, soil, wind stub, AUX stub via sensors.cpp)
   if (!initSensors()) {
     Serial.println("⚠️ Sensor init failed (continuing, but reads may fail)");
@@ -2089,6 +2443,8 @@ void loop() {
   static unsigned long lastBeat        = 0;   // heartbeat
   static unsigned long lastA1Check     = 0;   // when we last checked A1F
   static unsigned long loopCounter     = 0;   // just to see loop advancing
+
+  feedWatchdog();  // main-loop heartbeat for the hang watchdog
 
   unsigned long nowMs = millis();
   NodeState st = currentNodeState();
@@ -2206,6 +2562,7 @@ void loop() {
     memset(mothershipMAC, 0, sizeof(mothershipMAC));
     rtcSynced        = false;
     deployedFlag     = false;
+    g_recordingPaused = false;
     lastTimeSyncUnix = 0;
     g_lastSyncSlot   = 0xFFFFFFFFUL;
     ds3231DisableAlarmInterrupt();
@@ -2381,6 +2738,123 @@ void loop() {
     Serial.printf("   ↪ CONFIG_ACK sent (v%u ok=%d): %s\n",
                   ack.appliedVersion, ack.ok,
                   ackRes == ESP_OK ? "OK" : esp_err_to_name(ackRes));
+  }
+
+  if (g_pendingNodeConfig) {
+    g_pendingNodeConfig = false;
+    node_config_message_t& cfg = g_pendingNodeConfigData;
+
+    if (cfg.targetState == 0 /*UNPAIRED*/) {
+      // ACK the desired version FIRST so the mothership can confirm removal,
+      // then wipe via the existing unpair path.
+      config_apply_ack_message_t ack{};
+      strcpy(ack.command, "CONFIG_ACK");
+      strncpy(ack.nodeId, NODE_ID, sizeof(ack.nodeId) - 1);
+      ack.appliedVersion = cfg.configVersion;
+      ack.ok = 1;
+      esp_err_t ackRes = sendEspNowAndWait(g_pendingNodeConfigMac, &ack, sizeof(ack), 250).queueResult;
+      Serial.printf("🗑️ [LOOP] NODE_CONFIG UNPAIRED v%u -> CONFIG_ACK %s, unpairing\n",
+                    cfg.configVersion, ackRes == ESP_OK ? "OK" : esp_err_to_name(ackRes));
+      g_pendingUnpair = true;   // reuse the existing wipe path
+    } else if (cfg.targetState == 2 /*DEPLOYED*/) {
+      uint16_t currentVer = getNodeConfigVersion();
+      Serial.printf("🧩 [LOOP] NODE_CONFIG DEPLOYED applying: v%u (current v%u) wakeMin=%u syncMin=%u\n",
+                    cfg.configVersion, currentVer, cfg.wakeIntervalMin, cfg.syncIntervalMin);
+
+      config_apply_ack_message_t ack{};
+      strcpy(ack.command, "CONFIG_ACK");
+      strncpy(ack.nodeId, NODE_ID, sizeof(ack.nodeId) - 1);
+      ack.appliedVersion = cfg.configVersion;
+      ack.ok = 0;
+
+      if (cfg.configVersion > currentVer) {
+        const uint8_t  oldWake    = g_intervalMin;
+        const uint16_t oldVersion = g_appliedConfigVersion;
+        const bool     wasPaused  = g_recordingPaused;
+        bool wakeChanged = false;
+        // NODE_CONFIG governs the recording (wake / A1) interval + the active vs
+        // standby state. targetState=DEPLOYED means ACTIVE: (re)enable recording.
+        // The sync (A2) schedule is left to SET_SYNC_SCHED so its live phase
+        // negotiation is never disturbed.
+        if (cfg.wakeIntervalMin > 0 && cfg.wakeIntervalMin != g_intervalMin) {
+          g_intervalMin = cfg.wakeIntervalMin;
+          wakeChanged = true;
+          Serial.printf("   ↪ wake interval updated: %u min\n", g_intervalMin);
+        }
+        g_recordingPaused = false;  // active — resume recording
+        const bool configPersisted = persistNodeConfig(cfg.configVersion, true);
+        if (configPersisted) setNodeConfigVersion(cfg.configVersion);
+        // Persist the configured sensor mask alongside the version bump. Only an
+        // authoritative mask (NODE_SENSOR_MASK_VALID set) is stored, so a legacy
+        // mothership sending 0 in this field can't wipe a real selection. Takes
+        // effect at the next wake, when initSensors() re-reads it.
+        if (configPersisted && (cfg.sensorMask & NODE_SENSOR_MASK_VALID) &&
+            cfg.sensorMask != g_expectedSensorMask) {
+          if (nodeSensorMaskSave(cfg.sensorMask)) {
+            g_expectedSensorMask = cfg.sensorMask;
+            Serial.printf("   ↪ sensor mask 0x%04X saved (applies next wake)\n",
+                          (unsigned)cfg.sensorMask);
+          } else {
+            Serial.println("   ⚠️ sensor mask persist FAILED");
+          }
+        }
+        // Re-arm if the interval changed OR we just resumed from standby (to
+        // bring the recording alarm A1 back).
+        if ((wakeChanged || wasPaused) && configPersisted &&
+            currentNodeState() == STATE_DEPLOYED && rtcSynced) {
+          g_rearmAlarmsPending = true;
+        }
+        if (wasPaused && configPersisted) Serial.println("   ▶️ resumed from standby");
+        ack.ok = configPersisted ? 1 : 0;
+        if (!configPersisted) {
+          g_intervalMin = oldWake;
+          g_recordingPaused = wasPaused;
+          g_appliedConfigVersion = oldVersion;
+          ack.appliedVersion = oldVersion;
+        }
+      } else {
+        ack.ok = 1;  // already current — still ACK so the mothership converges
+      }
+      esp_err_t ackRes = sendEspNowAndWait(g_pendingNodeConfigMac, &ack, sizeof(ack), 250).queueResult;
+      Serial.printf("   ↪ NODE_CONFIG CONFIG_ACK (v%u ok=%d): %s\n",
+                    ack.appliedVersion, ack.ok, ackRes == ESP_OK ? "OK" : esp_err_to_name(ackRes));
+    } else if (cfg.targetState == 3 /*STANDBY*/) {
+      // Pause recording but stay deployed and keep the sync (A2) check-ins so we
+      // remain remotely resumable. The re-arm (paused) drops the A1 alarm.
+      uint16_t currentVer = getNodeConfigVersion();
+      config_apply_ack_message_t ack{};
+      strcpy(ack.command, "CONFIG_ACK");
+      strncpy(ack.nodeId, NODE_ID, sizeof(ack.nodeId) - 1);
+      ack.appliedVersion = cfg.configVersion;
+      ack.ok = 0;
+      if (cfg.configVersion > currentVer) {
+        const bool     wasPaused  = g_recordingPaused;
+        const uint16_t oldVersion = g_appliedConfigVersion;
+        g_recordingPaused = true;
+        const bool configPersisted = persistNodeConfig(cfg.configVersion, true);
+        if (configPersisted) setNodeConfigVersion(cfg.configVersion);
+        if (!wasPaused && configPersisted &&
+            currentNodeState() == STATE_DEPLOYED && rtcSynced) {
+          g_rearmAlarmsPending = true;  // re-arm to drop the recording alarm
+        }
+        ack.ok = configPersisted ? 1 : 0;
+        if (!configPersisted) {
+          g_recordingPaused = wasPaused;
+          g_appliedConfigVersion = oldVersion;
+          ack.appliedVersion = oldVersion;
+        }
+        Serial.printf("⏸️ [LOOP] NODE_CONFIG STANDBY v%u %s (recording paused)\n",
+                      cfg.configVersion, configPersisted ? "applied" : "persist FAILED");
+      } else {
+        ack.ok = 1;
+      }
+      esp_err_t ackRes = sendEspNowAndWait(g_pendingNodeConfigMac, &ack, sizeof(ack), 250).queueResult;
+      Serial.printf("   ↪ NODE_CONFIG CONFIG_ACK (v%u ok=%d): %s\n",
+                    ack.appliedVersion, ack.ok, ackRes == ESP_OK ? "OK" : esp_err_to_name(ackRes));
+    } else {
+      Serial.printf("[LOOP] NODE_CONFIG targetState=%u ignored (reserved)\n",
+                    (unsigned)cfg.targetState);
+    }
   }
 
   if (g_pendingPersistConfig) {

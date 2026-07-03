@@ -355,9 +355,15 @@ HttpsPostResult ModemDriver::httpsPost(const String& url,
                 host.c_str(), port, path.c_str(), useSSL ? 1 : 0);
 
   // 1. Ensure PDP context is active
+  //    APN is configurable via build flag MODEM_APN; defaults to "TM" (Think Mobile).
+  //    Previous default was "internet.eplus.de" (Aldi Talk).
   {
     String resp;
-    sendAT("AT+CGDCONT=1,\"IP\",\"internet.eplus.de\"", resp, 5000);
+#ifndef MODEM_APN
+#define MODEM_APN "TM"
+#endif
+    String cgdcont = "AT+CGDCONT=1,\"IP\",\"" MODEM_APN "\"";
+    sendAT(cgdcont.c_str(), resp, 5000);
     sendAT("AT+CGACT=1,1", resp, 10000);
   }
 
@@ -1085,6 +1091,173 @@ int ModemDriver::getSignalQuality() {
 
   Serial.println("[Modem] getSignalQuality() — failed");
   return 99;
+}
+
+// ---------------------------------------------------------------------------
+// getDiagnostics()
+// ---------------------------------------------------------------------------
+
+// 3GPP access-technology code (AT+COPS <AcT>) -> short label.
+static const char* actCodeToStr(int act) {
+  switch (act) {
+    case 0: return "GSM";
+    case 1: return "GSM_COMPACT";
+    case 2: return "UTRAN";
+    case 3: return "GSM_EGPRS";
+    case 4: return "UTRAN_HSDPA";
+    case 5: return "UTRAN_HSUPA";
+    case 6: return "UTRAN_HSPA";
+    case 7: return "LTE";
+    case 8: return "EC_GSM_IOT";
+    case 9: return "LTE_NB";
+    default: return "UNKNOWN";
+  }
+}
+
+// Extract the first run of >= minDigits consecutive digits from s (for ICCID).
+static String firstDigitRun(const String& s, int minDigits) {
+  int len = s.length();
+  for (int i = 0; i < len; ++i) {
+    if (isdigit((int)s.charAt(i))) {
+      int j = i;
+      while (j < len && isdigit((int)s.charAt(j))) j++;
+      if (j - i >= minDigits) return s.substring(i, j);
+      i = j;
+    }
+  }
+  return "";
+}
+
+bool ModemDriver::getDiagnostics(ModemDiagnostics& d) {
+  d.imei = "";
+  d.iccid = "";
+  d.rssiDbm = 0;
+  d.ber = 99;
+  d.rsrpDbm = 0;
+  d.rsrqDb = 0;
+  d.operatorName = "";
+  d.accessTech = "";
+  d.cpsi = "";
+
+  bool anyResponse = false;
+  String resp;
+
+  d.imei = getImei();
+  if (d.imei.length() > 0) anyResponse = true;
+
+  // AT+CSQ -> +CSQ: <rssi>,<ber>   (rssi 0-31, 99=unknown; ber 0-7, 99=unknown)
+  if (sendAT("AT+CSQ", resp, 2000)) {
+    anyResponse = true;
+    int idx = resp.indexOf("+CSQ:");
+    if (idx >= 0) {
+      int colon = resp.indexOf(':', idx);
+      int comma = resp.indexOf(',', colon);
+      if (colon >= 0 && comma >= 0) {
+        int rssiRaw = resp.substring(colon + 1, comma).toInt();
+        int end = resp.indexOf('\r', comma);
+        d.ber = resp.substring(comma + 1, end > comma ? end : resp.length()).toInt();
+        d.rssiDbm = (rssiRaw >= 0 && rssiRaw <= 31) ? (-113 + 2 * rssiRaw) : 0;
+      }
+    }
+  }
+
+  // AT+CESQ -> +CESQ: <rxlev>,<ber>,<rscp>,<ecno>,<rsrq>,<rsrp>  (LTE last two)
+  // RSRP dBm = index - 141 (0..97); RSRQ dB ~ index/2 - 20 (0..34); 255=unknown.
+  if (sendAT("AT+CESQ", resp, 2000)) {
+    anyResponse = true;
+    int idx = resp.indexOf("+CESQ:");
+    if (idx >= 0) {
+      int p = resp.indexOf(':', idx) + 1;
+      int vals[6] = {255, 255, 255, 255, 255, 255};
+      for (int k = 0; k < 6 && p > 0; ++k) {
+        int comma = resp.indexOf(',', p);
+        String tok = (comma >= 0) ? resp.substring(p, comma) : resp.substring(p);
+        tok.trim();
+        vals[k] = tok.toInt();
+        if (comma < 0) break;
+        p = comma + 1;
+      }
+      if (vals[5] != 255) d.rsrpDbm = vals[5] - 141;
+      if (vals[4] != 255) d.rsrqDb = vals[4] / 2 - 20;
+    }
+  }
+
+  // AT+COPS? -> +COPS: <mode>,<format>,"<operator>",<AcT>
+  if (sendAT("AT+COPS?", resp, 2000)) {
+    anyResponse = true;
+    int q1 = resp.indexOf('"');
+    int q2 = (q1 >= 0) ? resp.indexOf('"', q1 + 1) : -1;
+    if (q1 >= 0 && q2 > q1) d.operatorName = resp.substring(q1 + 1, q2);
+    int lastComma = resp.lastIndexOf(',');
+    if (lastComma >= 0) {
+      int end = resp.indexOf('\r', lastComma);
+      int act = resp.substring(lastComma + 1, end > lastComma ? end : resp.length()).toInt();
+      d.accessTech = actCodeToStr(act);
+    }
+  }
+
+  // AT+CICCID -> +ICCID: <19-20 digit ICCID>
+  if (sendAT("AT+CICCID", resp, 2000)) {
+    anyResponse = true;
+    d.iccid = firstDigitRun(resp, 18);
+  }
+
+  // AT+CPSI? -> raw serving-cell line (system mode, operator, band, cell, TAC).
+  if (sendAT("AT+CPSI?", resp, 2000)) {
+    anyResponse = true;
+    int idx = resp.indexOf("+CPSI:");
+    if (idx >= 0) {
+      int start = idx + 6;
+      int end = resp.indexOf('\r', start);
+      String line = (end > start) ? resp.substring(start, end) : resp.substring(start);
+      line.trim();
+      d.cpsi = line;
+      // Derive access tech from the first CPSI token if COPS didn't give one.
+      if (d.accessTech.length() == 0 && line.length() > 0) {
+        int c = line.indexOf(',');
+        d.accessTech = (c > 0) ? line.substring(0, c) : line;
+      }
+    }
+  }
+
+  Serial.printf("[Modem] Diagnostics: rssi=%ddBm ber=%d rsrp=%ddBm rsrq=%ddB op=%s act=%s\n",
+                d.rssiDbm, d.ber, d.rsrpDbm, d.rsrqDb,
+                d.operatorName.c_str(), d.accessTech.c_str());
+  return anyResponse;
+}
+
+String modemDiagnosticsToJson(const ModemDiagnostics& d, uint32_t regTimeMs) {
+  auto esc = [](const String& v) -> String {
+    String out;
+    out.reserve(v.length() + 8);
+    for (size_t i = 0; i < v.length(); i++) {
+      char c = v[i];
+      if (c == '"' || c == '\\') { out += '\\'; out += c; }
+      else if (c == '\n' || c == '\r' || c == '\t') { out += ' '; }
+      else { out += c; }
+    }
+    return out;
+  };
+
+  // The backend wants `null` (not 0) for unmeasured values, so it can tell
+  // "not measured" from a real reading. Sentinels: rssi/rsrp/rsrq 0 (never a
+  // real dBm/dB here), ber 99, regTimeMs 0xFFFFFFFF (untracked, e.g. manual).
+  String j;
+  j.reserve(256);
+  j += "{";
+  j += "\"imei\":\"" + esc(d.imei) + "\",";
+  j += "\"iccid\":\"" + esc(d.iccid) + "\",";
+  j += "\"rssiDbm\":" + (d.rssiDbm == 0 ? String("null") : String(d.rssiDbm)) + ",";
+  j += "\"ber\":" + (d.ber == 99 ? String("null") : String(d.ber)) + ",";
+  j += "\"rsrpDbm\":" + (d.rsrpDbm == 0 ? String("null") : String(d.rsrpDbm)) + ",";
+  j += "\"rsrqDb\":" + (d.rsrqDb == 0 ? String("null") : String(d.rsrqDb)) + ",";
+  j += "\"operator\":\"" + esc(d.operatorName) + "\",";
+  j += "\"accessTech\":\"" + esc(d.accessTech) + "\",";
+  j += "\"cpsi\":\"" + esc(d.cpsi) + "\",";
+  j += "\"regTimeMs\":" +
+       (regTimeMs == 0xFFFFFFFFUL ? String("null") : String(regTimeMs));
+  j += "}";
+  return j;
 }
 
 // ---------------------------------------------------------------------------
