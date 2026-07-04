@@ -28,9 +28,12 @@ struct SensorSlot {
     uint8_t backendIndex;
 };
 
-// Max number of sensors handled by this node firmware.
-// Baseline standard profile uses 8 slots, with headroom for AUX expansion.
-constexpr size_t MAX_SENSORS = 16;
+// Max number of REGISTRY sensors (physical channels) this node firmware tracks.
+// Spectral metadata (Clear/NIR/gain/integration/saturation) is NOT registered —
+// it rides the snapshot as metadata (see buildReadingsArray) — so the spectral
+// sensor costs only its 8 visible-band slots here.
+//   air(2) + spectral bands(8) + soil(4) + wind(1) + aux(2) = 17
+constexpr size_t MAX_SENSORS = 20;  // headroom above the 17-slot standard profile
 
 // Global registry (defined in sensors.cpp)
 extern SensorSlot g_sensors[MAX_SENSORS];

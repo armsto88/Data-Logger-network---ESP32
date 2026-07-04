@@ -1294,10 +1294,20 @@ static void sendCaptivePortalLanding() {
 }
 
 static String headCommon(const String& title, const String& actionsHtml = String()) {
+  // No-store on every portal page: phones/captive-portal browsers cache the AP
+  // pages aggressively, which repeatedly showed stale UI after a reflash. This
+  // header is queued for this request's send(); the belt-and-braces meta tags
+  // below cover browsers that ignore the HTTP header.
+  server.sendHeader("Cache-Control", "no-store, no-cache, must-revalidate");
+  server.sendHeader("Pragma", "no-cache");
+  server.sendHeader("Expires", "0");
+
   String h;
   h.reserve(4500);
   h += F("<!DOCTYPE html><html><head>");
   h += F("<meta charset='UTF-8'><meta name='viewport' content='width=device-width, initial-scale=1'>");
+  h += F("<meta http-equiv='Cache-Control' content='no-cache, no-store, must-revalidate'>"
+         "<meta http-equiv='Pragma' content='no-cache'><meta http-equiv='Expires' content='0'>");
   h += F("<style>"); h += FPSTR(COMMON_CSS); h += F("</style>");
   h += F("<script>"); h += FPSTR(COMMON_JS);  h += F("</script>");
   h += F("</head><body>");
@@ -2432,6 +2442,13 @@ static void handleStationDetail() {
   }
   html += F("</div>");
 
+  // Sensor configuration — opens the toggle-button picker, returns here on save.
+  html += F("<div style='margin-bottom:12px'>"
+            "<a href='/node-sensors?id=");
+  html += target->nodeId;
+  html += F("' class='btn btn--sm' style='display:block;text-align:center;padding:12px'>"
+            "&#9881; Configure Sensors</a></div>");
+
   html += F("<form action='/station' method='POST' onsubmit='return confirmRemove()'>"
             "<input type='hidden' name='node_id' value='");
   html += target->nodeId;
@@ -2898,49 +2915,17 @@ static void handleSettings() {
   html += F("<details style='margin-top:14px'>");
   html += F("<summary style='font-weight:bold;cursor:pointer'>Advanced settings</summary>");
 
-  html += F("<div class='row'>");
-  html += F("<div class='col'><label class='label' for='min_bat_mv'>Min battery (mV)</label>");
-  html += F("<input class='input' id='min_bat_mv' name='min_bat_mv' type='number' min='0' value='");
-  html += String(tx.minBatteryMv);
-  html += F("'></div>");
-  html += F("<div class='col'><label class='label' for='max_bytes'>Max bytes per session</label>");
-  html += F("<input class='input' id='max_bytes' name='max_bytes' type='number' min='0' value='");
-  html += String(tx.maxBytesPerSession);
-  html += F("'></div>");
-  html += F("</div>");
-
-  html += F("<div class='row'>");
-  html += F("<div class='col'><label class='label' for='max_retries'>Max retries per window</label>");
-  html += F("<input class='input' id='max_retries' name='max_retries' type='number' min='0' value='");
-  html += String(tx.maxRetriesPerWindow);
-  html += F("'></div>");
-  html += F("<div class='col'><label class='label' for='upload_min'>Upload interval (min, 0=every collection)</label>");
-  html += F("<input class='input' id='upload_min' name='upload_min' type='number' min='0' value='");
-  html += String(tx.uploadIntervalMin);
-  html += F("'></div>");
-  html += F("</div>");
+  // Upload interval, min-battery, max-bytes and max-retries are no longer exposed
+  // here — they're fixed at sensible defaults in transmission_settings (upload
+  // every sync, 3500 mV 1S Li-ion guard, 96 KB cap, 3 retries).
 
   html += F("<label class='label'><input type='checkbox' name='allow_manual' value='1'");
   if (tx.allowManualUpload) html += F(" checked");
   html += F("> <strong>Allow manual upload from this page</strong></label>");
   html += F("<div class='help'>Manual upload powers on the modem and transmits now. This takes 30-60s and draws extra power.</div>");
 
-  html += F("<p class='muted' style='margin-top:10px'>Legacy fields — leave blank unless advised:</p>");
-
-  html += F("<label class='label' for='token'>Auth token</label>");
-  html += F("<input class='input' id='token' name='token' type='password' placeholder='auth token' value='");
-  html += htmlEscape(tx.authToken);
-  html += F("'>");
-
-  html += F("<label class='label' for='site_id'>Site ID</label>");
-  html += F("<input class='input' id='site_id' name='site_id' type='text' placeholder='site-001' value='");
-  html += htmlEscape(tx.siteId);
-  html += F("'>");
-
-  html += F("<label class='label' for='deploy_id'>Deployment ID</label>");
-  html += F("<input class='input' id='deploy_id' name='deploy_id' type='text' placeholder='deploy-001' value='");
-  html += htmlEscape(tx.deploymentId);
-  html += F("'>");
+  // Legacy fields (Auth token / Site ID / Deployment ID) hidden for now — their
+  // stored values are preserved untouched on save (see handleSetTransmission).
 
   html += F("</details>");
 
@@ -2987,9 +2972,8 @@ static void handleSetTransmission() {
   TransmissionSettings tx;
   tx.enabled          = server.hasArg("enabled") && server.arg("enabled") == "1";
   tx.endpointUrl      = server.arg("url");
-  tx.authToken        = server.arg("token");
   tx.apiKey           = server.arg("api_key");  // may be blank; preserved below
-  tx.siteId           = server.arg("site_id");
+  // authToken / siteId / deploymentId inputs are hidden — carried from prev below.
 
   // QR code string: if present and contains '|', split into url|key.
   String qrString = server.arg("qr_string");
@@ -3006,20 +2990,24 @@ static void handleSetTransmission() {
       tx.apiKey = qrString;
     }
   }
-  tx.deploymentId     = server.arg("deploy_id");
-  tx.uploadIntervalMin= (uint16_t)server.arg("upload_min").toInt();
-  tx.minBatteryMv     = (uint16_t)server.arg("min_bat_mv").toInt();
-  tx.maxBytesPerSession = (uint32_t)server.arg("max_bytes").toInt();
-  tx.maxRetriesPerWindow = (uint8_t)server.arg("max_retries").toInt();
   tx.allowManualUpload = server.hasArg("allow_manual") && server.arg("allow_manual") == "1";
 
-  // Preserve phase anchor (not edited via this form)
+  // uploadIntervalMin / minBatteryMv / maxBytesPerSession / maxRetriesPerWindow
+  // are no longer user-editable — carry the fixed defaults straight from load
+  // (which forces them), along with the phase anchor this form doesn't edit.
   TransmissionSettings prev;
   loadTransmissionSettings(prev);
-  tx.uploadPhaseUnix = prev.uploadPhaseUnix;
+  tx.uploadPhaseUnix     = prev.uploadPhaseUnix;
+  tx.uploadIntervalMin   = prev.uploadIntervalMin;
+  tx.minBatteryMv        = prev.minBatteryMv;
+  tx.maxBytesPerSession  = prev.maxBytesPerSession;
+  tx.maxRetriesPerWindow = prev.maxRetriesPerWindow;
   tx.useJsonUpload = prev.useJsonUpload;
   tx.mothershipId = prev.mothershipId;  // not editable via this form yet
   tx.projectId = prev.projectId;        // not editable via this form yet
+  tx.authToken    = prev.authToken;     // legacy fields hidden — preserve stored values
+  tx.siteId       = prev.siteId;
+  tx.deploymentId = prev.deploymentId;
   // Keep the previous API key if the form field was left blank (no QR string).
   if (tx.apiKey.length() == 0 || tx.apiKey.indexOf("\u2022") >= 0) {
     tx.apiKey = prev.apiKey;
@@ -3304,6 +3292,92 @@ static void handleShutdown() {
 // operator marked installed; VALID bit is added in firmware). Bumps the node's
 // desired configVersion so the selection is delivered + reconciled via NODE_CONFIG
 // during the next sync window, and refreshes the RAM cache used for fault display.
+// GET /node-sensors?id=<nodeId> — the toggle-button sensor picker. Buttons are
+// pre-selected from the node's current configured mask; Save posts to
+// /set-node-sensors (from_ui=1) which redirects back to the node page.
+static void handleNodeSensorsPage() {
+  String nodeId = server.arg("id");
+  if (nodeId.length() == 0) nodeId = server.arg("node_id");
+
+  NodeInfo* target = nullptr;
+  for (auto& n : registeredNodes) {
+    if (n.nodeId == nodeId) { target = &n; break; }
+  }
+
+  String back = String("<a href='/station?id=") + nodeId + "' class='btn btn--sm'>Back</a>";
+  String html = headCommon("Configure Sensors", back);
+  html += F("<div class='section'>");
+
+  if (!target) {
+    html += F("<h3>Node not found</h3><a href='/stations' class='btn btn--primary'>Back to Nodes</a>");
+    html += F("</div>");
+    html += footCommon();
+    server.send(404, "text/html", html);
+    return;
+  }
+
+  const NodeDesiredConfig dc = getDesiredConfig(nodeId.c_str());
+  const uint16_t mask = (dc.sensorMask & NODE_SENSOR_MASK_VALID)
+      ? (uint16_t)(dc.sensorMask & ~NODE_SENSOR_MASK_VALID) : 0;
+
+  html += F("<h3>Sensors installed</h3>");
+  html += F("<p class='muted'>Tap the sensors fitted to this node, then Save. "
+            "Changes reach the node at its next sync check-in.</p>");
+
+  html += F("<form id='sf' action='/set-node-sensors' method='POST'>");
+  html += F("<input type='hidden' name='node_id' value='"); html += nodeId; html += F("'>");
+  html += F("<input type='hidden' name='from_ui' value='1'>");
+  html += F("<input type='hidden' id='mask' name='mask' value='0'>");
+  html += F("<div class='sensor-grid'>");
+
+  struct SensorOption { uint16_t bit; const char* label; const char* grp; };
+  static const SensorOption kOptions[] = {
+    { (uint16_t)(SNAP_PRESENT_AIR_TEMP | SNAP_PRESENT_AIR_RH), "Air (SHT41)",        "" },
+    { SNAP_PRESENT_SPECTRAL,                                   "Spectral (AS7343)",  "" },
+    { SNAP_PRESENT_SOIL1,                                      "Soil Probe 1",       "" },
+    { SNAP_PRESENT_SOIL2,                                      "Soil Probe 2",       "" },
+    { SNAP_PRESENT_WIND,                                       "Wind (Reed cup)",    "wind" },
+    { NODE_SENSOR_CFG_WIND_ULTRASONIC,                         "Wind (Ultrasonic)",  "wind" },
+    { SNAP_PRESENT_AUX1,                                       "Aux 1",              "" },
+    { SNAP_PRESENT_AUX2,                                       "Aux 2",              "" },
+  };
+  for (const auto& opt : kOptions) {
+    const bool sel = (mask & opt.bit) != 0;
+    html += F("<button type='button' class='sbtn");
+    if (sel) html += F(" sbtn--on");
+    html += F("' data-bit='"); html += String((unsigned)opt.bit); html += F("'");
+    if (opt.grp[0]) { html += F(" data-grp='"); html += opt.grp; html += F("'"); }
+    html += F(">"); html += opt.label; html += F("</button>");
+  }
+
+  html += F("</div>");
+  html += F("<button type='submit' class='btn btn--success' "
+            "style='margin-top:16px;width:100%;padding:14px;font-size:16px'>Save Sensors</button>");
+  html += F("</form>");
+
+  html += F("<style>"
+    ".sensor-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:8px}"
+    ".sbtn{padding:16px 10px;border:2px solid #cbd5e1;border-radius:12px;background:#fff;"
+    "font-size:15px;font-weight:600;color:#333;cursor:pointer;text-align:center;min-height:60px;line-height:1.25}"
+    ".sbtn--on{background:#1f9d55;border-color:#1a8548;color:#fff}"
+    "</style>");
+  html += F("<script>(function(){"
+    "var f=document.getElementById('sf'),m=document.getElementById('mask');"
+    "var btns=f.querySelectorAll('.sbtn');"
+    "function recompute(){var v=0;btns.forEach(function(b){"
+    "if(b.classList.contains('sbtn--on'))v|=parseInt(b.dataset.bit,10);});m.value=v;}"
+    "btns.forEach(function(b){b.addEventListener('click',function(){"
+    "var on=!b.classList.contains('sbtn--on');"
+    "if(on&&b.dataset.grp){btns.forEach(function(o){"
+    "if(o!==b&&o.dataset.grp===b.dataset.grp)o.classList.remove('sbtn--on');});}"
+    "b.classList.toggle('sbtn--on',on);recompute();});});"
+    "recompute();})();</script>");
+
+  html += F("</div>");
+  html += footCommon();
+  server.send(200, "text/html", html);
+}
+
 static void handleSetNodeSensors() {
   String nodeId = server.arg("node_id");
   if (nodeId.length() == 0 || !server.hasArg("mask")) {
@@ -3311,8 +3385,8 @@ static void handleSetNodeSensors() {
                 "{\"ok\":false,\"error\":\"node_id and mask required\"}");
     return;
   }
-  // Keep only the 9 defined capability bits (SNAP_PRESENT_AIR_TEMP..BAT_V).
-  const uint16_t capBits = (uint16_t)((uint32_t)server.arg("mask").toInt() & 0x01FFu);
+  // Keep only the operator-selectable bits (9 present bits + ultrasonic selector).
+  const uint16_t capBits = (uint16_t)((uint32_t)server.arg("mask").toInt() & NODE_SENSOR_CFG_ALL_BITS);
   // Always authoritative: even an all-off selection is a deliberate config, so
   // the node stops auto-registering passive sensors. (0 without VALID = auto.)
   const uint16_t storedMask = (uint16_t)(capBits | NODE_SENSOR_MASK_VALID);
@@ -3337,6 +3411,14 @@ static void handleSetNodeSensors() {
 
   Serial.printf("[CONFIG] %s sensor mask -> 0x%04X desired v%u\n",
                 nodeId.c_str(), (unsigned)storedMask, (unsigned)dc.configVersion);
+
+  // Submitted from the on-device picker page — send the operator back to the
+  // node detail page to finish deployment. API callers omit from_ui and get JSON.
+  if (server.hasArg("from_ui")) {
+    server.sendHeader("Location", String("/station?id=") + nodeId);
+    server.send(303, "text/plain", "");
+    return;
+  }
 
   String resp = String("{\"ok\":true,\"nodeId\":\"") + nodeId +
                 "\",\"sensorMask\":" + String((unsigned)capBits) +
@@ -3397,6 +3479,7 @@ void startConfigServer() {
   server.on("/stations", HTTP_GET, handleStationsPage);
   server.on("/station", HTTP_GET, handleStationDetail);
   server.on("/station", HTTP_POST, handleNodeConfigSave);
+  server.on("/node-sensors", HTTP_GET, handleNodeSensorsPage);
   server.on("/set-node-sensors", HTTP_POST, handleSetNodeSensors);
   server.on("/revert-node", HTTP_POST, handleRevertNode);
 

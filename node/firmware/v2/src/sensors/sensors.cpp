@@ -36,6 +36,11 @@ uint16_t resolveSensorId(const char* label, const char* type) {
     if (strcmp(label, "SPECTRAL_590") == 0) return SENSOR_ID_SPECTRAL_590;
     if (strcmp(label, "SPECTRAL_630") == 0) return SENSOR_ID_SPECTRAL_630;
     if (strcmp(label, "SPECTRAL_680") == 0) return SENSOR_ID_SPECTRAL_680;
+    if (strcmp(label, "SPECTRAL_CLEAR") == 0) return SENSOR_ID_SPECTRAL_CLEAR;
+    if (strcmp(label, "SPECTRAL_NIR") == 0) return SENSOR_ID_SPECTRAL_NIR;
+    if (strcmp(label, "SPECTRAL_GAIN") == 0) return SENSOR_ID_SPECTRAL_GAIN;
+    if (strcmp(label, "SPECTRAL_ATIME_MS") == 0) return SENSOR_ID_SPECTRAL_ATIME;
+    if (strcmp(label, "SPECTRAL_SAT") == 0) return SENSOR_ID_SPECTRAL_SAT;
     if (strcmp(label, "PAR") == 0) return SENSOR_ID_UNKNOWN;
     if (strcmp(label, "WIND_SPEED") == 0) return SENSOR_ID_WIND_SPEED;
     if (strcmp(label, "SOIL1_VWC") == 0) return SENSOR_ID_SOIL1_VWC;
@@ -68,11 +73,17 @@ uint16_t   g_expectedSensorMask = 0;
 
 namespace {
 
-// Is this channel permitted by the configured mask? Auto mode (mask not valid)
+// Is this slot permitted by the configured mask? Auto mode (mask not valid)
 // registers everything, preserving legacy behaviour. Self-identifying sensors
 // are never gated — only the passive ones the node cannot probe for on the bus.
-bool sensorAllowedByMask(uint16_t sensorId) {
+// The two wind backends share the WIND capability bit but are selected
+// independently: reed cup on SNAP_PRESENT_WIND, ultrasonic on its own selector.
+bool sensorAllowedByMask(uint8_t backend, uint16_t sensorId) {
   if (!(g_expectedSensorMask & NODE_SENSOR_MASK_VALID)) return true;
+  if (backend == SENSOR_BACKEND_REED_WIND)
+    return (g_expectedSensorMask & SNAP_PRESENT_WIND) != 0;
+  if (backend == SENSOR_BACKEND_ULTRASONIC_WIND)
+    return (g_expectedSensorMask & NODE_SENSOR_CFG_WIND_ULTRASONIC) != 0;
   const uint16_t bit = snapPresentBitForSensorId(sensorId);
   if ((bit & NODE_SENSOR_PASSIVE_BITS) == 0) return true;
   return (g_expectedSensorMask & bit) != 0;
@@ -85,7 +96,7 @@ bool commitSensorSlot(uint8_t backend, size_t backendIndex,
                       const char* label, const char* type) {
   if (g_numSensors >= MAX_SENSORS) return false;
   const uint16_t id = resolveSensorId(label, type);
-  if (!sensorAllowedByMask(id)) {
+  if (!sensorAllowedByMask(backend, id)) {
     Serial.printf("[SENS] gated id=%u label='%s' (mask 0x%04X)\n",
                   (unsigned)id, label ? label : "?", (unsigned)g_expectedSensorMask);
     return false;
@@ -272,5 +283,31 @@ size_t buildReadingsArray(v2_reading_t* out, size_t maxCount) {
     out[count].value    = value;
     ++count;
   }
+
+  // Spectral housekeeping. The AS7341 is a single physical sensor; its Clear,
+  // NIR, applied gain, integration time, and saturation flag describe that one
+  // spectral measurement rather than being independent channels. They are
+  // appended here as extra readings instead of occupying registry slots (which
+  // would let one sensor consume 13 of MAX_SENSORS). Emitted only when a
+  // spectral sample succeeded this cycle; getMetadata() shares read()'s cache.
+  if (par_as7343_backend::metadataAvailable() && count < maxCount) {
+    par_as7343_backend::SpectralMetadata md = par_as7343_backend::getMetadata();
+    if (md.valid) {
+      const struct { uint16_t id; float val; } extras[] = {
+        { SENSOR_ID_SPECTRAL_CLEAR, md.clear },
+        { SENSOR_ID_SPECTRAL_NIR,   md.nir },
+        { SENSOR_ID_SPECTRAL_GAIN,  md.gain },
+        { SENSOR_ID_SPECTRAL_ATIME, md.integrationMs },
+        { SENSOR_ID_SPECTRAL_SAT,   (float)md.saturated },
+      };
+      for (const auto& e : extras) {
+        if (count >= maxCount) break;
+        out[count].sensorId = e.id;
+        out[count].value    = e.val;
+        ++count;
+      }
+    }
+  }
+
   return count;
 }

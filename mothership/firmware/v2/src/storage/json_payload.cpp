@@ -13,8 +13,10 @@
 //   5 configVersion  6 batVoltage  7 airTemp  8 airHumidity
 //   9-16 spectral_415..spectral_680  17 windSpeed  18 windDir
 //   19 soil1Vwc 20 soil1Temp 21 soil2Vwc 22 soil2Temp  23 aux1  24 aux2
+//   25 spectral_clear 26 spectral_nir 27 spectral_gain
+//   28 spectral_integration_ms 29 spectral_saturated
 
-static constexpr int kNumCsvColumns = 25;
+static constexpr int kNumCsvColumns = 30;
 static constexpr uint16_t kMaxReadingsPerPost = 100;  // backend hard limit
 
 enum CellType {
@@ -58,6 +60,11 @@ static const ColumnMapping kColumnMappings[kNumCsvColumns] = {
   {22, "soil2Temp",      CELL_NUM_NULLABLE},
   {23, "aux1",           CELL_NUM_NULLABLE},
   {24, "aux2",           CELL_NUM_NULLABLE},
+  {25, "spectral_clear",          CELL_NUM_NULLABLE},
+  {26, "spectral_nir",            CELL_NUM_NULLABLE},
+  {27, "spectral_gain",           CELL_NUM_NULLABLE},
+  {28, "spectral_integration_ms", CELL_NUM_NULLABLE},
+  {29, "spectral_saturated",      CELL_NUM_NULLABLE},
 };
 
 // ---------------------------------------------------------------------------

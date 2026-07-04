@@ -80,11 +80,15 @@ void loadTransmissionSettings(TransmissionSettings& s) {
   prefs.getString("deploy_id", stringBuf, sizeof(stringBuf));
   stringBuf[sizeof(stringBuf) - 1] = '\0';
   s.deploymentId = String(stringBuf);
-  s.uploadIntervalMin  = prefs.getUShort("upload_min", 0);
   s.uploadPhaseUnix    = prefs.getUInt("phase_unix", 0);
-  s.minBatteryMv       = prefs.getUShort("min_bat_mv", DEFAULT_MIN_BAT_MV);
-  s.maxBytesPerSession = prefs.getUInt("max_bytes", DEFAULT_MAX_BYTES);
-  s.maxRetriesPerWindow = prefs.getUChar("max_retries", DEFAULT_MAX_RETRIES);
+  // These four are no longer user-editable — they're fixed at sensible defaults
+  // (see transmission_settings.h) and forced here so any stale NVS value or old
+  // UI override is ignored. Upload every sync (0), 1S Li-ion brownout guard, the
+  // 96 KB CSV-path cap (inert on the JSON path), and 3 retries per window.
+  s.uploadIntervalMin   = 0;
+  s.minBatteryMv        = DEFAULT_MIN_BAT_MV;
+  s.maxBytesPerSession  = DEFAULT_MAX_BYTES;
+  s.maxRetriesPerWindow = DEFAULT_MAX_RETRIES;
   s.allowManualUpload  = prefs.getBool("allow_manual", DEFAULT_ALLOW_MANUAL);
   // Force JSON upload on.  A previous config-save bug could persist a stale
   // `false` for the use_json key (or leave it absent on units migrating from

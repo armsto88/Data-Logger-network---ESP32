@@ -277,6 +277,12 @@ typedef struct rnt_pairing_t {
 #define SENSOR_ID_SPECTRAL_590  1106
 #define SENSOR_ID_SPECTRAL_630  1107
 #define SENSOR_ID_SPECTRAL_680  1108
+// Additional AS7341 outputs (same 1100 spectral group):
+#define SENSOR_ID_SPECTRAL_CLEAR 1109  // wideband "Clear" photodiode, raw counts
+#define SENSOR_ID_SPECTRAL_NIR   1110  // ~910 nm NIR, raw counts
+#define SENSOR_ID_SPECTRAL_GAIN  1111  // applied gain multiplier (0.5..512)
+#define SENSOR_ID_SPECTRAL_ATIME 1112  // integration time this read (ms)
+#define SENSOR_ID_SPECTRAL_SAT   1113  // saturation/validity flag (0=ok, 1=saturated)
 #define SENSOR_ID_WIND_SPEED    1201
 #define SENSOR_ID_WIND_DIR      1202
 #define SENSOR_ID_SOIL1_VWC     2001
@@ -327,6 +333,15 @@ typedef struct rnt_pairing_t {
 // older mothership that sends 0 in this field stays fully compatible).
 #define NODE_SENSOR_MASK_VALID   (1u << 15)
 
+// Config-only selector: choose the ultrasonic wind backend instead of the reed
+// cup. Both report as SNAP_PRESENT_WIND, so this bit only tells the node which
+// backend to register — it is normalised back to SNAP_PRESENT_WIND for
+// mothership fault detection. Reed cup is selected via SNAP_PRESENT_WIND itself.
+#define NODE_SENSOR_CFG_WIND_ULTRASONIC (1u << 9)
+
+// All operator-selectable bits: the 9 present bits (0-8) + the ultrasonic selector.
+#define NODE_SENSOR_CFG_ALL_BITS (0x01FFu | NODE_SENSOR_CFG_WIND_ULTRASONIC)
+
 // Passive capability bits: sensors the node cannot probe for on the bus, so they
 // are only registered/read when the configured mask enables them. The remaining
 // bits (AIR_TEMP/AIR_RH/SPECTRAL) are self-identifying I2C parts that are always
@@ -346,6 +361,9 @@ inline uint16_t snapPresentBitForSensorId(uint16_t sensorId) {
     case SENSOR_ID_SPECTRAL_480: case SENSOR_ID_SPECTRAL_515:
     case SENSOR_ID_SPECTRAL_555: case SENSOR_ID_SPECTRAL_590:
     case SENSOR_ID_SPECTRAL_630: case SENSOR_ID_SPECTRAL_680:
+    case SENSOR_ID_SPECTRAL_CLEAR: case SENSOR_ID_SPECTRAL_NIR:
+    case SENSOR_ID_SPECTRAL_GAIN: case SENSOR_ID_SPECTRAL_ATIME:
+    case SENSOR_ID_SPECTRAL_SAT:
       return SNAP_PRESENT_SPECTRAL;
     case SENSOR_ID_WIND_SPEED:   case SENSOR_ID_WIND_DIR:  return SNAP_PRESENT_WIND;
     case SENSOR_ID_SOIL1_VWC:    case SENSOR_ID_SOIL1_TEMP: return SNAP_PRESENT_SOIL1;

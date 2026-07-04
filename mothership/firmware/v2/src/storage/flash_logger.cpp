@@ -100,7 +100,12 @@ bool decodeV2(const uint8_t* data, int len, DecodedSnapshot& out) {
       case SENSOR_ID_SPECTRAL_555:
       case SENSOR_ID_SPECTRAL_590:
       case SENSOR_ID_SPECTRAL_630:
-      case SENSOR_ID_SPECTRAL_680:   out.sensorPresent |= SNAP_PRESENT_SPECTRAL; break;
+      case SENSOR_ID_SPECTRAL_680:
+      case SENSOR_ID_SPECTRAL_CLEAR:
+      case SENSOR_ID_SPECTRAL_NIR:
+      case SENSOR_ID_SPECTRAL_GAIN:
+      case SENSOR_ID_SPECTRAL_ATIME:
+      case SENSOR_ID_SPECTRAL_SAT:    out.sensorPresent |= SNAP_PRESENT_SPECTRAL; break;
       case SENSOR_ID_WIND_SPEED:
       case SENSOR_ID_WIND_DIR:       out.sensorPresent |= SNAP_PRESENT_WIND; break;
       case SENSOR_ID_SOIL1_VWC:
@@ -220,7 +225,13 @@ bool logDecodedSnapshot(const DecodedSnapshot& decoded) {
   n += appendSensor(row, sizeof(row), n, decoded, SENSOR_ID_SOIL2_VWC);   n += snprintf(row + n, sizeof(row) - n, ",");
   n += appendSensor(row, sizeof(row), n, decoded, SENSOR_ID_SOIL2_TEMP);  n += snprintf(row + n, sizeof(row) - n, ",");
   n += appendSensor(row, sizeof(row), n, decoded, SENSOR_ID_AUX1);        n += snprintf(row + n, sizeof(row) - n, ",");
-  n += appendSensor(row, sizeof(row), n, decoded, SENSOR_ID_AUX2);
+  n += appendSensor(row, sizeof(row), n, decoded, SENSOR_ID_AUX2);        n += snprintf(row + n, sizeof(row) - n, ",");
+  // Extended AS7341 outputs (appended so existing column indices are stable).
+  n += appendSensor(row, sizeof(row), n, decoded, SENSOR_ID_SPECTRAL_CLEAR); n += snprintf(row + n, sizeof(row) - n, ",");
+  n += appendSensor(row, sizeof(row), n, decoded, SENSOR_ID_SPECTRAL_NIR);   n += snprintf(row + n, sizeof(row) - n, ",");
+  n += appendSensor(row, sizeof(row), n, decoded, SENSOR_ID_SPECTRAL_GAIN);  n += snprintf(row + n, sizeof(row) - n, ",");
+  n += appendSensor(row, sizeof(row), n, decoded, SENSOR_ID_SPECTRAL_ATIME); n += snprintf(row + n, sizeof(row) - n, ",");
+  n += appendSensor(row, sizeof(row), n, decoded, SENSOR_ID_SPECTRAL_SAT);
 
   if (n <= 0) return false;
   return flashLogCSVRow(String(row));
@@ -235,7 +246,9 @@ static const char* kCSVHeader =
     "batVoltage,airTemp,airHumidity,"
     "spectral_415,spectral_445,spectral_480,spectral_515,"
     "spectral_555,spectral_590,spectral_630,spectral_680,"
-    "windSpeed,windDir,soil1Vwc,soil1Temp,soil2Vwc,soil2Temp,aux1,aux2";
+    "windSpeed,windDir,soil1Vwc,soil1Temp,soil2Vwc,soil2Temp,aux1,aux2,"
+    "spectral_clear,spectral_nir,spectral_gain,spectral_integration_ms,"
+    "spectral_saturated";
 
 static bool gFlashReady = false;
 static bool gFlashMountFailed = false;
@@ -352,6 +365,8 @@ bool logSnapshotRow(const node_snapshot_t* snap) {
   n += appendFloat(row, sizeof(row), n, snap->soil2Temp);    n += snprintf(row + n, sizeof(row) - n, ",");
   n += appendFloat(row, sizeof(row), n, snap->aux1);         n += snprintf(row + n, sizeof(row) - n, ",");
   n += appendFloat(row, sizeof(row), n, snap->aux2);
+  // Extended AS7341 columns — absent in the V1 snapshot struct, emit nan.
+  n += snprintf(row + n, sizeof(row) - n, ",nan,nan,nan,nan,nan");
 
   if (n <= 0) return false;
   return flashLogCSVRow(String(row));
@@ -411,6 +426,8 @@ bool logSnapshotBatch(const node_snapshot_t* snapshots, int count) {
     n += appendFloat(row, sizeof(row), n, snap->soil2Temp);    n += snprintf(row + n, sizeof(row) - n, ",");
     n += appendFloat(row, sizeof(row), n, snap->aux1);         n += snprintf(row + n, sizeof(row) - n, ",");
     n += appendFloat(row, sizeof(row), n, snap->aux2);
+    // Extended AS7341 columns — absent in the V1 snapshot struct, emit nan.
+    n += snprintf(row + n, sizeof(row) - n, ",nan,nan,nan,nan,nan");
 
     if (n > 0) {
       f.println(row);

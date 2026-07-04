@@ -180,7 +180,13 @@ void processSnapshot(const DecodedSnapshot& decoded, const uint8_t* mac) {
       // doesn't flap the dashboard. expectedSensorMask holds capability bits only.
       {
         const uint16_t present  = decoded.sensorPresent;
-        const uint16_t expected = n.expectedSensorMask;  // capability bits, no VALID
+        // Normalise the ultrasonic-wind selector to the WIND present bit — a
+        // snapshot only ever reports SNAP_PRESENT_WIND regardless of backend —
+        // and keep only the 9 present bits for the comparison.
+        uint16_t expected = n.expectedSensorMask;  // capability bits, no VALID
+        if (expected & NODE_SENSOR_CFG_WIND_ULTRASONIC)
+          expected = (uint16_t)((expected & ~NODE_SENSOR_CFG_WIND_ULTRASONIC) | SNAP_PRESENT_WIND);
+        expected &= 0x01FF;
         const uint16_t missNow  = (uint16_t)(expected & ~present);
         n.sensorFaultMask   = (uint16_t)(missNow & n.sensorMissPrev);
         n.sensorMissPrev    = missNow;
@@ -295,7 +301,17 @@ static void runCoordinatedSyncWindow(
     const std::vector<node_config_message_t>& nodeCfgs,
     uint16_t activeSyncMin, uint32_t activeSyncPhase,
     uint8_t legacyGraceCycles) {
-  static constexpr uint32_t kJoinWindowMs = 12000UL;
+  // The rendezvous window is ANCHORED TO THE SYNC SLOT, not to our (pre-rolled)
+  // wake — otherwise the mothership's ~10 s pre-roll consumes it before any node
+  // is even awake. A node's DS3231 Alarm 2 is minute-resolution (it wakes on the
+  // slot) and it cold-boots ~2.5 s before it can send NODE_HELLO, so we keep
+  // collecting HELLOs until slot + kJoinPostSlotSec. Sized for ~20 nodes booting
+  // together (HELLO jitter + a couple of retries + ESP-NOW contention). The old
+  // fixed 12 s window closed ~2 s after the slot — just before nodes could answer
+  // — which is why responders was always 0.
+  static constexpr uint32_t kJoinPostSlotSec = 15;      // hold rendezvous this long past the slot
+  static constexpr uint32_t kJoinFloorMs     = 15000UL; // min (if we wake at/after the slot)
+  static constexpr uint32_t kJoinCapMs       = 45000UL; // hard ceiling
   static constexpr uint32_t kCoordinatedWindowMs = 105000UL;
   static constexpr uint16_t kGrantWindowMs = 9000U;
   static constexpr uint8_t kGrantQuota = 4;
@@ -312,10 +328,31 @@ static void runCoordinatedSyncWindow(
   uint32_t sessionId = getRTCTime() ^ esp_random();
   if (sessionId == 0) sessionId = 1;
 
+  // Anchor the join window to the slot: round the current RTC time to the nearest
+  // phase-aligned boundary, then hold the rendezvous open until slot +
+  // kJoinPostSlotSec. Falls back to the floor when no anchor is known.
+  uint32_t joinWindowMs = kJoinFloorMs;
+  {
+    const uint32_t nowUnix = getRTCTime();
+    if (activeSyncMin > 0 && activeSyncPhase > 0 && nowUnix >= activeSyncPhase) {
+      const uint32_t period = (uint32_t)activeSyncMin * 60UL;
+      const uint32_t rem = (nowUnix - activeSyncPhase) % period;
+      const int32_t toSlotSec = (rem <= period - rem)
+          ? -(int32_t)rem                 // nearest slot is behind us (woke late)
+          : (int32_t)(period - rem);      // nearest slot is ahead (normal pre-roll)
+      int32_t ms = (toSlotSec + (int32_t)kJoinPostSlotSec) * 1000;
+      if (ms < (int32_t)kJoinFloorMs) ms = (int32_t)kJoinFloorMs;
+      if (ms > (int32_t)kJoinCapMs)   ms = (int32_t)kJoinCapMs;
+      joinWindowMs = (uint32_t)ms;
+    }
+  }
+  Serial.printf("[SYNC] join window=%lu ms (anchored to slot+%lus, deployed=%d)\n",
+                (unsigned long)joinWindowMs, (unsigned long)kJoinPostSlotSec, deployedCount);
+
   sync_session_open_message_t sessionOpen{};
   strncpy(sessionOpen.command, "SYNC_SESSION", sizeof(sessionOpen.command) - 1);
   sessionOpen.sessionId = sessionId;
-  sessionOpen.joinWindowMs = (uint16_t)kJoinWindowMs;
+  sessionOpen.joinWindowMs = (uint16_t)joinWindowMs;
   // Nodes start their local timer when they hear a beacon, possibly near the
   // end of rendezvous. Leave a 15 s release margin beyond our grant deadline.
   sessionOpen.sessionWindowSec = (uint16_t)((syncBudgetMs + 15000UL) / 1000UL);
@@ -371,7 +408,7 @@ static void runCoordinatedSyncWindow(
   // callback; no node receives permission to dump during this collection phase.
   uint32_t lastBeaconMs = 0;
   uint32_t lastConfigBurstMs = 0;
-  while ((uint32_t)(millis() - syncStartMs) < kJoinWindowMs) {
+  while ((uint32_t)(millis() - syncStartMs) < joinWindowMs) {
     const uint32_t nowMs = millis();
     if (lastBeaconMs == 0 || (uint32_t)(nowMs - lastBeaconMs) >= 1000UL) {
       broadcastSyncWindowOpen();  // rolling-upgrade compatibility

@@ -156,8 +156,8 @@ namespace soil_moist_temp_backend {
   const char* label(size_t index) {
     switch (index) {
       case 0: return "SOIL1_VWC";
-      case 1: return "SOIL2_VWC";
-      case 2: return "SOIL1_TEMP";
+      case 1: return "SOIL1_TEMP";
+      case 2: return "SOIL2_VWC";
       case 3: return "SOIL2_TEMP";
       default: return "UNKNOWN";
     }
@@ -166,9 +166,9 @@ namespace soil_moist_temp_backend {
   const char* type(size_t index) {
     switch (index) {
       case 0:
-      case 1:
-        return "SOIL_VWC";
       case 2:
+        return "SOIL_VWC";
+      case 1:
       case 3:
         return "SOIL_TEMP";
       default:
@@ -183,10 +183,10 @@ namespace soil_moist_temp_backend {
     if (!haveSample) return false;
 
     switch (index) {
-      case 0: outValue = lastThetaV1; break;
-      case 1: outValue = lastThetaV2; break;
-      case 2: outValue = lastTemp1C;  break;
-      case 3: outValue = lastTemp2C;  break;
+      case 0: outValue = lastThetaV1; break;  // SOIL1_VWC
+      case 1: outValue = lastTemp1C;  break;  // SOIL1_TEMP
+      case 2: outValue = lastThetaV2; break;  // SOIL2_VWC
+      case 3: outValue = lastTemp2C;  break;  // SOIL2_TEMP
       default: return false;
     }
     return true;

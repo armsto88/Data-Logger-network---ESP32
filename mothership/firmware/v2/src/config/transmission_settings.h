@@ -11,7 +11,7 @@
 // Defaults
 // ---------------------------------------------------------------------------
 static constexpr bool     DEFAULT_TX_ENABLED    = false;
-static constexpr uint16_t DEFAULT_MIN_BAT_MV    = 3700;
+static constexpr uint16_t DEFAULT_MIN_BAT_MV    = 3500;  // 1S Li-ion brownout guard for modem TX
 static constexpr uint32_t DEFAULT_MAX_BYTES     = 98304;    // 96 KB (supports ~30 nodes)
 static constexpr uint8_t  DEFAULT_MAX_RETRIES    = 3;
 static constexpr bool     DEFAULT_ALLOW_MANUAL   = true;
