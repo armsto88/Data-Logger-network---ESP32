@@ -1497,6 +1497,7 @@ void setup() {
   Serial.println();
   Serial.println("=== Mothership V1 Firmware ===");
   Serial.printf("Build: %s %s\n", __DATE__, __TIME__);
+  Serial.println("[FW] V2 snapshot decode; CSV schema=30; spectral metadata IDs=1109-1113");
 
   // Arm a conservative fallback before wake classification or long-running
   // sync/upload work. Preserve the flag that caused an RTC wake because the

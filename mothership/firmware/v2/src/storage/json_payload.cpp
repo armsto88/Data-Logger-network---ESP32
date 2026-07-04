@@ -117,13 +117,24 @@ static int splitCsvRow(const String& line, String* fields, int maxFields) {
 // ---------------------------------------------------------------------------
 
 static bool appendReadingObject(String& json, const String& line, bool& first,
-                                const String& fallbackIso) {
+                                const String& fallbackIso, bool traceSpectral) {
   String fields[kNumCsvColumns];
   const int n = splitCsvRow(line, fields, kNumCsvColumns);
   if (n < 6) {
     Serial.printf("[JSON] Skipping malformed CSV row (%d fields): %.60s\n",
                   n, line.c_str());
     return false;
+  }
+
+  if (traceSpectral) {
+    const char* clear = n > 25 ? fields[25].c_str() : "ABSENT";
+    const char* nir   = n > 26 ? fields[26].c_str() : "ABSENT";
+    const char* gain  = n > 27 ? fields[27].c_str() : "ABSENT";
+    const char* tint  = n > 28 ? fields[28].c_str() : "ABSENT";
+    const char* sat   = n > 29 ? fields[29].c_str() : "ABSENT";
+    Serial.printf("[JSON-SPEC] csv_fields=%d spectral_clear=%s spectral_nir=%s "
+                  "spectral_gain=%s spectral_integration_ms=%s spectral_saturated=%s\n",
+                  n, clear, nir, gain, tint, sat);
   }
 
   if (!first) json += ",";
@@ -181,6 +192,9 @@ static bool appendReadingObject(String& json, const String& line, bool& first,
   }
 
   json += "}";
+  if (traceSpectral) {
+    Serial.printf("[JSON-SPEC-OBJECT] %s\n", json.c_str());
+  }
   return true;
 }
 
@@ -254,7 +268,8 @@ JsonPayload buildJsonUpload(const String& csvChunk,
         // Row cap reached — leave this row for the next chunk.
         break;
       }
-      if (appendReadingObject(readings, line, firstReading, fallbackIso)) {
+      if (appendReadingObject(readings, line, firstReading, fallbackIso,
+                              emitted == 0)) {
         emitted++;
       }
     }

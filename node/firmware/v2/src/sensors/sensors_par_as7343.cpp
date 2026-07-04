@@ -143,6 +143,7 @@ void sampleIfNeeded() {
   // ladder/tries. Each re-read costs one integration (~50 ms), bounded by
   // kMaxAutoGainTries.
   uint8_t status2 = 0;
+  bool statusValid = false;
   bool saturated = false;
   const uint32_t fs = fullScaleCounts();
   const float satHigh = 0.90f * (float)fs;  // step down above this
@@ -158,21 +159,33 @@ void sampleIfNeeded() {
     haveRead = true;
 
     status2 = 0;
-    readStatus2(status2);
-    saturated = (status2 & AS7341_STATUS2_ASAT) != 0;
+    statusValid = readStatus2(status2);
+    saturated = statusValid && ((status2 & AS7341_STATUS2_ASAT) != 0);
 
     const float maxCount = maxExposureCount();
     const bool tooBright = saturated || maxCount >= satHigh;
     const bool tooDark   = maxCount < satLow;
 
-    if (tooBright && g_gainIdx > 0) {
+    // Never change gain after the final acquisition: the metadata must report
+    // the gain that produced the accepted counts. Reserve another attempt for
+    // every gain change so the new setting is actually sampled.
+    const bool canRetry = (attempt + 1U) < kMaxAutoGainTries;
+    if (canRetry && tooBright && g_gainIdx > 0) {
       g_gainIdx--;
-      g_par.setGain(kGainLadder[g_gainIdx].gain);
+      if (!g_par.setGain(kGainLadder[g_gainIdx].gain)) {
+        g_haveSample = false;
+        Serial.println(F("[PAR] AS734x auto-gain step-down failed"));
+        return;
+      }
       continue;
     }
-    if (tooDark && g_gainIdx < kGainLadderLen - 1) {
+    if (canRetry && tooDark && g_gainIdx < kGainLadderLen - 1) {
       g_gainIdx++;
-      g_par.setGain(kGainLadder[g_gainIdx].gain);
+      if (!g_par.setGain(kGainLadder[g_gainIdx].gain)) {
+        g_haveSample = false;
+        Serial.println(F("[PAR] AS734x auto-gain step-up failed"));
+        return;
+      }
       continue;
     }
     break;  // on-scale, or clamped at ladder end — accept this read
@@ -199,13 +212,19 @@ void sampleIfNeeded() {
   g_lastChannel[CH_ATIME_MS] = (float)g_par.getTINT();  // integration time (ms)
   // Report saturated if we could not resolve it away (still clipped, or invalid
   // measurement). AVALID clear also counts as not-trustworthy.
-  bool avalid = (status2 & AS7341_STATUS2_AVALID) != 0;
+  bool avalid = statusValid && ((status2 & AS7341_STATUS2_AVALID) != 0);
   g_lastChannel[CH_SAT] = (saturated || !avalid) ? 1.0f : 0.0f;
+  if (!statusValid) {
+    Serial.println(F("[PAR] AS734x STATUS2 read failed; exposure marked invalid"));
+  }
 
   float parProxy = 0.0f;
   for (size_t i = CH_415; i <= CH_680; ++i) parProxy += g_lastChannel[i];
 
-  g_lastSampleMs = now;
+  // Timestamp the completed exposure, not the start of a potentially long
+  // auto-gain sequence. getMetadata() never starts a second acquisition:
+  // Clear/NIR/gain/time must qualify these exact visible-band counts.
+  g_lastSampleMs = millis();
   g_haveSample = true;
 
   Serial.printf("[PAR] F1=%.0f F4=%.0f F8=%.0f CLR=%.0f NIR=%.0f "
@@ -292,16 +311,13 @@ bool read(size_t index, float& outValue) {
 }
 
 bool metadataAvailable() {
-  return g_ready;
+  return g_ready && g_haveSample;
 }
 
 SpectralMetadata getMetadata() {
   SpectralMetadata m{};
   m.valid = false;
-  if (!g_ready) return m;
-
-  sampleIfNeeded();
-  if (!g_haveSample) return m;
+  if (!g_ready || !g_haveSample) return m;
 
   m.clear         = g_lastChannel[CH_CLEAR];
   m.nir           = g_lastChannel[CH_NIR];

@@ -2,6 +2,7 @@
 
 #include <Arduino.h>
 #include <LittleFS.h>
+#include "storage/csv_schema.h"
 
 // Upload cursor / queue manager for the Mothership V1 modem upload subsystem.
 //
@@ -16,12 +17,7 @@
 // ---------------------------------------------------------------------------
 // CSV header (must match flash_logger.cpp)
 // ---------------------------------------------------------------------------
-static constexpr const char* kUploadCSVHeader =
-    "datetime,nodeId,seqNum,sensorPresent,qualityFlags,configVersion,"
-    "batVoltage,airTemp,airHumidity,"
-    "spectral_415,spectral_445,spectral_480,spectral_515,"
-    "spectral_555,spectral_590,spectral_630,spectral_680,"
-    "windSpeed,windDir,soil1Vwc,soil1Temp,soil2Vwc,soil2Temp,aux1,aux2";
+static constexpr const char* kUploadCSVHeader = kCurrentCSVHeader30;
 
 // ---------------------------------------------------------------------------
 // Cursor — persisted in NVS

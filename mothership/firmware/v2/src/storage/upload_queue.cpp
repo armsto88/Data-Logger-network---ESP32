@@ -6,6 +6,11 @@ static const char* kDataFile    = "/datalog.csv";
 static const char* kTempFile    = "/datalog_tmp.csv";
 static const char* kBackupFile  = "/datalog_bak.csv";
 
+static bool isLegacyCSVHeader(String header) {
+  header.trim();
+  return header == String(kLegacyCSVHeader25);
+}
+
 static bool commitTempDataFile(const char* context) {
   LittleFS.remove(kBackupFile);
 
@@ -292,16 +297,19 @@ UploadPayload UploadQueue::getNewData(uint32_t maxBytes) {
     return payload;
   }
 
-  // Use the actual header from the file so the uploaded payload matches the
-  // on-disk CSV exactly (forward-compatible with a future dynamic header).
-  // Fall back to the compile-time constant if the file has no header line.
+  // Normally use the actual header. During the safe 25->30 migration, present
+  // the current superset header while leaving the old on-disk file and cursor
+  // untouched. Legacy rows have 25 cells (the five appended values are absent)
+  // and new rows have all 30; both remain positionally valid.
   {
     File hf = LittleFS.open(kDataFile, "r");
     if (hf) {
       String header = hf.readStringUntil('\n');
       hf.close();
       if (header.length() > 0) {
-        payload.csvData = header;
+        payload.csvData = isLegacyCSVHeader(header)
+            ? String(kUploadCSVHeader)
+            : header;
         payload.csvData += "\n";
       } else {
         payload.csvData = String(kUploadCSVHeader);
@@ -425,12 +433,18 @@ bool UploadQueue::purgeUploaded() {
     return false;
   }
 
-  // Write header to temp — copy the actual first line from the source file
-  // so a future dynamic header is preserved verbatim. Fall back to the
-  // compile-time constant if the source has no readable header.
+  const bool queueDrained = m_cursor.byteOffset >= rf.size();
+
+  // Copy the source header while rows remain. Once every queued byte has been
+  // uploaded, safely switch an empty legacy file to the current 30-column
+  // header. No row offsets move while unuploaded data exists.
   {
     String header = rf.readStringUntil('\n');
-    if (header.length() > 0) {
+    header.trim();
+    if (queueDrained && isLegacyCSVHeader(header)) {
+      wf.println(kUploadCSVHeader);
+      Serial.println("[UQ] purgeUploaded: queue drained; upgraded CSV header 25 -> 30 columns");
+    } else if (header.length() > 0) {
       wf.println(header);
     } else {
       wf.println(kUploadCSVHeader);
@@ -553,6 +567,7 @@ bool UploadQueue::emergencyPurgeIfFull(uint8_t thresholdPct) {
     if (hf) {
       String header = hf.readStringUntil('\n');
       hf.close();
+      header.trim();
       if (header.length() > 0) {
         wf.println(header);
       } else {

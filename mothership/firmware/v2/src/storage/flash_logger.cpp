@@ -1,5 +1,7 @@
 #include "storage/flash_logger.h"
+#include "storage/csv_schema.h"
 #include "protocol.h"
+#include <LittleFS.h>
 #include <time.h>
 #include <math.h>
 
@@ -179,7 +181,35 @@ static int appendSensor(char* buf, size_t bufSize, int offset,
   return appendFloat(buf, bufSize, offset, *p);
 }
 
-bool logDecodedSnapshot(const DecodedSnapshot& decoded) {
+static void traceDecodedSpectralMetadata(const DecodedSnapshot& decoded) {
+  const uint16_t ids[] = {
+    SENSOR_ID_SPECTRAL_CLEAR, SENSOR_ID_SPECTRAL_NIR,
+    SENSOR_ID_SPECTRAL_GAIN, SENSOR_ID_SPECTRAL_ATIME,
+    SENSOR_ID_SPECTRAL_SAT,
+  };
+  const char* labels[] = {"clear", "nir", "gain", "integration_ms", "saturated"};
+
+  size_t present = 0;
+  for (uint16_t id : ids) {
+    if (decoded.find(id)) ++present;
+  }
+
+  Serial.printf("[SNAP-SPEC] node=%.15s seq=%lu proto=%u readings=%u extended=%u/5",
+                decoded.nodeId, static_cast<unsigned long>(decoded.seqNum),
+                static_cast<unsigned>(decoded.protocolVersion),
+                static_cast<unsigned>(decoded.readingCount),
+                static_cast<unsigned>(present));
+  for (size_t i = 0; i < 5; ++i) {
+    Serial.printf(" %s=", labels[i]);
+    const float* value = decoded.find(ids[i]);
+    if (value && isfinite(*value)) Serial.printf("%.3f", *value);
+    else Serial.print(value ? "NONFINITE" : "MISSING");
+  }
+  Serial.println();
+}
+
+bool formatDecodedSnapshotCSVRow(const DecodedSnapshot& decoded, String& outRow) {
+  traceDecodedSpectralMetadata(decoded);
   // Convert Unix timestamp to ISO 8601 datetime
   char tsBuf[25];
   uint32_t ts = decoded.nodeTimestamp;
@@ -233,22 +263,35 @@ bool logDecodedSnapshot(const DecodedSnapshot& decoded) {
   n += appendSensor(row, sizeof(row), n, decoded, SENSOR_ID_SPECTRAL_ATIME); n += snprintf(row + n, sizeof(row) - n, ",");
   n += appendSensor(row, sizeof(row), n, decoded, SENSOR_ID_SPECTRAL_SAT);
 
-  if (n <= 0) return false;
-  return flashLogCSVRow(String(row));
+  if (n <= 0 || n >= static_cast<int>(sizeof(row))) return false;
+  outRow = String(row);
+
+  size_t columns = 1;
+  for (size_t i = 0; i < outRow.length(); ++i) {
+    if (outRow[i] == ',') ++columns;
+  }
+  Serial.printf("[FLASH-SPEC] seq=%lu columns=%u extended_csv=%s,%s,%s,%s,%s\n",
+                static_cast<unsigned long>(decoded.seqNum),
+                static_cast<unsigned>(columns),
+                decoded.find(SENSOR_ID_SPECTRAL_CLEAR) ? "number" : "nan",
+                decoded.find(SENSOR_ID_SPECTRAL_NIR) ? "number" : "nan",
+                decoded.find(SENSOR_ID_SPECTRAL_GAIN) ? "number" : "nan",
+                decoded.find(SENSOR_ID_SPECTRAL_ATIME) ? "number" : "nan",
+                decoded.find(SENSOR_ID_SPECTRAL_SAT) ? "number" : "nan");
+  return columns == kCurrentCSVColumnCount;
+}
+
+bool logDecodedSnapshot(const DecodedSnapshot& decoded) {
+  String row;
+  if (!formatDecodedSnapshotCSVRow(decoded, row)) return false;
+  return flashLogCSVRow(row);
 }
 
 // CSV header matching node_snapshot_t fields.
 // Columns: datetime, nodeId, seqNum, sensorPresent, qualityFlags, configVersion,
 //          batVoltage, airTemp, airHumidity, spectral[8], windSpeed, windDir,
 //          soil1Vwc, soil1Temp, soil2Vwc, soil2Temp, aux1, aux2
-static const char* kCSVHeader =
-    "datetime,nodeId,seqNum,sensorPresent,qualityFlags,configVersion,"
-    "batVoltage,airTemp,airHumidity,"
-    "spectral_415,spectral_445,spectral_480,spectral_515,"
-    "spectral_555,spectral_590,spectral_630,spectral_680,"
-    "windSpeed,windDir,soil1Vwc,soil1Temp,soil2Vwc,soil2Temp,aux1,aux2,"
-    "spectral_clear,spectral_nir,spectral_gain,spectral_integration_ms,"
-    "spectral_saturated";
+static const char* kCSVHeader = kCurrentCSVHeader30;
 
 static bool gFlashReady = false;
 static bool gFlashMountFailed = false;
@@ -291,17 +334,35 @@ bool initFlash() {
       return false;
     }
   } else {
-    // Verify header matches; if not, recreate the file.
+    // Never delete queued rows merely because the schema gained appended
+    // columns. A legacy 25-column file remains positionally compatible with
+    // new 30-column rows. UploadQueue presents the current header to uploads
+    // and upgrades the on-disk header after the queue is fully drained.
     File f = LittleFS.open(kFlashFile, "r");
-    if (f) {
-      String firstLine = f.readStringUntil('\n');
-      firstLine.trim();
-      f.close();
-      if (firstLine != String(kCSVHeader)) {
-        Serial.println("[FLASH] Header mismatch — recreating datalog.csv");
-        LittleFS.remove(kFlashFile);
-        flashCreateCSVHeader();
+    if (!f) {
+      Serial.println("[FLASH] Existing datalog.csv could not be opened");
+      gFlashReady = false;
+      return false;
+    }
+    String firstLine = f.readStringUntil('\n');
+    const bool hasDataRows = f.available();
+    firstLine.trim();
+    f.close();
+
+    if (firstLine == String(kLegacyCSVHeader25)) {
+      if (hasDataRows) {
+        Serial.println("[FLASH] Legacy 25-column CSV has queued rows; preserving until upload drain");
+      } else {
+        Serial.println("[FLASH] Empty legacy CSV; upgrading header to 30 columns");
+        if (!flashCreateCSVHeader()) {
+          gFlashReady = false;
+          return false;
+        }
       }
+    } else if (firstLine != String(kCSVHeader)) {
+      Serial.println("[FLASH] Unknown CSV header; preserving file and refusing incompatible appends");
+      gFlashReady = false;
+      return false;
     }
   }
 

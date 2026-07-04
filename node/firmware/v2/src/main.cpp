@@ -2311,6 +2311,8 @@ void setup() {
 
   Serial.begin(115200);
   delay(2000);
+  Serial.printf("[FW] node build=%s protocol=%u spectral_metadata_ids=1109-1113\n",
+                FW_BUILD, static_cast<unsigned>(NODE_PROTOCOL_VERSION));
 
   // Arm the watchdog before any hang-prone work (I2C init, sensor init, sync).
   initWatchdog();

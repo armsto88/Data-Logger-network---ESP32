@@ -1,6 +1,7 @@
 // sensors.h
 #pragma once
 #include <Arduino.h>
+#include "protocol.h"
 
 // Which backend produced a slot. Stored per-slot so readSensor() dispatches
 // directly instead of inferring the backend from cumulative counts — that
@@ -34,6 +35,14 @@ struct SensorSlot {
 // sensor costs only its 8 visible-band slots here.
 //   air(2) + spectral bands(8) + soil(4) + wind(1) + aux(2) = 17
 constexpr size_t MAX_SENSORS = 20;  // headroom above the 17-slot standard profile
+constexpr size_t SPECTRAL_METADATA_READING_COUNT = 5;
+
+// captureSensorsToQueue() adds one battery reading before registry readings.
+// Prove at compile time that even a completely full registry still leaves room
+// for the AS7341 metadata without exceeding the ESP-NOW V2 packet limit.
+static_assert(MAX_SENSORS + 1 + SPECTRAL_METADATA_READING_COUNT <=
+                  MAX_READINGS_PER_SNAPSHOT,
+              "V2 snapshot capacity cannot hold registry + battery + spectral metadata");
 
 // Global registry (defined in sensors.cpp)
 extern SensorSlot g_sensors[MAX_SENSORS];
@@ -50,9 +59,6 @@ bool initSensors();
 
 // Read a single sensor by index; returns true on success
 bool readSensor(size_t index, float &outValue);
-
-// V2 key-value snapshot support
-#include "protocol.h"
 
 // Build an array of V2 readings from the sensor registry.
 // Iterates g_sensors[], reads each sensor via readSensor(), and emits

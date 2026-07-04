@@ -1,7 +1,6 @@
 #pragma once
 
 #include <Arduino.h>
-#include <LittleFS.h>
 #include "protocol.h"  // node_snapshot_t, node_snapshot_v2_t, SENSOR_ID_*
 
 // Flash (LittleFS) logging module for Mothership V1.
@@ -68,6 +67,9 @@ bool initFlash();
 bool logSnapshotRow(const node_snapshot_t* snap);
 bool logSnapshotBatch(const node_snapshot_t* snapshots, int count);
 bool logDecodedSnapshot(const DecodedSnapshot& decoded);
+// Format the canonical 30-column row without touching LittleFS. Used by the
+// logger and the focused V2 spectral-pipeline regression test.
+bool formatDecodedSnapshotCSVRow(const DecodedSnapshot& decoded, String& outRow);
 bool flashLogCSVRow(const String& row);
 String flashGetCSVStats();
 bool flashCreateCSVHeader();

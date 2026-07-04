@@ -28,13 +28,13 @@ const char* label(size_t index);
 const char* type(size_t index);
 bool read(size_t index, float& outValue);
 
-// True once init() has succeeded — the snapshot builder uses this to decide
-// whether to append the metadata readings.
+// True only when a successful spectral sample is cached. The snapshot builder
+// uses this to append metadata from the same exposure as the visible bands.
 bool metadataAvailable();
 
-// Returns the housekeeping values for the most recent spectral sample. Triggers
-// a sample if needed (same cache as read()). `valid` is false if no sample could
-// be taken this cycle.
+// Returns housekeeping for the already-captured spectral sample. It never
+// starts another acquisition; `valid` is false when no successful sample is
+// available, preventing metadata from qualifying a different exposure.
 SpectralMetadata getMetadata();
 
 } // namespace par_as7343_backend

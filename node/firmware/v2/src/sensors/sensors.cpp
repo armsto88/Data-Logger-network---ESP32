@@ -289,10 +289,24 @@ size_t buildReadingsArray(v2_reading_t* out, size_t maxCount) {
   // spectral measurement rather than being independent channels. They are
   // appended here as extra readings instead of occupying registry slots (which
   // would let one sensor consume 13 of MAX_SENSORS). Emitted only when a
-  // spectral sample succeeded this cycle; getMetadata() shares read()'s cache.
-  if (par_as7343_backend::metadataAvailable() && count < maxCount) {
+  // spectral sample succeeded this cycle; getMetadata() reads that exact cached
+  // exposure and never starts a second acquisition.
+  if (par_as7343_backend::metadataAvailable()) {
     par_as7343_backend::SpectralMetadata md = par_as7343_backend::getMetadata();
-    if (md.valid) {
+    const bool finite = isfinite(md.clear) && isfinite(md.nir) &&
+                        isfinite(md.gain) && isfinite(md.integrationMs);
+    if (!md.valid) {
+      Serial.println(F("[SENS-SPEC] metadata unavailable after spectral read"));
+    } else if (!finite) {
+      Serial.printf("[SENS-SPEC] metadata non-finite: clear=%.3f nir=%.3f gain=%.3f tint=%.3f\n",
+                    md.clear, md.nir, md.gain, md.integrationMs);
+    } else if ((maxCount - count) < SPECTRAL_METADATA_READING_COUNT) {
+      // Append all five or none. A partial metadata set cannot safely qualify
+      // the exposure and would turn capacity pressure into misleading rows.
+      Serial.printf("[SENS-SPEC] no snapshot capacity: used=%u max=%u need=%u; metadata omitted\n",
+                    static_cast<unsigned>(count), static_cast<unsigned>(maxCount),
+                    static_cast<unsigned>(SPECTRAL_METADATA_READING_COUNT));
+    } else {
       const struct { uint16_t id; float val; } extras[] = {
         { SENSOR_ID_SPECTRAL_CLEAR, md.clear },
         { SENSOR_ID_SPECTRAL_NIR,   md.nir },
@@ -301,11 +315,15 @@ size_t buildReadingsArray(v2_reading_t* out, size_t maxCount) {
         { SENSOR_ID_SPECTRAL_SAT,   (float)md.saturated },
       };
       for (const auto& e : extras) {
-        if (count >= maxCount) break;
         out[count].sensorId = e.id;
         out[count].value    = e.val;
         ++count;
       }
+      Serial.printf("[SENS-SPEC] appended ids=1109-1113 clear=%.3f nir=%.3f gain=%.1f "
+                    "integration_ms=%.3f saturated=%u total=%u/%u\n",
+                    md.clear, md.nir, md.gain, md.integrationMs,
+                    static_cast<unsigned>(md.saturated),
+                    static_cast<unsigned>(count), static_cast<unsigned>(maxCount));
     }
   }
 
