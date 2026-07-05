@@ -545,6 +545,27 @@ static uint32_t computeNextOldSlotUnix(int oldIntervalMin) {
   return phase + (slots + 1UL) * period;
 }
 
+// "Next upload" as the user will actually observe it. While a schedule change
+// is pending, the fleet is still asleep on the OLD schedule and keeps
+// collecting on it until the next old-schedule slot (the handover), when both
+// mothership and nodes switch to the new interval together. During that window
+// computeNextSyncIsoLocal() is misleading — it projects the not-yet-active new
+// interval forward from the preserved old phase, showing a slot that will not
+// actually occur. So when a change is pending we report the handover time
+// instead. The pending-detection here MUST match buildScheduleTransitionBanner()
+// so the banner's "Handover at" and this "Next upload" never disagree.
+static String computeNextCollectionIsoLocal() {
+  if (gSyncMode == SYNC_MODE_INTERVAL) {
+    const int oldSync = readAnchorSyncIntervalMin();
+    const int newSync = computeAutoSyncMin(gWakeIntervalMin);
+    if (oldSync > 0 && newSync > 0 && oldSync != newSync) {
+      const uint32_t handoverUnix = computeNextOldSlotUnix(oldSync);
+      if (handoverUnix > 0) return formatDateTimeDisplay(DateTime(handoverUnix));
+    }
+  }
+  return computeNextSyncIsoLocal();
+}
+
 // Build a "schedule change pending" banner shown only when the desired sync
 // interval (derived from the wake setting) differs from the anchor the fleet
 // is currently aligned to. The new schedule is delivered to nodes at the next
@@ -1389,7 +1410,7 @@ static String buildStatusJson() {
   json += (gSyncMode == SYNC_MODE_INTERVAL) ? "interval" : "daily";
   json += "\",";
   json += "\"nextSyncLocal\":\"";
-  json += computeNextSyncIsoLocal();
+  json += computeNextCollectionIsoLocal();
   json += "\",";
   json += "\"fleet\":{";
   json += "\"total\":";
@@ -1789,7 +1810,7 @@ static void handleRoot() {
     html += String(gSyncIntervalMin);
     html += F(" min</span></div>"
               "<div class='stat'><strong>Next upload</strong><span class='num' style='font-size:16px'><span id='kpi-next-sync'>");
-    html += computeNextSyncIsoLocal();
+    html += computeNextCollectionIsoLocal();
     html += F("</span></span></div>"
               "</div>"
               "</div>");

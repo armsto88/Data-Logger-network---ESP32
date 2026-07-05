@@ -3,6 +3,7 @@
 #include <Arduino.h>
 #include <esp_now.h>
 #include "protocol.h"
+#include "storage/flash_logger.h"  // DecodedSnapshot
 
 // ESP-NOW sync-only module for Mothership V1.
 // Provides receive-only ESP-NOW on a fixed channel without WiFi AP.
@@ -11,9 +12,15 @@
 // Callback type for received ESP-NOW data
 typedef void (*EspNowRecvCallback)(const uint8_t* mac, const uint8_t* data, int len);
 
+// Holds the fully-decoded snapshot (V1 or V2, any sensor mix) so nothing is
+// lost between the ESP-NOW receive callback and processSnapshot(). Previously
+// this held a node_snapshot_t (V1-only fixed fields), which silently dropped
+// the AS7341 extended metadata (Clear/NIR/gain/integration/saturated) — those
+// fields have no slot in node_snapshot_t, so every sync-window-delivered
+// reading lost them even though the wire packet carried them correctly.
 struct EspNowSnapSlot {
   uint8_t mac[6];
-  node_snapshot_t snap;
+  DecodedSnapshot snap;
 };
 
 struct SyncHelloSlot {

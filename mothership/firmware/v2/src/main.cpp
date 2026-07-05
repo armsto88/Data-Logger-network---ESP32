@@ -205,15 +205,6 @@ void processSnapshot(const DecodedSnapshot& decoded, const uint8_t* mac) {
   // deployed nodes send node_snapshot_t (V1) or node_snapshot_v2_t (V2).
 }
 
-// V1 compatibility wrapper — decodes a node_snapshot_t into the common
-// DecodedSnapshot form and delegates to the canonical overload.
-void processSnapshot(const node_snapshot_t* snap, const uint8_t* mac) {
-  if (!snap || !mac) return;
-  DecodedSnapshot decoded;
-  decodeV1(*snap, decoded);
-  processSnapshot(decoded, mac);
-}
-
 struct ActiveSyncNode {
   uint8_t mac[6] = {0};
   char nodeId[16] = {0};
@@ -280,7 +271,7 @@ static void drainAndPersistSnapshots() {
   do {
     drained = drainSnapQueue(slots, 8);
     for (int i = 0; i < drained; ++i) {
-      processSnapshot(&slots[i].snap, slots[i].mac);
+      processSnapshot(slots[i].snap, slots[i].mac);
     }
   } while (drained > 0);
 }
@@ -1061,7 +1052,7 @@ void handleSyncWake() {
   do {
     finalDrained = drainSnapQueue(finalSlots, 4);
     for (int i = 0; i < finalDrained; ++i) {
-      processSnapshot(&finalSlots[i].snap, finalSlots[i].mac);
+      processSnapshot(finalSlots[i].snap, finalSlots[i].mac);
     }
   } while (finalDrained > 0);
 

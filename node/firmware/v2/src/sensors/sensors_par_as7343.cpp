@@ -210,13 +210,20 @@ void sampleIfNeeded() {
   g_lastChannel[CH_NIR]      = (float)g_par.getChannel(AS7341_CHANNEL_NIR);
   g_lastChannel[CH_GAIN]     = kGainLadder[g_gainIdx].mult;
   g_lastChannel[CH_ATIME_MS] = (float)g_par.getTINT();  // integration time (ms)
-  // Report saturated if we could not resolve it away (still clipped, or invalid
-  // measurement). AVALID clear also counts as not-trustworthy.
-  bool avalid = statusValid && ((status2 & AS7341_STATUS2_AVALID) != 0);
-  g_lastChannel[CH_SAT] = (saturated || !avalid) ? 1.0f : 0.0f;
-  if (!statusValid) {
-    Serial.println(F("[PAR] AS734x STATUS2 read failed; exposure marked invalid"));
-  }
+
+  // Saturation flag: derived from the ACCEPTED (cached) channel counts, not a
+  // post-read STATUS2. readAllChannels() leaves the AS7341 free-running (its
+  // final enableSpectralMeasurement(true) is never cleared), so reading STATUS2
+  // after it returns races a fresh, in-flight integration: AVALID reads 0 and
+  // the ASAT bits are stale. That pinned this flag at 1 on every exposure even
+  // in dim light (~7% of full scale). Validity is already guaranteed by the
+  // successful readAllChannels() (delayForData waited on data-ready); genuine
+  // clipping is fully determined by whether the strongest channel sits at ADC
+  // full scale for the applied ATIME/ASTEP. STATUS2/ASAT is still read above as
+  // an auto-gain hint, but no longer gates the reported saturation.
+  const float clipThreshold = 0.99f * (float)fs;
+  const bool  clipped = maxExposureCount() >= clipThreshold;
+  g_lastChannel[CH_SAT] = clipped ? 1.0f : 0.0f;
 
   float parProxy = 0.0f;
   for (size_t i = CH_415; i <= CH_680; ++i) parProxy += g_lastChannel[i];

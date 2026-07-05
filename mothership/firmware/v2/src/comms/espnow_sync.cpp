@@ -119,14 +119,13 @@ static void onEspNowRecv(const uint8_t* mac_addr, const uint8_t* data, int len) 
   }
 
   if (gSnapQueue && mac_addr && data) {
-    // V2 snapshot (NODE_SNAPSHOT2) — variable length.
+    // V2 snapshot (NODE_SNAPSHOT2) — variable length. Store the fully decoded
+    // snapshot directly (no V1 downgrade) so extended metadata (Clear/NIR/
+    // gain/integration/saturated) survives into processSnapshot().
     if (isV2Snapshot(data, len)) {
-      DecodedSnapshot decoded;
-      if (decodeV2(data, len, decoded)) {
-        EspNowSnapSlot slot{};
-        memcpy(slot.mac, mac_addr, sizeof(slot.mac));
-        decodedToV1(decoded, slot.snap);
-
+      EspNowSnapSlot slot{};
+      memcpy(slot.mac, mac_addr, sizeof(slot.mac));
+      if (decodeV2(data, len, slot.snap)) {
         if (xQueueSendToBack(gSnapQueue, &slot, 0) != pdTRUE) {
           EspNowSnapSlot discarded{};
           xQueueReceive(gSnapQueue, &discarded, 0);
@@ -143,7 +142,7 @@ static void onEspNowRecv(const uint8_t* mac_addr, const uint8_t* data, int len) 
       if (strncmp(snap->command, "NODE_SNAPSHOT", 15) == 0) {
         EspNowSnapSlot slot{};
         memcpy(slot.mac, mac_addr, sizeof(slot.mac));
-        memcpy(&slot.snap, snap, sizeof(slot.snap));
+        decodeV1(*snap, slot.snap);
 
         if (xQueueSendToBack(gSnapQueue, &slot, 0) != pdTRUE) {
           // Keep the newest field reading: discard one oldest slot and retry.

@@ -109,7 +109,7 @@ Repository HEAD at investigation start:
 
 That commit introduced the extended metadata implementation. The prior commit cannot send IDs 1109-1113.
 
-No USB ESP32 serial device was attached during this investigation; only Bluetooth COM ports were present. Therefore the exact binaries currently flashed on the field node and mothership could not be read or honestly identified.
+No USB ESP32 serial device was attached during the initial investigation, so the exact deployed images could not initially be identified. The mothership was subsequently attached and verified as described below; node verification is still pending.
 
 New locally built production artifacts:
 
@@ -122,6 +122,41 @@ SHA-256 1D7F9E705F9713D1A1C5216DA678B405A4AD9A9B76158C2DB133C6875EF932FA
 ```
 
 Build timestamps are also printed at boot. Capture those lines from each attached board before and after flashing. The mothership already sends its `firmwareBuild` in upload metadata; compare that value with its boot line.
+
+### Mothership hardware follow-up, 2026-07-05
+
+The mothership appeared as CH340 `COM4`. Its pre-flash boot identity was:
+
+```text
+Build: Jul  4 2026 13:53:43
+```
+
+It was flashed successfully with `mothership-v1-main`. The upload wrote the bootloader, partition table, OTA metadata, and application image; it did not write or erase the LittleFS/SPIFFS data partition at `0x310000`. Post-flash serial evidence was:
+
+```text
+Build: Jul  4 2026 19:30:12
+[FW] V2 snapshot decode; CSV schema=30; spectral metadata IDs=1109-1113
+```
+
+This confirms the current 30-column decoder/logger/migration image is running on the mothership. A normal USB service wake does not receive a node snapshot, so the `[SNAP-SPEC]`, CSV, and JSON boundary evidence still requires the updated node and a data/sync wake.
+
+### Node 1 hardware follow-up, 2026-07-05
+
+Node 1 appeared as CH340 `COM4` with identity `ENV_6C0AA0`. Before flashing it detected the AS7341 and registered visible IDs 1101-1108, but its boot output did not contain the new `[FW] ... spectral_metadata_ids=1109-1113` marker. Its queue state before flashing was empty with `nextSeq=1174`.
+
+The verified `esp32wroom` production image was uploaded successfully without erasing NVS. During the next scheduled data wake the node released `PWR_HOLD` and its CH340 disappeared, interrupting the host serial reader before the buffered exposure lines could be returned. A second physical wake is required to capture the post-flash build marker and inspect whether the queue advanced to sequence 1175. This is not yet counted as runtime proof of the five metadata values.
+
+### Node 1 hardware follow-up, 2026-07-05
+
+Node 1 appeared as CH340 `COM4` and identified itself as `ENV_6C0AA0`. Before flashing it detected the AS7341 and registered F1-F8, but its boot output did not contain the new marker:
+
+```text
+[FW] node build=<date time> protocol=2 spectral_metadata_ids=1109-1113
+```
+
+That proves the previously running application was not the final instrumented image. `esp32wroom` was flashed successfully twice at the operator's request. Esptool verified every written segment. The application upload did not erase the NVS partition, so node identity, deployment configuration, and its local queue were retained.
+
+The board was disconnected before a post-flash data alarm completed, so a physical `[PAR]`/`[SENS-SPEC]` exposure and transfer to the mothership remain the next acceptance step.
 
 ## Verification performed
 

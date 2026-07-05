@@ -137,6 +137,64 @@ statements in lockstep.
 
 ---
 
+## Trap 6: Two mothership receive paths — testing one does not prove the other
+
+The mothership has **two separate ESP-NOW receive callbacks**, and it's easy to verify
+only one of them:
+
+| Path | File | When active | Used by |
+|------|------|-------------|---------|
+| Config-mode | `espnow_config.cpp` | WiFi AP up (discovery, pairing, bench tests) | Manual testing, `mothership-v2-test-spectral-pipeline` |
+| Sync-mode | `espnow_sync.cpp` | Every real fleet sync window | **The only path that matters in the field** |
+
+**What went wrong (2026-07-05):** adding the 5 AS7341 metadata fields was verified with a
+bench regression test and a live bring-up capture — both went through **config-mode**,
+which decodes straight into the flexible `DecodedSnapshot` (ID/value pairs) and looked
+perfect. But every field-deployed reading still landed `null` in the backend.
+
+The cause: `espnow_sync.cpp`'s receive callback decoded the packet correctly, then called
+`decodedToV1(decoded, slot.snap)` to downgrade it into `node_snapshot_t` — a **legacy,
+fixed-field struct** predating the ID/value-pair protocol, with named fields only for
+what existed when V1 was written (`spectral[8]`, `batVoltage`, `soil1Vwc`, ...). Anything
+without a dedicated field there — the 5 new metadata values, or any future sensor without
+a hand-added V1 field — is silently discarded at that single conversion line, before ever
+reaching flash or JSON. The queue (`EspNowSnapSlot`) was left carrying `node_snapshot_t`
+as a leftover compatibility shim from before the flexible protocol existed, and was never
+upgraded when V2 landed.
+
+**The fix:** `EspNowSnapSlot` now carries a `DecodedSnapshot` directly (same flexible
+shape used everywhere else). `onEspNowRecv()` in `espnow_sync.cpp` decodes straight into
+the slot for both V1 and V2 wire packets — no downgrade step. `processSnapshot()` in
+`main.cpp` is called with the decoded snapshot directly; the old `node_snapshot_t*`
+compatibility wrapper was deleted since nothing needs it anymore.
+
+**Symptom in logs:** the giveaway is a mismatch between what the *node* built and what
+the *mothership* decoded for the identical `seq`. Node-side: `sensorCount=20` with all
+expected IDs listed. Mothership-side, during a **real sync** (not a bench test):
+`[SNAP-SPEC] ... readings=15 extended=0/5 clear=MISSING ...`. If a bench/config-mode test
+shows the field working but the field data is still null, **this is the first thing to
+check** — don't assume decodeV2() itself is broken; check whether the sync-window path
+still round-trips through a fixed-field struct.
+
+**Because of the fix, this class of bug cannot recur:** there is now exactly one snapshot
+shape (`DecodedSnapshot`, ID/value pairs, capacity `MAX_READINGS_PER_SNAPSHOT`) from radio
+receive through to flash/JSON, on both mothership receive paths. Adding a sensor never
+requires touching `espnow_sync.cpp`, `espnow_config.cpp`, or the snapshot queue again —
+only the steps in Trap 2 above.
+
+**One ceiling this does NOT remove:** `MAX_READINGS_PER_SNAPSHOT` (protocol.h) caps the
+*total* readings (channels + metadata) a single node snapshot can carry — currently **33**,
+derived from the ESP-NOW single-packet limit: `(250 − 48 byte header) / 6 bytes per
+reading = 33`. This is a **different constant from `MAX_SENSORS`** (Trap 1, the node's
+registry-slot cap) — `MAX_READINGS_PER_SNAPSHOT` also has to fit metadata that never
+touches the registry. Current usage is ~20–26 depending on node sensor mix (a
+compile-time `static_assert` guards this — e.g. `20 + 1 + 5 = 26 <= 33`). If future
+sensors push a single node's total past 33, that needs a real design change (multi-packet
+snapshots), not a constant bump — raising `MAX_READINGS_PER_SNAPSHOT` alone would exceed
+one ESP-NOW packet's hard 250-byte payload limit.
+
+---
+
 ## Trap 5: Flash order & the CSV wipe
 
 - **Flash the mothership before the nodes** when you add new sensor IDs. The mothership
@@ -156,6 +214,8 @@ Copy this into the PR description and tick each box:
 
 - [ ] Decided per value: **channel** (registry slot) vs **metadata** (snapshot extra)?
 - [ ] `MAX_SENSORS` still ≥ total registry slots, with headroom? Comment math updated?
+- [ ] `MAX_READINGS_PER_SNAPSHOT` (33) still covers channels + metadata for the busiest
+      node? (Different cap from `MAX_SENSORS` — see Trap 6.)
 - [ ] `SENSOR_ID_*` added in the correct range block (protocol.h)?
 - [ ] `resolveSensorId()` maps every new label?
 - [ ] `snapPresentBitForSensorId()` maps every new ID to its capability bit?
@@ -169,6 +229,10 @@ Copy this into the PR description and tick each box:
 - [ ] Boot log verified: every expected `[SENS] Slot` line present, total count correct?
 - [ ] Sync log verified: `present=0x....` mask includes the new capability bit, no false
       `sensor fault mask` lines?
+- [ ] Verified on a **real sync window**, not just a config-mode/bench test — the two
+      mothership receive paths are separate code (Trap 6). Check mothership
+      `[SNAP-SPEC] ... extended=N/N` (or equivalent) during an actual RTC-alarm sync, not
+      only during discovery/pairing/manual upload.
 - [ ] Flash order planned (mothership first) and CSV-wipe backlog handled?
 
 ---
