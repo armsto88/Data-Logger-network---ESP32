@@ -219,6 +219,14 @@ Per the V2 snapshot protocol, each node can report:
 
 Passive sensors (soil, wind, AUX) are gated by an operator-configured sensor mask; self-identifying I2C sensors (SHT41, AS7343) are always auto-detected.
 
+Each node carries three bitmasks that let the dashboard distinguish a faulty sensor from a paused node:
+
+- **Configured mask** — what the operator has told the node to capture.
+- **Reported mask** — what the node actually reported in the latest snapshot (a channel is only present on a successful read).
+- **Fault mask** — a channel that's configured but missing for two or more consecutive uploads, flagged as faulty rather than just showing a gap in the data.
+
+The AS7343 spectral sensor also reports five metadata channels alongside the 8 spectral bands: broadband clear, near-infrared, acquisition gain, integration time, and a saturation flag. Gain and integration time enable a calibration-free "basic counts" normalisation so spectral readings are comparable across different acquisition settings; saturated snapshots can be flagged and excluded from derived vegetation-index or canopy metrics.
+
 ---
 
 ## 6. Power and wake architecture
@@ -267,7 +275,8 @@ Two backends coexist behind a **data-provider boundary** — an abstraction laye
 - **Edge Functions (Deno):**
   - `ingest-fieldmesh` — the authenticated telemetry ingestion endpoint. Validates Bearer tokens, enforces payload size limits, normalises payloads, and writes readings with idempotent, retry-safe semantics (so a duplicate upload from a mothership retry does not create duplicate rows).
   - `issue-device-key` — issues and rotates device API keys.
-- **Version-controlled migrations** for schema evolution, including modem diagnostics, pause/battery health, and sensor mask support.
+- **Version-controlled migrations** for schema evolution, including modem diagnostics, pause/battery health, sensor mask support, and AS7341 spectral raw channels.
+- **Project sharing** — a `project_members` table lets a project owner grant read-only access to other users (e.g. a colleague or client viewing a site's data) without exposing device credentials or allowing writes. Row-level security policies ensure a shared viewer can see a project's nodes, readings, status, config, and motherships — and nothing else.
 - **Realtime** delivery of telemetry updates to connected dashboard clients — when a mothership uploads, any open dashboard sees the new readings without polling.
 
 The JSON upload protocol emitted by the mothership firmware is designed for this backend: Bearer auth, JSON array body, no query params, status object on the first POST of each session.
@@ -312,9 +321,12 @@ Every mothership upload session carries a rich **status context** sent once on t
 - Flash usage: total bytes, used bytes, percentage
 - Sync schedule: next sync time (ISO local), mode (interval or daily), wake interval, sync interval
 - Firmware version and build timestamp
-- Modem diagnostics: signal quality, IMEI, registration time
-- Boot diagnostics: reset reason, monotonic boot count, free heap, minimum free heap, snapshot queue drops
-- Per-node status: last seen, last reported battery, config version applied, sensor fault mask
+- Modem diagnostics: signal strength (RSSI, RSRP, RSRQ), SIM identity (ICCID), carrier/operator, network type (LTE vs. 2G), registration time, IMEI
+- Boot diagnostics: reset reason, monotonic boot count, free heap, minimum free heap, snapshot queue drops — so you can tell the difference between "the sensor stopped working" and "the modem lost signal"
+- Per-node status: last seen, last reported battery, config version applied, sensor fault mask (configured vs. reported vs. missing-for-two-uploads)
+- Node paused/standby count across the fleet — so you can tell which sensors are intentionally not recording versus which have gone silent
+- Battery voltage under load (sampled during modem TX) — a much better indicator of real battery health than a resting voltage reading alone
+- AS7341 spectral metadata: broadband clear, near-infrared, acquisition gain, integration time, and a saturation flag — enabling calibration-free "basic counts" normalisation and quality filtering of spectral readings
 - Upload cursor: pending rows, rows uploaded, retry count, last upload Unix time, last result (success / failed / pending)
 - Project-start timestamp (first-ever boot, stored once, never overwritten)
 
