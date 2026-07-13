@@ -41,8 +41,15 @@ static uint32_t g_prechargeMs    = BOOST_PRECHARGE_MS;
 
 // Acoustic gate: only edges within [GATE_START_US, GATE_END_US] from TX first edge
 // are counted as valid detections.
-static int32_t  g_gateStartUs    = 350;
-static int32_t  g_gateEndUs      = 550;
+// Override at build time: -DGATE_START_US=200 -DGATE_END_US=400 (10 cm path, TOF≈294µs)
+#ifndef GATE_START_US
+#define GATE_START_US 350
+#endif
+#ifndef GATE_END_US
+#define GATE_END_US 550
+#endif
+static int32_t  g_gateStartUs    = GATE_START_US;
+static int32_t  g_gateEndUs      = GATE_END_US;
 
 #ifndef INTER_SHOT_MS
 #define INTER_SHOT_MS 120

@@ -1,12 +1,15 @@
-// Node V2 Main Systems Bring-up — combined menu-driven sketch
-// Tests all V2 main systems except ultrasonic in a single flash.
-// Follows patterns from firmware/nodes/bringup/ sketches.
+// Node V3 Main Systems Bring-up — combined menu-driven sketch
+// Tests all V3 main systems (I2C, battery, power latch, boost, damping,
+// directional TX select, RX mux, ADS1015, DS3231 RTC) in a single flash.
 
 #include <Arduino.h>
 #include <Wire.h>
-#include <SparkFun_SHTC3.h>
 #include <Adafruit_ADS1X15.h>
 #include <RTClib.h>
+
+#ifdef DISABLE_BROWNOUT
+#include "soc/rtc_cntl_reg.h"
+#endif
 
 // ── Pin definitions (all #ifndef guarded for build-flag override) ──────────
 
@@ -22,8 +25,12 @@
 #define MUX_ADDR 0x71
 #endif
 
-#ifndef SHTC3_ADDR
-#define SHTC3_ADDR 0x70
+#ifndef MUX_A_PIN
+#define MUX_A_PIN 16
+#endif
+
+#ifndef MUX_B_PIN
+#define MUX_B_PIN 17
 #endif
 
 #ifndef ADS1015_ADDR
@@ -47,7 +54,7 @@
 #endif
 
 #ifndef BAT_DIVIDER_SCALE
-#define BAT_DIVIDER_SCALE 3.62f
+#define BAT_DIVIDER_SCALE 3.62f   // V3 divider — verify with DMM during bring-up
 #endif
 
 #ifndef BAT_ADC_SAMPLES
@@ -70,6 +77,38 @@
 #define TOF_EDGE_PIN 34
 #endif
 
+#ifndef PIN_REL_N
+#define PIN_REL_N 33
+#endif
+
+#ifndef PIN_REL_E
+#define PIN_REL_E 32
+#endif
+
+#ifndef PIN_REL_S
+#define PIN_REL_S 21
+#endif
+
+#ifndef PIN_REL_W
+#define PIN_REL_W 22
+#endif
+
+#ifndef PIN_DRV_N
+#define PIN_DRV_N 26
+#endif
+
+#ifndef PIN_DRV_E
+#define PIN_DRV_E 27
+#endif
+
+#ifndef PIN_DRV_S
+#define PIN_DRV_S 14
+#endif
+
+#ifndef PIN_DRV_W
+#define PIN_DRV_W 13
+#endif
+
 #ifndef ALARM_INTERVAL_S
 #define ALARM_INTERVAL_S 10
 #endif
@@ -89,16 +128,22 @@ static bool rtcInitialised = false;
 
 static void printMenu() {
   Serial.println();
-  Serial.println("=== Node V2 Main Systems Bring-up ===");
+  Serial.println("=== Node V3 Main Systems Bring-up ===");
   Serial.printf("Pins: SDA=%d SCL=%d PWR_HOLD=%d BAT_ADC=%d"
-                 " TX_BURST_PWM=%d TX_22V_EN_N=%d RX_EN_N=%d TOF_EDGE=%d\n",
-                 I2C_SDA_PIN, I2C_SCL_PIN, PWR_HOLD_PIN, BAT_ADC_PIN,
-                 TX_BURST_PWM_PIN, TX_22V_EN_N_PIN, RX_EN_N_PIN, TOF_EDGE_PIN);
-  Serial.printf("I2C: MUX=0x%02X SHTC3=0x%02X ADS1015=0x%02X RTC=0x%02X\n",
-                 MUX_ADDR, SHTC3_ADDR, ADS1015_ADDR, RTC_ADDR);
+                " TX_BURST_PWM=%d TX_22V_EN_N=%d RX_EN_N=%d TOF_EDGE=%d\n",
+                I2C_SDA_PIN, I2C_SCL_PIN, PWR_HOLD_PIN, BAT_ADC_PIN,
+                TX_BURST_PWM_PIN, TX_22V_EN_N_PIN, RX_EN_N_PIN, TOF_EDGE_PIN);
+  Serial.printf("Damp: REL_N=%d REL_E=%d REL_S=%d REL_W=%d | "
+                "Drv: DRV_N=%d DRV_E=%d DRV_S=%d DRV_W=%d | "
+                "Mux: A=%d B=%d\n",
+                PIN_REL_N, PIN_REL_E, PIN_REL_S, PIN_REL_W,
+                PIN_DRV_N, PIN_DRV_E, PIN_DRV_S, PIN_DRV_W,
+                MUX_A_PIN, MUX_B_PIN);
+  Serial.printf("I2C: MUX=0x%02X ADS1015=0x%02X RTC=0x%02X\n",
+                MUX_ADDR, ADS1015_ADDR, RTC_ADDR);
   Serial.println();
   Serial.println("  1 = I2C bus scan");
-  Serial.println("  2 = Mux channel sweep + SHTC3 read");
+  Serial.println("  2 = Mux channel sweep (probe each channel for any device)");
   Serial.println("  3 = Battery voltage (IO35 ADC)");
   Serial.println("  4 = PWR_HOLD latch toggle (15s ON / 15s OFF)");
   Serial.println("  5 = TX_BURST_PWM gate toggle (1s ON / 2s OFF)");
@@ -106,6 +151,9 @@ static void printMenu() {
   Serial.println("  7 = RX_EN_N + AND-gate verification");
   Serial.println("  8 = ADS1015 analog read (4 channels)");
   Serial.println("  9 = DS3231 RTC alarm (10s interval, 8s hold)");
+  Serial.println("  d = DAMP/REL shunt toggle cycle (N, E, S, W)");
+  Serial.println("  v = DRV directional TX select toggle cycle (N, E, S, W)");
+  Serial.println("  m = Mux direction select (A,B combos)");
   Serial.println("  r = Repeat this menu");
   Serial.println("  h = Hold PWR_HOLD HIGH (keep board alive)");
   Serial.println("  l = Release PWR_HOLD (board may power off)");
@@ -133,12 +181,12 @@ static void testI2cScan() {
     Serial.println("No I2C devices found");
   }
   Serial.printf("Scan done — %u device(s) found\n", found);
-  Serial.printf("Expected: 0x%02X(MUX) 0x%02X(SHTC3) 0x%02X(RTC) 0x%02X(ADS)\n",
-                 MUX_ADDR, SHTC3_ADDR, RTC_ADDR, ADS1015_ADDR);
+  Serial.printf("Expected: 0x%02X(MUX) 0x%02X(RTC) 0x%02X(ADS)\n",
+                MUX_ADDR, RTC_ADDR, ADS1015_ADDR);
   Serial.println("--- I2C bus scan end ---");
 }
 
-// ── Test 2: Mux channel sweep + SHTC3 ─────────────────────────────────────
+// ── Test 2: Mux channel sweep ─────────────────────────────────────────────
 
 static bool muxSelectChannel(uint8_t channel) {
   if (channel > 7) return false;
@@ -153,25 +201,15 @@ static void muxDisableAll() {
   Wire.endTransmission();
 }
 
-static bool probeShtc3(float &tempC, float &rh) {
-  SHTC3 sensor;
-  SHTC3_Status_TypeDef status = sensor.begin(Wire);
-  if (status != SHTC3_Status_Nominal) return false;
-
-  status = sensor.setMode(SHTC3_CMD_CSE_TF_NPM);
-  if (status != SHTC3_Status_Nominal) return false;
-
-  status = sensor.update();
-  if (status != SHTC3_Status_Nominal) return false;
-  if (!sensor.passTcrc || !sensor.passRHcrc) return false;
-
-  tempC = sensor.toDegC();
-  rh = sensor.toPercent();
-  return true;
+static bool i2cDevicePresent(uint8_t addr) {
+  Wire.beginTransmission(addr);
+  uint8_t err = Wire.endTransmission();
+  return err == 0;
 }
 
-static void testMuxShtc3() {
-  Serial.println("--- Mux channel sweep + SHTC3 start ---");
+static void testMuxSweep() {
+  Serial.println("--- Mux channel sweep start ---");
+  Serial.println("Scanning each mux channel for ANY I2C device (0x01-0x7F).");
 
   for (uint8_t ch = 0; ch < 8; ch++) {
     Serial.printf("CH%u: ", ch);
@@ -181,16 +219,21 @@ static void testMuxShtc3() {
     }
     delay(2);
 
-    float tC = 0.0f, rh = 0.0f;
-    if (probeShtc3(tC, rh)) {
-      Serial.printf("SHTC3 @0x%02X OK | T=%.2f C RH=%.2f %%\n", SHTC3_ADDR, tC, rh);
-    } else {
-      Serial.printf("no valid SHTC3 response @0x%02X\n", SHTC3_ADDR);
+    bool any = false;
+    for (uint8_t addr = 1; addr < 127; addr++) {
+      if (i2cDevicePresent(addr)) {
+        Serial.printf("device @0x%02X ", addr);
+        any = true;
+      }
     }
+    if (!any) {
+      Serial.print("no device");
+    }
+    Serial.println();
   }
 
   muxDisableAll();
-  Serial.println("--- Mux channel sweep + SHTC3 end ---");
+  Serial.println("--- Mux channel sweep end ---");
 }
 
 // ── Test 3: Battery voltage ────────────────────────────────────────────────
@@ -207,8 +250,8 @@ static uint16_t readAdcAvg() {
 static void testBattery() {
   Serial.println("--- Battery voltage start ---");
   Serial.printf("[CFG] ADC_PIN=%d SAMPLES=%d VREF=%.4f DIV_SCALE=%.4f\n",
-                 BAT_ADC_PIN, BAT_ADC_SAMPLES, BAT_ADC_VREF, BAT_DIVIDER_SCALE);
-  Serial.println("[NOTE] V2 uses 47k/47k divider — calibrate BAT_DIVIDER_SCALE against DMM.");
+                BAT_ADC_PIN, BAT_ADC_SAMPLES, BAT_ADC_VREF, BAT_DIVIDER_SCALE);
+  Serial.println("[NOTE] V3 divider — verify with DMM during bring-up.");
 
   uint16_t raw = readAdcAvg();
   float pinV = (static_cast<float>(raw) / 4095.0f) * BAT_ADC_VREF;
@@ -264,7 +307,8 @@ static void testTx22vEnable() {
   Serial.println("--- TX_22V_EN_N boost enable toggle start ---");
   Serial.println("Drive TX_22V_EN_N LOW (boost ON) for 5s, then HIGH (boost OFF) for 5s.");
   Serial.println("Probe 22V_SYS and EN_22 test points.");
-  Serial.println("Note: LOW on TX_22V_EN_N = HIGH on EN_22 = boost enabled (inverter).");
+  Serial.println("Note: V3 uses U49 inverter on TX_22V_EN_N.");
+  Serial.println("      LOW on TX_22V_EN_N = HIGH on EN_22 = boost enabled (inverter).");
 
   digitalWrite(TX_22V_EN_N_PIN, LOW);
   Serial.printf("t=%lu ms | TX_22V_EN_N=LOW (boost ON, EN_22=HIGH)\n", millis());
@@ -277,7 +321,7 @@ static void testTx22vEnable() {
   Serial.println("--- TX_22V_EN_N boost enable toggle end ---");
 }
 
-// ── Test 7: RX_EN_N + AND-gate verification ───────────────────────────────
+// ── Test 7: RX_EN_N + AND-gate verification ────────────────────────────────
 
 static void testRxEnableAndGate() {
   Serial.println("--- RX_EN_N + AND-gate verification start ---");
@@ -413,7 +457,7 @@ static bool armNextAlarm(DateTime fromNow) {
 
 static void testRtcAlarm() {
   Serial.println("--- DS3231 RTC alarm test start ---");
-  Serial.println("[NOTE] On V2, RTC INT/SQW drives an NFET gate controlling the main power gate.");
+  Serial.println("[NOTE] On V3, RTC INT/SQW drives the power gate through Q38 inverter.");
   Serial.println("       It is NOT connected to a GPIO. This test only verifies I2C alarm setting/clearing.");
 
   if (!rtcInitialised) {
@@ -483,17 +527,101 @@ static void testRtcAlarm() {
   Serial.println("--- DS3231 RTC alarm test end ---");
 }
 
+// ── Test 'd': DAMP/REL shunt toggle cycle ──────────────────────────────────
+
+static void testRelShuntToggle() {
+  Serial.println("--- DAMP/REL shunt toggle cycle start ---");
+  Serial.println("Cycling each damping shunt (REL_N, REL_E, REL_S, REL_W) HIGH for 2s, then LOW.");
+  Serial.println("Probe each direction to confirm the transducer is shunted/damped.");
+
+  static const uint8_t pins[] = { PIN_REL_N, PIN_REL_E, PIN_REL_S, PIN_REL_W };
+  static const char* names[] = { "REL_N", "REL_E", "REL_S", "REL_W" };
+
+  for (size_t i = 0; i < sizeof(pins) / sizeof(pins[0]); i++) {
+    digitalWrite(pins[i], HIGH);
+    Serial.printf("%s (GPIO%d) = HIGH (2s)\n", names[i], pins[i]);
+    delay(2000);
+
+    digitalWrite(pins[i], LOW);
+    Serial.printf("%s (GPIO%d) = LOW\n", names[i], pins[i]);
+    delay(250);
+  }
+
+  Serial.println("--- DAMP/REL shunt toggle cycle end ---");
+}
+
+// ── Test 'v': DRV directional TX select toggle cycle ───────────────────────
+
+static void testDrvDirectionToggle() {
+  Serial.println("--- DRV directional TX select toggle cycle start ---");
+  Serial.println("Cycling each TX direction select (DRV_N, DRV_E, DRV_S, DRV_W) HIGH for 2s, then LOW.");
+  Serial.println("Probe the selected TX transducer/channel. Only one DRV line should be HIGH at a time.");
+
+  static const uint8_t pins[] = { PIN_DRV_N, PIN_DRV_E, PIN_DRV_S, PIN_DRV_W };
+  static const char* names[] = { "DRV_N", "DRV_E", "DRV_S", "DRV_W" };
+
+  for (size_t i = 0; i < sizeof(pins) / sizeof(pins[0]); i++) {
+    digitalWrite(pins[i], HIGH);
+    Serial.printf("%s (GPIO%d) = HIGH (2s)\n", names[i], pins[i]);
+    delay(2000);
+
+    digitalWrite(pins[i], LOW);
+    Serial.printf("%s (GPIO%d) = LOW\n", names[i], pins[i]);
+    delay(250);
+  }
+
+  Serial.println("--- DRV directional TX select toggle cycle end ---");
+}
+
+// ── Test 'm': Mux direction select (A,B combos) ─────────────────────────────
+
+static void testMuxDirectionSelect() {
+  Serial.println("--- Mux direction select (A,B) start ---");
+  Serial.println("Toggling MUX_A/MUX_B through 00, 01, 10, 11 — 2s each.");
+  Serial.println("Map the four RX directions selected by each combination.");
+
+  struct Combo { bool a; bool b; const char* label; };
+  static const Combo combos[] = {
+    { LOW,  LOW,  "00" },
+    { LOW,  HIGH, "01" },
+    { HIGH, LOW,  "10" },
+    { HIGH, HIGH, "11" },
+  };
+
+  for (size_t i = 0; i < sizeof(combos) / sizeof(combos[0]); i++) {
+    digitalWrite(MUX_A_PIN, combos[i].a ? HIGH : LOW);
+    digitalWrite(MUX_B_PIN, combos[i].b ? HIGH : LOW);
+    Serial.printf("MUX_%s | A=%d B=%d (GPIO%d=%d GPIO%d=%d) — 2s\n",
+                  combos[i].label,
+                  combos[i].a ? 1 : 0, combos[i].b ? 1 : 0,
+                  MUX_A_PIN, combos[i].a ? HIGH : LOW,
+                  MUX_B_PIN, combos[i].b ? HIGH : LOW);
+    delay(2000);
+  }
+
+  // Leave mux in a safe default (disabled via RX_EN_N; A/B don't matter much,
+  // but we return them LOW for consistency).
+  digitalWrite(MUX_A_PIN, LOW);
+  digitalWrite(MUX_B_PIN, LOW);
+  Serial.println("Restored MUX_A=LOW, MUX_B=LOW.");
+  Serial.println("--- Mux direction select (A,B) end ---");
+}
+
 // ── setup / loop ───────────────────────────────────────────────────────────
 
 void setup() {
   Serial.begin(115200);
   delay(800);
 
+#ifdef DISABLE_BROWNOUT
+  WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);
+#endif
+
   // Latch power immediately
   pinMode(PWR_HOLD_PIN, OUTPUT);
   digitalWrite(PWR_HOLD_PIN, HIGH);
 
-  // Safe defaults for V2-specific pins
+  // Safe defaults for V3-specific pins
   pinMode(TX_22V_EN_N_PIN, OUTPUT);
   digitalWrite(TX_22V_EN_N_PIN, HIGH);  // boost OFF (active-low)
 
@@ -502,6 +630,22 @@ void setup() {
 
   pinMode(TX_BURST_PWM_PIN, OUTPUT);
   digitalWrite(TX_BURST_PWM_PIN, LOW);
+
+  // Damping shunt MOSFETs: LOW = damping OFF
+  pinMode(PIN_REL_N, OUTPUT); digitalWrite(PIN_REL_N, LOW);
+  pinMode(PIN_REL_E, OUTPUT); digitalWrite(PIN_REL_E, LOW);
+  pinMode(PIN_REL_S, OUTPUT); digitalWrite(PIN_REL_S, LOW);
+  pinMode(PIN_REL_W, OUTPUT); digitalWrite(PIN_REL_W, LOW);
+
+  // Directional TX select: LOW = not selected
+  pinMode(PIN_DRV_N, OUTPUT); digitalWrite(PIN_DRV_N, LOW);
+  pinMode(PIN_DRV_E, OUTPUT); digitalWrite(PIN_DRV_E, LOW);
+  pinMode(PIN_DRV_S, OUTPUT); digitalWrite(PIN_DRV_S, LOW);
+  pinMode(PIN_DRV_W, OUTPUT); digitalWrite(PIN_DRV_W, LOW);
+
+  // RX mux direction select
+  pinMode(MUX_A_PIN, OUTPUT); digitalWrite(MUX_A_PIN, LOW);
+  pinMode(MUX_B_PIN, OUTPUT); digitalWrite(MUX_B_PIN, LOW);
 
   pinMode(TOF_EDGE_PIN, INPUT);  // read-only
 
@@ -514,8 +658,8 @@ void setup() {
   Wire.setClock(100000);
 
   Serial.println();
-  Serial.println("=== Node V2 Main Systems Bring-up ===");
-  Serial.println("Power latched. All V2 pins configured to safe defaults.");
+  Serial.println("=== Node V3 Main Systems Bring-up ===");
+  Serial.println("Power latched. All V3 pins configured to safe defaults.");
   printMenu();
 }
 
@@ -532,14 +676,20 @@ void loop() {
 
     switch (c) {
       case '1': testI2cScan();       break;
-      case '2': testMuxShtc3();      break;
+      case '2': testMuxSweep();      break;
       case '3': testBattery();       break;
       case '4': testPwrHold();       break;
       case '5': testTxBurstPwm();    break;
       case '6': testTx22vEnable();   break;
       case '7': testRxEnableAndGate(); break;
       case '8': testAds1015();       break;
-      case '9': testRtcAlarm();      break;
+      case '9': testRtcAlarm();       break;
+      case 'd':
+      case 'D': testRelShuntToggle(); break;
+      case 'v':
+      case 'V': testDrvDirectionToggle(); break;
+      case 'm':
+      case 'M': testMuxDirectionSelect(); break;
       case 'r':
       case 'R': printMenu();         break;
       case 'h':

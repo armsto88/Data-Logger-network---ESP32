@@ -154,10 +154,10 @@ The 74HC4052 receive mux selects which directional receive pair is passed into t
 #### RX direction decode
 
 ```text
-N: MUX_A=0, MUX_B=0
-S: MUX_A=1, MUX_B=0
-W: MUX_A=0, MUX_B=1
-E: MUX_A=1, MUX_B=1
+N: MUX_B=0, MUX_A=0  (Y0)
+E: MUX_B=0, MUX_A=1  (Y1)
+S: MUX_B=1, MUX_A=0  (Y2)
+W: MUX_B=1, MUX_A=1  (Y3)
 ```
 
 #### Firmware implication

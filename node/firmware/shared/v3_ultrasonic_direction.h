@@ -13,30 +13,26 @@
 #include <Arduino.h>
 #include "v3_ultrasonic_pins.h"
 
-// RX mux direction table:
-//   N: MUX_A=0, MUX_B=0
-//   S: MUX_A=1, MUX_B=0
-//   W: MUX_A=0, MUX_B=1
-//   E: MUX_A=1, MUX_B=1
-
-// ---------------------------------------------------------------------------
-// setRxDirection — set MUX_A/B for the selected receive direction
-// ---------------------------------------------------------------------------
+// RX mux direction table (V3 overview §18 — MUX_B is MSB, MUX_A is LSB):
+//   N: MUX_B=0, MUX_A=0  (Y0)
+//   E: MUX_B=0, MUX_A=1  (Y1)
+//   S: MUX_B=1, MUX_A=0  (Y2)
+//   W: MUX_B=1, MUX_A=1  (Y3)
 static inline void setRxDirection(char dir) {
   switch (dir) {
     case 'N':
       digitalWrite(PIN_MUX_A, LOW);
       digitalWrite(PIN_MUX_B, LOW);
       break;
-    case 'S':
+    case 'E':
       digitalWrite(PIN_MUX_A, HIGH);
       digitalWrite(PIN_MUX_B, LOW);
       break;
-    case 'W':
+    case 'S':
       digitalWrite(PIN_MUX_A, LOW);
       digitalWrite(PIN_MUX_B, HIGH);
       break;
-    case 'E':
+    case 'W':
       digitalWrite(PIN_MUX_A, HIGH);
       digitalWrite(PIN_MUX_B, HIGH);
       break;
