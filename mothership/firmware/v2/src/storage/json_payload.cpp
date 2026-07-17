@@ -299,6 +299,7 @@ JsonPayload buildJsonUpload(const String& csvChunk,
   const uint32_t statusEst = status
       ? 900U + status->nodesJson.length() + status->transmissionJson.length()
         + status->modemJson.length() + status->diagnosticsJson.length()
+        + status->firmwareJson.length() + status->controlJson.length()
       : 0U;
   body.reserve(readings.length() + fwVersion.length() + 160U + statusEst);
   body += "{\"readings\":[";
@@ -393,6 +394,18 @@ JsonPayload buildJsonUpload(const String& csvChunk,
     if (status->diagnosticsJson.length()) {
       body += ",\"diagnostics\":";
       body += status->diagnosticsJson;
+    }
+
+    // status.firmware{} — mothership firmware identity + OTA state.
+    if (status->firmwareJson.length()) {
+      body += ",\"firmware\":";
+      body += status->firmwareJson;
+    }
+
+    // status.control{} — dispatcher state revision + recent command results.
+    if (status->controlJson.length()) {
+      body += ",\"control\":";
+      body += status->controlJson;
     }
 
     body += "}";

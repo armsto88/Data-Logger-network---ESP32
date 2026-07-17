@@ -19,6 +19,7 @@ static volatile uint32_t gSnapDropCount = 0;
 static QueueHandle_t gAckQueue = nullptr;
 static constexpr int kAckQueueDepth = 8;
 static QueueHandle_t gHelloQueue = nullptr;
+static QueueHandle_t gCapsQueue = nullptr;
 static QueueHandle_t gDoneQueue = nullptr;
 static QueueHandle_t gReleaseAckQueue = nullptr;
 static constexpr int kControlQueueDepth = 32;
@@ -80,6 +81,19 @@ static void onEspNowRecv(const uint8_t* mac_addr, const uint8_t* data, int len) 
     memcpy(slot.mac, mac_addr, sizeof(slot.mac));
     memcpy(&slot.hello, data, sizeof(slot.hello));
     xQueueSendToBack(gHelloQueue, &slot, 0);
+    return;
+  }
+
+  // FW_CAPS — additive node firmware/OTA identity, sent after NODE_HELLO.
+  // Exact-length + tag match; older nodes never send it. Enqueue for the main
+  // loop to fold into the registry (never touch the registry from the callback).
+  if (gCapsQueue && mac_addr && data &&
+      len == static_cast<int>(sizeof(fw_caps_message_t)) &&
+      strncmp(reinterpret_cast<const char*>(data), "FW_CAPS", 7) == 0) {
+    SyncCapsSlot slot{};
+    memcpy(slot.mac, mac_addr, sizeof(slot.mac));
+    memcpy(&slot.caps, data, sizeof(slot.caps));
+    xQueueSendToBack(gCapsQueue, &slot, 0);
     return;
   }
 
@@ -317,12 +331,14 @@ void initSnapQueue(int depth) {
   }
 
   if (gHelloQueue) vQueueDelete(gHelloQueue);
+  if (gCapsQueue) vQueueDelete(gCapsQueue);
   if (gDoneQueue) vQueueDelete(gDoneQueue);
   if (gReleaseAckQueue) vQueueDelete(gReleaseAckQueue);
   gHelloQueue = xQueueCreate(kControlQueueDepth, sizeof(SyncHelloSlot));
+  gCapsQueue = xQueueCreate(kControlQueueDepth, sizeof(SyncCapsSlot));
   gDoneQueue = xQueueCreate(kControlQueueDepth, sizeof(SyncDoneSlot));
   gReleaseAckQueue = xQueueCreate(kControlQueueDepth, sizeof(SyncReleaseAckSlot));
-  if (!gHelloQueue || !gDoneQueue || !gReleaseAckQueue) {
+  if (!gHelloQueue || !gCapsQueue || !gDoneQueue || !gReleaseAckQueue) {
     Serial.println("[ESP-NOW] coordinated sync queue allocation failed");
   }
 }
@@ -331,6 +347,13 @@ int drainSyncHellos(SyncHelloSlot* out, int maxItems) {
   if (!gHelloQueue || !out || maxItems <= 0) return 0;
   int count = 0;
   while (count < maxItems && xQueueReceive(gHelloQueue, &out[count], 0) == pdTRUE) ++count;
+  return count;
+}
+
+int drainSyncCaps(SyncCapsSlot* out, int maxItems) {
+  if (!gCapsQueue || !out || maxItems <= 0) return 0;
+  int count = 0;
+  while (count < maxItems && xQueueReceive(gCapsQueue, &out[count], 0) == pdTRUE) ++count;
   return count;
 }
 
@@ -387,6 +410,10 @@ void deinitEspNowSync() {
   if (gHelloQueue) {
     vQueueDelete(gHelloQueue);
     gHelloQueue = nullptr;
+  }
+  if (gCapsQueue) {
+    vQueueDelete(gCapsQueue);
+    gCapsQueue = nullptr;
   }
   if (gDoneQueue) {
     vQueueDelete(gDoneQueue);

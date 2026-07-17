@@ -54,6 +54,9 @@ struct StatusContext {
   String   modemJson;           // status.modem{} — pre-built "{...}" ("" = omit)
   String   diagnosticsJson;     // status.diagnostics{} — pre-built "{...}" ("" = omit)
   uint16_t fleetPaused;         // status.fleet.paused (deployed nodes in standby)
+  // --- Firmware & control (additive; "" = omit the object) ---
+  String   firmwareJson;        // status.firmware{} — mothership identity + OTA state
+  String   controlJson;         // status.control{}  — dispatcher revision + results
 };
 
 // ---------------------------------------------------------------------------

@@ -18,6 +18,7 @@ static NodeSlot      gNodes[CMD_MAX_NODES];
 static CommandResult gResults[CMD_MAX_RESULTS];
 static uint8_t       gResultHead = 0;   // next write index (ring)
 static uint8_t       gResultCount = 0;
+static CmdSource     gLastChangeSource = SRC_LOCAL_UI;
 
 static Preferences   gNvs;
 static const char*   kNs = "dispatch";
@@ -97,6 +98,23 @@ uint8_t dispatcherRecentResults(CommandResult* out, uint8_t max) {
   uint8_t n = (gResultCount < max) ? gResultCount : max;
   for (uint8_t i = 0; i < n; i++) out[i] = gResults[i];
   return n;
+}
+
+CmdSource dispatcherLastChangeSource() { return gLastChangeSource; }
+
+String dispatcherStatusJson() {
+  String j = "{\"stateRevision\":" + String(gRevision);
+  j += ",\"lastChangeSource\":\"";
+  j += (gLastChangeSource == SRC_DASHBOARD) ? "DASHBOARD" : "LOCAL_UI";
+  j += "\",\"results\":[";
+  for (uint8_t i = 0; i < gResultCount; i++) {
+    if (i) j += ",";
+    j += "{\"cmdId\":\""; j += gResults[i].cmdId;
+    j += "\",\"outcome\":\""; j += cmdOutcomeStr(gResults[i].outcome);
+    j += "\",\"revision\":"; j += String(gResults[i].assignedRevision); j += "}";
+  }
+  j += "]}";
+  return j;
 }
 
 // ---- node table helpers ----
@@ -183,6 +201,7 @@ CommandResult dispatcherSubmit(const Command& c) {
 
   n->cfg = c.payload;
   gRevision++;
+  gLastChangeSource = c.source;
   n->pendingRevision = gRevision;
   n->converged = false;
   strlcpy(n->pendingCmdId, c.cmdId, CMD_ID_LEN);

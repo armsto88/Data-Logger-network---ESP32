@@ -135,6 +135,25 @@ typedef struct node_hello_message {
     uint32_t rtcUnix;       // node RTC time at wake
 } node_hello_message_t;
 
+// Node -> Mothership: firmware / OTA capability report. Sent right after
+// NODE_HELLO in the wake window. ADDITIVE — the mothership dispatch matches on
+// exact length + "FW_CAPS" tag, so older mothership firmware ignores it and
+// older nodes simply never send it. Must stay within the 250-byte ESP-NOW
+// ceiling (asserted below).
+typedef struct fw_caps_message {
+    char     command[16];      // "FW_CAPS"
+    char     nodeId[16];
+    uint16_t protocolVersion;  // NODE_PROTOCOL_VERSION the node speaks
+    char     fwVersion[12];    // semantic version, e.g. "0.1.0"
+    char     buildId[24];      // git short hash (+ "-dirty")
+    char     hwTarget[16];     // hardware target, e.g. "node-v3"
+    uint32_t maxImageSize;     // inactive OTA slot capacity (bytes)
+    uint8_t  rollbackCapable;  // 1 = deferred-verify rollback available
+    uint8_t  reserved[3];      // future use / alignment
+} fw_caps_message_t;
+static_assert(sizeof(fw_caps_message_t) <= 250,
+              "FW_CAPS exceeds the ESP-NOW v1 payload ceiling");
+
 // Node -> Mothership: asynchronous status push (used by rescue and field recovery flows)
 typedef struct node_status_message {
     char command[16];       // "NODE_STATUS"

@@ -3274,7 +3274,7 @@ static void handleManualUpload() {
           mTotal, mDeployed, mPaired, mUnpaired,
           gUploadQueue.getPendingRows(), manCursor.rowsUploaded,
           manCursor.retryCount, manCursor.lastUploadUnix,
-          FW_VERSION, FW_BUILD, manNowUnix,
+          FW_SEMVER, FW_BUILD, manNowUnix,
           WiFi.macAddress(),
           mPending, tx.enabled,
           gUploadQueue.getPendingRows(), (uint64_t)getCSVFileSize(), String(""),
@@ -3287,7 +3287,9 @@ static void handleManualUpload() {
           manLastResult,
           manModemJson,
           manDiagJson,
-          mPaused
+          mPaused,
+          mothershipFirmwareStatusJson(),
+          dispatcherStatusJson()
         };
 
         while (posts < kMaxManualPosts && gUploadQueue.getPendingRows() > 0 && !stop) {
@@ -3297,7 +3299,7 @@ static void handleManualUpload() {
           // Status object only on the first POST of this click (it doesn't
           // change between chunks). posts increments after a POST, so it stays
           // 0 until the first real POST; malformed-skip iterations don't POST.
-          JsonPayload json = buildJsonUpload(payload.csvData, 100, FW_VERSION,
+          JsonPayload json = buildJsonUpload(payload.csvData, 100, FW_SEMVER,
                                              (posts == 0) ? &manStatusCtx : nullptr,
                                              getRTCTimeUnix());
           if (json.ok && json.rowCount == 0 && json.csvBytesConsumed > 0) {
@@ -3594,19 +3596,11 @@ static uint32_t controlRecordNodeChange(const String& nodeId, uint8_t wake,
 }
 
 // GET /api/control — authoritative revision + recent command results (mirroring).
+// Uses the shared dispatcher serializer so the local and cloud control blocks
+// are byte-identical in shape.
 static void handleControlStatus() {
-  CommandResult res[CMD_MAX_RESULTS];
-  uint8_t n = dispatcherRecentResults(res, CMD_MAX_RESULTS);
-  String j = "{\"revision\":" + String(dispatcherRevision()) + ",\"results\":[";
-  for (uint8_t i = 0; i < n; i++) {
-    if (i) j += ",";
-    j += "{\"cmdId\":\""; j += res[i].cmdId;
-    j += "\",\"outcome\":\""; j += cmdOutcomeStr(res[i].outcome);
-    j += "\",\"revision\":"; j += String(res[i].assignedRevision); j += "}";
-  }
-  j += "]}";
   server.sendHeader("Cache-Control", "no-store");
-  server.send(200, "application/json", j);
+  server.send(200, "application/json", dispatcherStatusJson());
 }
 
 // ---------------------------------------------------------------------------

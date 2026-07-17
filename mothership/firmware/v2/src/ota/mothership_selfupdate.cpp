@@ -91,6 +91,29 @@ MothershipOtaStatus mothershipOtaGetStatus() {
   return s;
 }
 
+String mothershipFirmwareStatusJson() {
+  FirmwareIdentity id = fwIdentity(NODE_PROTOCOL_VERSION);
+  const esp_partition_t* run = esp_ota_get_running_partition();
+  esp_ota_img_states_t st = ESP_OTA_IMG_UNDEFINED;
+  if (run) esp_ota_get_state_partition(run, &st);
+  const char* otaState =
+      (st == ESP_OTA_IMG_PENDING_VERIFY) ? "pending_verify" :
+      (st == ESP_OTA_IMG_VALID)          ? "confirmed" :
+      (st == ESP_OTA_IMG_INVALID)        ? "invalid" :
+      (st == ESP_OTA_IMG_ABORTED)        ? "aborted" : "undefined";
+
+  String j = "{\"version\":\"";        j += id.semver;
+  j += "\",\"buildId\":\"";            j += id.buildId;
+  j += "\",\"hwTarget\":\"";           j += id.hwTarget;
+  j += "\",\"protocolVersion\":";      j += String(id.protocolVersion);
+  j += ",\"releaseId\":null";          // populated once the OTA state store lands
+  j += ",\"runningSlot\":\"";          j += (run ? run->label : "?");
+  j += "\",\"otaState\":\"";           j += otaState;
+  j += "\",\"lastOtaReason\":\"";      j += fwReasonStr(gLastReason);
+  j += "\"}";
+  return j;
+}
+
 bool mothershipOtaFirstBootCheck() {
   if (!otaIsPendingVerify()) return false;
   esp_err_t err = otaConfirmImage();

@@ -29,6 +29,10 @@ FwReason mothershipOtaImageFinish();
 
 void mothershipOtaAbort();
 
+// Pre-built status.firmware{} JSON for the cloud upload payload: identity
+// (version/build/hw/protocol), running slot, and OTA state.
+String mothershipFirmwareStatusJson();
+
 struct MothershipOtaStatus {
   bool     manifestReady;
   uint32_t expectedSize;

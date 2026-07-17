@@ -65,6 +65,15 @@ struct NodeInfo {
   bool      syncStale;
   uint8_t   staleMissCount;
   uint32_t  lastStaleAssistMs;
+  // Firmware / OTA capability reported by the node via FW_CAPS (RAM only; empty
+  // strings / 0 = not yet reported). Refreshed each sync window a node is heard.
+  String    fwVersion;          // node firmware semver, e.g. "0.1.0"
+  String    fwBuildId;          // node git build id
+  String    hwRevision;         // node hardware target, e.g. "node-v3"
+  uint8_t   otaProtocolVersion; // 0 = unknown
+  uint32_t  otaMaxImageSize;    // inactive-slot capacity (bytes); 0 = unknown
+  bool      rollbackCapable;
+  bool      hasFirmwareCaps;    // true once a FW_CAPS has been received
 };
 
 struct NodeDesiredConfig {
@@ -81,6 +90,10 @@ struct NodeDesiredConfig {
 // fault detection doesn't touch NVS in the hot path. Pass the raw capability
 // bits (NODE_SENSOR_MASK_VALID stripped). No-op if the node isn't registered.
 void setNodeExpectedSensorMask(const char* nodeId, uint16_t capabilityBits);
+
+// Fold a node's FW_CAPS report into the registry (RAM only). No-op if the node
+// isn't registered. Called from handleSyncWake after draining the caps queue.
+void setNodeFirmwareCaps(const fw_caps_message_t& caps);
 
 // -----------------------------------------------------------------------------
 // Registry queries

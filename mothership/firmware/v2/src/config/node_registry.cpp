@@ -182,6 +182,27 @@ void setNodeExpectedSensorMask(const char* nodeId, uint16_t capabilityBits) {
   }
 }
 
+void setNodeFirmwareCaps(const fw_caps_message_t& caps) {
+  // Null-terminate the fixed wire buffers before copying into Strings.
+  char nid[sizeof(caps.nodeId) + 1];      memcpy(nid, caps.nodeId, sizeof(caps.nodeId));       nid[sizeof(caps.nodeId)] = '\0';
+  char ver[sizeof(caps.fwVersion) + 1];   memcpy(ver, caps.fwVersion, sizeof(caps.fwVersion)); ver[sizeof(caps.fwVersion)] = '\0';
+  char bld[sizeof(caps.buildId) + 1];     memcpy(bld, caps.buildId, sizeof(caps.buildId));     bld[sizeof(caps.buildId)] = '\0';
+  char hw[sizeof(caps.hwTarget) + 1];     memcpy(hw, caps.hwTarget, sizeof(caps.hwTarget));    hw[sizeof(caps.hwTarget)] = '\0';
+
+  for (auto& n : registeredNodes) {
+    if (strncmp(n.nodeId.c_str(), nid, 16) == 0) {
+      n.fwVersion          = ver;
+      n.fwBuildId          = bld;
+      n.hwRevision         = hw;
+      n.otaProtocolVersion = (uint8_t)caps.protocolVersion;
+      n.otaMaxImageSize    = caps.maxImageSize;
+      n.rollbackCapable    = caps.rollbackCapable != 0;
+      n.hasFirmwareCaps    = true;
+      return;
+    }
+  }
+}
+
 void setDesiredConfig(const char* nodeId, const NodeDesiredConfig& cfg) {
   Preferences prefs;
   const String key = desiredConfigKeyPrefix(nodeId);
@@ -723,6 +744,26 @@ String buildNodesStatusJson(uint32_t nowUnix) {
     if (isnan(n.lastReportedBatV)) { out += "null"; }
     else { dtostrf(n.lastReportedBatV, 1, 2, nb); out += nb; }
     out += ",\"configVersion\":"; out += String((unsigned)n.configVersionApplied);
+    // Desired config (mothership-side intent) so the dashboard can show
+    // desired-vs-applied convergence without waiting on the node.
+    {
+      NodeDesiredConfig dc = getDesiredConfig(n.nodeId.c_str());
+      out += ",\"desiredConfigVersion\":";   out += String((unsigned)dc.configVersion);
+      out += ",\"desiredTargetState\":";     out += String((unsigned)dc.targetState);
+      out += ",\"desiredWakeIntervalMin\":"; out += String((unsigned)dc.wakeIntervalMin);
+    }
+    // Node firmware/OTA identity via FW_CAPS. null/false until the node reports.
+    if (n.hasFirmwareCaps) {
+      out += ",\"firmwareVersion\":\"";   out += jsonEscapeStr(n.fwVersion);  out += "\"";
+      out += ",\"firmwareBuild\":\"";     out += jsonEscapeStr(n.fwBuildId);  out += "\"";
+      out += ",\"hardwareRevision\":\"";  out += jsonEscapeStr(n.hwRevision); out += "\"";
+      out += ",\"otaProtocolVersion\":";  out += String((unsigned)n.otaProtocolVersion);
+      out += ",\"otaMaxImageSize\":";     out += String((unsigned long)n.otaMaxImageSize);
+      out += ",\"rollbackCapable\":";     out += n.rollbackCapable ? "true" : "false";
+      out += ",\"otaCapable\":true";
+    } else {
+      out += ",\"firmwareVersion\":null,\"hardwareRevision\":null,\"otaCapable\":false";
+    }
     out += ",\"notes\":\"";   out += jsonEscapeStr(getNodeNotes(n.nodeId)); out += "\"";
     out += ",\"isActive\":";           out += n.isActive ? "true" : "false";
     out += ",\"deployPending\":";       out += n.deployPending ? "true" : "false";

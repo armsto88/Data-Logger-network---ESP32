@@ -50,7 +50,7 @@ Being precise here saves you from designing against the wrong contract.
 - **Unique per-mothership auth** for the check-in (not a shared secret), TLS-only.
 - For OTA: an **approved, immutable release service** (see §4).
 
-> **Design against the full contract in §5**, not just today's payload. The firmware team will land the additive fields; you should build the UI/data model assuming they exist and degrade gracefully while they roll out.
+> **Design against the full contract in §5**, not just today's payload. The firmware team will land the additive fields per `mothership/docs/MOTHERSHIP_STATUS_REPORTING_PLAN.md` (Tier 1 = mothership firmware identity + control; Tier 2 = per-node desired-vs-applied; Tier 3 = per-node firmware via `FW_CAPS`). Build the UI/data model assuming they exist and degrade gracefully while they roll out.
 
 ---
 
@@ -82,14 +82,15 @@ Use the firmware's stable codes; don't invent your own. Full lists in §5.5. Exa
 All three are the **same command** to the firmware: a per-node desired-state change carried by `SET_NODE_CONFIG`, gated by the mothership dispatcher, then delivered to the node via the existing versioned `NODE_CONFIG` flow at the next sync window.
 
 ### 3.1 The controllable fields
-| Control | Field | Semantics |
+| Control | Field + value | Semantics |
 |---|---|---|
-| **Data / recording interval** | `wakeIntervalMin` (1–240) | How often the node wakes to sample. |
-| **Pause / resume** | `targetState` / standby | **Pause** = standby: node **stops recording but stays deployed and keeps syncing** (remotely resumable). **Resume** returns it to active recording. |
-| **Undeploy** | `targetState = UNPAIRED` (unpair) | Removes the node from active duty. This is a heavier lifecycle change than pause. |
-| (Sensor selection) | `sensorMask` | Which sensors the node should treat as installed. |
+| **Data / recording interval** | `wakeIntervalMin` = 1–240 | How often the node wakes to sample. |
+| **Pause** | `targetState = 3` (STANDBY) | Node **stops recording but stays deployed and keeps syncing** (remotely resumable). |
+| **Resume** | `targetState = 2` (DEPLOYED/ACTIVE) | Returns to active recording. |
+| **Undeploy** | `targetState = 0` (UNPAIRED) | Removes the node from active duty (heavier than pause). |
+| (Sensor selection) | `sensorMask` (uint16) | Which sensors the node treats as installed (see Appendix A.2). |
 
-Note the distinction the operator must understand: **pause is reversible standby (still in the mesh); undeploy removes it.** The mothership already implements both (`recordingPaused` for pause, unpair for undeploy) and now records them through the dispatcher.
+`targetState` enum: `0=UNPAIRED, 1=PAIRED, 2=DEPLOYED/ACTIVE, 3=STANDBY`. So **pause = 3, resume = 2, undeploy = 0**. The distinction the operator must understand: **pause is reversible standby (still in the mesh); undeploy removes it.** All are applied via the sync-window `NODE_CONFIG` reconcile and confirmed by an advancing `configVersion`. **See Appendix A for the exact, source-grounded contract.**
 
 ### 3.2 Command lifecycle the UI must render
 A dashboard change is **not "applied"** the moment it's submitted. Track and show:
@@ -276,6 +277,103 @@ The backend **never** emits ESP-NOW; the dashboard **never** addresses a node. A
 > **Mothership OTA:** the operator selects a pre-approved, immutable **release** (never a URL/binary); backend enqueues `DEPLOY_RELEASE { releaseId }`; the mothership pulls it, verifies an **Ed25519-signed manifest** (detached signature over `manifest.json`, per-artifact SHA-256, role/hardware/anti-downgrade checks), installs to an inactive slot, reboots with a first-boot self-test and **automatic rollback** on failure. Track `QUEUED → ACCEPTED → PREFLIGHT → DOWNLOADING → VERIFYING → READY_TO_REBOOT → PENDING_BOOT_VALIDATION → CONFIRMED` / `ROLLED_BACK` / `FAILED`. Low battery **defers** (not fails). Rollback is a safe outcome, not an error.
 >
 > **Backend must provide:** durable queue with immutable `commandId`, monotonic `cursor`, `expiresAtUnix`, target binding, per-mothership auth (TLS-only, unique key), user audit, separation of *queued intent* vs *reported state*, and an approved immutable release service. **Firmware provides:** revision assignment, validation, node protocol, install/verify/rollback, convergence, and (Phase 1/2) additive status fields + command ingestion. Use the exact field names and reason-code vocabularies from the integration brief §5; do not invent new ones.
+
+---
+
+## Appendix A — Source-grounded contract (real code, not proposals)
+
+Added at the dashboard team's request so the backend queue is built against the *actual* firmware. Each item is marked **IMPLEMENTED** or **NOT-YET-BUILT**. File paths are in this repo.
+
+### A.1 `GET /api/control` + cloud `status.control{}` — exact response — **IMPLEMENTED**
+Source: `dispatcherStatusJson()` in `node/firmware/shared/command_dispatcher.cpp` — the ONE serializer used by both `GET /api/control` (local) and the cloud `status.control{}` block, so they are byte-identical:
+```json
+{"stateRevision":1,"lastChangeSource":"LOCAL_UI","results":[{"cmdId":"L00037442","outcome":"ACCEPTED","revision":1}]}
+```
+- `stateRevision` (uint32): the mothership's authoritative, NVS-persisted revision. Monotonic; 0 → 1 on the first accepted change; survives reboot. *(Note: earlier drafts of this doc called it `revision`; the field is now `stateRevision`.)*
+- `lastChangeSource`: `LOCAL_UI` or `DASHBOARD` — the source of the last accepted change.
+- `results[]`: up to `CMD_MAX_RESULTS = 8` most-recent results (ring buffer), each `{cmdId, outcome, revision}` where `revision` = assigned revision (0 if not accepted). Storage order, not strictly chronological.
+- Now also emitted to the cloud as `status.control{}` in the upload payload (needs a mothership reflash + a Supabase column).
+
+### A.2 `SET_NODE_CONFIG` payload — fields, types, ranges — **dispatcher IMPLEMENTED**
+Two structs are involved. The dispatcher validates/revisions a controlled subset (`DispatchNodeConfig`, `command_dispatcher.h`); the value actually delivered to the node is the registry's `NodeDesiredConfig` (`node_registry.h`).
+
+| Field | Type | Range / rule |
+|---|---|---|
+| `nodeId` | char[16] | non-empty; ≤15 chars |
+| `wakeIntervalMin` | uint8 | **1–240** (0 or >240 → `INVALID`) |
+| `targetState` | uint8 | `0`=UNPAIRED, `1`=PAIRED, `2`=DEPLOYED/ACTIVE, `3`=STANDBY (see §3.1) |
+| `sensorMask` | uint16 | SNAP bits + selector + VALID (below) |
+
+`sensorMask` bits (`node/firmware/shared/protocol.h`):
+
+| Bit | Constant | Meaning |
+|---|---|---|
+| 0 | `SNAP_PRESENT_AIR_TEMP` | air temperature |
+| 1 | `SNAP_PRESENT_AIR_RH` | humidity |
+| 2 | `SNAP_PRESENT_SPECTRAL` | all 8 spectral channels (group) |
+| 3 | `SNAP_PRESENT_WIND` | wind speed + direction |
+| 4 | `SNAP_PRESENT_SOIL1` | soil1 vwc + temp |
+| 5 | `SNAP_PRESENT_SOIL2` | soil2 vwc + temp |
+| 6 | `SNAP_PRESENT_AUX1` | aux1 |
+| 7 | `SNAP_PRESENT_AUX2` | aux2 |
+| 8 | `SNAP_PRESENT_BAT_V` | battery voltage |
+| 9 | `NODE_SENSOR_CFG_WIND_ULTRASONIC` | wind selector: ultrasonic (set) vs reed-cup (clear); normalized to WIND for fault detection |
+| 15 | `NODE_SENSOR_MASK_VALID` | **1 = mask is authoritative; 0 = auto-detect** (node registers whatever it finds) |
+
+Operator-selectable bits: `NODE_SENSOR_CFG_ALL_BITS = 0x03FF` (bits 0–9). To make a selection stick you must OR in `NODE_SENSOR_MASK_VALID` (0x8000) — otherwise `0` means "auto", not "no sensors".
+
+### A.3 The LTE check-in — **IMPLEMENTED as the data upload; command parsing NOT built**
+- **It is the same request as the data upload — there is no separate check-in.** The mothership calls `modem.httpsPost(url, body, "application/json", authToken)` (`mothership/firmware/v2/src/comms/modem_driver.{h,cpp}`), one or more times per wake (chunked readings, plus a status-only heartbeat when there are zero rows).
+- **Request:** HTTPS POST to the configured ingest URL (Supabase), `Content-Type: application/json`, per-mothership bearer-style auth token (e.g. `fm_bkyd_001_<uuid>`), body = the canonical batch `{ readings[], meta{firmwareVersion,…}, status{ batVoltage, nodes[…], … } }`.
+- **Response parsed today:** `struct HttpsPostResult { bool success; int httpStatus; String responseBody; String errorDetail; }`. **`responseBody` is already captured** (via `AT+HTTPREAD`), but the upload logic branches **only on `httpStatus`** — 200 = success + advance cursor; 400/401 = non-retryable stop; 429/5xx/-1 = retry next window. The body is not inspected.
+- **Can firmware parse a `commands[]` array added to the response? YES — the plumbing exists** (`responseBody` is in hand); only the parser is missing. That parser is the Phase-2 firmware work; the envelope is defined in plan §13.4 (mirrored in §5.4 here). Decide with firmware: which POST carries commands when a wake makes several (recommend the final/status POST), and the per-check-in cap.
+
+### A.4 Dispatcher compare-and-set — **IMPLEMENTED**
+Source: `dispatcherSubmit()` in `command_dispatcher.cpp`. `gRevision` starts at 0 (or the NVS-restored value) and is incremented **only** on an accepted state-changing command; the new value is the `assignedRevision`. Checks run in this order:
+1. **`REPLAY`** — `cmdId` already in the result ring → return the stored result verbatim; never re-execute; no revision change. (This is the idempotency guarantee.)
+2. **`CMD_REQUEST_STATUS`** → `ACCEPTED` no-op, no revision bump.
+3. **`INVALID`** — `validPayload` fails (empty nodeId, or `wakeIntervalMin ∉ [1,240]`) or node table full. No revision change.
+4. **`REVISION_CONFLICT`** — `c.expectedRevision != gRevision`; returns `currentRevision = gRevision`; no change. (Local UI passes the current revision, so only a stale dashboard command trips this.)
+5. **`ACCEPTED`** — apply config → `gRevision++` → `assignedRevision = gRevision`. Before applying, any earlier accepted-but-not-yet-`converged` command for the *same node* with a different `cmdId` is flipped to **`SUPERSEDED`**.
+- Convergence: `dispatcherMarkConverged(nodeId, revision)` marks a node's command converged (call when the node ACKs); a converged command is immune to later supersession.
+- Persistence: `gRevision` + result ring + node table → NVS namespace `"dispatch"` on every accept; restored by `dispatcherInit()`.
+- Enum `CmdOutcome` serializes as: `ACCEPTED`, `REVISION_CONFLICT`, `INVALID`, `SUPERSEDED`, `REPLAY`.
+
+### A.5 Firmware identity + FW_CAPS
+**`FirmwareIdentity` — IMPLEMENTED** (`node/firmware/shared/firmware_identity.h`):
+```c
+struct FirmwareIdentity {
+  const char* role;             // "node" | "mothership"
+  const char* semver;           // "0.1.0"
+  const char* buildId;          // git short hash, e.g. "8397884-dirty"
+  const char* hwTarget;         // "mothership-v1" | "node-v3"
+  uint16_t    protocolVersion;  // = NODE_PROTOCOL_VERSION (currently 2)
+  uint8_t     identityVersion;  // FW_IDENTITY_VERSION = 1
+};
+```
+Real mothership value (serial): `role=mothership ver=0.1.0 build=8397884-dirty hw=mothership-v1 proto=2 idv=1`. `buildId` is injected at build time by `scripts/fw_version.py` (git short hash + `-dirty` on an uncommitted tree). `releaseId` is not in this struct yet. This identity is **not in the cloud payload yet** (Phase-1 additive change).
+
+**`FW_CAPS` — IMPLEMENTED (2026-07-17; needs a node + mothership reflash to take effect).** Additive node→mothership ESP-NOW message `fw_caps_message_t` (`protocol.h`, **96 bytes**), sent once per wake after `NODE_HELLO`:
+```c
+struct fw_caps_message {
+  char command[16];      // "FW_CAPS"
+  char nodeId[16];
+  uint16_t protocolVersion;
+  char fwVersion[12];    // "0.1.0"
+  char buildId[24];      // git short hash (+ "-dirty")
+  char hwTarget[16];     // "node-v3"
+  uint32_t maxImageSize; // inactive OTA slot capacity
+  uint8_t rollbackCapable;
+  uint8_t reserved[3];
+};
+```
+The mothership folds it into the registry and emits per node in `status.nodes[]`: `firmwareVersion`, `firmwareBuild`, `hardwareRevision`, `otaProtocolVersion`, `otaMaxImageSize`, `rollbackCapable`, `otaCapable` (or `firmwareVersion:null, otaCapable:false` for a node that hasn't reported yet). So treat per-node firmware as "unknown" **only until the node's first post-reflash sync window**.
+
+### A.6 commandId origin + limits
+- **`commandId` origin:** for **local UI** changes, **firmware generates it** — `snprintf(cmdId, 24, "L%08lx", millis())`, e.g. `L00037442` (`controlRecordNodeChange`, config_server.cpp). For **dashboard** changes, the **backend must generate an immutable `commandId`**; the mothership uses it purely as the idempotency key.
+- **`CMD_ID_LEN = 24`** (bytes incl. NUL → **≤23 usable chars**). ⚠️ A full UUID (36 chars) will be **truncated** by `strlcpy`, which can break idempotency if two IDs share the first 23 chars. Either keep backend IDs ≤23 chars (e.g. a base62 ULID prefix) **or** ask firmware to widen `CMD_ID_LEN` before UUIDs are used.
+- **`expiresAtUnix`:** in the envelope contract but **NOT enforced by firmware yet** (ingestion isn't built). When it lands, expired commands are dropped as `COMMAND_EXPIRED`.
+- **Bounded commands per check-in:** **not enforced yet.** Existing constants: `CMD_MAX_RESULTS = 8` (result ring), `CMD_MAX_NODES = 16`. Propose a small per-check-in cap (e.g. 8) so a check-in can't extend the powered session — open decision §7 Q2.
 
 ---
 *Questions? Talk to the firmware team — and see `FIELDMESH_OTA_FIRMWARE_UPDATE_PLAN.md` §4 (control model), §5 (release/manifest), §13 (status model), and §0 (what's built).*

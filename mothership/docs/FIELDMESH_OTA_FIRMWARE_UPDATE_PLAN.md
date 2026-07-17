@@ -776,6 +776,8 @@ Initial default:
 
 ## 13. Status model and user interface
 
+> **Implemented field contract (keep aligned):** this section is design intent. The concrete, source-grounded shapes actually built live in `docs/FIELDMESH_FIRMWARE_DASHBOARD_INTEGRATION_BRIEF.md` **Appendix A**. Key specifics that differ from the abstract examples below: node `targetState` is a **uint8 enum `0=UNPAIRED, 1=PAIRED, 2=DEPLOYED/ACTIVE, 3=STANDBY`** — so **pause = 3, resume = 2, undeploy = 0** (JSON envelope examples may use the string names, which map to these). `sensorMask` is a **uint16** with a `VALID` bit (0x8000) and a wind selector (bit 9). The LTE **check-in is the existing data upload** (one HTTPS POST; `responseBody` is already captured but not yet parsed for commands). `FW_CAPS` (per-node firmware version/hw/OTA capability) is **not built yet**. `commandId` is capped at **≤23 chars** (`CMD_ID_LEN=24`). When these change, update Appendix A first, then reconcile this section.
+
 ### 13.1 Per-device status
 
 Record and expose:
@@ -1018,6 +1020,8 @@ Exit gate:
 - Backend/frontend and firmware reviewers agree on the store-and-forward/revision contract, and both device roles can boot either slot, preserve NVS, deliberately fail validation, and return to the previous image on bench hardware.
 
 ### Phase 1 - observability without updating
+
+> **Implementation plan:** `MOTHERSHIP_STATUS_REPORTING_PLAN.md` breaks this into shippable tiers — Tier 1 (mothership firmware identity + control block into the cloud payload, no node change), Tier 2 (per-node desired-vs-applied, no node change), Tier 3 (`FW_CAPS` node→mothership firmware report). Tiers 1–2 can ship immediately.
 
 Deliverables:
 

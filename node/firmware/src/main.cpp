@@ -12,6 +12,7 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
 #include "esp_system.h"
+#include "esp_ota_ops.h"  // FW_CAPS: inactive-slot capacity for maxImageSize
 #include "sensors.h"
 #include "sensors/soil_moist_temp.h"
 #include "storage/local_queue.h"
@@ -1848,6 +1849,36 @@ static void setNodeConfigVersion(uint16_t v) {
   g_appliedConfigVersion = v;
 }
 
+// Send FW_CAPS (firmware/OTA identity) once per wake, right after NODE_HELLO.
+// The node cold-boots each wake, so the static guard resets — exactly one
+// send per wake regardless of hello retries. Additive: the mothership matches
+// on exact length + tag, so legacy mothership firmware ignores it.
+static void sendFwCaps() {
+  static bool sentThisWake = false;
+  if (sentThisWake) return;
+  if (!hasMothershipMAC() || !bringupEspNow()) return;
+  static const uint8_t broadcastAddress[6] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
+
+  FirmwareIdentity id = fwIdentity(NODE_PROTOCOL_VERSION);
+  fw_caps_message_t caps{};
+  strcpy(caps.command, "FW_CAPS");
+  strncpy(caps.nodeId,    NODE_ID,      sizeof(caps.nodeId)    - 1);
+  caps.protocolVersion = NODE_PROTOCOL_VERSION;
+  strncpy(caps.fwVersion, id.semver,    sizeof(caps.fwVersion) - 1);
+  strncpy(caps.buildId,   id.buildId,   sizeof(caps.buildId)   - 1);
+  strncpy(caps.hwTarget,  id.hwTarget,  sizeof(caps.hwTarget)  - 1);
+  const esp_partition_t* next = esp_ota_get_next_update_partition(nullptr);
+  caps.maxImageSize    = next ? next->size : 0;
+  caps.rollbackCapable = 1;  // stock bootloader supports deferred-verify rollback
+
+  sendEspNowAndWait(mothershipMAC, &caps, sizeof(caps), 250);
+  sendEspNowAndWait(broadcastAddress, &caps, sizeof(caps), 250);
+  sentThisWake = true;
+  Serial.printf("📦 FW_CAPS sent: v%s build=%s hw=%s maxImg=%u\n",
+                caps.fwVersion, caps.buildId, caps.hwTarget,
+                (unsigned)caps.maxImageSize);
+}
+
 // Send NODE_HELLO to mothership at top of each wake cycle (before data flush)
 static void sendNodeHello(bool broadcastFallback) {
   if (!hasMothershipMAC()) return;
@@ -1877,6 +1908,9 @@ static void sendNodeHello(bool broadcastFallback) {
   if ((uint32_t)POST_WAKE_WINDOW_MS > 0) {
     g_postWakeWindowUntilMs = millis() + (uint32_t)POST_WAKE_WINDOW_MS;
   }
+
+  // Report firmware/OTA identity alongside the hello (once per wake).
+  sendFwCaps();
 }
 static bool armDeploymentWakeAlarms(DateTime* nextDataOut, DateTime* nextSyncOut) {
   Serial.printf("[ARM] syncMode=%s syncMin=%u phase=%lu wakeMin=%u paused=%d\n",

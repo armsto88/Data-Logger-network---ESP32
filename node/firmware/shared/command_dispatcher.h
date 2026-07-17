@@ -69,5 +69,9 @@ const DispatchNodeConfig* dispatcherNodeConfig(const char* nodeId);
 bool          dispatcherKnownCmd(const char* cmdId);          // seen before?
 bool          dispatcherResultFor(const char* cmdId, CommandResult* out);
 uint8_t       dispatcherRecentResults(CommandResult* out, uint8_t max);   // for status/UI
+// Canonical control-status JSON: {"stateRevision":N,"lastChangeSource":"...","results":[...]}
+// One serializer for both GET /api/control and the cloud status.control{} block.
+String        dispatcherStatusJson();
+CmdSource     dispatcherLastChangeSource();
 // Node applied the desired state (CONFIG_ACK / snapshot). Clears its pending flag.
 void          dispatcherMarkConverged(const char* nodeId, uint32_t revision);

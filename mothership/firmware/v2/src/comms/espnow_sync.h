@@ -38,6 +38,11 @@ struct SyncReleaseAckSlot {
   sync_release_ack_message_t ack;
 };
 
+struct SyncCapsSlot {
+  uint8_t mac[6];
+  fw_caps_message_t caps;
+};
+
 bool initEspNowSyncOnly(int channel);
 void broadcastSyncWindowOpen();
 bool broadcastSyncSessionOpen(const sync_session_open_message_t& open);
@@ -69,6 +74,9 @@ void initSnapQueue(int depth);
 int drainSnapQueue(EspNowSnapSlot* outSlots, int maxSlots);
 uint32_t getSnapDropCount();
 int drainSyncHellos(SyncHelloSlot* out, int maxItems);
+// FW_CAPS collection — nodes report firmware/OTA identity after NODE_HELLO. The
+// receive callback enqueues them; handleSyncWake drains and updates the registry.
+int drainSyncCaps(SyncCapsSlot* out, int maxItems);
 int drainDumpDone(SyncDoneSlot* out, int maxItems);
 int drainReleaseAcks(SyncReleaseAckSlot* out, int maxItems);
 

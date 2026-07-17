@@ -33,6 +33,7 @@
 #include "protocol.h"
 #include "firmware_identity.h"  // role/version/build/hw identity (FW_GIT injected)
 #include "ota/mothership_selfupdate.h"
+#include "command_dispatcher.h"  // dispatcherStatusJson() for status.control{}
 
 // Defer OTA image confirmation to our own first-boot self-test (see the call to
 // mothershipOtaFirstBootCheck() below). Without this the Arduino core would
@@ -393,6 +394,19 @@ static void runCoordinatedSyncWindow(
           responders[(size_t)existing].queueDepth = hellos[i].hello.queueDepth;
         }
       }
+
+      // Fold any FW_CAPS reports into the registry (additive; older nodes send
+      // none). Keeps the loop alive if caps arrive without a fresh hello.
+      SyncCapsSlot caps[8];
+      int capsCount = drainSyncCaps(caps, 8);
+      for (int i = 0; i < capsCount; ++i) {
+        caps[i].caps.nodeId[sizeof(caps[i].caps.nodeId) - 1] = '\0';
+        setNodeFirmwareCaps(caps[i].caps);
+        Serial.printf("[SYNC] FW_CAPS %.15s v%.11s hw=%.15s proto=%u\n",
+                      caps[i].caps.nodeId, caps[i].caps.fwVersion,
+                      caps[i].caps.hwTarget, (unsigned)caps[i].caps.protocolVersion);
+      }
+      count += capsCount;
     } while (count > 0);
   };
 
@@ -665,6 +679,11 @@ void performModemUpload(const TransmissionSettings& txSettings, uint32_t session
         (isnan(loadedBatV) ? String("null") : String(loadedBatV, 2)) +
         ",\"sessionMs\":" + String((unsigned)(millis() - sessionStartMs)) + "}";
 
+    // Firmware identity + OTA state, and the dispatcher control revision — both
+    // pre-built here and emitted as status.firmware{} / status.control{}.
+    const String firmwareStatusJson = mothershipFirmwareStatusJson();
+    const String controlStatusJson  = dispatcherStatusJson();
+
     const StatusContext statusCtx = {
       restingBatV, flashPct, fsTotal, fsUsed,
       "scheduled", computeNextSyncIsoLocal(),
@@ -673,7 +692,7 @@ void performModemUpload(const TransmissionSettings& txSettings, uint32_t session
       fTotal, fDeployed, fPaired, fUnpaired,
       uploadQueue.getPendingRows(), statusCursor.rowsUploaded,
       statusCursor.retryCount, statusCursor.lastUploadUnix,
-      FW_VERSION, FW_BUILD, getRTCTime(),
+      FW_SEMVER, FW_BUILD, getRTCTime(),
       WiFi.macAddress(),
       fPending, txSettings.enabled,
       uploadQueue.getPendingRows(), (uint64_t)getCSVFileSize(), String(""),
@@ -686,7 +705,9 @@ void performModemUpload(const TransmissionSettings& txSettings, uint32_t session
       statusLastResult,
       modemJson,
       diagJson,
-      fPaused
+      fPaused,
+      firmwareStatusJson,
+      controlStatusJson
     };
 
     while (uploadQueue.getPendingRows() > 0 && !sessionExpired()) {
@@ -702,7 +723,7 @@ void performModemUpload(const TransmissionSettings& txSettings, uint32_t session
       // session — it doesn't change between chunks, so repeating it on every
       // chunk just bloats the body and writes mothership_status N times.
       JsonPayload json = buildJsonUpload(payload.csvData, kMaxReadingsPerPost,
-                                         FW_VERSION, firstChunk ? &statusCtx : nullptr,
+                                         FW_SEMVER, firstChunk ? &statusCtx : nullptr,
                                          getRTCTime());
       if (json.ok && json.rowCount == 0 && json.csvBytesConsumed > 0) {
         // The row(s) in this chunk were malformed and skipped by the builder.
@@ -802,7 +823,7 @@ void performModemUpload(const TransmissionSettings& txSettings, uint32_t session
     // empty readings[] array and records a zero-reading sync_session while
     // refreshing mothership_status and nodes.
     if (totalPendingRows == 0 && isSupabase && !sessionExpired()) {
-      JsonPayload heartbeat = buildJsonUpload(String(), 1, FW_VERSION,
+      JsonPayload heartbeat = buildJsonUpload(String(), 1, FW_SEMVER,
                                                &statusCtx, getRTCTime());
       if (!heartbeat.ok) {
         Serial.println("[UPLOAD] Status heartbeat JSON build failed");
