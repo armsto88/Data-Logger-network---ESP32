@@ -36,7 +36,7 @@ This directory contains peer-review frameworks and calibration protocols for the
 
 ---
 
-### 3. [SPECTRAL_SENSOR_CALIBRATION_PROTOCOL.md](SPECTRAL_SENSOR_CALIBRATION_PROTOCOL.md)
+### 3. [SPECTRAL_SENSOR_CALIBRATION_PROTOCOL.md](as7341/SPECTRAL_SENSOR_CALIBRATION_PROTOCOL.md)
 **For the AS7341 spectral sensor** (8 visible bands + Clear + NIR).
 
 **Phases:**

@@ -1,28 +1,35 @@
 # Node Documentation
 
-Design notes, hardware checklists, and sensor implementation docs for the ESP32-WROOM sensor nodes.
+**Last reviewed:** 2026-07-17
 
-## Hardware
+Design notes, hardware checklists, sensor implementation records, and bring-up results for the ESP32-WROOM sensor nodes.
 
-- [NODE_HARDWARE_V2_CHECKLIST.md](NODE_HARDWARE_V2_CHECKLIST.md) — V2 hardware bring-up and validation checklist
-- [NODE-PCB-OVERVIEW.md](NODE-PCB-OVERVIEW.md) — node PCB design summary and pin mapping
-- [NODE_V2_BRINGUP_RESULTS.md](NODE_V2_BRINGUP_RESULTS.md) — V2 hardware bring-up test results
-- [NODE_V3_22V_BOOST_UPDATE.md](NODE_V3_22V_BOOST_UPDATE.md) — V3 22 V boost circuit update: inductor upgrade, U49 retained, decoupling improved
+## Hardware and bring-up
 
-## Storage
+- [NODE_HARDWARE_V2_CHECKLIST.md](NODE_HARDWARE_V2_CHECKLIST.md) - V2 hardware validation checklist.
+- [NODE-PCB-OVERVIEW.md](NODE-PCB-OVERVIEW.md) - PCB architecture and pin mapping.
+- [Node V2 bring-up results](../firmware/tests/NODE_V2_BRINGUP_RESULTS.md) - canonical V2 test record; the former one-line pointer in this folder was removed on 2026-07-17.
+- [Node V3 bring-up results](../firmware/tests/NODE_V3_BRINGUP_RESULTS.md) - canonical V3 test record.
+- [NODE_V3_OVERVIEW.md](NODE_V3_OVERVIEW.md) - complete V3 board overview.
+- [NODE_V3_22V_BOOST_UPDATE.md](NODE_V3_22V_BOOST_UPDATE.md) - V3 22 V boost changes.
+- [NODE_V3_ULTRASONIC_CHANGES_BRINGUP_FIRMWARE_GUIDE_2026-06-12.md](NODE_V3_ULTRASONIC_CHANGES_BRINGUP_FIRMWARE_GUIDE_2026-06-12.md) - V3 design changes and production firmware guidance.
+- [NODE_V4_ULTRASONIC_REDESIGN_NOTES.md](NODE_V4_ULTRASONIC_REDESIGN_NOTES.md) - V4 shared bidirectional transducer redesign.
 
-- [NODE-LOCAL-STORAGE-CONTRACT-V1.md](NODE-LOCAL-STORAGE-CONTRACT-V1.md) — local queue storage and data format specification
+## Storage and robustness
+
+- [NODE-LOCAL-STORAGE-CONTRACT-V1.md](NODE-LOCAL-STORAGE-CONTRACT-V1.md) - queue invariants, recovery, capacity, and tests.
+- [NODE_ROBUSTNESS_FIX_PROMPTS.md](NODE_ROBUSTNESS_FIX_PROMPTS.md) - historical task-level robustness instructions retained for traceability.
 
 ## Sensors
 
-- [SENSOR_AND_CSV_BRINGUP.md](SENSOR_AND_CSV_BRINGUP.md) — sensor initialization and CSV logging tests
-- [CWT_TH-A_SOIL_SENSOR_IMPLEMENTATION_NOTES.md](CWT_TH-A_SOIL_SENSOR_IMPLEMENTATION_NOTES.md) — soil sensor driver implementation
+- [SENSOR_AND_CSV_BRINGUP.md](SENSOR_AND_CSV_BRINGUP.md) - sensor initialisation and CSV bring-up.
+- [CWT_TH-A_SOIL_SENSOR_IMPLEMENTATION_NOTES.md](CWT_TH-A_SOIL_SENSOR_IMPLEMENTATION_NOTES.md) - soil sensor driver implementation.
+- [shared sensor-package checklist](../../docs/ADDING_A_NEW_SENSOR_CHECKLIST.md) - required end-to-end integration checks.
 
-## Ultrasonic Anemometer
+## Ultrasonic anemometer
 
-- [ultrasonic_anemometer_function_note.md](ultrasonic_anemometer_function_note.md) — ultrasonic wind sensor function spec
-- [ULTRASONIC_ANEMOMETER_WORK_PLAN.md](ULTRASONIC_ANEMOMETER_WORK_PLAN.md) — development roadmap for ultrasonic sensor
-- [ultrasonic_circuit_v2_design_advice.md](ultrasonic_circuit_v2_design_advice.md) — circuit design notes
-- [ULTRASONIC_NOISE_ANALYSIS_2026-04-11.md](ULTRASONIC_NOISE_ANALYSIS_2026-04-11.md) — signal noise analysis
-- [NODE_V3_ULTRASONIC_CHECKLIST.md](NODE_V3_ULTRASONIC_CHECKLIST.md) — V3 ultrasonic bring-up and validation checklist (22 V boost, signal chain, acoustic discrimination)
-- [NODE_V3_ULTRASONIC_CHANGES_BRINGUP_FIRMWARE_GUIDE_2026-06-12.md](NODE_V3_ULTRASONIC_CHANGES_BRINGUP_FIRMWARE_GUIDE_2026-06-12.md) — V3 design changes, bring-up plan, and production firmware guidance (TX path, RX chain, layout, state machine)
+- [ultrasonic_anemometer_function_note.md](ultrasonic_anemometer_function_note.md) - hardware/firmware function specification.
+- [ULTRASONIC_ANEMOMETER_WORK_PLAN.md](ULTRASONIC_ANEMOMETER_WORK_PLAN.md) - development and validation plan.
+- [ultrasonic_circuit_v2_design_advice.md](ultrasonic_circuit_v2_design_advice.md) - V2 circuit recommendations.
+- [ULTRASONIC_NOISE_ANALYSIS_2026-04-11.md](ULTRASONIC_NOISE_ANALYSIS_2026-04-11.md) - dated signal/noise findings.
+- [NODE_V3_ULTRASONIC_CHECKLIST.md](NODE_V3_ULTRASONIC_CHECKLIST.md) - V3 electrical and acoustic validation.

@@ -14,6 +14,14 @@
 #include "system/power.h"
 #include "system/pins.h"
 #include "protocol.h"
+#include "firmware_identity.h"
+#include "ota/mothership_selfupdate.h"
+#include "command_dispatcher.h"
+#include "esp_ota_ops.h"
+
+// Defined below; used by the node-config handlers above its definition.
+static uint32_t controlRecordNodeChange(const String& nodeId, uint8_t wake,
+                                        uint8_t target, uint16_t mask, CmdSource src);
 
 #include <WiFi.h>
 #include <WebServer.h>
@@ -31,7 +39,12 @@ static const char* BASE_SSID = "Logger";
 static String ssid = String(BASE_SSID) + String(DEVICE_ID);  // "Logger001"
 static const char* password = "logger123";
 const char* FW_VERSION = "v1.0.0";
-const char* FW_BUILD   = __DATE__ " " __TIME__;
+// Git build id injected by scripts/fw_version.py; __DATE__/__TIME__ freeze
+// across cached reflashes (see memory: flash-recovery-bootloader).
+#ifndef FW_GIT
+#define FW_GIT "nogit"
+#endif
+const char* FW_BUILD   = FW_GIT;
 
 // ---------------------------------------------------------------------------
 // Sync globals + NVS
@@ -684,7 +697,7 @@ a{color:var(--primary);text-decoration:none}
 .header{padding:var(--sp-3) 0;text-align:center}
 .header-top{display:flex;align-items:center;justify-content:space-between;gap:10px}
 .header-actions{display:flex;align-items:center;gap:8px}
-.h1{font-size:22px;font-weight:700;margin:0}
+.h1{font-size:24px;font-weight:700;margin:0}
 .top-time{display:flex;align-items:center;justify-content:space-between;gap:10px;background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:14px 16px;margin-bottom:12px;min-height:62px}
 .top-time__label{color:var(--sub);font-size:.95rem;font-weight:600}
 .top-time__value{font-weight:700;color:#566246;font-size:1.25rem}
@@ -902,6 +915,47 @@ a{color:var(--primary);text-decoration:none}
   background:#fff;border:1px solid var(--border);border-radius:14px;box-shadow:0 10px 34px rgba(0,0,0,.16);
   color:var(--sub);font-size:.92rem}
 .fm-load-box .spinner{width:2em;height:2em;border-width:3px;margin:0;color:#7a9b70}
+
+/* --- Persistent navigation: fixed bottom bar (phone) / static row (desktop) --- */
+/* Content clears the fixed bar; desktop override below zeroes this. */
+body{padding-bottom:calc(70px + env(safe-area-inset-bottom))}
+.tabbar{position:fixed;left:0;right:0;bottom:0;z-index:20;display:grid;grid-template-columns:repeat(4,1fr);
+  background:var(--panel);border-top:1px solid var(--border);box-shadow:0 -2px 10px rgba(74,74,72,.10);
+  padding-bottom:env(safe-area-inset-bottom)}
+.tabbar a{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:3px;
+  min-height:56px;padding:6px 4px;color:var(--sub);font-size:.72rem;font-weight:600;
+  border-top:3px solid transparent;text-decoration:none}
+.tabbar a .icon{width:22px;height:22px}
+.tabbar a[aria-current="page"]{color:var(--primary);border-top-color:var(--primary);background:rgba(91,117,83,.08)}
+@media(hover:hover){.tabbar a:hover{color:var(--text);background:rgba(91,117,83,.06)}}
+
+/* Flat secondary section — border only. Shadow is reserved for primary surfaces. */
+.section--flat{box-shadow:none}
+
+/* Primary action card at the end of the page flow (shadowed to stand out from
+   the flat secondary sections). Not floating — the fixed tab bar owns the bottom. */
+.sticky-action{margin:16px 0;padding:12px;background:var(--panel);border:1px solid var(--border);
+  border-radius:var(--radius);box-shadow:var(--shadow)}
+.sticky-action .btn{margin-top:0}
+
+/* Tabular numerals so readings/voltage/time/percent don't jitter as they update. */
+.num,.top-time__value,.chip--bat-ok,.chip--bat-med,.chip--bat-low{font-variant-numeric:tabular-nums}
+
+@media(min-width:768px){
+  .tabbar{position:static;box-shadow:none;border-top:none;border-bottom:1px solid var(--border);
+    max-width:720px;margin:0 auto 8px}
+  .tabbar a{flex-direction:row;gap:8px;min-height:48px;font-size:.9rem;
+    border-top:none;border-bottom:3px solid transparent}
+  .tabbar a[aria-current="page"]{border-top-color:transparent;border-bottom-color:var(--primary)}
+  body{padding-bottom:0}
+}
+
+@media(prefers-reduced-motion:reduce){
+  html{scroll-behavior:auto}
+  .spinner{animation:none}
+  .node-new{animation:none}
+  .item--node,.action-choice span,.btn{transition:none}
+}
 )CSS";
 
 const char COMMON_JS[] PROGMEM = R"JS(
@@ -1314,7 +1368,42 @@ static void sendCaptivePortalLanding() {
               "</body></html>");
 }
 
-static String headCommon(const String& title, const String& actionsHtml = String()) {
+// Persistent primary navigation. navActive selects the current destination:
+// 0=Overview, 1=Stations, 2=Export, 3=Settings; <0 emits nothing (child/result
+// pages keep their header Back button). Export is a download route, so its tab is
+// a plain link with no aria-current state. Icons reuse the inline SVGs already in
+// the page bodies — no external assets.
+static String navBarHtml(int navActive) {
+  if (navActive < 0) return String();
+  auto tab = [](const char* href, const char* label, const char* pathD, bool active) {
+    String s = F("<a href='");
+    s += href;
+    s += F("'");
+    if (active) s += F(" aria-current='page'");
+    s += F("><svg class='icon' viewBox='0 0 24 24' aria-hidden='true'><path d='");
+    s += pathD;
+    s += F("'/></svg><span>");
+    s += label;
+    s += F("</span></a>");
+    return s;
+  };
+  String h = F("<nav class='tabbar' aria-label='Primary'>");
+  h += tab("/", "Overview",
+           "M12 3l9 8h-3v9h-5v-6h-2v6H4v-9H1z", navActive == 0);
+  h += tab("/stations", "Nodes",
+           "M12 2a4 4 0 110 8 4 4 0 010-8zm-7 12a3 3 0 110 6 3 3 0 010-6zm14 0a3 3 0 110 6 3 3 0 010-6zM9.3 9.8l-3 3.9 1.6 1.2 3-3.9-1.6-1.2zm5.4 0l-1.6 1.2 3 3.9 1.6-1.2-3-3.9z",
+           navActive == 1);
+  h += tab("/export", "Export",
+           "M12 3a1 1 0 011 1v8.59l2.3-2.3 1.4 1.42-4.7 4.7-4.7-4.7 1.4-1.42 2.3 2.3V4a1 1 0 011-1zm-7 14h14v2H5v-2z",
+           navActive == 2);
+  h += tab("/settings", "Settings",
+           "M19.14 12.94c.04-.3.06-.61.06-.94 0-.32-.02-.64-.07-.94l2.03-1.58a.49.49 0 00.12-.61l-1.92-3.32a.488.488 0 00-.59-.22l-2.39.96c-.5-.38-1.03-.7-1.62-.94l-.36-2.54a.484.484 0 00-.48-.41h-3.84a.485.485 0 00-.48.41l-.36 2.54c-.59.24-1.13.57-1.62.94l-2.39-.96c-.22-.08-.47 0-.59.22L2.74 8.87c-.12.21-.08.47.12.61l2.03 1.58c-.05.3-.09.63-.09.94s.02.64.07.94l-2.03 1.58a.49.49 0 00-.12.61l1.92 3.32c.12.22.37.29.59.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.05.24.24.41.48.41h3.84c.24 0 .44-.17.47-.41l.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.22.08.47 0 .59-.22l1.92-3.32c.12-.22.07-.47-.12-.61l-2.01-1.58zM12 15.6c-1.98 0-3.6-1.62-3.6-3.6s1.62-3.6 3.6-3.6 3.6 1.62 3.6 3.6-1.62 3.6-3.6 3.6z",
+           navActive == 3);
+  h += F("</nav>");
+  return h;
+}
+
+static String headCommon(const String& title, const String& actionsHtml = String(), int navActive = -1) {
   // No-store on every portal page: phones/captive-portal browsers cache the AP
   // pages aggressively, which repeatedly showed stale UI after a reflash. This
   // header is queued for this request's send(); the belt-and-braces meta tags
@@ -1347,6 +1436,7 @@ static String headCommon(const String& title, const String& actionsHtml = String
   h += F("</div>");
   h += F("</div>");
   h += F("</div>");
+  h += navBarHtml(navActive);
   return h;
 }
 
@@ -1665,7 +1755,8 @@ static String buildDataStatusSectionHtml() {
 // Route handlers
 // ---------------------------------------------------------------------------
 static void handleRoot() {
-  String html = headCommon("fieldMesh");
+  String html = headCommon("fieldMesh",
+    F("<span id='conn-status' class='conn-dot'>Connected</span>"), 0);
 
   char currentTime[24];
   getRTCTimeString(currentTime, sizeof(currentTime));
@@ -1702,76 +1793,11 @@ static void handleRoot() {
             "</div>"
             "</details>");
 
-  // --- Quick actions: Find New Nodes + Manage nodes ---
-  html += F("<div class='section action-stack' style='margin:0 0 12px 0'>"
-            "<form class='async-form' action='/find-stations' method='POST' style='margin:0'>"
-            "<button type='submit' id='find-btn' data-loading-label='Searching for nodes…' class='btn btn--primary' style='width:100%'><svg class='icon' viewBox='0 0 24 24' aria-hidden='true'><path d='M12 3c-3.9 0-7.4 1.6-9.9 4.1l1.4 1.4C5.6 6.4 8.7 5 12 5s6.4 1.4 8.5 3.5l1.4-1.4C19.4 4.6 15.9 3 12 3zm0 5c-2.6 0-5 .9-6.9 2.6l1.4 1.4C8 10.5 9.9 10 12 10s4 .5 5.5 2l1.4-1.4C17 8.9 14.6 8 12 8zm0 5c-1.3 0-2.5.5-3.5 1.5l1.4 1.4c.6-.6 1.3-.9 2.1-.9s1.5.3 2.1.9l1.4-1.4c-1-1-2.2-1.5-3.5-1.5zm0 4a2 2 0 100 4 2 2 0 000-4z'/></svg> Find New Nodes</button>"
-            "</form>"
-            "<a href='/stations' class='btn btn--success'><svg class='icon' viewBox='0 0 24 24' aria-hidden='true'><path d='M12 2a4 4 0 110 8 4 4 0 010-8zm-7 12a3 3 0 110 6 3 3 0 010-6zm14 0a3 3 0 110 6 3 3 0 010-6zM9.3 9.8l-3 3.9 1.6 1.2 3-3.9-1.6-1.2zm5.4 0l-1.6 1.2 3 3.9 1.6-1.2-3-3.9z'/></svg> Manage nodes</a>"
-            "</div>");
-
-  // Discovery progress panel (hidden until a scan starts) + connection pill.
-  html += F("<div id='discovery-panel' class='discovery-panel' hidden>"
-            "<div class='dp-row'><strong><span class='spinner' aria-hidden='true'></span>"
-            "<span id='dp-state'>Searching</span></strong>"
-            "<span>Elapsed <span id='dp-elapsed'>0s</span></span></div>"
-            "<div class='dp-row'><span>New nodes this scan: <strong id='dp-found'>0</strong></span></div>"
-            "<div class='dp-msg'>Keep new nodes powered on and in pairing mode.</div></div>");
-  html += F("<div style='text-align:right;margin:-4px 0 8px'><span id='conn-status' class='conn-dot'>Connected</span></div>");
-
-  // --- Status cards row: Mothership battery + Storage ---
-  {
-    const uint64_t fsTotal = (uint64_t)LittleFS.totalBytes();
-    const uint64_t fsUsed  = (uint64_t)LittleFS.usedBytes();
-    const uint32_t storagePct = (fsTotal > 0) ? (uint32_t)((fsUsed * 100ULL) / fsTotal) : 0;
-    const float hubBatV = readBatteryVoltage();
-    const char* batClass = (hubBatV >= 3.9f) ? "chip--bat-ok"
-                         : (hubBatV >= 3.5f) ? "chip--bat-med"
-                         : "chip--bat-low";
-    const char* batLabel = (hubBatV >= 3.9f) ? "OK"
-                         : (hubBatV >= 3.5f) ? "Medium"
-                         : "Low";
-    char batBuf[10];
-    snprintf(batBuf, sizeof(batBuf), "%.2fV", hubBatV);
-
-    html += F("<div class='stats' style='margin:0 0 12px 0;text-align:left'>");
-    html += F("<div class='stat' style='text-align:left'>"
-              "<strong>Mothership battery</strong><br>");
-    html += F("<span class='chip ");
-    html += batClass;
-    html += F("' style='font-size:16px;font-weight:600'>");
-    html += batBuf;
-    html += F("</span> <span class='muted'>");
-    html += batLabel;
-    html += F("</span></div>");
-    html += F("<div class='stat' style='text-align:left'>"
-              "<strong>Storage</strong><br><span class='num' style='font-size:18px'>");
-    html += String(storagePct);
-    html += F("% used</span><br><span class='muted'>");
-    html += (fsTotal > 0) ? formatBytesUi(fsUsed) : String("n/a");
-    html += F("</span></div>");
-    // Third card: last upload time
-    html += F("<div class='stat' style='text-align:left'>"
-              "<strong>Last upload</strong><br><span class='num' style='font-size:14px'>");
-    {
-      UploadCursor cursor = {0,0,0,0,0};
-      if (flashIsReady()) { gUploadQueue.init(); cursor = gUploadQueue.getCursor(); }
-      if (cursor.lastUploadUnix > 0) {
-        DateTime lastUp(cursor.lastUploadUnix);
-        html += formatDateTimeDisplay(lastUp);
-      } else {
-        html += F("Never");
-      }
-    }
-    html += F("</span></div>");
-    html += F("</div>");
-  }
-
-  // --- Node KPI tiles ---
-  html += F("<div class='section' aria-live='polite'>"
+  // --- Fleet KPI tiles (flat) ---
+  html += F("<div class='section section--flat' aria-live='polite'>"
             "<div id='ui-status' class='help' style='display:none;margin-bottom:10px;border:1px solid var(--border);border-radius:8px;padding:8px 10px'></div>"
             "<h3>Nodes</h3>"
-            "<div class='stats stats--kpi' style='margin:0 0 12px 0'>"
+            "<div class='stats stats--kpi' style='margin:0'>"
               "<div class='stat");
   if (deployedNodes > 0) html += F(" stat--deployed-active");
   html += F("'><strong>Active</strong><span id='kpi-deployed-num' class='num'>");
@@ -1788,16 +1814,80 @@ static void handleRoot() {
   html += String(unpairedNodes.size());
   html += F("</span></div>"
             "</div>");
+  // Primary entry to the node manager (also reachable via the Stations tab).
+  html += F("<a href='/stations' class='btn btn--success' style='margin-top:12px'><svg class='icon' viewBox='0 0 24 24' aria-hidden='true'><path d='M12 2a4 4 0 110 8 4 4 0 010-8zm-7 12a3 3 0 110 6 3 3 0 010-6zm14 0a3 3 0 110 6 3 3 0 010-6zM9.3 9.8l-3 3.9 1.6 1.2 3-3.9-1.6-1.2zm5.4 0l-1.6 1.2 3 3.9 1.6-1.2-3-3.9z'/></svg> Manage nodes</a>");
   html += F("</div>");
+
+  // --- Add stations: Find New Nodes + live discovery progress (flat) ---
+  html += F("<div class='section section--flat'>"
+            "<h3>Add nodes</h3>"
+            "<form class='async-form' action='/find-stations' method='POST' style='margin:0 0 8px'>"
+            "<button type='submit' id='find-btn' data-loading-label='Searching for nodes…' class='btn'><svg class='icon' viewBox='0 0 24 24' aria-hidden='true'><path d='M12 3c-3.9 0-7.4 1.6-9.9 4.1l1.4 1.4C5.6 6.4 8.7 5 12 5s6.4 1.4 8.5 3.5l1.4-1.4C19.4 4.6 15.9 3 12 3zm0 5c-2.6 0-5 .9-6.9 2.6l1.4 1.4C8 10.5 9.9 10 12 10s4 .5 5.5 2l1.4-1.4C17 8.9 14.6 8 12 8zm0 5c-1.3 0-2.5.5-3.5 1.5l1.4 1.4c.6-.6 1.3-.9 2.1-.9s1.5.3 2.1.9l1.4-1.4c-1-1-2.2-1.5-3.5-1.5zm0 4a2 2 0 100 4 2 2 0 000-4z'/></svg> Find New Nodes</button>"
+            "</form>"
+            "<div id='discovery-panel' class='discovery-panel' hidden>"
+            "<div class='dp-row'><strong><span class='spinner' aria-hidden='true'></span>"
+            "<span id='dp-state'>Searching</span></strong>"
+            "<span>Elapsed <span id='dp-elapsed'>0s</span></span></div>"
+            "<div class='dp-row'><span>New nodes this scan: <strong id='dp-found'>0</strong></span></div>"
+            "<div class='dp-msg'>Keep new nodes powered on and in pairing mode.</div></div>"
+            "</div>");
+
+  // --- Hub health: battery + storage + last upload (flat, border-only) ---
+  {
+    const uint64_t fsTotal = (uint64_t)LittleFS.totalBytes();
+    const uint64_t fsUsed  = (uint64_t)LittleFS.usedBytes();
+    const uint32_t storagePct = (fsTotal > 0) ? (uint32_t)((fsUsed * 100ULL) / fsTotal) : 0;
+    const float hubBatV = readBatteryVoltage();
+    const char* batClass = (hubBatV >= 3.9f) ? "chip--bat-ok"
+                         : (hubBatV >= 3.5f) ? "chip--bat-med"
+                         : "chip--bat-low";
+    const char* batLabel = (hubBatV >= 3.9f) ? "OK"
+                         : (hubBatV >= 3.5f) ? "Medium"
+                         : "Low";
+    char batBuf[10];
+    snprintf(batBuf, sizeof(batBuf), "%.2fV", hubBatV);
+
+    html += F("<div class='section section--flat'><h3>Mothership</h3>");
+    html += F("<div class='stats' style='margin:0;text-align:left'>");
+    html += F("<div class='stat' style='text-align:left'>"
+              "<strong>Battery</strong><br>");
+    html += F("<span class='chip ");
+    html += batClass;
+    html += F("' style='font-size:16px;font-weight:600'>");
+    html += batBuf;
+    html += F("</span> <span class='muted'>");
+    html += batLabel;
+    html += F("</span></div>");
+    html += F("<div class='stat' style='text-align:left'>"
+              "<strong>Storage</strong><br><span class='num' style='font-size:18px'>");
+    html += String(storagePct);
+    html += F("% used</span><br><span class='muted'>");
+    html += (fsTotal > 0) ? formatBytesUi(fsUsed) : String("n/a");
+    html += F("</span></div>");
+    html += F("<div class='stat' style='text-align:left'>"
+              "<strong>Last upload</strong><br><span class='num' style='font-size:14px'>");
+    {
+      UploadCursor cursor = {0,0,0,0,0};
+      if (flashIsReady()) { gUploadQueue.init(); cursor = gUploadQueue.getCursor(); }
+      if (cursor.lastUploadUnix > 0) {
+        DateTime lastUp(cursor.lastUploadUnix);
+        html += formatDateTimeDisplay(lastUp);
+      } else {
+        html += F("Never");
+      }
+    }
+    html += F("</span></div>");
+    html += F("</div></div>");
+  }
 
   // --- Schedule change pending (only rendered during a transition) ---
   html += buildScheduleTransitionBanner();
 
-  // --- Collection schedule ---
+  // --- Collection schedule (flat) ---
   {
-    html += F("<div class='section'>"
+    html += F("<div class='section section--flat'>"
               "<h3>Collection schedule</h3>"
-              "<div class='stats' style='margin:0 0 12px 0'>"
+              "<div class='stats' style='margin:0'>"
               "<div class='stat'><strong>Recording every</strong><span class='num' style='font-size:16px'>");
     if (gWakeIntervalMin > 0) {
       html += String(gWakeIntervalMin);
@@ -1816,7 +1906,7 @@ static void handleRoot() {
               "</div>");
   }
 
-  // --- Cloud upload status ---
+  // --- Cloud upload status (flat; status shown as a chip, not a bare dot) ---
   {
     TransmissionSettings txSettings;
     loadTransmissionSettings(txSettings);
@@ -1826,25 +1916,25 @@ static void handleRoot() {
       cursor = gUploadQueue.getCursor();
     }
 
-    const char* dotColour = "#6b7280";
+    const char* chipCls = "chip";
     const char* statusLabel = "Upload off";
     if (txSettings.enabled) {
       if (cursor.retryCount > 0) {
-        dotColour = "#c47a5a";
+        chipCls = "chip chip--bat-med";
         statusLabel = "Last upload failed";
       } else {
-        dotColour = "#7a9b70";
+        chipCls = "chip chip--cfg-ok";
         statusLabel = "Connected";
       }
     }
 
-    html += F("<div class='section'>"
+    html += F("<div class='section section--flat'>"
               "<h3>Cloud upload</h3>"
-              "<p style='margin:4px 0'><span style='display:inline-block;width:12px;height:12px;border-radius:50%;background:");
-    html += dotColour;
-    html += F(";margin-right:8px;vertical-align:middle'></span><strong>");
+              "<p style='margin:4px 0'><span class='");
+    html += chipCls;
+    html += F("' style='font-weight:600'>");
     html += statusLabel;
-    html += F("</strong></p>");
+    html += F("</span></p>");
     if (cursor.lastUploadUnix > 0) {
       DateTime lastUp(cursor.lastUploadUnix);
       html += F("<p class='muted'>Last upload ");
@@ -1860,19 +1950,15 @@ static void handleRoot() {
     html += F("</div>");
   }
 
-  // --- Navigation buttons ---
-  html += F("<div class='section action-stack'>"
-            "<a href='/settings' class='btn'><svg class='icon' viewBox='0 0 24 24' aria-hidden='true'><path d='M19.14 12.94c.04-.3.06-.61.06-.94 0-.32-.02-.64-.07-.94l2.03-1.58a.49.49 0 00.12-.61l-1.92-3.32a.488.488 0 00-.59-.22l-2.39.96c-.5-.38-1.03-.7-1.62-.94l-.36-2.54a.484.484 0 00-.48-.41h-3.84a.485.485 0 00-.48.41l-.36 2.54c-.59.24-1.13.57-1.62.94l-2.39-.96c-.22-.08-.47 0-.59.22L2.74 8.87c-.12.21-.08.47.12.61l2.03 1.58c-.05.3-.09.63-.09.94s.02.64.07.94l-2.03 1.58a.49.49 0 00-.12.61l1.92 3.32c.12.22.37.29.59.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.05.24.24.41.48.41h3.84c.24 0 .44-.17.47-.41l.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.22.08.47 0 .59-.22l1.92-3.32c.12-.22.07-.47-.12-.61l-2.01-1.58zM12 15.6c-1.98 0-3.6-1.62-3.6-3.6s1.62-3.6 3.6-3.6 3.6 1.62 3.6 3.6-1.62 3.6-3.6 3.6z'/></svg> Settings</a>"
-            "<a href='/export' class='btn'><svg class='icon' viewBox='0 0 24 24' aria-hidden='true'><path d='M12 3a1 1 0 011 1v8.59l2.3-2.3 1.4 1.42-4.7 4.7-4.7-4.7 1.4-1.42 2.3 2.3V4a1 1 0 011-1zm-7 14h14v2H5v-2z'/></svg> Export Data</a>"
-            "</div>");
-  html += F("<div style='margin:16px 0'>"
+  // --- Primary action: sticky Finish & Start Recording (pinned above tab bar) ---
+  html += F("<div class='sticky-action'>"
             "<form class='async-form' action='/start' method='POST'>"
             "<button type='submit' class='btn btn--primary' style='width:100%;min-height:56px;font-size:18px;font-weight:700'>"
             "▶ Finish &amp; Start Recording"
             "</button>"
             "</form>"
-            "</div>"
-            "<p class='muted' style='text-align:center;margin-top:6px'>Saves settings, closes the setup network, and begins recording</p>");
+            "<p class='muted' style='text-align:center;margin:6px 0 0'>Saves settings, closes the setup network, and begins recording</p>"
+            "</div>");
 
   // --- About / Advanced collapsed panel ---
   html += F("<details style='margin:16px 0'>"
@@ -2273,11 +2359,10 @@ static void handleRevertNode() {
 
 static void handleStationsPage() {
   String html = headCommon("Nodes",
-    "<a href='/' class='btn btn--sm'>Back</a><a href='/stations' class='btn btn--sm'>Refresh</a>");
+    "<span id='conn-status' class='conn-dot'>Connected</span><a href='/stations' class='btn btn--sm'>Refresh</a>", 1);
   auto allNodes = getRegisteredNodes();
 
   html += F("<div id='ui-status' class='help' style='display:none;margin-bottom:10px;border:1px solid var(--border);border-radius:8px;padding:8px 10px'></div>");
-  html += F("<div style='text-align:right;margin:0 0 6px'><span id='conn-status' class='conn-dot'>Connected</span></div>");
   html += F("<div id='discovery-panel' class='discovery-panel' hidden>"
             "<div class='dp-row'><strong><span class='spinner' aria-hidden='true'></span>"
             "<span id='dp-state'>Searching</span></strong>"
@@ -2618,25 +2703,57 @@ static void handleNodeConfigSave() {
 
   NodeDesiredConfig dc = getDesiredConfig(nodeId.c_str());
   bool cfgChanged = false;
-  uint32_t globalPhaseUnix = gLastSyncBroadcastUnix;
-  if (globalPhaseUnix == 0) globalPhaseUnix = getRTCTimeUnix();
+  const uint16_t desiredSyncMin = (gSyncMode == SYNC_MODE_DAILY)
+      ? 0u : (uint16_t)computeAutoSyncMin(interval);
+  const int anchorSyncIntervalMin = readAnchorSyncIntervalMin();
+  const bool scheduleHandoverPending =
+      gSyncMode == SYNC_MODE_INTERVAL &&
+      anchorSyncIntervalMin > 0 &&
+      anchorSyncIntervalMin != desiredSyncMin;
+
+  uint32_t bootstrapPhaseUnix = scheduleHandoverPending
+      ? computeNextOldSlotUnix(anchorSyncIntervalMin)
+      : (uint32_t)gLastSyncBroadcastUnix;
+  if (bootstrapPhaseUnix == 0) bootstrapPhaseUnix = getRTCTimeUnix();
   if (gSyncMode == SYNC_MODE_DAILY) {
-    const uint32_t dayStartUnix = (globalPhaseUnix / 86400UL) * 86400UL;
+    const uint32_t dayStartUnix = (bootstrapPhaseUnix / 86400UL) * 86400UL;
     const uint32_t targetOffset = (uint32_t)gSyncDailyHour * 3600UL + (uint32_t)gSyncDailyMinute * 60UL;
     uint32_t nextDailyUnix = dayStartUnix + targetOffset;
     if (nextDailyUnix <= getRTCTimeUnix()) nextDailyUnix += 86400UL;
-    globalPhaseUnix = nextDailyUnix;
+    bootstrapPhaseUnix = nextDailyUnix;
   }
-  globalPhaseUnix -= (globalPhaseUnix % 60UL);
-  // Update the phase anchor so armNextSyncAlarmPhase uses it when config exits
-  gLastSyncBroadcastUnix = globalPhaseUnix;
-  saveSyncRuntimeGuardsToNVS();
-  if (dc.wakeIntervalMin != (uint8_t)interval) { dc.wakeIntervalMin = (uint8_t)interval; cfgChanged = true; }
-  const uint16_t desiredSyncMin = (gSyncMode == SYNC_MODE_DAILY) ? 0u : (uint16_t)computeAutoSyncMin(interval);
-  if (dc.syncIntervalMin != desiredSyncMin) { dc.syncIntervalMin = desiredSyncMin; cfgChanged = true; }
-  if (dc.syncPhaseUnix != globalPhaseUnix) { dc.syncPhaseUnix = globalPhaseUnix; cfgChanged = true; }
-  if (dc.configVersion == 0) { dc.configVersion = 1; cfgChanged = true; }
-  else if (cfgChanged) { dc.configVersion = (dc.configVersion < 0xFFFFu) ? (dc.configVersion + 1u) : 1u; }
+  bootstrapPhaseUnix -= (bootstrapPhaseUnix % 60UL);
+
+  // A per-node metadata/lifecycle save must not rewrite the fleet anchor or
+  // replace a transition phase prepared by handleSetWakeInterval(). Doing so
+  // can make a pause/resume action erase the OLD-vs-NEW schedule marker before
+  // sleeping nodes have received the handover. Only fill schedule fields for a
+  // new/legacy desired-config record; fleet schedule changes are owned by the
+  // global schedule handlers.
+  const bool newDesiredConfig = dc.configVersion == 0;
+  if (!scheduleHandoverPending || newDesiredConfig ||
+      (dc.wakeIntervalMin == 0 && interval > 0)) {
+    dc.wakeIntervalMin = (uint8_t)interval;
+    cfgChanged = true;
+  }
+  if (!scheduleHandoverPending || newDesiredConfig ||
+      (gSyncMode == SYNC_MODE_INTERVAL && dc.syncIntervalMin == 0)) {
+    dc.syncIntervalMin = desiredSyncMin;
+    cfgChanged = true;
+  }
+  if (!scheduleHandoverPending || newDesiredConfig || dc.syncPhaseUnix == 0) {
+    dc.syncPhaseUnix = bootstrapPhaseUnix;
+    cfgChanged = true;
+  }
+  if (newDesiredConfig) dc.configVersion = 1;
+  else if (cfgChanged) {
+    dc.configVersion = (dc.configVersion < 0xFFFFu)
+        ? (dc.configVersion + 1u) : 1u;
+  }
+  // Record the change through the shared dispatcher (revision + durable result)
+  // before applying it to the registry / delivering via NODE_CONFIG.
+  controlRecordNodeChange(nodeId, dc.wakeIntervalMin, dc.targetState,
+                          dc.sensorMask, SRC_LOCAL_UI);
   setDesiredConfig(nodeId.c_str(), dc);
   if (target) target->wakeIntervalMin = (uint8_t)interval;
   // Persist any updated node fields (name/notes/lat/lon) to NVS.
@@ -2818,8 +2935,8 @@ static void handleSettings() {
   const uint32_t storagePct = (fsTotal > 0)
     ? (uint32_t)((fsUsed * 100ULL) / fsTotal) : 0;
 
-  String actionsHtml = String("<a href='/' class='btn btn--sm'>Back</a>");
-  String html = headCommon("Settings", actionsHtml);
+  String actionsHtml = String("<a href='/settings' class='btn btn--sm'>Refresh</a>");
+  String html = headCommon("Settings", actionsHtml, 3);
 
   html += F("<div id='ui-status' class='help' style='display:none;margin-bottom:10px;border:1px solid var(--border);border-radius:8px;padding:8px 10px'></div>");
 
@@ -3426,6 +3543,8 @@ static void handleSetNodeSensors() {
     dc.sensorMask = storedMask;
     dc.configVersion = (dc.configVersion == 0) ? 1u
                      : (dc.configVersion < 0xFFFFu ? dc.configVersion + 1u : 1u);
+    controlRecordNodeChange(nodeId, dc.wakeIntervalMin, dc.targetState,
+                            dc.sensorMask, SRC_LOCAL_UI);
     setDesiredConfig(nodeId.c_str(), dc);
   }
   setNodeExpectedSensorMask(nodeId.c_str(), capBits);
@@ -3447,7 +3566,127 @@ static void handleSetNodeSensors() {
   server.send(200, "application/json", resp);
 }
 
+// ---------------------------------------------------------------------------
+// Command dispatcher gate (plan §4.2/§4.3)
+// Every local node-config mutation is recorded through the shared dispatcher so
+// it gets a mothership-owned state revision and a durable result. Local UI acts
+// on current state, so it submits expectedRevision = current and is not blocked;
+// the revision trail is what lets a future stale dashboard command be rejected.
+// The registry's NodeDesiredConfig + NODE_CONFIG remain the node-delivery path.
+// ---------------------------------------------------------------------------
+static uint32_t controlRecordNodeChange(const String& nodeId, uint8_t wake,
+                                        uint8_t target, uint16_t mask, CmdSource src) {
+  Command c{};
+  snprintf(c.cmdId, CMD_ID_LEN, "L%08lx", (unsigned long)millis());
+  c.type = CMD_SET_NODE_CONFIG;
+  c.source = src;
+  c.expectedRevision = dispatcherRevision();   // local UI operates on current state
+  strlcpy(c.payload.nodeId, nodeId.c_str(), CMD_NODEID_LEN);
+  c.payload.wakeIntervalMin = wake ? wake : 1;  // dispatcher requires >= 1
+  c.payload.targetState = target;
+  c.payload.sensorMask = mask;
+
+  CommandResult r = dispatcherSubmit(c);
+  Serial.printf("[CTRL] %s change -> %s rev=%u\n", nodeId.c_str(),
+                cmdOutcomeStr(r.outcome),
+                r.assignedRevision ? r.assignedRevision : r.currentRevision);
+  return r.assignedRevision ? r.assignedRevision : r.currentRevision;
+}
+
+// GET /api/control — authoritative revision + recent command results (mirroring).
+static void handleControlStatus() {
+  CommandResult res[CMD_MAX_RESULTS];
+  uint8_t n = dispatcherRecentResults(res, CMD_MAX_RESULTS);
+  String j = "{\"revision\":" + String(dispatcherRevision()) + ",\"results\":[";
+  for (uint8_t i = 0; i < n; i++) {
+    if (i) j += ",";
+    j += "{\"cmdId\":\""; j += res[i].cmdId;
+    j += "\",\"outcome\":\""; j += cmdOutcomeStr(res[i].outcome);
+    j += "\",\"revision\":"; j += String(res[i].assignedRevision); j += "}";
+  }
+  j += "]}";
+  server.sendHeader("Cache-Control", "no-store");
+  server.send(200, "application/json", j);
+}
+
+// ---------------------------------------------------------------------------
+// Local mothership self-update (/firmware) — plan §7.1
+// Step 1: POST /firmware/manifest  (body = manifest.json, ?sig=<128 hex>)
+// Step 2: POST /firmware/image     (multipart file = matching mothership.bin)
+// ---------------------------------------------------------------------------
+static void handleFirmwarePage() {
+  FirmwareIdentity id = fwIdentity(NODE_PROTOCOL_VERSION);
+  MothershipOtaStatus s = mothershipOtaGetStatus();
+  const esp_partition_t* run = esp_ota_get_running_partition();
+
+  String h = F("<!doctype html><meta name=viewport content='width=device-width,initial-scale=1'>"
+               "<h2>Firmware self-update</h2>");
+  h += "<p><b>Running:</b> "; h += id.role; h += " v"; h += id.semver;
+  h += " build "; h += id.buildId; h += " hw "; h += id.hwTarget;
+  h += " slot "; h += (run ? run->label : "?"); h += "</p>";
+  h += "<p><b>Staged manifest:</b> "; h += (s.manifestReady ? "yes" : "no");
+  if (s.manifestReady) { h += " &rarr; v"; h += s.targetVersion; h += " ("; h += s.targetReleaseId;
+                         h += "), "; h += String(s.expectedSize); h += " bytes"; }
+  h += "</p><p><b>Last result:</b> "; h += fwReasonStr(s.lastReason); h += "</p>";
+  h += F("<hr><p>1. Stage signed manifest, then 2. upload the matching binary. "
+         "A bad signature, wrong hardware, or hash mismatch is rejected and the "
+         "running firmware is left untouched.</p>"
+         "<form method=POST action='/firmware/image' enctype='multipart/form-data'>"
+         "<input type=file name=fw> <button>Upload &amp; install</button></form>");
+  server.send(200, "text/html", h);
+}
+
+static void handleFirmwareManifest() {
+  String body = server.arg("plain");
+  String sigHex = server.arg("sig");
+  if (body.length() == 0 || sigHex.length() != 128) {
+    server.send(400, "application/json",
+                "{\"error\":\"POST manifest.json as body, ?sig=<128 hex>\"}");
+    return;
+  }
+  uint8_t sig[64];
+  if (!fwHexToBytes(sigHex.c_str(), sig, 64)) {
+    server.send(400, "application/json", "{\"error\":\"bad signature hex\"}");
+    return;
+  }
+  FwReason r = mothershipOtaVerifyManifest((const uint8_t*)body.c_str(), body.length(), sig);
+  MothershipOtaStatus s = mothershipOtaGetStatus();
+  String resp = String("{\"reason\":\"") + fwReasonStr(r) +
+                "\",\"ready\":" + (s.manifestReady ? "true" : "false") +
+                ",\"targetVersion\":\"" + s.targetVersion +
+                "\",\"size\":" + String(s.expectedSize) + "}";
+  server.send(r == FW_NONE ? 200 : 400, "application/json", resp);
+}
+
+// Streamed multipart upload: each chunk goes straight into the inactive slot.
+static void handleFirmwareImageData() {
+  HTTPUpload& up = server.upload();
+  if (up.status == UPLOAD_FILE_WRITE) {
+    mothershipOtaImageChunk(up.buf, up.currentSize);
+  } else if (up.status == UPLOAD_FILE_ABORTED) {
+    mothershipOtaAbort();
+  }
+}
+
+static void handleFirmwareImageDone() {
+  FwReason r = mothershipOtaImageFinish();
+  if (r == FW_NONE) {
+    server.send(200, "application/json", "{\"reason\":\"NONE\",\"rebooting\":true}");
+    delay(400);
+    esp_restart();
+  } else {
+    MothershipOtaStatus s = mothershipOtaGetStatus();
+    String resp = String("{\"reason\":\"") + fwReasonStr(r) +
+                  "\",\"written\":" + String(s.written) + "}";
+    server.send(400, "application/json", resp);
+  }
+}
+
 void startConfigServer() {
+  // Load the shared control revision + recent command results from NVS so a
+  // reboot mid-session resumes the same authoritative revision.
+  dispatcherInit();
+
   // WiFi AP + STA (AP for web UI, STA for ESP-NOW on same channel).
   // ESP-NOW was already initialised by initEspNowConfig() before this call.
   WiFi.mode(WIFI_AP_STA);
@@ -3535,6 +3774,12 @@ void startConfigServer() {
     server.sendHeader("Location", "/download-csv", true);
     server.send(302, "text/plain", "");
   });
+
+  // Shared control revision + local self-update (§4.2, §7.1)
+  server.on("/api/control", HTTP_GET, handleControlStatus);
+  server.on("/firmware", HTTP_GET, handleFirmwarePage);
+  server.on("/firmware/manifest", HTTP_POST, handleFirmwareManifest);
+  server.on("/firmware/image", HTTP_POST, handleFirmwareImageDone, handleFirmwareImageData);
 
   server.onNotFound(sendCaptivePortalLanding);
   dnsServer.start(53, "*", WiFi.softAPIP());

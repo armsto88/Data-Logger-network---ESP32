@@ -20,9 +20,12 @@
 #include "node_event_queue.h"
 
 #include "protocol.h"     // pins, ESPNOW_CHANNEL, protocol structs
+#include "firmware_identity.h"  // role/version/build/hw identity (FW_GIT injected)
 
+// Prefer the injected git build id over __DATE__/__TIME__, which freeze across
+// cached reflashes (see memory: flash-recovery-bootloader).
 #ifndef FW_BUILD
-  #define FW_BUILD __DATE__ " " __TIME__
+  #define FW_BUILD FW_GIT
 #endif
 
 // -------------------- Node config --------------------
@@ -2313,6 +2316,7 @@ void setup() {
   delay(2000);
   Serial.printf("[FW] node build=%s protocol=%u spectral_metadata_ids=1109-1113\n",
                 FW_BUILD, static_cast<unsigned>(NODE_PROTOCOL_VERSION));
+  fwIdentityPrint(fwIdentity(NODE_PROTOCOL_VERSION));
 
   // Arm the watchdog before any hang-prone work (I2C init, sensor init, sync).
   initWatchdog();

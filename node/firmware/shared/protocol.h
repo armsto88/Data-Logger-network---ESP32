@@ -285,6 +285,9 @@ typedef struct rnt_pairing_t {
 #define SENSOR_ID_SPECTRAL_SAT   1113  // saturation/validity flag (0=ok, 1=saturated)
 #define SENSOR_ID_WIND_SPEED    1201
 #define SENSOR_ID_WIND_DIR      1202
+// The SOIL*_VWC names are retained for wire/schema compatibility. Current
+// node firmware emits moisture sensor output volts in these channels; backend
+// calibration is responsible for converting volts to moisture/VWC.
 #define SENSOR_ID_SOIL1_VWC     2001
 #define SENSOR_ID_SOIL2_VWC     2002
 #define SENSOR_ID_SOIL1_TEMP    2003

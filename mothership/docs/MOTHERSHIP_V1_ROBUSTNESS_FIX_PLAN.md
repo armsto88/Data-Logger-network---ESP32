@@ -4,6 +4,31 @@
 **Date:** 2026-06-21
 **Scope:** Non-breaking, staged hardening of Mothership V1 firmware against 15 critical/medium bugs identified in two independent robustness reviews.
 
+## Consolidated execution record
+
+**Execution prompts created:** 2026-06-22
+
+**Merged into this plan:** 2026-07-17
+
+The former `MOTHERSHIP_V1_ROBUSTNESS_FIX_PROMPTS.md` expanded Stages 3-10
+below into individual coding-agent prompts. At the time that prompt set was
+written, Stages 1 and 2 were recorded as completed and Stages 3-10 remained the
+ordered execution sequence. Its durable instructions were:
+
+1. Implement one stage at a time and do not skip ahead.
+2. Run every validation command for that stage before continuing.
+3. Keep prior-stage and existing bring-up targets compiling.
+4. Make only the files and behaviours named by the active stage.
+5. Preserve the already working autonomous sync flow; changes are additive and
+   defensive.
+6. Finish with `pio run -e mothership-v1-main` from
+   `mothership/firmware/v1/`.
+
+The stage-specific files, fixes, tests, validation targets, risks, and scope
+boundaries from those prompts are retained in the corresponding sections of
+this plan. The 2026-06-22 completion labels are historical status, not a claim
+about which code is currently flashed in deployed hardware.
+
 ## Critical constraint
 
 The system WORKS today. It has been validated across 13 bring-up tests and full autonomous sync cycles (node -> ESP-NOW -> mothership -> flash log -> power off -> repeat). **No stage may regress the working sync flow.** Every change is additive and defensive. Each stage compiles independently (`pio run -e mothership-v1-main`) and is testable on hardware without breaking existing bring-up tests 1-13.

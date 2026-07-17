@@ -1,6 +1,13 @@
 # PlatformIO build output
 .pio/
 
+# OTA release signing — NEVER commit private keys or built release artifacts
+keys/
+release/
+*.pem
+*_ed25519*
+!*_ed25519.pub.hex
+
 # VS Code workspace files
 .vscode/.browse.c_cpp.db*
 .vscode/c_cpp_properties.json

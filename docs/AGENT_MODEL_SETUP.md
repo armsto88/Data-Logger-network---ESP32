@@ -18,7 +18,7 @@ This repo's custom agent stack is declared in `.github/agents/`. The `model:` fi
 | `Implement Change` | `glm-5.1:cloud` | `qwen3.5:cloud` | `minimax-m3:cloud` |
 | `Review Changes` | `gemma4:31b-cloud` | `nemotron-3-super:cloud` | `minimax-m3:cloud` |
 
-Legacy reference files under `docs/legacy-agent-workflow/` have their `model:` line replaced with `ARCHIVED — see docs/AGENT_MODEL_SETUP.md`. They are not invoked by the active workflow, but the Claude/GPT strings are gone so nothing in the repo advertises a hosted model.
+The former Positron role files were consolidated on 2026-07-17 into `docs/archive/LEGACY_AGENT_WORKFLOW_2026-05-24.md`. They are not invoked by the active workflow; current agent definitions live under `.github/agents/`.
 
 ---
 

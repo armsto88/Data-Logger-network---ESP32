@@ -1,0 +1,17 @@
+# FieldMesh node OTA partition table — PINNED.
+#
+# This mirrors the Arduino-ESP32 `default.csv` (4 MB) geometry that the node
+# has been building against implicitly via `board = esp32dev`. Pinning it in
+# the repo removes the risk (plan §3.3 / §14.2) of a future toolchain bump
+# silently changing the fleet's slot layout under OTA.
+#
+# Two 0x140000 (1280 KiB) OTA app slots. Observed node image ~834 KiB, so ~447
+# KiB headroom per slot. Do NOT shrink a slot below the largest shipped image.
+#
+# Name,     Type, SubType,  Offset,   Size,     Flags
+nvs,        data, nvs,      0x9000,   0x5000,
+otadata,    data, ota,      0xe000,   0x2000,
+app0,       app,  ota_0,    0x10000,  0x140000,
+app1,       app,  ota_1,    0x150000, 0x140000,
+spiffs,     data, spiffs,   0x290000, 0x160000,
+coredump,   data, coredump, 0x3F0000, 0x10000,

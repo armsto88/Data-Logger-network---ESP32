@@ -31,6 +31,13 @@
 #include "storage/json_payload.h"
 #include "comms/modem_driver.h"
 #include "protocol.h"
+#include "firmware_identity.h"  // role/version/build/hw identity (FW_GIT injected)
+#include "ota/mothership_selfupdate.h"
+
+// Defer OTA image confirmation to our own first-boot self-test (see the call to
+// mothershipOtaFirstBootCheck() below). Without this the Arduino core would
+// auto-confirm a new image before we know it is healthy, defeating rollback.
+extern "C" bool verifyRollbackLater() { return true; }
 
 // Enlarge the Arduino loop task stack (default 8 KB). The sync-wake upload
 // builds the full status+JSON payload (nodes[], modem diagnostics, transmission,
@@ -789,10 +796,39 @@ void performModemUpload(const TransmissionSettings& txSettings, uint32_t session
       }
     }
 
-    // No status-only push for Supabase: an empty array carries no data, so we
-    // simply skip uploading when there are no pending rows.
-    if (firstChunk) {
-      Serial.println("[UPLOAD] JSON: no pending rows — nothing to upload");
+    // A fully paused fleet legitimately has no reading rows, but the cloud
+    // still needs proof that the mothership woke, completed the sync window,
+    // and remains healthy. Supabase accepts the canonical batch shape with an
+    // empty readings[] array and records a zero-reading sync_session while
+    // refreshing mothership_status and nodes.
+    if (totalPendingRows == 0 && isSupabase && !sessionExpired()) {
+      JsonPayload heartbeat = buildJsonUpload(String(), 1, FW_VERSION,
+                                               &statusCtx, getRTCTime());
+      if (!heartbeat.ok) {
+        Serial.println("[UPLOAD] Status heartbeat JSON build failed");
+      } else {
+        String url = buildUploadUrl(txSettings);
+        Serial.printf("[UPLOAD] POSTing status heartbeat (%u bytes, 0 readings)\n",
+                      heartbeat.byteLength);
+        HttpsPostResult result = modem.httpsPost(
+            url, heartbeat.body, "application/json", authHeader);
+        if (result.httpStatus == 200) {
+          Serial.println("[UPLOAD] Status heartbeat SUCCESS: HTTP 200");
+          uploadQueue.resetRetryCount();
+          anyJsonSuccess = true;
+          firstChunk = false;
+        } else if (result.httpStatus == 400 || result.httpStatus == 401) {
+          Serial.printf("[UPLOAD] Status heartbeat non-retryable HTTP %d (%s)\n",
+                        result.httpStatus,
+                        result.httpStatus == 401 ? "auth/credential issue" : "bad payload");
+        } else {
+          Serial.printf("[UPLOAD] Status heartbeat retryable HTTP %d, %s\n",
+                        result.httpStatus, result.errorDetail.c_str());
+          uploadQueue.incrementRetryCount(retryNowUnix, retryCooldownSec);
+        }
+      }
+    } else if (firstChunk) {
+      Serial.println("[UPLOAD] JSON: no reading payload sent");
     }
 
     if (anyJsonSuccess) {
@@ -1137,7 +1173,9 @@ void handleSyncWake() {
 
       if (batMv >= txSettings.minBatteryMv) {
         if (!uploadQueue.maxRetriesExceeded(txSettings.maxRetriesPerWindow, getRTCTime())) {
-          if (uploadQueue.getPendingBytes() > 0) {
+          const bool needsStatusHeartbeat =
+              txSettings.useJsonUpload && txSettings.apiKey.length() > 0;
+          if (uploadQueue.getPendingBytes() > 0 || needsStatusHeartbeat) {
             performModemUpload(txSettings, sessionStartMs);
             if (millis() - sessionStartMs > kSyncSessionLimitMs) {
               Serial.println("[WATCHDOG] Session timeout during upload - proceeding to alarm re-arm");
@@ -1487,7 +1525,7 @@ void setup() {
   delay(800);
   Serial.println();
   Serial.println("=== Mothership V1 Firmware ===");
-  Serial.printf("Build: %s %s\n", __DATE__, __TIME__);
+  fwIdentityPrint(fwIdentity(NODE_PROTOCOL_VERSION));
   Serial.println("[FW] V2 snapshot decode; CSV schema=30; spectral metadata IDs=1109-1113");
 
   // Arm a conservative fallback before wake classification or long-running
@@ -1579,6 +1617,12 @@ void setup() {
   if (sources.rtcAlarm && !clearAlarmFlag()) {
     Serial.println("[WAKE] Warning: failed to clear RTC alarm flag");
   }
+
+  // First-boot OTA self-test: reaching here means PWR_HOLD, NVS/registry, RTC,
+  // and wake classification all succeeded on this boot. If the running image is
+  // on probation, confirm it now; a new image that hung before this point would
+  // have been rolled back by the bootloader instead.
+  mothershipOtaFirstBootCheck();
 
   // Branch based on wake reason
   switch (reason) {

@@ -32,7 +32,7 @@ the snapshot via a `getMetadata()`-style accessor (see `sensors_par_as7343.cpp`)
 
 ## Trap 1: MAX_SENSORS registry overflow (the silent killer)
 
-`MAX_SENSORS` in [node/firmware/v2/shared/sensors.h](../node/firmware/v2/shared/sensors.h)
+`MAX_SENSORS` in [node/firmware/shared/sensors.h](../node/firmware/shared/sensors.h)
 caps the registry. When it's full, `commitSensorSlot()` **returns false silently** — no
 crash, no error, the sensor just never registers. Backends registered *later* in
 `initSensors()` are the ones that get starved.
@@ -69,9 +69,9 @@ or `null` downstream. Touch **all** of these:
 ### Node side
 1. **Driver backend** (`sensors_<name>.cpp/.h`) — read the hardware, expose
    `count()/label()/type()/read()`. Metadata goes through a separate accessor.
-2. **Sensor IDs** ([protocol.h](../node/firmware/v2/shared/protocol.h)) — add
+2. **Sensor IDs** ([protocol.h](../node/firmware/shared/protocol.h)) — add
    `SENSOR_ID_*` constants. **IDs are grouped by range** (1100=spectral, 2000=soil, etc.).
-3. **`resolveSensorId()`** ([sensors.cpp](../node/firmware/v2/src/sensors/sensors.cpp)) —
+3. **`resolveSensorId()`** ([sensors.cpp](../node/firmware/src/sensors/sensors.cpp)) —
    map the new label string → sensor ID. Miss this and the slot resolves to
    `SENSOR_ID_UNKNOWN (0)` and is skipped in the snapshot.
 4. **`snapPresentBitForSensorId()`** (protocol.h) — map the ID → its `SNAP_PRESENT_*`

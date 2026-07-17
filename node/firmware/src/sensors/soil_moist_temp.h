@@ -7,8 +7,8 @@ namespace soil_moist_temp_backend {
     // Called once in initSensors()
     bool   init();
 
-    // How many logical soil sensors we expose
-    // (2x VWC + 2x temp = 4)
+    // How many logical soil sensors we expose. The legacy VWC channels carry
+    // moisture sensor output volts; backend calibration converts to moisture.
     size_t count();
 
     // Label for CSV / debug, e.g. "SOIL1_VWC"
