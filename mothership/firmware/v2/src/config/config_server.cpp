@@ -148,6 +148,7 @@ static bool persistRecordingPlan() {
       ? kRecordingPlanA : kRecordingPlanB;
   Preferences prefs;
   if (!prefs.begin(kRecordingPlanNs, false)) return false;
+  if (prefs.isKey(key)) prefs.remove(key);
   const bool wrote = prefs.putBytes(key, &candidate, sizeof(candidate)) ==
                      sizeof(candidate);
   prefs.end();

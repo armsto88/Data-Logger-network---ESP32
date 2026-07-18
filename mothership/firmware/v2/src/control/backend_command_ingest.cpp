@@ -108,6 +108,9 @@ bool persistState(uint32_t cursor, bool enabled) {
 
   Preferences prefs;
   if (!prefs.begin(kStateNamespace, false)) return false;
+  // Replace only the older A/B copy. This permits an in-place schema migration
+  // on nearly-full deployed NVS without erasing any unrelated namespace.
+  if (prefs.isKey(key)) prefs.remove(key);
   const bool wrote = prefs.putBytes(key, &candidate, sizeof(candidate)) ==
                      sizeof(candidate);
   prefs.end();
@@ -271,8 +274,11 @@ void backendControlInit() {
     gState.lastCommandCursor = old.lastCommandCursor;
     gState.remoteManagementEnabled = old.remoteManagementEnabled;
     prefs.end();
-    persistState(gState.lastCommandCursor,
-                 gState.remoteManagementEnabled != 0);
+    Serial.printf("[CONTROL] backend state V1->V2 migration cursor=%lu: %s\n",
+                  static_cast<unsigned long>(gState.lastCommandCursor),
+                  persistState(gState.lastCommandCursor,
+                               gState.remoteManagementEnabled != 0)
+                      ? "durable" : "FAILED");
     return;
   }
   prefs.end();

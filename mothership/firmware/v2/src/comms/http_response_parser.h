@@ -17,3 +17,9 @@ struct HttpResponseParseResult {
 // HTTP 200 is not a successful response.
 HttpResponseParseResult parseHttpResponseBytes(const String& httpBytes,
                                                bool peerClosed);
+
+// Extract exactly the byte count declared by every
+// +CCHRECV: DATA,0,<length> frame. UART control URCs that follow the payload
+// are excluded, and an incomplete declared frame is rejected.
+bool extractA7670CchPayload(const String& uartBytes, String& httpBytes,
+                           uint32_t& declaredBytes, String& error);

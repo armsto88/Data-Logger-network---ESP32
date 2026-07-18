@@ -164,6 +164,10 @@ static bool persist() {
   const char* key = (candidate.generation & 1U) ? kStateA : kStateB;
 
   if (!gNvs.begin(kNs, false)) return false;
+  // A/B means this key is the older redundant copy. Remove it before writing
+  // the larger replacement so NVS can reclaim its blob pages instead of
+  // needing space for three simultaneous copies during schema migration.
+  if (gNvs.isKey(key)) gNvs.remove(key);
   const bool wrote = gNvs.putBytes(key, &candidate, sizeof(candidate)) ==
                      sizeof(candidate);
   gNvs.end();
@@ -224,7 +228,23 @@ void dispatcherInit() {
         ? SRC_DASHBOARD : SRC_LOCAL_UI;
     gGeneration = selected.generation;
     gNvs.end();
-    persist();
+    // The checksummed record is authoritative. Remove obsolete pre-A/B keys
+    // and the older redundant V1 slot before allocating the V2 blob; deployed
+    // units can have very little free NVS after years of configuration writes.
+    if (gNvs.begin(kNs, false)) {
+      const char* replacement = ((gGeneration + 1U) & 1U) ? kStateA : kStateB;
+      if (gNvs.isKey(replacement)) gNvs.remove(replacement);
+      const char* legacyKeys[] = {
+        "rev", "nodes", "nodes2", "results", "rhead", "rcount", "source"
+      };
+      for (const char* legacyKey : legacyKeys) {
+        if (gNvs.isKey(legacyKey)) gNvs.remove(legacyKey);
+      }
+      gNvs.end();
+    }
+    Serial.printf("[CONTROL] dispatcher V1->V2 migration revision=%lu: %s\n",
+                  static_cast<unsigned long>(gRevision),
+                  persist() ? "durable" : "FAILED");
     return;
   }
 

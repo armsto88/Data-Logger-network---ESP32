@@ -744,22 +744,25 @@ bool ModemDriver::httpsPostSSL(const String& host, int port,
         peerClosed = true;
       }
     }
+    String observedHttp;
+    String frameError;
+    uint32_t observedDeclared = 0;
+    const bool observedFrameComplete = extractA7670CchPayload(
+        resp, observedHttp, observedDeclared, frameError);
+    if (!observedFrameComplete) {
+      const int httpStart = resp.indexOf("HTTP/1.");
+      if (httpStart >= 0) observedHttp = resp.substring(httpStart);
+    }
     const HttpResponseParseResult observed =
-        parseHttpResponseBytes(resp, peerClosed);
-    if (observed.bodyComplete &&
+        parseHttpResponseBytes(observedHttp, peerClosed);
+    if (observedFrameComplete && observed.bodyComplete &&
         (observed.contentLength >= 0 || observed.chunked)) break;
     if (peerClosed && millis() - lastResponseByteAt >= 500) break;
     delay(10);
   }
 
-  // Log raw response for debugging (truncated if very long)
-  if (resp.length() > 0) {
-    String logResp = resp.length() > 500 ? resp.substring(0, 500) + "..." : resp;
-    Serial.printf("[Modem] SSL raw response (%u bytes): %s\n",
-                  (unsigned)resp.length(), logResp.c_str());
-  }
-
-  // Debug: log what we actually received for diagnosis
+  // Keep the transport diagnostic bounded and avoid printing response headers,
+  // which can contain cookies. The decoded entity body is logged below.
   Serial.printf("[Modem] SSL response analysis: gotData=%d gotCchRecv=%d peerClosed=%d respLen=%u\n",
                 gotData, gotCchRecv, peerClosed, (unsigned)resp.length());
   if (resp.indexOf("HTTP/1.") >= 0) {
@@ -802,13 +805,21 @@ bool ModemDriver::httpsPostSSL(const String& host, int port,
     }
   }
 
+  String framedHttp;
+  String frameError;
+  uint32_t declaredResponseBytes = 0;
+  const bool frameComplete = extractA7670CchPayload(
+      resp, framedHttp, declaredResponseBytes, frameError);
+  if (!frameComplete) {
+    const int httpStart = resp.indexOf("HTTP/1.");
+    if (httpStart >= 0) framedHttp = resp.substring(httpStart);
+  }
   const HttpResponseParseResult completeHttp =
-      parseHttpResponseBytes(resp, peerClosed);
+      parseHttpResponseBytes(framedHttp, peerClosed);
   result.responseWireBytes = resp.length();
-  result.responseHttpBytes = resp.indexOf("HTTP/1.") >= 0
-      ? resp.length() - static_cast<uint32_t>(resp.indexOf("HTTP/1.")) : 0;
+  result.responseHttpBytes = framedHttp.length();
   result.responseComplete = completeHttp.headersComplete &&
-                            completeHttp.bodyComplete;
+                            completeHttp.bodyComplete && frameComplete;
   if (result.responseComplete) {
     result.httpStatus = completeHttp.statusCode;
     resp = completeHttp.body;
@@ -818,17 +829,26 @@ bool ModemDriver::httpsPostSSL(const String& host, int port,
     gotCchRecv = false;
     peerClosed = false;
     result.httpStatus = -1;
-    result.errorDetail = "Incomplete SSL HTTP response: " + completeHttp.error;
+    result.errorDetail = "Incomplete SSL HTTP response: " +
+        (frameComplete ? completeHttp.error : frameError);
   }
 
   if (gotData) {
     result.responseBody = resp;
     result.success = (result.httpStatus == 200 || result.httpStatus == 302);
-    Serial.printf("[Modem] SSL HTTP status=%d complete=1 wireBytes=%lu bodyBytes=%u success=%s\n",
+    Serial.printf("[Modem] SSL HTTP status=%d complete=1 wireBytes=%lu framedBytes=%lu bodyBytes=%u success=%s\n",
                   result.httpStatus,
                   static_cast<unsigned long>(result.responseWireBytes),
+                  static_cast<unsigned long>(declaredResponseBytes),
                   static_cast<unsigned>(result.responseBody.length()),
                   result.success ? "YES" : "NO");
+    const size_t logLength =
+        result.responseBody.length() > 4096 ? 4096 : result.responseBody.length();
+    Serial.printf("[Modem] SSL HTTP entity body (%u/%u bytes): %s%s\n",
+                  static_cast<unsigned>(logLength),
+                  static_cast<unsigned>(result.responseBody.length()),
+                  result.responseBody.substring(0, logLength).c_str(),
+                  logLength < result.responseBody.length() ? "..." : "");
   } else if (gotCchRecv && !peerClosed) {
     // Got data but couldn't parse status — assume success (conservative)
     result.responseBody = resp;

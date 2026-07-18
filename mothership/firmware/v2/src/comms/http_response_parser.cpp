@@ -31,33 +31,94 @@ bool decodeChunked(const String& encoded, String& decoded, String& error) {
   decoded.reserve(encoded.length());
   size_t cursor = 0;
   while (cursor < encoded.length()) {
-    const int lineEnd = encoded.indexOf("\r\n", cursor);
+    const int lineEnd = encoded.indexOf('\n', cursor);
     if (lineEnd < 0) return false;
     uint32_t chunkBytes = 0;
-    if (!parseChunkSize(encoded.substring(cursor, lineEnd), chunkBytes)) {
+    String sizeLine = encoded.substring(cursor, lineEnd);
+    if (sizeLine.endsWith("\r")) sizeLine.remove(sizeLine.length() - 1);
+    if (!parseChunkSize(sizeLine, chunkBytes)) {
       error = "invalid chunk size";
       return false;
     }
-    cursor = static_cast<size_t>(lineEnd + 2);
+    cursor = static_cast<size_t>(lineEnd + 1);
     if (chunkBytes == 0) {
       if (cursor + 2 <= encoded.length() &&
           encoded.substring(cursor, cursor + 2) == "\r\n") return true;
-      return encoded.indexOf("\r\n\r\n", cursor) >= 0;
+      if (cursor < encoded.length() && encoded[cursor] == '\n') return true;
+      return encoded.indexOf("\r\n\r\n", cursor) >= 0 ||
+             encoded.indexOf("\n\n", cursor) >= 0;
     }
     if (chunkBytes > encoded.length() - cursor) return false;
     decoded += encoded.substring(cursor, cursor + chunkBytes);
     cursor += chunkBytes;
-    if (cursor + 2 > encoded.length()) return false;
-    if (encoded.substring(cursor, cursor + 2) != "\r\n") {
+    if (cursor >= encoded.length()) return false;
+    if (cursor + 2 <= encoded.length() &&
+        encoded.substring(cursor, cursor + 2) == "\r\n") {
+      cursor += 2;
+    } else if (encoded[cursor] == '\n') {
+      cursor += 1;
+    } else {
       error = "missing chunk terminator";
       return false;
     }
-    cursor += 2;
   }
   return false;
 }
 
 }  // namespace
+
+bool extractA7670CchPayload(const String& uartBytes, String& httpBytes,
+                           uint32_t& declaredBytes, String& error) {
+  static constexpr const char* kMarker = "+CCHRECV: DATA,0,";
+  httpBytes = "";
+  declaredBytes = 0;
+  error = "";
+  size_t cursor = 0;
+  bool found = false;
+  while (cursor < uartBytes.length()) {
+    const int marker = uartBytes.indexOf(kMarker, cursor);
+    if (marker < 0) break;
+    found = true;
+    const int lineEnd = uartBytes.indexOf('\n', marker);
+    if (lineEnd < 0) {
+      error = "CCHRECV header incomplete";
+      return false;
+    }
+    String lengthText = uartBytes.substring(
+        marker + static_cast<int>(strlen(kMarker)), lineEnd);
+    lengthText.trim();
+    if (lengthText.length() == 0) {
+      error = "CCHRECV length missing";
+      return false;
+    }
+    for (size_t i = 0; i < lengthText.length(); ++i) {
+      if (lengthText[i] < '0' || lengthText[i] > '9') {
+        error = "CCHRECV length invalid";
+        return false;
+      }
+    }
+    const uint64_t frameLength = strtoull(lengthText.c_str(), nullptr, 10);
+    if (frameLength > 16 * 1024 ||
+        declaredBytes + frameLength > 16 * 1024) {
+      error = "CCHRECV payload too large";
+      return false;
+    }
+    const size_t payloadStart = static_cast<size_t>(lineEnd + 1);
+    if (frameLength > uartBytes.length() - payloadStart) {
+      error = "CCHRECV payload incomplete";
+      return false;
+    }
+    httpBytes += uartBytes.substring(
+        payloadStart, payloadStart + static_cast<size_t>(frameLength));
+    declaredBytes += static_cast<uint32_t>(frameLength);
+    cursor = payloadStart + static_cast<size_t>(frameLength);
+  }
+  if (!found) {
+    error = "CCHRECV frame missing";
+    return false;
+  }
+  return true;
+}
 
 HttpResponseParseResult parseHttpResponseBytes(const String& httpBytes,
                                                bool peerClosed) {

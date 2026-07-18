@@ -21,6 +21,17 @@ void runSuite() {
   HttpResponseParseResult r = parseHttpResponseBytes(fixed, true);
   check("Content-Length body complete", r.statusCode == 200 &&
         r.bodyComplete && r.body == json);
+  String extracted;
+  String frameError;
+  uint32_t declared = 0;
+  String framed = "+CCHRECV: DATA,0," + String(fixed.length()) + "\r\n" +
+                  fixed + "\r\n+CCH_PEER_CLOSED: 0\r\n";
+  check("CCH frame excludes following peer-close URC",
+        extractA7670CchPayload(framed, extracted, declared, frameError) &&
+        extracted == fixed && declared == fixed.length());
+  framed = "+CCHRECV: DATA,0,10\r\nshort";
+  check("truncated CCH frame rejected",
+        !extractA7670CchPayload(framed, extracted, declared, frameError));
 
   const String truncated = "HTTP/1.1 200 OK\r\nContent-Length: 20\r\n\r\nshort";
   r = parseHttpResponseBytes(truncated, true);
