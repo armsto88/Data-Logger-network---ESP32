@@ -23,22 +23,37 @@ static constexpr bool     DEFAULT_USE_JSON       = true;
 static constexpr const char* DEFAULT_ENDPOINT_URL =
     "https://unhzttnuayrgqrzeqetz.supabase.co/functions/v1/ingest-fieldmesh";
 
-// Default mothership UUID issued by the backend.  Sent as "mothership_id" in
-// every reading object so Supabase can route data to the correct project.
-// Stored in NVS key "mothership_id" so it can be changed per deployment.
-static constexpr const char* DEFAULT_MOTHERSHIP_ID =
-    "f68a7546-6727-42a0-948f-5eae5f521f66";
+// Provisioning credentials are BLANK by default. A newly manufactured or
+// wiped/reflashed FieldHub must remain unprovisioned until the local
+// connection-key provisioning flow (hardware QR → dashboard → provisioning QR)
+// succeeds; it must never ship or fall back to a baked-in credential. Existing
+// deployed hubs are unaffected — their values live in NVS, and a blank
+// compile-time fallback is only consulted when NVS has no stored value.
+//
+// A development build may inject working defaults without editing this file, by
+// compiling with -D FM_DEFAULT_MOTHERSHIP_ID=\"...\", -D FM_DEFAULT_PROJECT_ID,
+// and -D FM_DEFAULT_API_KEY.
+#ifndef FM_DEFAULT_MOTHERSHIP_ID
+#define FM_DEFAULT_MOTHERSHIP_ID ""
+#endif
+#ifndef FM_DEFAULT_PROJECT_ID
+#define FM_DEFAULT_PROJECT_ID ""
+#endif
+#ifndef FM_DEFAULT_API_KEY
+#define FM_DEFAULT_API_KEY ""
+#endif
 
-// Default project UUID.  The Supabase schema requires "project_id" on every
-// reading.  Stored in NVS key "project_id" so it can be changed per deployment.
-static constexpr const char* DEFAULT_PROJECT_ID =
-    "65a72fab-6014-4159-9198-575d695db66a";
+// Mothership UUID sent as "mothership_id" in each reading (NVS key
+// "mothership_id"). Blank until provisioned.
+static constexpr const char* DEFAULT_MOTHERSHIP_ID = FM_DEFAULT_MOTHERSHIP_ID;
 
-// Default device API key (sent as Authorization: Bearer).  Pre-loaded so the
-// unit can upload without typing the key on a phone.  A key entered via the
-// Settings page / QR string overrides this.
-static constexpr const char* DEFAULT_API_KEY =
-    "fm_bkyd_001_b3d189ae-8b1a-4c2a-8dc8-2b6730d90567";
+// Project UUID sent as "project_id" in each reading (NVS key "project_id").
+// Blank until provisioned.
+static constexpr const char* DEFAULT_PROJECT_ID = FM_DEFAULT_PROJECT_ID;
+
+// Device API key / connection key (sent as Authorization: Bearer). Blank until
+// the local provisioning flow applies a dashboard-issued key.
+static constexpr const char* DEFAULT_API_KEY = FM_DEFAULT_API_KEY;
 
 // ---------------------------------------------------------------------------
 // Settings struct

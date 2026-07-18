@@ -13,6 +13,7 @@
 #include "storage/flash_logger.h"
 #include "system/power.h"
 #include "system/pins.h"
+#include "system/hardware_identity.h"
 #include "protocol.h"
 #include "firmware_identity.h"
 #include "ota/mothership_selfupdate.h"
@@ -27,15 +28,16 @@
 #include <LittleFS.h>
 #include <Preferences.h>
 #include <RTClib.h>
+#include <qrcode.h>
 #include <vector>
 
 // ---------------------------------------------------------------------------
 // Device identification and WiFi
 // ---------------------------------------------------------------------------
 const char* DEVICE_ID = "001";
-static const char* BASE_SSID = "Logger";
-static String ssid = String(BASE_SSID) + String(DEVICE_ID);  // "Logger001"
-static const char* password = "logger123";
+// Config-mode AP SSID — reassigned to hwApSsid() ("FieldHub(<MAC>)") in
+// startConfigServer() once eFuse/WiFi are ready. The AP is open (no password).
+static String ssid = "FieldHub";
 const char* FW_VERSION = "v1.0.0";
 // Git build id injected by scripts/fw_version.py; __DATE__/__TIME__ freeze
 // across cached reflashes (see memory: flash-recovery-bootloader).
@@ -530,12 +532,27 @@ void loadSyncRuntimeGuardsFromNVS() {
     }
   } else {
     gLastSyncBroadcastUnix = 0;
-    Serial.println("[WARN] Phase anchor lost - fleet may desync");
+    // Can't tell from here whether this is a fresh device that has never
+    // completed a sync broadcast (expected — e.g. no nodes paired yet) or an
+    // established fleet that genuinely lost its anchor, so this stays
+    // informational rather than an alarming WARN on every unpaired boot.
+    Serial.println("[SYNC] No valid phase anchor in NVS (fresh device, or no sync broadcast yet)");
   }
   gPrefs.end();
 }
 
 void saveSyncRuntimeGuardsToNVS() {
+  // gLastSyncBroadcastUnix only gets set by an actual SET_SYNC_SCHED broadcast
+  // to a paired node — with zero nodes paired (e.g. right after onboarding,
+  // before any node has joined) it's still 0. Persisting a record with that
+  // phase would fail syncAnchorValid() by design, so skip the write instead of
+  // attempting it and logging a misleading "FAILED": there is genuinely no
+  // anchor to save yet, not an NVS/write problem.
+  if (gLastSyncBroadcastUnix < kMinValidPhaseUnix) {
+    Serial.println("[SYNC] No anchor to save yet (no sync broadcast has reached a paired node)");
+    return;
+  }
+
   if (!gPrefs.begin("ui", false)) {
     Serial.println("[SYNC] Anchor save failed: NVS unavailable");
     return;
@@ -1028,6 +1045,48 @@ static const char* nodeStateToString(int s) {
     case DEPLOYED: return "DEPLOYED";
     default:       return "UNKNOWN";
   }
+}
+
+// Render `text` as a self-contained, offline QR code SVG (no external assets).
+// Dark modules are drawn as a single SVG path over a white quiet-zone border,
+// so it scans reliably from a laptop webcam. Version 6 / ECC-M comfortably fits
+// the ~60-byte hardware-registration deep link with margin to spare.
+static String renderQrSvg(const String& text, int modulepx = 6) {
+  QRCode qrcode;
+  const uint8_t version = 6;                 // 41x41 — ~130B byte-mode at ECC-M
+  uint8_t data[256];                         // qrcode_getBufferSize(6) == 211
+  if (qrcode_initText(&qrcode, data, version, ECC_MEDIUM, text.c_str()) < 0) {
+    return String(F("<p class='muted'>QR unavailable</p>"));
+  }
+  const int n = qrcode.size;
+  const int quiet = 4;                       // required 4-module quiet zone
+  const int dim = (n + quiet * 2) * modulepx;
+
+  String svg;
+  svg.reserve((size_t)n * n * 8 + 256);
+  svg += F("<svg xmlns='http://www.w3.org/2000/svg' width='");
+  svg += String(dim);
+  svg += F("' height='");
+  svg += String(dim);
+  svg += F("' viewBox='0 0 ");
+  svg += String(dim); svg += F(" "); svg += String(dim);
+  svg += F("' role='img' aria-label='FieldHub hardware QR' shape-rendering='crispEdges'>");
+  svg += F("<rect width='100%' height='100%' fill='#ffffff'/><path fill='#000000' d='");
+  for (int y = 0; y < n; ++y) {
+    for (int x = 0; x < n; ++x) {
+      if (qrcode_getModule(&qrcode, x, y)) {
+        const int px = (x + quiet) * modulepx;
+        const int py = (y + quiet) * modulepx;
+        svg += 'M'; svg += String(px); svg += ' '; svg += String(py);
+        svg += 'h'; svg += String(modulepx);
+        svg += 'v'; svg += String(modulepx);
+        svg += 'h'; svg += String(-modulepx);
+        svg += 'z';
+      }
+    }
+  }
+  svg += F("'/></svg>");
+  return svg;
 }
 
 // ---------------------------------------------------------------------------
@@ -1751,6 +1810,33 @@ static void sendCaptivePortalLanding() {
               "</body></html>");
 }
 
+// OS connectivity-check ("captive portal probe") responders. Rather than
+// serving a portal page (which makes iOS/Android classify the AP as a
+// no-internet captive network and — on Android especially — aggressively drop
+// the association mid-setup), each probe gets the exact "you have internet,
+// no portal here" answer its OS expects. This keeps the phone stably attached
+// to the FieldHub AP while provisioning. The trade is that the OS no longer
+// auto-launches the portal, so the setup flow tells the user to open
+// http://192.168.4.1 explicitly. (Ref: github.com/tzapu/WiFiManager#114.)
+static void sendProbeNoContent() {
+  server.sendHeader("Cache-Control", "no-store");
+  server.send(204);  // Android generate_204 success + generic "nothing here"
+}
+static void sendProbeAppleSuccess() {
+  server.sendHeader("Cache-Control", "no-store");
+  server.send(200, "text/html",
+              "<HTML><HEAD><TITLE>Success</TITLE></HEAD>"
+              "<BODY>Success</BODY></HTML>");
+}
+static void sendProbeNcsi() {
+  server.sendHeader("Cache-Control", "no-store");
+  server.send(200, "text/plain", "Microsoft NCSI");
+}
+static void sendProbeMsConnect() {
+  server.sendHeader("Cache-Control", "no-store");
+  server.send(200, "text/plain", "Microsoft Connect Test");
+}
+
 // Persistent primary navigation. navActive selects the current destination:
 // 0=Overview, 1=Stations, 2=Export, 3=Settings; <0 emits nothing (child/result
 // pages keep their header Back button). Export is a download route, so its tab is
@@ -2155,6 +2241,20 @@ static String buildDataStatusSectionHtml() {
 // Route handlers
 // ---------------------------------------------------------------------------
 static void handleRoot() {
+  // Unprovisioned (no connection key saved) → send the user straight into the
+  // first-run setup wizard instead of the normal home page. Once provisioned,
+  // "/" behaves exactly as before. The wizard itself stays reachable manually
+  // (Settings → "Run setup wizard") regardless of this gate.
+  {
+    TransmissionSettings txProbe;
+    loadTransmissionSettings(txProbe);
+    if (txProbe.apiKey.length() == 0) {
+      server.sendHeader("Location", "/setup", true);
+      server.send(302, "text/plain", "");
+      return;
+    }
+  }
+
   String html = headCommon("fieldMesh",
     F("<span id='conn-status' class='conn-dot'>Connected</span>"), 0);
 
@@ -2364,7 +2464,11 @@ static void handleRoot() {
   html += F("<details style='margin:16px 0'>"
             "<summary style='font-weight:bold;cursor:pointer;padding:10px;border:1px solid var(--border);border-radius:8px;background:var(--panel)'>About / Advanced</summary>"
             "<div class='section' style='margin-top:8px'>"
-            "<div class='help'><strong>Device ID:</strong> ");
+            "<div class='help'><strong>Hardware code:</strong> ");
+  html += htmlEscape(hwCode());
+  // Internal radio node ID retained for diagnostics/compatibility only — this is
+  // NOT the customer-facing FieldHub identity (that is the hardware code/MAC).
+  html += F("<br><strong>Radio node ID (internal):</strong> ");
   html += DEVICE_ID;
   html += F("<br><strong>Firmware:</strong> ");
   html += FW_VERSION;
@@ -2389,22 +2493,27 @@ static void handleRoot() {
 static void handleSetTime() {
   String dt = server.arg("datetime");
   int year, mm, dd, hh, mi, ss;
-  if (sscanf(dt.c_str(), "%d:%d:%d %d-%d-%d", &hh, &mi, &ss, &dd, &mm, &year) == 6 && year >= 2000) {
-    if (setRTCTime(year, mm, dd, hh, mi, ss)) {
-      String html = headCommon("fieldMesh");
-      html += F("<div class='section center'><h3>SUCCESS: RTC Time Updated</h3><p>New time:<br><strong>");
-      html += dt;
-      html += F("</strong></p><a href='/' class='btn btn--primary'>Back to Main Page</a></div>");
-      html += footCommon();
-      server.send(200, "text/html", html);
-    } else {
-      String html = headCommon("fieldMesh");
-      html += F("<div class='section center'><h3>ERROR: Failed to Set RTC Time</h3><p>Please try again.</p>"
-                "<a href='/' class='btn btn--primary'>Try Again</a></div>");
-      html += footCommon();
-      server.send(500, "text/html", html);
-    }
-  } else {
+  const bool parsed =
+      sscanf(dt.c_str(), "%d:%d:%d %d-%d-%d", &hh, &mi, &ss, &dd, &mm, &year) == 6 && year >= 2000;
+  const bool ok = parsed && setRTCTime(year, mm, dd, hh, mi, ss);
+
+  // AJAX branch (setup wizard / async forms): stay on the page with a JSON
+  // result instead of navigating to a standalone confirmation page.
+  if (isAjaxRequest()) {
+    if (ok)          sendAjaxResult(true, String("Time set to ") + dt);
+    else if (!parsed) sendAjaxResult(false, "Invalid time format (HH:MM:SS DD-MM-YYYY)");
+    else              sendAjaxResult(false, "Failed to set RTC time");
+    return;
+  }
+
+  if (ok) {
+    String html = headCommon("fieldMesh");
+    html += F("<div class='section center'><h3>SUCCESS: RTC Time Updated</h3><p>New time:<br><strong>");
+    html += dt;
+    html += F("</strong></p><a href='/' class='btn btn--primary'>Back to Main Page</a></div>");
+    html += footCommon();
+    server.send(200, "text/html", html);
+  } else if (!parsed) {
     String html = headCommon("fieldMesh");
     html += F("<div class='section center'><h3>WARNING: Invalid Time Format</h3>"
               "<p>Please use the format: HH:MM:SS DD-MM-YYYY</p><p>You entered: <em>");
@@ -2412,7 +2521,30 @@ static void handleSetTime() {
     html += F("</em></p><a href='/' class='btn btn--primary'>Try Again</a></div>");
     html += footCommon();
     server.send(400, "text/html", html);
+  } else {
+    String html = headCommon("fieldMesh");
+    html += F("<div class='section center'><h3>ERROR: Failed to Set RTC Time</h3><p>Please try again.</p>"
+              "<a href='/' class='btn btn--primary'>Try Again</a></div>");
+    html += footCommon();
+    server.send(500, "text/html", html);
   }
+}
+
+// POST /set-remote-management (ajax) — lightweight standalone toggle used by the
+// setup wizard. arg remote_management=1 enables, anything else disables. The
+// full Settings form also sets this, but the wizard wants a one-field call that
+// doesn't touch every other transmission setting.
+static void handleSetRemoteManagement() {
+  const bool want = server.hasArg("remote_management") &&
+                    server.arg("remote_management") == "1";
+  const bool ok = backendControlSetRemoteManagementEnabled(want);
+  if (isAjaxRequest()) {
+    if (ok) sendAjaxResult(true, want ? "Dashboard changes allowed" : "Dashboard changes off");
+    else    sendAjaxResult(false, "Could not save setting");
+    return;
+  }
+  server.sendHeader("Location", "/settings", true);
+  server.send(302, "text/plain", "");
 }
 
 static void handleDownloadCSV() {
@@ -3607,20 +3739,25 @@ static void handleSettings() {
 
   html += F("<div id='ui-status' class='help' style='display:none;margin-bottom:10px;border:1px solid var(--border);border-radius:8px;padding:8px 10px'></div>");
 
+  // Re-run the guided setup wizard (pre-filled with current values) for anyone
+  // who'd rather step through onboarding again than hunt through this page.
+  html += F("<div class='section section--flat' style='margin-bottom:10px'>"
+            "<a href='/setup' class='btn btn--sm'>Run setup wizard</a></div>");
+
   // --- Schedule change pending (only rendered during a transition) ---
   html += buildScheduleTransitionBanner();
 
   html += F("<div class='section'>");
 
   // --- Recording interval presets ---
+  // Uses the canonical kAllowedIntervals (same set the setup wizard offers), so
+  // an interval chosen in the wizard is always representable/shown selected here.
   html += F("<h3>Recording interval</h3>"
             "<p class='muted'>How often each node measures.</p>"
             "<form class='async-form' action='/set-recording-interval' method='POST'>"
             "<div class='action-choices'>");
-  static const int kRecordingPresets[] = {1, 5, 10, 30};
-  static const size_t kRecordingPresetCount = sizeof(kRecordingPresets) / sizeof(kRecordingPresets[0]);
-  for (size_t i = 0; i < kRecordingPresetCount; ++i) {
-    int v = kRecordingPresets[i];
+  for (size_t i = 0; i < kAllowedCount; ++i) {
+    int v = kAllowedIntervals[i];
     html += F("<label class='action-choice action-choice--start'><input type='radio' name='interval' value='");
     html += String(v);
     html += F("'");
@@ -3656,11 +3793,8 @@ static void handleSettings() {
   const bool remoteManagementEnabled = backendControlRemoteManagementEnabled();
   html += F("<label class='label' style='margin-top:12px'><input type='checkbox' name='remote_management' value='1'");
   if (remoteManagementEnabled) html += F(" checked");
-  html += F("> <strong>Allow queued dashboard node changes</strong></label>");
-  html += F("<div class='help'>Dashboard changes are stored in the backend, received at a later LTE check-in, then sent to nodes during the following normal sync window. Turning this off stops new command execution without stopping logging, syncing or uploads.</div>");
-  if (!remoteManagementEnabled) {
-    html += F("<label class='label' style='margin-top:8px'><input type='checkbox' name='confirm_remote_management' value='yes'> I understand and deliberately want to enable remote management on this FieldHub.</label>");
-  }
+  html += F("> <strong>Allow dashboard changes to nodes</strong></label>");
+  html += F("<div class='help'>Lets changes made in the dashboard reach nodes during the next sync. Turning it off just stops that — logging, syncing and uploads keep working.</div>");
 
   html += F("<label class='label' for='api_key'>API Key</label>");
   if (tx.apiKey.length() > 0) {
@@ -3680,20 +3814,17 @@ static void handleSettings() {
   html += htmlEscape(tx.endpointUrl);
   html += F("</p>");
 
-  // Device identity — the backend team needs the MAC to issue an API key, and
-  // the mothership_id is what routes this device's data in Supabase.
-  html += F("<label class='label' style='margin-top:10px'>Device MAC (give to backend for API key)</label>");
-  html += F("<p class='muted' style='font-size:13px'>");
-  html += htmlEscape(WiFi.macAddress());
+  // FieldHub hardware identity — the customer-facing code + canonical MAC used
+  // to register this hub in the dashboard. No customer-facing "Device ID".
+  html += F("<label class='label' style='margin-top:10px'>FieldHub hardware code</label>");
+  html += F("<p class='muted' style='font-size:14px;font-weight:600'>");
+  html += htmlEscape(hwCode());
   html += F("</p>");
-  html += F("<label class='label'>Mothership ID</label>");
-  html += F("<p class='muted' style='word-break:break-all;font-size:13px'>");
-  html += htmlEscape(tx.mothershipId);
+  html += F("<label class='label'>Hardware MAC</label>");
+  html += F("<p class='muted' style='font-family:monospace;font-size:13px'>");
+  html += htmlEscape(hwMacString());
   html += F("</p>");
-  html += F("<label class='label'>Project ID</label>");
-  html += F("<p class='muted' style='word-break:break-all;font-size:13px'>");
-  html += htmlEscape(tx.projectId);
-  html += F("</p>");
+  html += F("<div class='help'>Use the code on the home screen to register this FieldHub in the FieldMesh dashboard, then scan the provisioning code it gives you.</div>");
 
   // Cloud status line
   {
@@ -3806,19 +3937,11 @@ static void handleSetTransmission() {
   }
   tx.allowManualUpload = server.hasArg("allow_manual") && server.arg("allow_manual") == "1";
 
-  const bool remoteWasEnabled = backendControlRemoteManagementEnabled();
+  // Remote dashboard control is a plain on/off — enabling it isn't a big deal
+  // (it only lets dashboard-queued changes reach nodes at the next sync), so
+  // there is no separate "I understand" confirmation gate.
   const bool remoteRequested = server.hasArg("remote_management") &&
                                server.arg("remote_management") == "1";
-  const bool remoteConfirmed = server.hasArg("confirm_remote_management") &&
-                               server.arg("confirm_remote_management") == "yes";
-  if (remoteRequested && !remoteWasEnabled && !remoteConfirmed) {
-    if (isAjaxRequest()) {
-      sendAjaxResult(false, "Confirm remote management before enabling it");
-    } else {
-      server.send(400, "text/plain", "Confirm remote management before enabling it");
-    }
-    return;
-  }
 
   // uploadIntervalMin / minBatteryMv / maxBytesPerSession / maxRetriesPerWindow
   // are no longer user-editable — carry the fixed defaults straight from load
@@ -3839,6 +3962,14 @@ static void handleSetTransmission() {
   // Keep the previous API key if the form field was left blank (no QR string).
   if (tx.apiKey.length() == 0 || tx.apiKey.indexOf("\u2022") >= 0) {
     tx.apiKey = prev.apiKey;
+  }
+  // The Settings page renders the endpoint read-only (no <input name='url'>),
+  // so server.arg("url") is always "" except via the legacy qr_string pipe
+  // format. Without this, every plain Settings save would silently wipe the
+  // endpoint set by /provision-apply back to blank (masked today only because
+  // the load-time fallback happens to match the sole allow-listed endpoint).
+  if (tx.endpointUrl.length() == 0) {
+    tx.endpointUrl = prev.endpointUrl;
   }
 
   if (!backendControlSetRemoteManagementEnabled(remoteRequested)) {
@@ -4110,6 +4241,412 @@ static void handleUploadStatus() {
 // ---------------------------------------------------------------------------
 // Start + loop
 // ---------------------------------------------------------------------------
+// GET /api/identity — local, unauthenticated hardware identity for diagnostics
+// and installer tooling. Never includes API keys, project IDs, or any secret.
+// The MAC here is the same canonical STA MAC shown on the portal card, used for
+// the AP suffix, embedded in the hardware QR, and reported in upload status.
+static void handleApiIdentity() {
+  String body;
+  body.reserve(160);
+  body += F("{\"hardwareMac\":\"");
+  body += hwMacString();
+  body += F("\",\"hardwareCode\":\"");
+  body += hwCode();
+  body += F("\",\"firmwareVersion\":\"");
+  body += FW_SEMVER;
+  body += F("\"}");
+  server.sendHeader("Cache-Control", "no-store");
+  server.send(200, "application/json", body);
+}
+
+// Shared connection-key provisioning widget markup + logic, used by both the
+// standalone /provision page and the setup wizard's Connect step so the flow
+// lives in exactly one place. Three ways to get the code in, all funneling into
+// the same confirm/apply call:
+//   1. URL-fragment auto-detect (arrived via a scanned/tapped QR link) — the
+//      credential rides in the fragment, never reaching the hub as a request.
+//   2. Manual paste — works on any browser, no camera at all.
+//   3. In-page camera scan (getUserMedia + native BarcodeDetector) — decodes
+//      frames inside the current tab, never handing off to the OS camera app,
+//      which is what dropped some phones off the AP mid-scan.
+// `onSuccessJs` runs after a successful POST /provision-apply (the URL fragment
+// is always cleared first). It has access to the widget's local `R` (result
+// div) and `C` (confirm div); for the standalone page it renders a "connected,
+// back home" result, for the wizard it advances to the next step.
+static String provisionWidgetHtml(const String& onSuccessJs) {
+  String h = F(
+    "<div id='pv-empty'>"
+    "<p class='muted'>Paste the connection code shown in the FieldMesh dashboard, or scan it.</p>"
+    "<textarea id='pv-paste' class='input' rows='3' placeholder='Paste connection code here' "
+    "style='font-family:monospace;font-size:13px' autocomplete='off' autocapitalize='off' spellcheck='false'></textarea>"
+    "<button id='pv-paste-go' class='btn btn--primary' style='margin-top:8px;width:100%'>Use pasted code</button>"
+    "<div style='margin-top:14px'>"
+    "<button id='pv-scan-go' class='btn' style='width:100%' hidden>Scan with camera</button>"
+    "<p id='pv-scan-unsupported' class='muted' style='display:none'>"
+    "Camera scanning isn't supported on this browser — paste the code instead, "
+    "or scan the QR with your phone's camera app and open the link it finds.</p>"
+    "<video id='pv-video' style='display:none;width:100%;border-radius:8px;margin-top:8px' playsinline muted></video>"
+    "</div></div>"
+    "<div id='pv-confirm' style='display:none'>"
+    "<p>Endpoint: <strong id='pv-host'></strong></p>"
+    "<p><span class='chip chip--cfg-ok' style='font-weight:600'>Connection key received</span></p>"
+    "<p class='muted'>Applying this will connect the FieldHub to your project and test the connection.</p>"
+    "<button id='pv-apply' class='btn btn--primary'>Apply &amp; connect</button> "
+    "<button id='pv-cancel' class='btn btn--sm'>Cancel</button></div>"
+    "<div id='pv-error' style='display:none'><p><span class='chip chip--bat-low' style='font-weight:600'>"
+    "Invalid provisioning code</span></p><p class='muted' id='pv-error-msg'></p>"
+    "<button id='pv-retry' class='btn'>Try again</button></div>"
+    "<div id='pv-result' style='display:none'></div>");
+  // Payload parsing + confirmation. The key is never logged or rendered.
+  h += F(
+    "<script>(function(){"
+    "var E=document.getElementById('pv-empty'),C=document.getElementById('pv-confirm'),"
+    "X=document.getElementById('pv-error'),R=document.getElementById('pv-result');"
+    "var stream=null;"
+    "function stopScan(){if(stream){stream.getTracks().forEach(function(t){t.stop();});stream=null;}"
+    "document.getElementById('pv-video').style.display='none';}"
+    "function reset(){stopScan();X.style.display='none';R.style.display='none';C.style.display='none';"
+    "E.style.display='block';}"
+    "function fail(m){stopScan();E.style.display='none';C.style.display='none';R.style.display='none';"
+    "X.style.display='block';document.getElementById('pv-error-msg').textContent=m||'';}"
+    "document.getElementById('pv-retry').addEventListener('click',reset);"
+    "function tryPayload(raw){"
+    "raw=(raw||'').trim();"
+    "var i=raw.indexOf('FM1.');if(i<0){fail('Unrecognised code — no FM1 code found.');return;}"
+    "raw=raw.slice(i);"
+    "var b64=raw.slice(4).replace(/-/g,'+').replace(/_/g,'/');"
+    "while(b64.length%4){b64+='=';}"
+    "var payload;try{payload=JSON.parse(atob(b64));}catch(e){fail('Could not read the code.');return;}"
+    "if(payload.v!==1||!payload.endpoint||!payload.connectionKey){fail('Code is missing required fields.');return;}"
+    "var host;try{host=new URL(payload.endpoint).host;}catch(e){host=payload.endpoint;}"
+    "stopScan();E.style.display='none';X.style.display='none';"
+    "document.getElementById('pv-host').textContent=host;C.style.display='block';"
+    "C.dataset.raw=raw;"
+    "}"
+    "document.getElementById('pv-paste-go').addEventListener('click',function(){"
+    "tryPayload(document.getElementById('pv-paste').value);});"
+    "document.getElementById('pv-cancel').addEventListener('click',reset);"
+    "document.getElementById('pv-apply').addEventListener('click',function(){"
+    "var btn=this;btn.disabled=true;btn.textContent='Applying...';"
+    "fetch('/provision-apply',{method:'POST',headers:{'Content-Type':'text/plain'},body:C.dataset.raw})"
+    ".then(function(r){return r.json();}).then(function(j){"
+    "C.style.display='none';"
+    "if(j.ok){if(history.replaceState){history.replaceState(null,'',location.pathname);}");
+  h += onSuccessJs;   // injected success behavior (standalone result vs. wizard advance)
+  h += F("}"
+    "else{R.style.display='block';"
+    "R.innerHTML=\"<p><span class='chip chip--bat-low' style='font-weight:600'>Could not connect</span></p>"
+    "<p class='muted' id='pv-rmsg'></p>\";"
+    "document.getElementById('pv-rmsg').textContent=j.message||'';"
+    "var rb=document.createElement('button');rb.className='btn';rb.textContent='Try again';rb.onclick=reset;"
+    "R.appendChild(rb);}"
+    "}).catch(function(){C.style.display='none';R.style.display='block';"
+    "R.innerHTML=\"<p class='muted'>Network error while applying. Try again.</p>\";"
+    "var rb=document.createElement('button');rb.className='btn';rb.textContent='Try again';rb.onclick=reset;"
+    "R.appendChild(rb);});"
+    "});"
+    // In-page camera scan (progressive enhancement): stays inside this tab —
+    // no OS camera-app handoff, so the phone's Wi-Fi association to the
+    // FieldHub AP is never disturbed by an app switch.
+    "if('BarcodeDetector' in window && navigator.mediaDevices && navigator.mediaDevices.getUserMedia){"
+    "var scanBtn=document.getElementById('pv-scan-go');scanBtn.hidden=false;"
+    "scanBtn.addEventListener('click',function(){"
+    "var video=document.getElementById('pv-video');"
+    "navigator.mediaDevices.getUserMedia({video:{facingMode:'environment'}}).then(function(s){"
+    "stream=s;video.srcObject=s;video.style.display='block';video.play();"
+    "var detector=new BarcodeDetector({formats:['qr_code']});"
+    "var tick=function(){"
+    "if(!stream)return;"
+    "detector.detect(video).then(function(codes){"
+    "if(codes.length){tryPayload(codes[0].rawValue);}"
+    "else{requestAnimationFrame(tick);}"
+    "}).catch(function(){requestAnimationFrame(tick);});"
+    "};requestAnimationFrame(tick);"
+    "}).catch(function(){fail('Camera permission denied. Paste the code instead.');});"
+    "});"
+    "}else{document.getElementById('pv-scan-unsupported').style.display='block';}"
+    // Fragment auto-detect last, so a scanned/tapped QR link still works.
+    "var fragRaw=(location.hash||'').replace(/^#/,'');"
+    "if(fragRaw){tryPayload(fragRaw);}"
+    "})();</script>");
+  return h;
+}
+
+// GET /provision — standalone connection-key provisioning page. This is the
+// documented external contract for the dashboard's QR
+// (http://192.168.4.1/provision#FM1.<base64url-payload>); it stays available
+// independent of the setup wizard.
+static void handleProvisionPage() {
+  String html = headCommon("Connect FieldHub", F("<a href='/' class='btn btn--sm'>Back</a>"));
+  html += F("<div class='section'><h3>Connect this FieldHub</h3>");
+  // Success continues INTO the setup wizard rather than dead-ending here. This
+  // matters for the common case where the user scans the dashboard QR with their
+  // phone's native camera: that opens this /provision page (often in a different
+  // browser than the wizard), and without this the wizard would be abandoned.
+  // The wizard is server-driven and resumes from device state, so continuing —
+  // even in a new browser — picks up exactly where setup should go next.
+  html += provisionWidgetHtml(F(
+    "R.style.display='block';"
+    "R.innerHTML=\"<p><span class='chip chip--cfg-ok' style='font-weight:600'>Connected</span></p>"
+    "<p class='muted'>This FieldHub is now connected. Continue setup to finish.</p>"
+    "<a href='/setup' class='btn btn--primary' style='width:100%;text-align:center'>Continue setup</a>\";"));
+  html += F("</div>");
+  html += footCommon();
+  server.sendHeader("Cache-Control", "no-store");
+  server.send(200, "text/html", html);
+}
+
+// POST /provision-apply — body is the raw "FM1.<base64url>" payload (text/plain,
+// so the key never lands in a URL/query/log). Firmware is authoritative: it
+// re-decodes and validates server-side (never trusting the client), enforces
+// the endpoint allow-list, and only then persists. A malformed/disallowed
+// payload leaves existing stored credentials untouched. The plaintext key is
+// never serial-printed, echoed, or included in any response.
+static void handleProvisionApply() {
+  String payload = server.hasArg("plain") ? server.arg("plain") : String("");
+  payload.trim();
+
+  ProvisioningPayload prov;
+  ProvisionParseResult r = hwParseProvisioning(payload, prov);
+  if (r != PROV_OK) {
+    Serial.printf("[PROVISION] rejected: %s\n", hwProvisionResultStr(r));
+    const char* msg =
+        (r == PROV_ENDPOINT_NOT_ALLOWED) ? "Endpoint not approved for FieldMesh" :
+        (r == PROV_BAD_VERSION)          ? "Unsupported provisioning code version" :
+                                           "Provisioning code could not be read";
+    sendAjaxResult(false, msg);
+    return;
+  }
+
+  // Apply onto existing settings: connectionKey -> Bearer apiKey, endpoint ->
+  // upload URL. All other fields (including any previously stored ones) are
+  // preserved. Only reached for a valid, approved payload.
+  TransmissionSettings tx;
+  loadTransmissionSettings(tx);
+  tx.endpointUrl = prov.endpoint;
+  tx.apiKey      = prov.connectionKey;
+  // Auto-enable cloud upload on a successful provision. Applying a connection
+  // key is an explicit "connect this hub" action, so there is no reason to make
+  // the user then separately hunt for and tick an "Enable cloud upload" box —
+  // that silent extra step was a reported onboarding snag.
+  tx.enabled     = true;
+  saveTransmissionSettings(tx);
+  // Log only non-secret facts — never the key.
+  Serial.printf("[PROVISION] applied: endpoint=%s keyLen=%u\n",
+                prov.endpoint.c_str(), (unsigned)prov.connectionKey.length());
+
+  sendAjaxResult(true, "Provisioned");
+}
+
+// GET /setup — first-run onboarding wizard. One server-rendered page whose
+// steps are shown/hidden client-side (same pattern as the provision widget),
+// each step reusing the existing per-setting endpoints so there is no duplicate
+// server logic. The wizard is intentionally hub-focused — get the FieldHub
+// online and under dashboard control — and does NOT deal with node deployment
+// (pairing/discovery is the node manager's job):
+//   1 Register (manual MAC entry / QR)  2 Connect (shared provision widget)
+//   3 Cloud confirmed  4 Dashboard control (/set-remote-management)
+//   5 Time (/set-time)  6 Recording interval (/set-wake-interval — the upload/
+//   sync cadence is auto-derived from this, never set by the user)  7 Review
+//   8 Finish (/start). The start step is computed from device state so a
+// mid-flow refresh doesn't force redoing completed steps.
+static void handleSetupWizard() {
+  TransmissionSettings tx;
+  loadTransmissionSettings(tx);
+  const bool hasKey  = tx.apiKey.length() > 0;
+  const bool hasTime = getRTCTimeUnix() >= kMinValidPhaseUnix;
+  const bool remoteEnabled = backendControlRemoteManagementEnabled();
+  const String mac = hwMacString();
+
+  // Endpoint host for the review line (strip scheme + path).
+  String host = tx.endpointUrl;
+  int schemeEnd = host.indexOf("://");
+  if (schemeEnd >= 0) host = host.substring(schemeEnd + 3);
+  int pathStart = host.indexOf('/');
+  if (pathStart >= 0) host = host.substring(0, pathStart);
+
+  // Resume point on a fresh page load (e.g. after scanning the dashboard QR,
+  // which provisions via /provision then continues here, possibly in a new
+  // browser). Once connected, land on the first post-connect config step so the
+  // rest of setup (Dashboard control → Time → Recording) still gets walked;
+  // registration + connect are already done at that point.
+  int startStep = hasKey ? 4 : 1;
+
+  String html = headCommon("Set up FieldHub", F("<a href='/' class='btn btn--sm'>Exit</a>"));
+  html += F("<div class='section'>"
+            "<p class='muted' style='margin:0 0 10px'>Setup &middot; step <span id='wz-cur'>1</span> of 8</p>");
+
+  // Step 1 — Register
+  html += F("<div class='wz-step' data-step='1'>"
+            "<h3>1. Register this FieldHub</h3>"
+            "<p class='muted'>In the FieldMesh dashboard, add a new FieldHub using this address:</p>"
+            "<div class='help'><strong>Hardware MAC</strong><br>"
+            "<span id='wz-mac' style='font-family:monospace;font-size:20px;font-weight:700'>");
+  html += htmlEscape(mac);
+  html += F("</span></div>"
+            "<button type='button' class='btn btn--sm' style='margin-top:10px' id='wz-copy'>Copy MAC</button>"
+            "<details style='margin-top:10px'><summary style='font-size:14px;color:var(--sub);cursor:pointer'>Or scan instead</summary>"
+            "<div style='margin-top:8px;text-align:center'>");
+  html += renderQrSvg(hwRegisterUri(mac));
+  html += F("</div></details>"
+            "<div style='margin-top:16px'><button type='button' class='btn btn--primary' data-wz='next'>I've registered — continue</button></div>"
+            "</div>");
+
+  // Step 2 — Connect (shared provision widget; success records cloud state +
+  // endpoint host for the Review step, then advances to step 3).
+  html += F("<div class='wz-step' data-step='2' style='display:none'>"
+            "<h3>2. Connect to FieldMesh</h3>");
+  html += provisionWidgetHtml(F(
+    "if(window.wzConnected)window.wzConnected(document.getElementById('pv-host').textContent);"));
+  html += F("<div style='margin-top:12px'><button type='button' class='btn btn--sm' data-wz='back'>Back</button></div>"
+            "</div>");
+
+  // Step 3 — Cloud confirmed
+  html += F("<div class='wz-step' data-step='3' style='display:none'>"
+            "<h3>3. Cloud upload</h3>"
+            "<p><span class='chip chip--cfg-ok' style='font-weight:600'>Cloud upload: Enabled</span></p>"
+            "<p class='muted'>Connecting this FieldHub turned on cloud upload automatically. Data will upload to your project during collection rounds.</p>"
+            "<div style='margin-top:12px'><button type='button' class='btn btn--sm' data-wz='back'>Back</button> "
+            "<button type='button' class='btn btn--primary' data-wz='next'>Continue</button></div>"
+            "</div>");
+
+  // Step 4 — Dashboard control
+  html += F("<div class='wz-step' data-step='4' style='display:none'>"
+            "<h3>4. Dashboard control</h3>"
+            "<p class='muted'>Let this FieldHub be configured from the dashboard. Changes you make in the dashboard reach nodes during the next sync. You can change this later in Settings.</p>"
+            "<label class='label'><input type='checkbox' id='wz-remote'");
+  if (remoteEnabled) html += F(" checked");
+  html += F("> Allow dashboard control</label>"
+            "<div id='wz-remote-result' class='help' style='margin-top:6px'></div>"
+            "<div style='margin-top:14px'><button type='button' class='btn btn--sm' data-wz='back'>Back</button> "
+            "<button type='button' class='btn btn--primary' data-wz='next'>Continue</button></div>"
+            "</div>");
+
+  // Step 5 — Time
+  html += F("<div class='wz-step' data-step='5' style='display:none'>"
+            "<h3>5. Set the clock</h3>"
+            "<p class='muted'>Sets the FieldHub clock from this device (stored as UTC). This is the time reference for the whole fleet.</p>"
+            "<p>This device (UTC): <strong id='wz-time-now'>--</strong></p>"
+            "<button type='button' class='btn btn--primary' id='wz-time-set'>Use this time</button>"
+            "<div id='wz-time-result' class='help' style='margin-top:8px'></div>"
+            "<div style='margin-top:12px'><button type='button' class='btn btn--sm' data-wz='back'>Back</button> "
+            "<button type='button' class='btn btn--primary' id='wz-time-next' data-wz='next'");
+  if (!hasTime) html += F(" disabled");  // already-set clock → don't force a re-set on resume
+  html += F(">Continue</button></div>"
+            "</div>");
+
+  // Step 6 — Recording interval (last config step). The upload/sync cadence is
+  // auto-derived from this by handleSetWakeInterval (computeAutoSyncMin) — the
+  // user never sets a sync schedule directly, so there is no sync UI here.
+  html += F("<div class='wz-step' data-step='6' style='display:none'>"
+            "<h3>6. Recording interval</h3>"
+            "<p class='muted'>How often should nodes record a reading? Uploads are scheduled automatically from this.</p>"
+            "<div id='wz-int-row' style='display:flex;flex-wrap:wrap;gap:6px'>");
+  for (size_t i = 0; i < kAllowedCount; ++i) {
+    html += F("<button type='button' class='btn btn--sm wz-int");
+    if (kAllowedIntervals[i] == gWakeIntervalMin) html += F(" btn--primary");
+    html += F("' data-int='");
+    html += String(kAllowedIntervals[i]);
+    html += F("'>");
+    html += String(kAllowedIntervals[i]);
+    html += F(" min</button>");
+  }
+  html += F("</div><div id='wz-int-result' class='help' style='margin-top:6px'></div>"
+            "<div style='margin-top:14px'><button type='button' class='btn btn--sm' data-wz='back'>Back</button> "
+            "<button type='button' class='btn' data-wz='skip'>Skip</button> "
+            "<button type='button' class='btn btn--primary' data-wz='next'>Continue</button></div>"
+            "</div>");
+
+  // Step 7 — Review
+  html += F("<div class='wz-step' data-step='7' style='display:none'>"
+            "<h3>Review</h3>"
+            "<div id='wz-review'></div>"
+            "<div style='margin-top:14px'><button type='button' class='btn btn--sm' data-wz='back'>Back</button> "
+            "<button type='button' class='btn btn--primary' data-wz='goto' data-goto='8'>Looks good</button></div>"
+            "</div>");
+
+  // Step 8 — Done. The wizard only sets the hub up; it deliberately does NOT
+  // power down here (that would drop the AP and block node deployment). It hands
+  // the user back to the main overview, where they add nodes via the node
+  // manager and press the existing "Finish & Start Recording" button when ready.
+  html += F("<div class='wz-step' data-step='8' style='display:none'>"
+            "<h3><span class='chip chip--cfg-ok' style='font-weight:700'>FieldHub ready</span></h3>"
+            "<p class='muted'>Your FieldHub is connected and configured. Next:</p>"
+            "<ol style='margin:8px 0 14px 18px;line-height:1.6'>"
+            "<li>Add your nodes — power them on, then open the node manager.</li>"
+            "<li>When everything's in place, press <strong>Finish &amp; Start Recording</strong> on the home screen.</li>"
+            "</ol>"
+            "<a href='/stations' class='btn' style='width:100%;text-align:center;margin-bottom:8px'>Add nodes</a>"
+            "<a href='/' class='btn btn--primary' style='width:100%;text-align:center'>Go to overview</a>"
+            "<div style='margin-top:10px'><button type='button' class='btn btn--sm' data-wz='back'>Back</button></div>"
+            "</div>");
+
+  html += F("</div>");  // .section
+
+  // --- Wizard controller ---
+  html += F("<script>(function(){var INIT=");
+  html += F("{\"startStep\":");        html += String(startStep);
+  html += F(",\"cloudEnabled\":");     html += (tx.enabled && hasKey) ? F("true") : F("false");
+  html += F(",\"endpointHost\":\"");   html += host; html += F("\"");
+  html += F(",\"interval\":");         html += String(gWakeIntervalMin);
+  html += F(",\"remote\":");           html += remoteEnabled ? F("true") : F("false");
+  html += F("};");
+  html += F(
+    "var TOTAL=8,cur=INIT.startStep||1;"
+    "var S={cloud:INIT.cloudEnabled,host:INIT.endpointHost,interval:INIT.interval,"
+    "remote:INIT.remote,time:false};"
+    "var steps=[].slice.call(document.querySelectorAll('.wz-step'));"
+    "function post(u,d){var b=Object.keys(d).map(function(k){return encodeURIComponent(k)+'='+encodeURIComponent(d[k]);}).join('&')+'&ajax=1';"
+    "return fetch(u,{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:b}).then(function(r){return r.json();});}"
+    "function row(k,v){return \"<p style='margin:4px 0'><strong>\"+k+\":</strong> \"+v+\"</p>\";}"
+    "function chip(ok,txt){return \"<span class='chip \"+(ok?'chip--cfg-ok':'chip--bat-low')+\"' style='font-weight:600'>\"+txt+\"</span>\";}"
+    "function renderReview(){var iv=S.interval?(S.interval+' min'):'not set (uses default)';"
+    "document.getElementById('wz-review').innerHTML="
+    "row('Cloud upload',S.cloud?('Enabled'+(S.host?(' &rarr; '+S.host):'')):'Not connected')+"
+    "row('Dashboard control',S.remote?'On':'Off')+"
+    "row('Recording interval',iv);}"
+    "function show(n){cur=Math.max(1,Math.min(TOTAL,n));"
+    "steps.forEach(function(s){s.style.display=(parseInt(s.dataset.step,10)===cur)?'block':'none';});"
+    "document.getElementById('wz-cur').textContent=cur;"
+    "if(cur===7)renderReview();"
+    "window.scrollTo(0,0);}"
+    "window.wzGo=show;"
+    "window.wzConnected=function(host){S.cloud=true;if(host)S.host=host;show(3);};"
+    "document.addEventListener('click',function(e){var t=e.target;while(t&&t!==document&&!t.getAttribute('data-wz'))t=t.parentNode;"
+    "if(!t||t===document)return;var a=t.getAttribute('data-wz');"
+    "if(a==='next'||a==='skip')show(cur+1);else if(a==='back')show(cur-1);"
+    "else if(a==='goto')show(parseInt(t.getAttribute('data-goto'),10));});"
+    // Step 1 copy
+    "document.getElementById('wz-copy').addEventListener('click',function(){"
+    "var t=document.getElementById('wz-mac').textContent;if(navigator.clipboard)navigator.clipboard.writeText(t);"
+    "this.textContent='Copied';var b=this;setTimeout(function(){b.textContent='Copy MAC';},1500);});"
+    // Step 4 dashboard control — immediate chip reinforcement
+    "document.getElementById('wz-remote').addEventListener('change',function(){"
+    "var on=this.checked;post('/set-remote-management',{remote_management:on?1:0}).then(function(j){"
+    "S.remote=on;document.getElementById('wz-remote-result').innerHTML="
+    "on?chip(true,'Dashboard control on'):\"<span class='chip' style='font-weight:600'>Dashboard control off</span>\";});});"
+    // Step 5 time
+    "function nowUtc(){var n=new Date(),z=function(x){return String(x).padStart(2,'0');};"
+    "return z(n.getUTCHours())+':'+z(n.getUTCMinutes())+':'+z(n.getUTCSeconds())+' '+z(n.getUTCDate())+'-'+z(n.getUTCMonth()+1)+'-'+n.getUTCFullYear();}"
+    "function tickClock(){var el=document.getElementById('wz-time-now');if(el)el.textContent=nowUtc();}"
+    "setInterval(tickClock,1000);tickClock();"
+    "document.getElementById('wz-time-set').addEventListener('click',function(){"
+    "post('/set-time',{datetime:nowUtc()}).then(function(j){"
+    "document.getElementById('wz-time-result').innerHTML=chip(j.ok,j.ok?'Clock set':(j.message||'Failed'));"
+    "if(j.ok){S.time=true;document.getElementById('wz-time-next').disabled=false;}});});"
+    // Step 6 recording interval (sync cadence auto-derived server-side)
+    "[].forEach.call(document.querySelectorAll('.wz-int'),function(b){b.addEventListener('click',function(){"
+    "var v=parseInt(b.getAttribute('data-int'),10);post('/set-wake-interval',{interval:v}).then(function(j){"
+    "S.interval=v;[].forEach.call(document.querySelectorAll('.wz-int'),function(x){x.classList.remove('btn--primary');});"
+    "b.classList.add('btn--primary');"
+    "document.getElementById('wz-int-result').innerHTML=chip(true,'Recording every '+v+' min &middot; uploads scheduled automatically');});});});"
+    "show(cur);"
+    "})();</script>");
+  html += footCommon();
+  server.sendHeader("Cache-Control", "no-store");
+  server.send(200, "text/html", html);
+}
+
 static void handleShutdown() {
   gShutdownRequested = true;
   if (isAjaxRequest()) {
@@ -4355,12 +4892,26 @@ void startConfigServer() {
   dispatcherInit();
   backendControlInit();
 
+  // Config-mode AP name = "FieldHub(<full MAC>)", so a user can pick the correct
+  // hub out of their phone's Wi-Fi list. Derived from the factory STA MAC — the
+  // same source as the portal card, /api/identity, the hardware QR, and the
+  // upload status MAC. Assigned here (not at static init) so eFuse/WiFi are
+  // guaranteed ready.
+  ssid = hwApSsid();
+
   // WiFi AP + STA (AP for web UI, STA for ESP-NOW on same channel).
   // ESP-NOW was already initialised by initEspNowConfig() before this call.
   WiFi.mode(WIFI_AP_STA);
   WiFi.setSleep(false);
 
-  bool apOk = WiFi.softAP(ssid.c_str(), password, ESPNOW_CHANNEL, false, 4);
+  // Fixed, shared WPA2 password (not a real access-control barrier — it's the
+  // same on every hub). An open/no-password AP made some phones' OS more
+  // aggressive about dropping the association once it decided the network had
+  // "no internet" (observed during provisioning QR scans), so a trivial shared
+  // WPA2 key buys connection stability without adding real friction. WPA2-PSK
+  // requires 8-63 chars, so this can't be shorter.
+  static const char* kApPassword = "fieldmesh";
+  bool apOk = WiFi.softAP(ssid.c_str(), kApPassword, ESPNOW_CHANNEL, false, 4);
   if (!apOk) {
     Serial.println("[AP] SoftAP failed to start");
   } else {
@@ -4373,17 +4924,19 @@ void startConfigServer() {
 
   // Routes
   server.on("/", HTTP_ANY, handleRoot);
-  server.on("/generate_204", HTTP_ANY, sendCaptivePortalLanding);
-  server.on("/gen_204", HTTP_ANY, sendCaptivePortalLanding);
-  server.on("/hotspot-detect.html", HTTP_ANY, sendCaptivePortalLanding);
-  server.on("/library/test/success.html", HTTP_ANY, sendCaptivePortalLanding);
-  server.on("/connecttest.txt", HTTP_ANY, sendCaptivePortalLanding);
-  server.on("/ncsi.txt", HTTP_ANY, sendCaptivePortalLanding);
-  server.on("/success.txt", HTTP_ANY, sendCaptivePortalLanding);
-  server.on("/wpad.dat", HTTP_ANY, sendCaptivePortalLanding);
-  server.on("/redirect", HTTP_ANY, sendCaptivePortalLanding);
-  server.on("/fwlink", HTTP_ANY, sendCaptivePortalLanding);
-  server.on("/mobile/status.php", HTTP_ANY, sendCaptivePortalLanding);
+  // OS connectivity checks — answer each with its expected "internet OK"
+  // signal so phones stay attached to the AP (see the probe responders above).
+  server.on("/generate_204", HTTP_ANY, sendProbeNoContent);        // Android
+  server.on("/gen_204", HTTP_ANY, sendProbeNoContent);             // Android
+  server.on("/hotspot-detect.html", HTTP_ANY, sendProbeAppleSuccess);       // Apple CNA
+  server.on("/library/test/success.html", HTTP_ANY, sendProbeAppleSuccess); // Apple CNA
+  server.on("/ncsi.txt", HTTP_ANY, sendProbeNcsi);                 // Windows NCSI
+  server.on("/connecttest.txt", HTTP_ANY, sendProbeMsConnect);     // Windows
+  server.on("/success.txt", HTTP_ANY, sendProbeNoContent);         // Firefox/other
+  server.on("/wpad.dat", HTTP_ANY, sendProbeNoContent);
+  server.on("/redirect", HTTP_ANY, sendProbeNoContent);
+  server.on("/fwlink", HTTP_ANY, sendProbeNoContent);
+  server.on("/mobile/status.php", HTTP_ANY, sendProbeNoContent);
   server.on("/favicon.ico", HTTP_ANY, []() { server.send(204); });
 
   // --- New canonical routes ---
@@ -4416,6 +4969,15 @@ void startConfigServer() {
   server.on("/set-transmission", HTTP_POST, handleSetTransmission);
   server.on("/manual-upload", HTTP_POST, handleManualUpload);
   server.on("/upload-status", HTTP_GET, handleUploadStatus);
+
+  // Hardware identity + secure connection-key provisioning.
+  server.on("/api/identity", HTTP_GET, handleApiIdentity);
+  server.on("/provision", HTTP_GET, handleProvisionPage);
+  server.on("/provision-apply", HTTP_POST, handleProvisionApply);
+
+  // First-run onboarding wizard + the lightweight per-setting endpoint it needs.
+  server.on("/setup", HTTP_GET, handleSetupWizard);
+  server.on("/set-remote-management", HTTP_POST, handleSetRemoteManagement);
 
   // --- Legacy route aliases (backwards compatibility) ---
   // GET routes redirect to the new canonical paths.

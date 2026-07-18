@@ -19,6 +19,7 @@
 #include "system/pins.h"
 #include "system/power.h"
 #include "system/wake_reason.h"
+#include "system/hardware_identity.h"
 #include "time/rtc_alarm.h"
 #include "comms/espnow_sync.h"
 #include "storage/sd_logger.h"
@@ -886,7 +887,7 @@ void performModemUpload(const TransmissionSettings& txSettings, uint32_t session
       uploadQueue.getPendingRows(), statusCursor.rowsUploaded,
       statusCursor.retryCount, statusCursor.lastUploadUnix,
       FW_SEMVER, FW_BUILD, getRTCTime(),
-      WiFi.macAddress(),
+      hwMacString(),  // canonical factory STA MAC — matches portal/identity/AP/QR
       fPending, txSettings.enabled,
       uploadQueue.getPendingRows(), (uint64_t)getCSVFileSize(), String(""),
       buildNodesStatusJson(nowUnix),
