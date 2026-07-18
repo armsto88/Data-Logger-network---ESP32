@@ -118,7 +118,7 @@ static bool markControlConverged(const char* nodeId,
   return nodeChanged || intervalChanged;
 }
 
-static void ingestBackendResponse(const String& responseBody) {
+static BackendIngestResult ingestBackendResponse(const String& responseBody) {
   const uint32_t rtcBefore = getRTCTime();
   const bool rtcTrusted = rtcBefore >= 1704067200UL;
   Serial.printf("[CONTROL] HTTP response body bytes=%u\n",
@@ -153,6 +153,7 @@ static void ingestBackendResponse(const String& responseBody) {
                     static_cast<long long>(delta));
     }
   }
+  return result;
 }
 
 static void boundedRetryAndShutdown(const char* context) {
@@ -832,6 +833,7 @@ void performModemUpload(const TransmissionSettings& txSettings, uint32_t session
 
     bool anyJsonSuccess = false;
     bool firstChunk = true;
+    bool controlReportDirty = false;
     uint32_t nowUnix = getRTCTime();
 
     // Build the status context once per upload session — the backend stores
@@ -878,7 +880,7 @@ void performModemUpload(const TransmissionSettings& txSettings, uint32_t session
     const String firmwareStatusJson = mothershipFirmwareStatusJson();
     const String controlStatusJson  = backendControlStatusJson();
 
-    const StatusContext statusCtx = {
+    StatusContext statusCtx = {
       restingBatV, flashPct, fsTotal, fsUsed,
       "scheduled", computeNextSyncIsoLocal(),
       gWakeIntervalMin, gSyncIntervalMin,
@@ -996,7 +998,9 @@ void performModemUpload(const TransmissionSettings& txSettings, uint32_t session
         firstChunk = false;
         // Commit readings first: control parsing never invalidates a successful
         // data POST or rewinds the existing upload cursor.
-        ingestBackendResponse(result.responseBody);
+        const BackendIngestResult ingest =
+            ingestBackendResponse(result.responseBody);
+        controlReportDirty = controlReportDirty || ingest.commandCount > 0;
         // Continue loop for next chunk if more rows remain.
       } else if (result.httpStatus == 400 || result.httpStatus == 401) {
         // Not transient: bad payload or bad credentials.  Do NOT advance the
@@ -1035,7 +1039,9 @@ void performModemUpload(const TransmissionSettings& txSettings, uint32_t session
           uploadQueue.resetRetryCount();
           anyJsonSuccess = true;
           firstChunk = false;
-          ingestBackendResponse(result.responseBody);
+          const BackendIngestResult ingest =
+              ingestBackendResponse(result.responseBody);
+          controlReportDirty = controlReportDirty || ingest.commandCount > 0;
         } else if (result.httpStatus == 400 || result.httpStatus == 401) {
           Serial.printf("[UPLOAD] Status heartbeat non-retryable HTTP %d (%s)\n",
                         result.httpStatus,
@@ -1048,6 +1054,47 @@ void performModemUpload(const TransmissionSettings& txSettings, uint32_t session
       }
     } else if (firstChunk) {
       Serial.println("[UPLOAD] JSON: no reading payload sent");
+    }
+
+    // A command is accepted from the HTTP response after the status object in
+    // that request has already been built. Report the new durable cursor,
+    // result and desired node state immediately instead of leaving the
+    // dashboard at "offered, not acknowledged" until the next sync wake.
+    if (controlReportDirty && isSupabase && !sessionExpired()) {
+      fPending = 0;
+      fPaused = 0;
+      for (const auto& node : getRegisteredNodes()) {
+        if (node.stateChangePending || node.deployPending) fPending++;
+        if (node.state == DEPLOYED && node.recordingPaused) fPaused++;
+      }
+      statusCtx.rtcUnix = getRTCTime();
+      statusCtx.fleetPending = fPending;
+      statusCtx.fleetPaused = fPaused;
+      statusCtx.pendingRows = uploadQueue.getPendingRows();
+      statusCtx.pendingBytes = uploadQueue.getPendingBytes();
+      statusCtx.nodesJson = buildNodesStatusJson(statusCtx.rtcUnix);
+      statusCtx.controlJson = backendControlStatusJson();
+
+      JsonPayload controlHeartbeat = buildJsonUpload(
+          String(), 1, FW_SEMVER, &statusCtx, statusCtx.rtcUnix);
+      if (!controlHeartbeat.ok) {
+        Serial.println("[CONTROL] acknowledgement heartbeat JSON build failed");
+      } else {
+        const String url = buildUploadUrl(txSettings);
+        Serial.printf("[CONTROL] POSTing acknowledgement heartbeat (%u bytes)\n",
+                      controlHeartbeat.byteLength);
+        HttpsPostResult result = modem.httpsPost(
+            url, controlHeartbeat.body, "application/json", authHeader);
+        if (result.httpStatus == 200) {
+          Serial.println("[CONTROL] acknowledgement heartbeat SUCCESS: HTTP 200");
+          uploadQueue.resetRetryCount();
+          anyJsonSuccess = true;
+          ingestBackendResponse(result.responseBody);
+        } else {
+          Serial.printf("[CONTROL] acknowledgement heartbeat HTTP %d, %s\n",
+                        result.httpStatus, result.errorDetail.c_str());
+        }
+      }
     }
 
     if (anyJsonSuccess) {
