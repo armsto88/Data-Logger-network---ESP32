@@ -81,7 +81,7 @@ struct NodeDesiredConfig {
   uint8_t  wakeIntervalMin;
   uint16_t syncIntervalMin;
   uint32_t syncPhaseUnix;
-  uint8_t  targetState;     // desired NodeState: 2=DEPLOYED (default), 0=UNPAIRED
+  uint8_t  targetState;     // 0=UNPAIRED, 2=DEPLOYED/ACTIVE, 3=STANDBY
   uint16_t sensorMask;      // configured sensors: SNAP_PRESENT_* bits + NODE_SENSOR_MASK_VALID
                             // (0 = unset/auto; the node then auto-detects everything)
 };
@@ -121,7 +121,7 @@ void savePairedNodes();
 void loadPairedNodes();
 
 NodeDesiredConfig getDesiredConfig(const char* nodeId);
-void setDesiredConfig(const char* nodeId, const NodeDesiredConfig& cfg);
+bool setDesiredConfig(const char* nodeId, const NodeDesiredConfig& cfg);
 
 // -----------------------------------------------------------------------------
 // Node meta helpers (numeric ID + Name + Notes in NVS)

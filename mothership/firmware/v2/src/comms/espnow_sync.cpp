@@ -20,6 +20,8 @@ static QueueHandle_t gAckQueue = nullptr;
 static constexpr int kAckQueueDepth = 8;
 static QueueHandle_t gHelloQueue = nullptr;
 static QueueHandle_t gCapsQueue = nullptr;
+static QueueHandle_t gStatusQueue = nullptr;
+static QueueHandle_t gDeployAckQueue = nullptr;
 static QueueHandle_t gDoneQueue = nullptr;
 static QueueHandle_t gReleaseAckQueue = nullptr;
 static constexpr int kControlQueueDepth = 32;
@@ -94,6 +96,37 @@ static void onEspNowRecv(const uint8_t* mac_addr, const uint8_t* data, int len) 
     memcpy(slot.mac, mac_addr, sizeof(slot.mac));
     memcpy(&slot.caps, data, sizeof(slot.caps));
     xQueueSendToBack(gCapsQueue, &slot, 0);
+    return;
+  }
+
+  // A node with no usable local config stays awake and announces NODE_STATUS.
+  // Queue it for main-context MAC+ID validation; never mutate the registry in
+  // this Wi-Fi callback.
+  if (gStatusQueue && mac_addr && data &&
+      len == static_cast<int>(sizeof(node_status_message_t)) &&
+      strncmp(reinterpret_cast<const char*>(data), "NODE_STATUS", 11) == 0) {
+    SyncStatusSlot slot{};
+    memcpy(slot.mac, mac_addr, sizeof(slot.mac));
+    memcpy(&slot.status, data, sizeof(slot.status));
+    if (xQueueSendToBack(gStatusQueue, &slot, 0) != pdTRUE) {
+      SyncStatusSlot discard{};
+      xQueueReceive(gStatusQueue, &discard, 0);
+      xQueueSendToBack(gStatusQueue, &slot, 0);
+    }
+    return;
+  }
+
+  if (gDeployAckQueue && mac_addr && data &&
+      len == static_cast<int>(sizeof(deployment_ack_message_t)) &&
+      strncmp(reinterpret_cast<const char*>(data), "DEPLOY_ACK", 10) == 0) {
+    SyncDeployAckSlot slot{};
+    memcpy(slot.mac, mac_addr, sizeof(slot.mac));
+    memcpy(&slot.ack, data, sizeof(slot.ack));
+    if (xQueueSendToBack(gDeployAckQueue, &slot, 0) != pdTRUE) {
+      SyncDeployAckSlot discard{};
+      xQueueReceive(gDeployAckQueue, &discard, 0);
+      xQueueSendToBack(gDeployAckQueue, &slot, 0);
+    }
     return;
   }
 
@@ -252,6 +285,10 @@ bool sendSnapshotAckNow(const uint8_t* mac, const snapshot_ack_t& ack) {
   return sendControlPacket(mac, &ack, sizeof(ack));
 }
 
+bool sendDeploymentNow(const uint8_t* mac, const deployment_command_t& deploy) {
+  return sendControlPacket(mac, &deploy, sizeof(deploy));
+}
+
 void broadcastSyncScheduleNow(int syncIntervalMinutes, uint32_t phaseUnix) {
   // Hand the new schedule to the fleet while they are awake in this window.
   // Mirrors broadcastSyncWindowOpen() — reuses the broadcast peer added in
@@ -332,13 +369,18 @@ void initSnapQueue(int depth) {
 
   if (gHelloQueue) vQueueDelete(gHelloQueue);
   if (gCapsQueue) vQueueDelete(gCapsQueue);
+  if (gStatusQueue) vQueueDelete(gStatusQueue);
+  if (gDeployAckQueue) vQueueDelete(gDeployAckQueue);
   if (gDoneQueue) vQueueDelete(gDoneQueue);
   if (gReleaseAckQueue) vQueueDelete(gReleaseAckQueue);
   gHelloQueue = xQueueCreate(kControlQueueDepth, sizeof(SyncHelloSlot));
   gCapsQueue = xQueueCreate(kControlQueueDepth, sizeof(SyncCapsSlot));
+  gStatusQueue = xQueueCreate(kControlQueueDepth, sizeof(SyncStatusSlot));
+  gDeployAckQueue = xQueueCreate(kControlQueueDepth, sizeof(SyncDeployAckSlot));
   gDoneQueue = xQueueCreate(kControlQueueDepth, sizeof(SyncDoneSlot));
   gReleaseAckQueue = xQueueCreate(kControlQueueDepth, sizeof(SyncReleaseAckSlot));
-  if (!gHelloQueue || !gCapsQueue || !gDoneQueue || !gReleaseAckQueue) {
+  if (!gHelloQueue || !gCapsQueue || !gStatusQueue || !gDeployAckQueue ||
+      !gDoneQueue || !gReleaseAckQueue) {
     Serial.println("[ESP-NOW] coordinated sync queue allocation failed");
   }
 }
@@ -354,6 +396,20 @@ int drainSyncCaps(SyncCapsSlot* out, int maxItems) {
   if (!gCapsQueue || !out || maxItems <= 0) return 0;
   int count = 0;
   while (count < maxItems && xQueueReceive(gCapsQueue, &out[count], 0) == pdTRUE) ++count;
+  return count;
+}
+
+int drainSyncStatuses(SyncStatusSlot* out, int maxItems) {
+  if (!gStatusQueue || !out || maxItems <= 0) return 0;
+  int count = 0;
+  while (count < maxItems && xQueueReceive(gStatusQueue, &out[count], 0) == pdTRUE) ++count;
+  return count;
+}
+
+int drainDeployAcks(SyncDeployAckSlot* out, int maxItems) {
+  if (!gDeployAckQueue || !out || maxItems <= 0) return 0;
+  int count = 0;
+  while (count < maxItems && xQueueReceive(gDeployAckQueue, &out[count], 0) == pdTRUE) ++count;
   return count;
 }
 
@@ -414,6 +470,14 @@ void deinitEspNowSync() {
   if (gCapsQueue) {
     vQueueDelete(gCapsQueue);
     gCapsQueue = nullptr;
+  }
+  if (gStatusQueue) {
+    vQueueDelete(gStatusQueue);
+    gStatusQueue = nullptr;
+  }
+  if (gDeployAckQueue) {
+    vQueueDelete(gDeployAckQueue);
+    gDeployAckQueue = nullptr;
   }
   if (gDoneQueue) {
     vQueueDelete(gDoneQueue);

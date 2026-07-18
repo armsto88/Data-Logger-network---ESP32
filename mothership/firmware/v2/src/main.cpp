@@ -33,7 +33,9 @@
 #include "protocol.h"
 #include "firmware_identity.h"  // role/version/build/hw identity (FW_GIT injected)
 #include "ota/mothership_selfupdate.h"
-#include "command_dispatcher.h"  // dispatcherStatusJson() for status.control{}
+#include "command_dispatcher.h"
+#include "control/backend_command_ingest.h"
+#include "control/node_config_control.h"
 
 // Defer OTA image confirmation to our own first-boot self-test (see the call to
 // mothershipOtaFirstBootCheck() below). Without this the Arduino core would
@@ -85,6 +87,51 @@ void handleSyncWake();
 void handleConfigWake();
 void handleServiceWake();
 void performModemUpload(const TransmissionSettings& txSettings, uint32_t sessionStartMs);
+
+static BackendCommandApplyResult executeBackendNodeConfig(const Command& command) {
+  const NodeConfigApplyResult applied = controlApplyNodeConfig(command);
+  BackendCommandApplyResult result{};
+  result.command = applied.command;
+  result.durable = applied.durable;
+  result.applied = applied.registryApplied;
+  result.wireConfigVersion = applied.wireConfigVersion;
+  return result;
+}
+
+static bool resolveBackendNodeConfig(const Command& requested,
+                                     Command& resolved,
+                                     CmdOutcome& rejection) {
+  return controlResolveBackendNodeConfig(requested, resolved, rejection);
+}
+
+static void ingestBackendResponse(const String& responseBody) {
+  const uint32_t rtcBefore = getRTCTime();
+  const bool rtcTrusted = rtcBefore >= 1704067200UL;
+  Serial.printf("[CONTROL] HTTP response body bytes=%u\n",
+                static_cast<unsigned>(responseBody.length()));
+  const BackendIngestResult result = backendIngestUploadResponse(
+      responseBody, rtcBefore, rtcTrusted, resolveBackendNodeConfig,
+      executeBackendNodeConfig);
+  Serial.printf("[CONTROL] response=%s commands=%u processed=%u rejected=%u replayed=%u initialRevision=%lu cursor=%lu\n",
+                backendIngestStatusStr(result.status),
+                static_cast<unsigned>(result.commandCount),
+                static_cast<unsigned>(result.processedCount),
+                static_cast<unsigned>(result.rejectedCount),
+                static_cast<unsigned>(result.replayedCount),
+                static_cast<unsigned long>(result.initialStateRevision),
+                static_cast<unsigned long>(result.persistedCursor));
+
+  // The backend-provided HTTPS response clock is the UTC authority. This also
+  // repairs an RTC that was previously entered as browser-local wall time.
+  if (result.serverTimeUnix >= 1704067200UL) {
+    const int64_t delta = static_cast<int64_t>(result.serverTimeUnix) - rtcBefore;
+    if (!rtcTrusted || delta > 2 || delta < -2) {
+      setRTCTime(result.serverTimeUnix);
+      Serial.printf("[TIME] RTC corrected from backend UTC (delta=%lld s)\n",
+                    static_cast<long long>(delta));
+    }
+  }
+}
 
 static void boundedRetryAndShutdown(const char* context) {
   constexpr int kMaxAttempts = 3;
@@ -179,9 +226,6 @@ void processSnapshot(const DecodedSnapshot& decoded, const uint8_t* mac) {
       if (decoded.nodeTimestamp > 0 && decoded.nodeTimestamp > n.lastNodeTimestamp) {
         n.lastNodeTimestamp = decoded.nodeTimestamp;
       }
-      if (decoded.configVersion > 0 && decoded.configVersion > n.configVersionApplied) {
-        n.configVersionApplied = decoded.configVersion;
-      }
       // Configured-sensor fault detection. A configured sensor whose channel is
       // absent from this snapshot (node emits a reading only on a successful
       // read) faults after two consecutive misses, so a single transient read
@@ -207,6 +251,13 @@ void processSnapshot(const DecodedSnapshot& decoded, const uint8_t* mac) {
       }
       break;
     }
+  }
+
+  // A snapshot's configVersion is an existing-protocol convergence signal when
+  // CONFIG_ACK was lost. Map it back to the retained dashboard/local command
+  // without adding another radio message.
+  if (decoded.configVersion > 0) {
+    controlMarkNodeConfigConverged(decoded.nodeId, decoded.configVersion);
   }
 
   // Legacy sensor_data_message_t packets are intentionally ignored. All
@@ -295,6 +346,36 @@ static int findActiveSyncNode(const std::vector<ActiveSyncNode>& nodes,
   return -1;
 }
 
+// Re-establish a known node whose own NVS record is unavailable. Config version
+// is intentionally zero: the following normal NODE_CONFIG burst must reapply
+// the FieldHub's authoritative active/standby state and sensor mask instead of
+// treating the recovery deploy as convergence.
+static bool buildRecoveryDeploy(const NodeInfo& node, uint16_t activeSyncMin,
+                                uint32_t activeSyncPhase,
+                                deployment_command_t& deploy) {
+  const uint32_t nowUnix = getRTCTime();
+  if (nowUnix < 1704067200UL || activeSyncPhase < 1704067200UL) return false;
+
+  const DateTime now(nowUnix);
+  const NodeDesiredConfig desired = getDesiredConfig(node.nodeId.c_str());
+  memset(&deploy, 0, sizeof(deploy));
+  strncpy(deploy.command, "DEPLOY_NODE", sizeof(deploy.command) - 1);
+  strncpy(deploy.nodeId, node.nodeId.c_str(), sizeof(deploy.nodeId) - 1);
+  strncpy(deploy.mothership_id, "M001", sizeof(deploy.mothership_id) - 1);
+  deploy.year = now.year();
+  deploy.month = now.month();
+  deploy.day = now.day();
+  deploy.hour = now.hour();
+  deploy.minute = now.minute();
+  deploy.second = now.second();
+  deploy.configVersion = 0;
+  deploy.wakeIntervalMin = desired.wakeIntervalMin ? desired.wakeIntervalMin
+      : (node.wakeIntervalMin ? node.wakeIntervalMin : DEFAULT_WAKE_INTERVAL_MINUTES);
+  deploy.syncIntervalMin = activeSyncMin;
+  deploy.syncPhaseUnix = activeSyncPhase;
+  return true;
+}
+
 static void runCoordinatedSyncWindow(
     uint32_t sessionStartMs, bool& sessionTimedOut,
     const std::vector<node_config_message_t>& nodeCfgs,
@@ -358,6 +439,7 @@ static void runCoordinatedSyncWindow(
   strncpy(sessionOpen.mothership_id, "M001", sizeof(sessionOpen.mothership_id) - 1);
 
   std::vector<ActiveSyncNode> responders;
+  std::vector<String> recoveryAttempts;
   auto collectHellos = [&]() {
     SyncHelloSlot hellos[8];
     int count = 0;
@@ -365,19 +447,36 @@ static void runCoordinatedSyncWindow(
       count = drainSyncHellos(hellos, 8);
       for (int i = 0; i < count; ++i) {
         hellos[i].hello.nodeId[sizeof(hellos[i].hello.nodeId) - 1] = '\0';
-        bool authorized = false;
-        for (const auto& registered : registeredNodes) {
+        NodeInfo* authorizedNode = nullptr;
+        for (auto& registered : registeredNodes) {
           if (registered.state == DEPLOYED &&
               memcmp(registered.mac, hellos[i].mac, 6) == 0 &&
               registered.nodeId == String(hellos[i].hello.nodeId)) {
-            authorized = true;
+            authorizedNode = &registered;
             break;
           }
         }
-        if (!authorized) {
+        if (!authorizedNode) {
           Serial.printf("[SYNC] ignored HELLO from unregistered/mismatched node %.15s\n",
                         hellos[i].hello.nodeId);
           continue;
+        }
+        // NODE_HELLO carries the node's persisted applied config version. Treat
+        // it as convergence evidence just like CONFIG_ACK/snapshot echo so a
+        // lost ACK cannot leave pause/resume reporting stale for another cycle.
+        const NodeDesiredConfig desired =
+            getDesiredConfig(hellos[i].hello.nodeId);
+        if (desired.configVersion > 0 &&
+            hellos[i].hello.configVersion >= desired.configVersion) {
+          const bool wasPending = authorizedNode->stateChangePending ||
+              authorizedNode->configVersionApplied < desired.configVersion;
+          controlMarkNodeConfigConverged(hellos[i].hello.nodeId,
+                                         hellos[i].hello.configVersion);
+          if (wasPending) {
+            Serial.printf("[SYNC] HELLO converged %.15s v%u\n",
+                          hellos[i].hello.nodeId,
+                          (unsigned)hellos[i].hello.configVersion);
+          }
         }
         int existing = findActiveSyncNode(responders, hellos[i].mac,
                                           hellos[i].hello.nodeId);
@@ -406,7 +505,80 @@ static void runCoordinatedSyncWindow(
                       caps[i].caps.nodeId, caps[i].caps.fwVersion,
                       caps[i].caps.hwTarget, (unsigned)caps[i].caps.protocolVersion);
       }
-      count += capsCount;
+
+      // An unpaired node cannot join the normal HELLO/session protocol, but
+      // reports NODE_STATUS while it remains awake. Only a MAC + nodeId match
+      // to an existing DEPLOYED record is eligible for automatic recovery;
+      // a dashboard-requested unpair (desired target 0) is never resurrected.
+      SyncStatusSlot statuses[8];
+      const int statusCount = drainSyncStatuses(statuses, 8);
+      for (int i = 0; i < statusCount; ++i) {
+        statuses[i].status.nodeId[sizeof(statuses[i].status.nodeId) - 1] = '\0';
+        NodeInfo* known = nullptr;
+        for (auto& node : registeredNodes) {
+          if (node.state == DEPLOYED &&
+              memcmp(node.mac, statuses[i].mac, 6) == 0 &&
+              node.nodeId == String(statuses[i].status.nodeId)) {
+            known = &node;
+            break;
+          }
+        }
+        const bool reportsUndeployed =
+            statuses[i].status.state != (uint8_t)DEPLOYED ||
+            statuses[i].status.deployed == 0;
+        if (!known || !reportsUndeployed) continue;
+
+        const NodeDesiredConfig desired = getDesiredConfig(known->nodeId.c_str());
+        if (desired.targetState == 0) {
+          Serial.printf("[RECOVERY] %.15s reports unpaired, but desired state is UNPAIRED\n",
+                        known->nodeId.c_str());
+          continue;
+        }
+
+        bool attempted = false;
+        for (const String& id : recoveryAttempts) {
+          if (id == known->nodeId) { attempted = true; break; }
+        }
+        if (attempted) continue;
+
+        deployment_command_t deploy{};
+        if (!buildRecoveryDeploy(*known, activeSyncMin, activeSyncPhase, deploy)) {
+          Serial.printf("[RECOVERY] %.15s not dispatched: invalid FieldHub clock/schedule\n",
+                        known->nodeId.c_str());
+          continue;
+        }
+
+        const bool sent = sendDeploymentNow(statuses[i].mac, deploy);
+        known->lastSeen = millis();
+        known->isActive = true;
+        known->deployPending = true;
+        Serial.printf("[RECOVERY] %s -> %.15s after unpaired status (direct=%s)\n",
+                      sent ? "DEPLOY_NODE sent" : "DEPLOY_NODE failed",
+                      known->nodeId.c_str(), sent ? "OK" : "FAIL");
+        if (sent) recoveryAttempts.push_back(known->nodeId);
+      }
+
+      // Explicit DEPLOY_ACK is the first proof that the node has accepted its
+      // recovered identity. NODE_CONFIG/HELLO will independently prove the
+      // authoritative desired configuration in the same or next sync window.
+      SyncDeployAckSlot deployAcks[8];
+      const int deployAckCount = drainDeployAcks(deployAcks, 8);
+      for (int i = 0; i < deployAckCount; ++i) {
+        deployAcks[i].ack.nodeId[sizeof(deployAcks[i].ack.nodeId) - 1] = '\0';
+        if (deployAcks[i].ack.deployed != 1) continue;
+        for (auto& node : registeredNodes) {
+          if (node.state == DEPLOYED &&
+              memcmp(node.mac, deployAcks[i].mac, 6) == 0 &&
+              node.nodeId == String(deployAcks[i].ack.nodeId)) {
+            node.deployPending = false;
+            node.lastSeen = millis();
+            node.isActive = true;
+            Serial.printf("[RECOVERY] DEPLOY_ACK confirmed %.15s\n", node.nodeId.c_str());
+            break;
+          }
+        }
+      }
+      count += capsCount + statusCount + deployAckCount;
     } while (count > 0);
   };
 
@@ -682,7 +854,7 @@ void performModemUpload(const TransmissionSettings& txSettings, uint32_t session
     // Firmware identity + OTA state, and the dispatcher control revision — both
     // pre-built here and emitted as status.firmware{} / status.control{}.
     const String firmwareStatusJson = mothershipFirmwareStatusJson();
-    const String controlStatusJson  = dispatcherStatusJson();
+    const String controlStatusJson  = backendControlStatusJson();
 
     const StatusContext statusCtx = {
       restingBatV, flashPct, fsTotal, fsUsed,
@@ -800,6 +972,9 @@ void performModemUpload(const TransmissionSettings& txSettings, uint32_t session
         uploadQueue.resetRetryCount();
         anyJsonSuccess = true;
         firstChunk = false;
+        // Commit readings first: control parsing never invalidates a successful
+        // data POST or rewinds the existing upload cursor.
+        ingestBackendResponse(result.responseBody);
         // Continue loop for next chunk if more rows remain.
       } else if (result.httpStatus == 400 || result.httpStatus == 401) {
         // Not transient: bad payload or bad credentials.  Do NOT advance the
@@ -838,6 +1013,7 @@ void performModemUpload(const TransmissionSettings& txSettings, uint32_t session
           uploadQueue.resetRetryCount();
           anyJsonSuccess = true;
           firstChunk = false;
+          ingestBackendResponse(result.responseBody);
         } else if (result.httpStatus == 400 || result.httpStatus == 401) {
           Serial.printf("[UPLOAD] Status heartbeat non-retryable HTTP %d (%s)\n",
                         result.httpStatus,
@@ -1126,6 +1302,8 @@ void handleSyncWake() {
       NodeDesiredConfig dc = getDesiredConfig(ackNodeId.c_str());
       if (dc.targetState == 0 /*UNPAIRED*/ && acks[i].ok == 1 &&
           acks[i].appliedVersion >= dc.configVersion) {
+        controlMarkNodeConfigConverged(ackNodeId.c_str(),
+                                       acks[i].appliedVersion);
         Serial.printf("[SYNC] CONFIG_ACK unpair confirmed: %s v%u — removing node\n",
                       ackNodeId.c_str(), (unsigned)acks[i].appliedVersion);
         for (auto it = registeredNodes.begin(); it != registeredNodes.end(); ++it) {
@@ -1143,23 +1321,15 @@ void handleSyncWake() {
         setNodeUserId(ackNodeId, ""); setNodeName(ackNodeId, ""); setNodeNotes(ackNodeId, "");
         savePairedNodes();
       } else if (acks[i].ok == 1 && acks[i].appliedVersion >= dc.configVersion) {
-        // Deployed/standby converged — reflect the confirmed recording state and
-        // clear the pending flag for the UI.
+        controlMarkNodeConfigConverged(ackNodeId.c_str(),
+                                       acks[i].appliedVersion);
+        // Deployed/standby converged through the shared ACK/HELLO/snapshot path.
         const bool nowPaused = (dc.targetState == 3 /*STANDBY*/);
-        for (auto& n : registeredNodes) {
-          if (n.nodeId == ackNodeId) {
-            n.recordingPaused = nowPaused;
-            n.stateChangePending = false;
-            n.pendingTargetState = PENDING_NONE;
-            break;
-          }
-        }
         Serial.printf("[SYNC] CONFIG_ACK converged: %s v%u (%s)\n",
                       ackNodeId.c_str(), (unsigned)acks[i].appliedVersion,
                       nowPaused ? "STANDBY" : "ACTIVE");
       }
     }
-    if (nAcks > 0) savePairedNodes();  // persist confirmed paused/active state
   }
 
   // Stop the WiFi-task producer before upload or purge code touches files.
@@ -1548,6 +1718,12 @@ void setup() {
   Serial.println("=== Mothership V1 Firmware ===");
   fwIdentityPrint(fwIdentity(NODE_PROTOCOL_VERSION));
   Serial.println("[FW] V2 snapshot decode; CSV schema=30; spectral metadata IDs=1109-1113");
+
+  // Available in every wake mode. A command received after this wake's node
+  // window is delivered through the existing NODE_CONFIG path at the next
+  // sync; there is no direct dashboard-to-device transport.
+  dispatcherInit();
+  backendControlInit();
 
   // Arm a conservative fallback before wake classification or long-running
   // sync/upload work. Preserve the flag that caused an RTC wake because the

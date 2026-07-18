@@ -6,12 +6,16 @@
 #include <esp_now.h>
 #include <WiFi.h>
 #include <esp_wifi.h>
+#include <freertos/FreeRTOS.h>
 
 // Config-mode ESP-NOW command layer for Mothership V1.
 // Slim extract from production espnow_manager.cpp.
 
 static const char* kDeviceId = "001";
 static constexpr uint8_t kBroadcastAddr[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+static portMUX_TYPE gRecoveryMux = portMUX_INITIALIZER_UNLOCKED;
+static bool gKnownNodeRecoveryPending = false;
+static char gKnownNodeRecoveryId[16] = {};
 
 // -----------------------------------------------------------------------------
 // Helpers
@@ -22,6 +26,34 @@ static String macToStr(const uint8_t mac[6]) {
   snprintf(b, sizeof(b), "%02X:%02X:%02X:%02X:%02X:%02X",
            mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
   return String(b);
+}
+
+static bool shouldRecoverKnownDeployedNode(const NodeInfo& node) {
+  if (node.state != DEPLOYED) return false;
+  const NodeDesiredConfig desired = getDesiredConfig(node.nodeId.c_str());
+  return desired.targetState != 0;  // Never override an explicit dashboard unpair.
+}
+
+static void queueKnownNodeRecovery(const String& nodeId) {
+  if (nodeId.isEmpty()) return;
+  portENTER_CRITICAL(&gRecoveryMux);
+  strlcpy(gKnownNodeRecoveryId, nodeId.c_str(), sizeof(gKnownNodeRecoveryId));
+  gKnownNodeRecoveryPending = true;
+  portEXIT_CRITICAL(&gRecoveryMux);
+}
+
+static bool takeKnownNodeRecovery(String& nodeId) {
+  char id[sizeof(gKnownNodeRecoveryId)] = {};
+  portENTER_CRITICAL(&gRecoveryMux);
+  if (gKnownNodeRecoveryPending) {
+    memcpy(id, gKnownNodeRecoveryId, sizeof(id));
+    gKnownNodeRecoveryId[0] = '\0';
+    gKnownNodeRecoveryPending = false;
+  }
+  portEXIT_CRITICAL(&gRecoveryMux);
+  if (id[0] == '\0') return false;
+  nodeId = String(id);
+  return true;
 }
 
 static void ensurePeerOnChannel(const uint8_t mac[6], uint8_t channel) {
@@ -231,7 +263,18 @@ static void onEspNowRecv(const uint8_t* mac, const uint8_t* data, int len) {
         if (memcmp(n.mac, mac, 6) == 0 || n.nodeId == String(st.nodeId)) {
           n.lastSeen = millis();
           n.isActive = true;
-          n.state = reported;
+          const bool reportsUndeployed = reported != DEPLOYED || st.deployed == 0;
+          if (reportsUndeployed && shouldRecoverKnownDeployedNode(n)) {
+            // A transient/corrupt node-side NVS record must not downgrade the
+            // FieldHub's authoritative deployment record. Expose it as pending
+            // and arrange a re-deploy from normal (non-callback) context.
+            n.deployPending = true;
+            queueKnownNodeRecovery(n.nodeId);
+            Serial.printf("[RECOVERY] known deployed node %.15s reported unpaired; preserving state and re-deploying\n",
+                          n.nodeId.c_str());
+          } else {
+            n.state = reported;
+          }
           savePairedNodes();
           break;
         }
@@ -259,6 +302,18 @@ static void onEspNowRecv(const uint8_t* mac, const uint8_t* data, int len) {
         }
       }
       registerNode(mac, discovery.nodeId, discovery.nodeType, keep);
+      for (auto& n : registeredNodes) {
+        if (memcmp(n.mac, mac, 6) == 0 || n.nodeId == String(discovery.nodeId)) {
+          if (shouldRecoverKnownDeployedNode(n)) {
+            n.deployPending = true;
+            queueKnownNodeRecovery(n.nodeId);
+            savePairedNodes();
+            Serial.printf("[RECOVERY] known deployed node %.15s sent discovery; re-deploy queued\n",
+                          n.nodeId.c_str());
+          }
+          break;
+        }
+      }
 
       discovery_response_t response{};
       strcpy(response.command, "DISCOVER_RESPONSE");
@@ -420,7 +475,26 @@ bool initEspNowConfig(int channel) {
 }
 
 void espnowConfigPoll() {
-  // No continuous loop — all receive handling is via the callback.
+  String nodeId;
+  if (!takeKnownNodeRecovery(nodeId)) return;
+
+  for (auto& node : registeredNodes) {
+    if (node.nodeId != nodeId) continue;
+    if (!shouldRecoverKnownDeployedNode(node)) {
+      Serial.printf("[RECOVERY] %s skipped: no longer an authoritative deployed node\n",
+                    nodeId.c_str());
+      return;
+    }
+
+    node.deployPending = true;
+    savePairedNodes();
+    const bool sent = deploySelectedNodes(std::vector<String>{nodeId});
+    Serial.printf("[RECOVERY] config-mode DEPLOY_NODE -> %s: %s\n",
+                  nodeId.c_str(), sent ? "sent" : "failed");
+    return;
+  }
+
+  Serial.printf("[RECOVERY] %s skipped: registry entry disappeared\n", nodeId.c_str());
 }
 
 // -----------------------------------------------------------------------------

@@ -17,11 +17,9 @@
 #include "firmware_identity.h"
 #include "ota/mothership_selfupdate.h"
 #include "command_dispatcher.h"
+#include "control/backend_command_ingest.h"
+#include "control/node_config_control.h"
 #include "esp_ota_ops.h"
-
-// Defined below; used by the node-config handlers above its definition.
-static uint32_t controlRecordNodeChange(const String& nodeId, uint8_t wake,
-                                        uint8_t target, uint16_t mask, CmdSource src);
 
 #include <WiFi.h>
 #include <WebServer.h>
@@ -218,6 +216,67 @@ static void discoveryTick() {
 // ---------------------------------------------------------------------------
 static uint32_t getRTCTimeUnix() {
   return getRTCTime();
+}
+
+static BackendCommandApplyResult executeBackendNodeConfigFromUi(
+    const Command& command) {
+  const NodeConfigApplyResult applied = controlApplyNodeConfig(command);
+  BackendCommandApplyResult result{};
+  result.command = applied.command;
+  result.durable = applied.durable;
+  result.applied = applied.registryApplied;
+  result.wireConfigVersion = applied.wireConfigVersion;
+  return result;
+}
+
+static bool resolveBackendNodeConfigFromUi(const Command& requested,
+                                           Command& resolved,
+                                           CmdOutcome& rejection) {
+  return controlResolveBackendNodeConfig(requested, resolved, rejection);
+}
+
+static void ingestBackendResponseFromUi(const String& responseBody) {
+  const uint32_t rtcBefore = getRTCTimeUnix();
+  Serial.printf("[CONTROL] manual HTTP response body bytes=%u\n",
+                static_cast<unsigned>(responseBody.length()));
+  const BackendIngestResult result = backendIngestUploadResponse(
+      responseBody, rtcBefore, rtcBefore >= kMinValidPhaseUnix,
+      resolveBackendNodeConfigFromUi,
+      executeBackendNodeConfigFromUi);
+  Serial.printf("[CONTROL] manual response=%s processed=%u cursor=%lu\n",
+                backendIngestStatusStr(result.status),
+                static_cast<unsigned>(result.processedCount),
+                static_cast<unsigned long>(result.persistedCursor));
+  if (result.serverTimeUnix >= kMinValidPhaseUnix) {
+    const int64_t delta = static_cast<int64_t>(result.serverTimeUnix) - rtcBefore;
+    if (rtcBefore < kMinValidPhaseUnix || delta > 2 || delta < -2) {
+      setRTCTime(result.serverTimeUnix);
+      Serial.printf("[TIME] RTC corrected from backend UTC (delta=%lld s)\n",
+                    static_cast<long long>(delta));
+    }
+  }
+}
+
+static NodeConfigApplyResult applyLocalDesiredConfig(
+    const String& nodeId, const NodeDesiredConfig& desired,
+    bool overrideSyncSchedule = false, bool allowUnpair = false) {
+  NodeConfigApplyOptions options{};
+  options.allowUnpair = allowUnpair;
+  options.overrideSyncSchedule = overrideSyncSchedule;
+  options.syncIntervalMin = desired.syncIntervalMin;
+  options.syncPhaseUnix = desired.syncPhaseUnix;
+  const NodeConfigApplyResult result = controlApplyLocalNodeConfig(
+      nodeId.c_str(), desired.wakeIntervalMin ? desired.wakeIntervalMin : 1,
+      desired.targetState, desired.sensorMask, options);
+  Serial.printf("[CTRL] %s local config -> %s rev=%lu wireV=%u durable=%d applied=%d\n",
+                nodeId.c_str(), cmdOutcomeStr(result.command.outcome),
+                static_cast<unsigned long>(
+                    result.command.assignedRevision
+                        ? result.command.assignedRevision
+                        : result.command.currentRevision),
+                static_cast<unsigned>(result.wireConfigVersion),
+                result.durable ? 1 : 0, result.registryApplied ? 1 : 0);
+  return result;
 }
 
 static bool setRTCTime(int year, int month, int day, int hour, int minute, int second) {
@@ -1263,13 +1322,13 @@ function wireAsyncForms(){
 function setCurrentTime(){
   const n=new Date();
   const z=n=>String(n).padStart(2,'0');
-  const s=`${z(n.getHours())}:${z(n.getMinutes())}:${z(n.getSeconds())} ${z(n.getDate())}-${z(n.getMonth()+1)}-${n.getFullYear()}`;
+  const s=`${z(n.getUTCHours())}:${z(n.getUTCMinutes())}:${z(n.getUTCSeconds())} ${z(n.getUTCDate())}-${z(n.getUTCMonth()+1)}-${n.getUTCFullYear()}`;
   const el=document.getElementById('datetime'); if(el) el.value=s;
 }
 const MONTH_SHORT=['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
 function formatHubClock(ms){
   const dt=new Date(ms);
-  return `${String(dt.getHours()).padStart(2,'0')}:${String(dt.getMinutes()).padStart(2,'0')} \u00b7 ${String(dt.getDate()).padStart(2,'0')} ${MONTH_SHORT[dt.getMonth()]} ${dt.getFullYear()}`;
+  return `${String(dt.getUTCHours()).padStart(2,'0')}:${String(dt.getUTCMinutes()).padStart(2,'0')} \u00b7 ${String(dt.getUTCDate()).padStart(2,'0')} ${MONTH_SHORT[dt.getUTCMonth()]} ${dt.getUTCFullYear()}`;
 }
 function toggleSettings(){
   const panel=document.getElementById('settings-panel');
@@ -1303,14 +1362,14 @@ window.addEventListener('DOMContentLoaded', () => {
     if (m){
       const mon = MONTH_SHORT.indexOf(m[5]);
       if (mon < 0) return NaN;
-      const dt = new Date(+m[6], mon, +m[4], +m[1], +m[2], m[3] ? +m[3] : 0);
-      return isNaN(dt) ? NaN : dt.getTime();
+      const value = Date.UTC(+m[6], mon, +m[4], +m[1], +m[2], m[3] ? +m[3] : 0);
+      return isNaN(value) ? NaN : value;
     }
     if (str.length >= 19){
       const H = +str.slice(0,2), M = +str.slice(3,5), S = +str.slice(6,8);
       const d = +str.slice(9,11), mo = +str.slice(12,14), y = +str.slice(15,19);
-      const dt = new Date(y, mo-1, d, H, M, S);
-      return isNaN(dt) ? NaN : dt.getTime();
+      const value = Date.UTC(y, mo-1, d, H, M, S);
+      return isNaN(value) ? NaN : value;
     }
     return NaN;
   }
@@ -1591,10 +1650,14 @@ static String buildLiveJson() {
     else nNew++;
     if (n.stateChangePending || n.deployPending) nPending++;
     const uint32_t battCenti = isnan(n.lastReportedBatV) ? 0u : (uint32_t)(n.lastReportedBatV * 100.0f);
+    const DispatchNodeConfig* mirrored = dispatcherNodeConfig(n.nodeId.c_str());
+    const bool mirroredPaused = mirrored
+        ? mirrored->targetState == 3 : n.recordingPaused;
     fp ^= (uint32_t)n.state + ((uint32_t)n.configVersionApplied << 4) +
-          (n.lastSeen / 1000UL) + battCenti + (n.recordingPaused ? 97U : 0U) +
+          (n.lastSeen / 1000UL) + battCenti + (mirroredPaused ? 97U : 0U) +
           (uint32_t)(n.nodeId.length() * 131U) + (uint32_t)(n.name.length() * 17U) +
-          ((uint32_t)n.expectedSensorMask << 9) + ((uint32_t)n.sensorFaultMask << 20);
+          ((uint32_t)n.expectedSensorMask << 9) + ((uint32_t)n.sensorFaultMask << 20) +
+          (mirrored ? ((uint32_t)mirrored->wakeIntervalMin << 24) : 0U);
     fp *= 16777619UL;  // FNV-style fold — cheap change detector, not a hash guarantee
   }
   fp ^= (gDiscovery.generation * 2654435761UL) + (gDiscovery.active ? 1UL : 0UL) +
@@ -1626,8 +1689,13 @@ static String buildLiveJson() {
     if (!first) j += ",";
     first = false;
     const String disp = n.name.length() ? n.name : (n.userId.length() ? n.userId : n.nodeId);
+    const DispatchNodeConfig* mirrored = dispatcherNodeConfig(n.nodeId.c_str());
     const uint8_t obs = (n.wakeIntervalMin > 0) ? n.wakeIntervalMin : n.inferredWakeIntervalMin;
-    const int recMin = (obs > 0) ? (int)obs : (gWakeIntervalMin > 0 ? gWakeIntervalMin : 5);
+    const int recMin = mirrored && mirrored->wakeIntervalMin > 0
+        ? mirrored->wakeIntervalMin
+        : ((obs > 0) ? (int)obs : (gWakeIntervalMin > 0 ? gWakeIntervalMin : 5));
+    const bool mirroredPaused = mirrored
+        ? mirrored->targetState == 3 : n.recordingPaused;
     j += "{\"id\":\"";     j += jsonEscapeLocal(n.nodeId); j += "\"";
     j += ",\"label\":\"";  j += jsonEscapeLocal(disp);     j += "\"";
     j += ",\"userId\":\""; j += jsonEscapeLocal(n.userId); j += "\"";
@@ -1637,7 +1705,7 @@ static String buildLiveJson() {
     if (isnan(n.lastReportedBatV)) { j += ",\"batV\":null"; }
     else { char b[12]; snprintf(b, sizeof(b), "%.2f", n.lastReportedBatV); j += ",\"batV\":"; j += b; }
     j += ",\"recMin\":";  j += String(recMin);
-    j += ",\"paused\":";  j += n.recordingPaused ? "true" : "false";
+    j += ",\"paused\":";  j += mirroredPaused ? "true" : "false";
     j += ",\"pending\":"; j += (n.stateChangePending || n.deployPending) ? "true" : "false";
     // Configured-sensor state for the deployment UI: which sensors are marked
     // installed, what reported last cycle, and which configured ones are faulted.
@@ -1771,7 +1839,7 @@ static void handleRoot() {
   }
 
   // --- Mothership time bar ---
-  html += F("<div class='top-time'><span class='top-time__label'>Mothership time</span><span id='rtc-now' class='top-time__value'>");
+  html += F("<div class='top-time'><span class='top-time__label'>Mothership time (UTC)</span><span id='rtc-now' class='top-time__value'>");
   html += currentTime;
   html += F("</span></div>");
 
@@ -1779,13 +1847,13 @@ static void handleRoot() {
   html += F("<details style='margin:4px 0 12px 0'>"
             "<summary style='font-size:14px;color:var(--sub);cursor:pointer;padding:4px 8px'>Set time</summary>"
             "<div style='margin-top:8px;padding:12px;border:1px solid var(--border);border-radius:8px;background:var(--panel)'>"
-            "<p class='muted' style='margin:0 0 8px 0'>Only needed for initial setup or clock correction.</p>"
+            "<p class='muted' style='margin:0 0 8px 0'>Only needed for initial setup or clock correction. Stored time is UTC.</p>"
             "<form action='/set-time' method='POST'>"
             "<label class='label' for='datetime'><strong>Set new time</strong></label>"
             "<input class='input' id='datetime' name='datetime' type='text' "
             "placeholder='HH:MM:SS DD-MM-YYYY' inputmode='numeric' autocomplete='off'>"
             "<div class='row'>"
-            "<button type='button' class='btn' onclick='setCurrentTime()'>Use browser time</button>"
+            "<button type='button' class='btn' onclick='setCurrentTime()'>Use browser UTC</button>"
             "<button type='submit' class='btn btn--success'>Set Time</button>"
             "</div>"
             "<div class='help'>Example: 21:05:00 14-11-2026</div>"
@@ -2156,11 +2224,8 @@ static void handleSetWakeInterval() {
           dc.syncPhaseUnix = transitionPhaseUnix;
           cfgChanged = true;
         }
-        if (dc.configVersion == 0) { dc.configVersion = 1; cfgChanged = true; }
-        else if (cfgChanged) {
-          dc.configVersion = (dc.configVersion < 0xFFFFu) ? (dc.configVersion + 1u) : 1u;
-        }
-        if (cfgChanged) setDesiredConfig(node.nodeId.c_str(), dc);
+        if (dc.configVersion == 0) cfgChanged = true;
+        if (cfgChanged) applyLocalDesiredConfig(node.nodeId, dc, true);
       }
     }
   }
@@ -2240,9 +2305,8 @@ static void handleSetSyncMode() {
     bool changed = false;
     if (dc.syncIntervalMin != modeSyncMin) { dc.syncIntervalMin = modeSyncMin; changed = true; }
     if (dc.syncPhaseUnix != transitionPhaseUnix) { dc.syncPhaseUnix = transitionPhaseUnix; changed = true; }
-    if (dc.configVersion == 0) { dc.configVersion = 1; changed = true; }
-    else if (changed) { dc.configVersion = (dc.configVersion < 0xFFFFu) ? (dc.configVersion + 1u) : 1u; }
-    if (changed) setDesiredConfig(node.nodeId.c_str(), dc);
+    if (dc.configVersion == 0) changed = true;
+    if (changed) applyLocalDesiredConfig(node.nodeId, dc, true);
   }
 
   Serial.printf("[UI] Sync mode set to %s (anchor preserved, transitionPhase=%lu)\n",
@@ -2300,9 +2364,8 @@ static void handleSetSyncTime() {
       bool changed = false;
       if (dc.syncIntervalMin != 0u) { dc.syncIntervalMin = 0u; changed = true; }
       if (dc.syncPhaseUnix != transitionPhaseUnix) { dc.syncPhaseUnix = transitionPhaseUnix; changed = true; }
-      if (dc.configVersion == 0) { dc.configVersion = 1; changed = true; }
-      else if (changed) { dc.configVersion = (dc.configVersion < 0xFFFFu) ? (dc.configVersion + 1u) : 1u; }
-      if (changed) setDesiredConfig(node.nodeId.c_str(), dc);
+      if (dc.configVersion == 0) changed = true;
+      if (changed) applyLocalDesiredConfig(node.nodeId, dc, true);
     }
   }
 
@@ -2505,18 +2568,34 @@ static void handleStationDetail() {
   String name    = getNodeName(target->nodeId);
   String notes   = getNodeNotes(target->nodeId);
   const bool isDeployed = (target->state == DEPLOYED);
+  const NodeDesiredConfig displayedDesired =
+      getDesiredConfig(target->nodeId.c_str());
+  const bool desiredPending = target->stateChangePending &&
+      displayedDesired.configVersion > target->configVersionApplied;
+  const bool displayedPaused = desiredPending
+      ? displayedDesired.targetState == 3
+      : target->recordingPaused;
   uint8_t observedWakeMin = (target->wakeIntervalMin > 0)
     ? target->wakeIntervalMin
     : target->inferredWakeIntervalMin;
-  int activeIntervalMin = (observedWakeMin > 0)
-    ? observedWakeMin
-    : (isAllowedInterval(gWakeIntervalMin) ? gWakeIntervalMin : 5);
+  int activeIntervalMin = desiredPending && displayedDesired.wakeIntervalMin > 0
+    ? displayedDesired.wakeIntervalMin
+    : ((observedWakeMin > 0)
+        ? observedWakeMin
+        : (isAllowedInterval(gWakeIntervalMin) ? gWakeIntervalMin : 5));
 
   // --- Status header ---
   html += F("<div class='muted' style='margin:0 0 10px 0'>");
   if (target->state == DEPLOYED) {
-    if (target->recordingPaused) html += F("<span class='chip chip--state-paused'>Paused</span>");
-    else html += F("<span class='chip chip--state-deployed'>Active</span>");
+    if (displayedPaused) {
+      html += desiredPending
+          ? F("<span class='chip chip--state-paused'>Pause queued</span>")
+          : F("<span class='chip chip--state-paused'>Paused</span>");
+    } else {
+      html += desiredPending
+          ? F("<span class='chip chip--state-deployed'>Resume/change queued</span>")
+          : F("<span class='chip chip--state-deployed'>Active</span>");
+    }
   }
   else if (target->state == PAIRED) html += F("<span class='chip chip--state-paired'>Connected</span>");
   else html += F("<span class='chip chip--state-unpaired'>New</span>");
@@ -2643,7 +2722,7 @@ static void handleStationDetail() {
   if (!isDeployed) {
     // New / Connected node — the in-hand deploy path.
     html += F("<label class='action-choice action-choice--start'><input type='radio' name='action' value='start'><span>Deploy (start recording)</span></label>");
-  } else if (target->recordingPaused) {
+  } else if (displayedPaused) {
     // Paused deployed node — resume remotely at the next sync.
     html += F("<label class='action-choice action-choice--start'><input type='radio' name='action' value='resume'><span>Resume recording</span></label>");
   } else {
@@ -2733,28 +2812,29 @@ static void handleNodeConfigSave() {
   const bool newDesiredConfig = dc.configVersion == 0;
   if (!scheduleHandoverPending || newDesiredConfig ||
       (dc.wakeIntervalMin == 0 && interval > 0)) {
-    dc.wakeIntervalMin = (uint8_t)interval;
-    cfgChanged = true;
+    if (dc.wakeIntervalMin != (uint8_t)interval) {
+      dc.wakeIntervalMin = (uint8_t)interval;
+      cfgChanged = true;
+    }
   }
   if (!scheduleHandoverPending || newDesiredConfig ||
       (gSyncMode == SYNC_MODE_INTERVAL && dc.syncIntervalMin == 0)) {
-    dc.syncIntervalMin = desiredSyncMin;
-    cfgChanged = true;
+    if (dc.syncIntervalMin != desiredSyncMin) {
+      dc.syncIntervalMin = desiredSyncMin;
+      cfgChanged = true;
+    }
   }
   if (!scheduleHandoverPending || newDesiredConfig || dc.syncPhaseUnix == 0) {
-    dc.syncPhaseUnix = bootstrapPhaseUnix;
-    cfgChanged = true;
+    if (dc.syncPhaseUnix != bootstrapPhaseUnix) {
+      dc.syncPhaseUnix = bootstrapPhaseUnix;
+      cfgChanged = true;
+    }
   }
-  if (newDesiredConfig) dc.configVersion = 1;
-  else if (cfgChanged) {
-    dc.configVersion = (dc.configVersion < 0xFFFFu)
-        ? (dc.configVersion + 1u) : 1u;
+  if (newDesiredConfig) cfgChanged = true;
+  if (cfgChanged) {
+    applyLocalDesiredConfig(nodeId, dc, true);
+    dc = getDesiredConfig(nodeId.c_str());
   }
-  // Record the change through the shared dispatcher (revision + durable result)
-  // before applying it to the registry / delivering via NODE_CONFIG.
-  controlRecordNodeChange(nodeId, dc.wakeIntervalMin, dc.targetState,
-                          dc.sensorMask, SRC_LOCAL_UI);
-  setDesiredConfig(nodeId.c_str(), dc);
   if (target) target->wakeIntervalMin = (uint8_t)interval;
   // Persist any updated node fields (name/notes/lat/lon) to NVS.
   if (target) savePairedNodes();
@@ -2798,12 +2878,11 @@ static void handleNodeConfigSave() {
     if (target && target->state == DEPLOYED) {
       NodeDesiredConfig du = getDesiredConfig(nodeId.c_str());
       du.targetState = 3;  // STANDBY
-      du.configVersion = (du.configVersion < 0xFFFFu) ? (du.configVersion + 1u) : 1u;
-      setDesiredConfig(nodeId.c_str(), du);
-      target->recordingPaused = true;
-      target->stateChangePending = true;
-      savePairedNodes();
-      pauseOk = true;
+      const NodeConfigApplyResult applied = applyLocalDesiredConfig(nodeId, du);
+      pauseOk = applied.durable && applied.registryApplied &&
+                (applied.command.outcome == OUT_ACCEPTED ||
+                 applied.command.outcome == OUT_REPLAY);
+      du = getDesiredConfig(nodeId.c_str());
       Serial.printf("[CONFIG] %s pause SCHEDULED: desired v%u STANDBY at next sync\n",
                     nodeId.c_str(), (unsigned)du.configVersion);
     }
@@ -2811,12 +2890,11 @@ static void handleNodeConfigSave() {
     if (target && target->state == DEPLOYED) {
       NodeDesiredConfig du = getDesiredConfig(nodeId.c_str());
       du.targetState = 2;  // DEPLOYED / ACTIVE
-      du.configVersion = (du.configVersion < 0xFFFFu) ? (du.configVersion + 1u) : 1u;
-      setDesiredConfig(nodeId.c_str(), du);
-      target->recordingPaused = false;
-      target->stateChangePending = true;
-      savePairedNodes();
-      resumeOk = true;
+      const NodeConfigApplyResult applied = applyLocalDesiredConfig(nodeId, du);
+      resumeOk = applied.durable && applied.registryApplied &&
+                 (applied.command.outcome == OUT_ACCEPTED ||
+                  applied.command.outcome == OUT_REPLAY);
+      du = getDesiredConfig(nodeId.c_str());
       Serial.printf("[CONFIG] %s resume SCHEDULED: desired v%u ACTIVE at next sync\n",
                     nodeId.c_str(), (unsigned)du.configVersion);
     }
@@ -2830,12 +2908,12 @@ static void handleNodeConfigSave() {
         // Do NOT send imperatively or delete locally (that orphaned the node).
         NodeDesiredConfig du = getDesiredConfig(nodeId.c_str());
         du.targetState = 0;  // UNPAIRED
-        du.configVersion = (du.configVersion < 0xFFFFu) ? (du.configVersion + 1u) : 1u;
-        setDesiredConfig(nodeId.c_str(), du);
-        target->stateChangePending = true;
-        target->pendingTargetState = PENDING_TO_UNPAIRED;
-        savePairedNodes();
-        unpairOk = true;  // scheduled — completes at next sync
+        const NodeConfigApplyResult applied =
+            applyLocalDesiredConfig(nodeId, du, false, true);
+        unpairOk = applied.durable && applied.registryApplied &&
+                   (applied.command.outcome == OUT_ACCEPTED ||
+                    applied.command.outcome == OUT_REPLAY);
+        du = getDesiredConfig(nodeId.c_str());
         Serial.printf("[CONFIG] %s unpair SCHEDULED (deployed): desired v%u UNPAIRED at next sync\n",
                       nodeId.c_str(), (unsigned)du.configVersion);
       } else {
@@ -2986,6 +3064,15 @@ static void handleSettings() {
   html += F("> <strong>Enable cloud upload</strong></label>");
   html += F("<div class='help'>When enabled, the Mothership uploads new data during collection rounds (subject to schedule and battery checks).</div>");
 
+  const bool remoteManagementEnabled = backendControlRemoteManagementEnabled();
+  html += F("<label class='label' style='margin-top:12px'><input type='checkbox' name='remote_management' value='1'");
+  if (remoteManagementEnabled) html += F(" checked");
+  html += F("> <strong>Allow queued dashboard node changes</strong></label>");
+  html += F("<div class='help'>Dashboard changes are stored in the backend, received at a later LTE check-in, then sent to nodes during the following normal sync window. Turning this off stops new command execution without stopping logging, syncing or uploads.</div>");
+  if (!remoteManagementEnabled) {
+    html += F("<label class='label' style='margin-top:8px'><input type='checkbox' name='confirm_remote_management' value='yes'> I understand and deliberately want to enable remote management on this FieldHub.</label>");
+  }
+
   html += F("<label class='label' for='api_key'>API Key</label>");
   if (tx.apiKey.length() > 0) {
     html += F("<p class='muted'>API key configured (last 4: ");
@@ -3130,6 +3217,20 @@ static void handleSetTransmission() {
   }
   tx.allowManualUpload = server.hasArg("allow_manual") && server.arg("allow_manual") == "1";
 
+  const bool remoteWasEnabled = backendControlRemoteManagementEnabled();
+  const bool remoteRequested = server.hasArg("remote_management") &&
+                               server.arg("remote_management") == "1";
+  const bool remoteConfirmed = server.hasArg("confirm_remote_management") &&
+                               server.arg("confirm_remote_management") == "yes";
+  if (remoteRequested && !remoteWasEnabled && !remoteConfirmed) {
+    if (isAjaxRequest()) {
+      sendAjaxResult(false, "Confirm remote management before enabling it");
+    } else {
+      server.send(400, "text/plain", "Confirm remote management before enabling it");
+    }
+    return;
+  }
+
   // uploadIntervalMin / minBatteryMv / maxBytesPerSession / maxRetriesPerWindow
   // are no longer user-editable — carry the fixed defaults straight from load
   // (which forces them), along with the phase anchor this form doesn't edit.
@@ -3149,6 +3250,12 @@ static void handleSetTransmission() {
   // Keep the previous API key if the form field was left blank (no QR string).
   if (tx.apiKey.length() == 0 || tx.apiKey.indexOf("\u2022") >= 0) {
     tx.apiKey = prev.apiKey;
+  }
+
+  if (!backendControlSetRemoteManagementEnabled(remoteRequested)) {
+    if (isAjaxRequest()) sendAjaxResult(false, "Could not persist remote management setting");
+    else server.send(500, "text/plain", "Could not persist remote management setting");
+    return;
   }
 
   saveTransmissionSettings(tx);
@@ -3289,7 +3396,7 @@ static void handleManualUpload() {
           manDiagJson,
           mPaused,
           mothershipFirmwareStatusJson(),
-          dispatcherStatusJson()
+          backendControlStatusJson()
         };
 
         while (posts < kMaxManualPosts && gUploadQueue.getPendingRows() > 0 && !stop) {
@@ -3319,6 +3426,7 @@ static void handleManualUpload() {
             gUploadQueue.purgeUploaded();
             gUploadQueue.resetRetryCount();
             sent += json.rowCount;
+            ingestBackendResponseFromUi(result.responseBody);
           } else if (result.httpStatus == 401 || result.httpStatus == 400) {
             char buf[80];
             snprintf(buf, sizeof(buf), "HTTP %d (%s)",
@@ -3543,11 +3651,15 @@ static void handleSetNodeSensors() {
   NodeDesiredConfig dc = getDesiredConfig(nodeId.c_str());
   if (dc.sensorMask != storedMask) {
     dc.sensorMask = storedMask;
-    dc.configVersion = (dc.configVersion == 0) ? 1u
-                     : (dc.configVersion < 0xFFFFu ? dc.configVersion + 1u : 1u);
-    controlRecordNodeChange(nodeId, dc.wakeIntervalMin, dc.targetState,
-                            dc.sensorMask, SRC_LOCAL_UI);
-    setDesiredConfig(nodeId.c_str(), dc);
+    const NodeConfigApplyResult applied = applyLocalDesiredConfig(nodeId, dc);
+    if (!applied.durable || !applied.registryApplied ||
+        (applied.command.outcome != OUT_ACCEPTED &&
+         applied.command.outcome != OUT_REPLAY)) {
+      server.send(500, "application/json",
+                  "{\"ok\":false,\"error\":\"config persistence failed\"}");
+      return;
+    }
+    dc = getDesiredConfig(nodeId.c_str());
   }
   setNodeExpectedSensorMask(nodeId.c_str(), capBits);
 
@@ -3568,39 +3680,11 @@ static void handleSetNodeSensors() {
   server.send(200, "application/json", resp);
 }
 
-// ---------------------------------------------------------------------------
-// Command dispatcher gate (plan §4.2/§4.3)
-// Every local node-config mutation is recorded through the shared dispatcher so
-// it gets a mothership-owned state revision and a durable result. Local UI acts
-// on current state, so it submits expectedRevision = current and is not blocked;
-// the revision trail is what lets a future stale dashboard command be rejected.
-// The registry's NodeDesiredConfig + NODE_CONFIG remain the node-delivery path.
-// ---------------------------------------------------------------------------
-static uint32_t controlRecordNodeChange(const String& nodeId, uint8_t wake,
-                                        uint8_t target, uint16_t mask, CmdSource src) {
-  Command c{};
-  snprintf(c.cmdId, CMD_ID_LEN, "L%08lx", (unsigned long)millis());
-  c.type = CMD_SET_NODE_CONFIG;
-  c.source = src;
-  c.expectedRevision = dispatcherRevision();   // local UI operates on current state
-  strlcpy(c.payload.nodeId, nodeId.c_str(), CMD_NODEID_LEN);
-  c.payload.wakeIntervalMin = wake ? wake : 1;  // dispatcher requires >= 1
-  c.payload.targetState = target;
-  c.payload.sensorMask = mask;
-
-  CommandResult r = dispatcherSubmit(c);
-  Serial.printf("[CTRL] %s change -> %s rev=%u\n", nodeId.c_str(),
-                cmdOutcomeStr(r.outcome),
-                r.assignedRevision ? r.assignedRevision : r.currentRevision);
-  return r.assignedRevision ? r.assignedRevision : r.currentRevision;
-}
-
-// GET /api/control — authoritative revision + recent command results (mirroring).
-// Uses the shared dispatcher serializer so the local and cloud control blocks
-// are byte-identical in shape.
+// GET /api/control - authoritative revision, cursor, enable flag and results.
+// Uses the backend-control serializer so local and cloud views stay identical.
 static void handleControlStatus() {
   server.sendHeader("Cache-Control", "no-store");
-  server.send(200, "application/json", dispatcherStatusJson());
+  server.send(200, "application/json", backendControlStatusJson());
 }
 
 // ---------------------------------------------------------------------------
@@ -3680,6 +3764,7 @@ void startConfigServer() {
   // Load the shared control revision + recent command results from NVS so a
   // reboot mid-session resumes the same authoritative revision.
   dispatcherInit();
+  backendControlInit();
 
   // WiFi AP + STA (AP for web UI, STA for ESP-NOW on same channel).
   // ESP-NOW was already initialised by initEspNowConfig() before this call.

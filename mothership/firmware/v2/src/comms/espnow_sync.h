@@ -43,12 +43,26 @@ struct SyncCapsSlot {
   fw_caps_message_t caps;
 };
 
+// An unpaired node emits NODE_STATUS while it stays awake for recovery. The
+// main sync loop validates its stable MAC + nodeId against the registry before
+// sending a recovery DEPLOY_NODE.
+struct SyncStatusSlot {
+  uint8_t mac[6];
+  node_status_message_t status;
+};
+
+struct SyncDeployAckSlot {
+  uint8_t mac[6];
+  deployment_ack_message_t ack;
+};
+
 bool initEspNowSyncOnly(int channel);
 void broadcastSyncWindowOpen();
 bool broadcastSyncSessionOpen(const sync_session_open_message_t& open);
 bool sendDumpGrant(const uint8_t* mac, const dump_grant_message_t& grant);
 bool sendSyncRelease(const uint8_t* mac, const sync_release_message_t& release);
 bool sendSnapshotAckNow(const uint8_t* mac, const snapshot_ack_t& ack);
+bool sendDeploymentNow(const uint8_t* mac, const deployment_command_t& deploy);
 // Announce a new sync schedule (SET_SYNC_SCHED) to the fleet over the
 // broadcast peer during a sync window. Used to hand a changed schedule to
 // sleeping nodes at the moment they are awake on the OLD schedule.
@@ -77,6 +91,8 @@ int drainSyncHellos(SyncHelloSlot* out, int maxItems);
 // FW_CAPS collection — nodes report firmware/OTA identity after NODE_HELLO. The
 // receive callback enqueues them; handleSyncWake drains and updates the registry.
 int drainSyncCaps(SyncCapsSlot* out, int maxItems);
+int drainSyncStatuses(SyncStatusSlot* out, int maxItems);
+int drainDeployAcks(SyncDeployAckSlot* out, int maxItems);
 int drainDumpDone(SyncDoneSlot* out, int maxItems);
 int drainReleaseAcks(SyncReleaseAckSlot* out, int maxItems);
 

@@ -203,20 +203,30 @@ void setNodeFirmwareCaps(const fw_caps_message_t& caps) {
   }
 }
 
-void setDesiredConfig(const char* nodeId, const NodeDesiredConfig& cfg) {
+bool setDesiredConfig(const char* nodeId, const NodeDesiredConfig& cfg) {
   Preferences prefs;
   const String key = desiredConfigKeyPrefix(nodeId);
   if (!prefs.begin("node_dcfg", false)) {
     Serial.println("[REG] setDesiredConfig: NVS open failed");
-    return;
+    return false;
   }
-  prefs.putUShort((key + "v").c_str(), cfg.configVersion);
-  prefs.putUChar((key + "w").c_str(), cfg.wakeIntervalMin);
-  prefs.putUShort((key + "s").c_str(), cfg.syncIntervalMin);
-  prefs.putULong((key + "p").c_str(), cfg.syncPhaseUnix);
-  prefs.putUChar((key + "t").c_str(), cfg.targetState);
-  prefs.putUShort((key + "m").c_str(), cfg.sensorMask);
+  bool ok = true;
+  ok = prefs.putUShort((key + "v").c_str(), cfg.configVersion) == sizeof(uint16_t) && ok;
+  ok = prefs.putUChar((key + "w").c_str(), cfg.wakeIntervalMin) == sizeof(uint8_t) && ok;
+  ok = prefs.putUShort((key + "s").c_str(), cfg.syncIntervalMin) == sizeof(uint16_t) && ok;
+  ok = prefs.putULong((key + "p").c_str(), cfg.syncPhaseUnix) == sizeof(uint32_t) && ok;
+  ok = prefs.putUChar((key + "t").c_str(), cfg.targetState) == sizeof(uint8_t) && ok;
+  ok = prefs.putUShort((key + "m").c_str(), cfg.sensorMask) == sizeof(uint16_t) && ok;
   prefs.end();
+
+  if (!ok) return false;
+  const NodeDesiredConfig verify = getDesiredConfig(nodeId);
+  return verify.configVersion == cfg.configVersion &&
+         verify.wakeIntervalMin == cfg.wakeIntervalMin &&
+         verify.syncIntervalMin == cfg.syncIntervalMin &&
+         verify.syncPhaseUnix == cfg.syncPhaseUnix &&
+         verify.targetState == cfg.targetState &&
+         verify.sensorMask == cfg.sensorMask;
 }
 
 // -----------------------------------------------------------------------------
@@ -419,6 +429,12 @@ void savePairedNodes() {
     snprintf(key, sizeof(key), "pau%d", idx);
     writeOk = prefs.putUChar(key, n.recordingPaused ? 1 : 0) == sizeof(uint8_t) && writeOk;
 
+    // Preserve the node-confirmed config version across the FieldHub's complete
+    // power-off between wakes. Pending state is reconstructed from this value
+    // and the separately persisted desired config when the registry reloads.
+    snprintf(key, sizeof(key), "cfgv%d", idx);
+    writeOk = prefs.putUShort(key, n.configVersionApplied) == sizeof(uint16_t) && writeOk;
+
     idx++;
   }
 
@@ -431,7 +447,7 @@ void savePairedNodes() {
   // Stale records above count are harmless, but remove them after the new count
   // is committed so a shrinking registry does not consume NVS indefinitely.
   if (writeOk && oldCount > count) {
-    const char* prefixes[] = {"mac", "id", "typ", "st", "batv", "lat", "lon", "dep", "pau"};
+    const char* prefixes[] = {"mac", "id", "typ", "st", "batv", "lat", "lon", "dep", "pau", "cfgv"};
     for (int stale = count; stale < oldCount; ++stale) {
       char key[16];
       for (const char* prefix : prefixes) {
@@ -624,6 +640,11 @@ void loadPairedNodes() {
     bool savedPaused = false;
     if (prefs.getType(key) == PT_U8) savedPaused = prefs.getUChar(key, 0) != 0;
 
+    // --- Node-confirmed config version (optional; added after initial rollout) ---
+    snprintf(key, sizeof(key), "cfgv%d", i);
+    uint16_t savedConfigVersion = 0;
+    if (prefs.getType(key) == PT_U16) savedConfigVersion = prefs.getUShort(key, 0);
+
     // All fields validated — build the NodeInfo record.
     NodeInfo newNode{};
     memcpy(newNode.mac, mac, 6);
@@ -641,7 +662,7 @@ void loadPairedNodes() {
     newNode.longitude            = (savedLon != 0.0f) ? savedLon : NAN;
     newNode.inferredWakeIntervalMin = 0;
     newNode.lastNodeTimestamp    = 0;
-    newNode.configVersionApplied = 0;
+    newNode.configVersionApplied = savedConfigVersion;
     newNode.lastConfigPushMs     = 0;
     newNode.deployPending        = false;
     newNode.stateChangePending   = false;
@@ -677,6 +698,16 @@ void loadPairedNodes() {
   for (auto& newNode : validatedNodes) {
     newNode.userId = getNodeUserId(newNode.nodeId);
     newNode.name   = getNodeName(newNode.nodeId);
+    // Reconstruct pending state from durable desired-vs-applied truth rather
+    // than persisting millis-based transient flags. This survives every cold
+    // wake and also migrates old records whose applied version defaults to 0.
+    const NodeDesiredConfig desired = getDesiredConfig(newNode.nodeId.c_str());
+    if (desired.configVersion > newNode.configVersionApplied) {
+      newNode.stateChangePending = true;
+      newNode.pendingTargetState = desired.targetState == 0
+          ? PENDING_TO_UNPAIRED : PENDING_TO_DEPLOYED;
+      newNode.pendingSinceMs = millis();
+    }
     registeredNodes.push_back(newNode);
   }
 
@@ -751,6 +782,7 @@ String buildNodesStatusJson(uint32_t nowUnix) {
       out += ",\"desiredConfigVersion\":";   out += String((unsigned)dc.configVersion);
       out += ",\"desiredTargetState\":";     out += String((unsigned)dc.targetState);
       out += ",\"desiredWakeIntervalMin\":"; out += String((unsigned)dc.wakeIntervalMin);
+      out += ",\"desiredSensorMask\":";      out += String((unsigned)dc.sensorMask);
     }
     // Node firmware/OTA identity via FW_CAPS. null/false until the node reports.
     if (n.hasFirmwareCaps) {

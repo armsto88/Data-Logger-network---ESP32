@@ -67,8 +67,8 @@ struct JsonPayload {
   uint32_t byteLength;       // body.length()
   uint16_t rowCount;         // readings emitted
   bool     ok;               // false = build failed (heap)
-  uint32_t csvBytesConsumed; // bytes of csvChunk consumed through the last
-                             // emitted row (for cursor advancement)
+  uint32_t csvBytesConsumed; // physical data-row bytes consumed (synthetic
+                             // csvChunk header excluded) for cursor advancement
 };
 
 // ---------------------------------------------------------------------------
@@ -80,7 +80,7 @@ struct JsonPayload {
 // text (header + rows) from UploadQueue::getNewData(). fwVersion is reported in
 // meta.firmwareVersion. csvBytesConsumed reports the byte offset within
 // csvChunk of the first un-parsed data row so the caller can advance the upload
-// cursor precisely.
+// cursor precisely. The prepended header is never included in this count.
 //
 // rtcFallbackUnix: the mothership RTC time (unix seconds). The backend rejects
 // a null datetime, so any reading whose CSV datetime is missing/"unknown" is

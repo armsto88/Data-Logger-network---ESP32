@@ -85,7 +85,7 @@ class ModemDriver {
 
   // HTTP/HTTPS POST via the A7670G socket API.
   // HTTPS uses CCH* API (CCHSTART/CCHOPEN/CCHSEND) with NTP sync + SNI.
-  // HTTP uses CIP* API (CIPOPEN/CIPSEND) as fallback.
+  // Explicit HTTP URLs use CIP* API (CIPOPEN/CIPSEND); HTTPS never downgrades.
   // Verified working on hardware with firmware A110B06A7670M7.
   HttpsPostResult httpsPost(const String& url,
                             const String& payload,

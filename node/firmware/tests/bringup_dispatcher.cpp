@@ -37,25 +37,26 @@ static void runSuite() {
   Serial.println("\n--- dispatcher assertion suite ---");
 
   // 1) Fresh accept -> revision 1.
-  CommandResult a = dispatcherSubmit(mkCfg("A", SRC_LOCAL_UI, 0, "N1", 10, 1));
+  CommandResult a = dispatcherSubmit(mkCfg("A", SRC_LOCAL_UI, 0, "N1", 10, 2));
   check("A accepted", a.outcome == OUT_ACCEPTED && a.assignedRevision == 1);
   check("revision is 1", dispatcherRevision() == 1);
 
   // 2) Replay of A -> stored result, no re-exec, revision unchanged.
-  CommandResult a2 = dispatcherSubmit(mkCfg("A", SRC_LOCAL_UI, 0, "N1", 99, 1));
+  CommandResult a2 = dispatcherSubmit(mkCfg("A", SRC_LOCAL_UI, 0, "N1", 99, 2));
+  check("A replay reports REPLAY", a2.outcome == OUT_REPLAY);
   check("A replay returns stored (rev 1)", a2.assignedRevision == 1);
   check("replay did not advance revision", dispatcherRevision() == 1);
   check("replay did not mutate config",
         dispatcherNodeConfig("N1") && dispatcherNodeConfig("N1")->wakeIntervalMin == 10);
 
   // 3) Stale compare-and-set (dashboard saw rev 0, current is 1) -> conflict.
-  CommandResult b = dispatcherSubmit(mkCfg("B", SRC_DASHBOARD, 0, "N1", 20, 1));
+  CommandResult b = dispatcherSubmit(mkCfg("B", SRC_DASHBOARD, 0, "N1", 20, 2));
   check("stale B -> REVISION_CONFLICT", b.outcome == OUT_REVISION_CONFLICT);
   check("conflict reports current rev 1", b.currentRevision == 1);
   check("conflict did not advance revision", dispatcherRevision() == 1);
 
   // 4) Correct CAS -> accept rev 2, and supersede the not-yet-converged A.
-  CommandResult c = dispatcherSubmit(mkCfg("C", SRC_DASHBOARD, 1, "N1", 20, 1));
+  CommandResult c = dispatcherSubmit(mkCfg("C", SRC_DASHBOARD, 1, "N1", 20, 2));
   check("C accepted at rev 2", c.outcome == OUT_ACCEPTED && c.assignedRevision == 2);
   CommandResult aStored;
   check("A now SUPERSEDED",
@@ -64,22 +65,27 @@ static void runSuite() {
         dispatcherNodeConfig("N1")->wakeIntervalMin == 20);
 
   // 5) Invalid payload (wake 0) -> rejected, no revision change.
-  CommandResult d = dispatcherSubmit(mkCfg("D", SRC_LOCAL_UI, 2, "N2", 0, 1));
+  CommandResult d = dispatcherSubmit(mkCfg("D", SRC_LOCAL_UI, 2, "N2", 0, 2));
   check("invalid D -> INVALID", d.outcome == OUT_INVALID);
   check("invalid did not advance revision", dispatcherRevision() == 2);
 
-  // 6) Pause a different node (targetState 0) -> accept rev 3.
-  CommandResult e = dispatcherSubmit(mkCfg("E", SRC_DASHBOARD, 2, "N2", 15, 0));
+  // 6) Pause a different node (explicit STANDBY=3) -> accept rev 3.
+  CommandResult e = dispatcherSubmit(mkCfg("E", SRC_DASHBOARD, 2, "N2", 15, 3));
   check("E (pause N2) accepted rev 3", e.outcome == OUT_ACCEPTED && e.assignedRevision == 3);
-  check("N2 targetState = PAUSED(0)", dispatcherNodeConfig("N2")->targetState == 0);
+  check("N2 targetState = STANDBY(3)", dispatcherNodeConfig("N2")->targetState == 3);
 
   // 7) Converged command is NOT superseded by a later change.
-  dispatcherMarkConverged("N1", 2);   // C converged
-  CommandResult f = dispatcherSubmit(mkCfg("F", SRC_LOCAL_UI, 3, "N1", 30, 1));
+  check("wire config version bound", dispatcherBindNodeConfigVersion("N1", 2, 7));
+  uint32_t wireRevision = 0;
+  check("wire version resolves revision",
+        dispatcherRevisionForConfigVersion("N1", 7, &wireRevision) && wireRevision == 2);
+  check("C convergence recorded once", dispatcherMarkConverged("N1", wireRevision));
+  check("C duplicate convergence ignored", !dispatcherMarkConverged("N1", wireRevision));
+  CommandResult f = dispatcherSubmit(mkCfg("F", SRC_LOCAL_UI, 3, "N1", 30, 2));
   check("F accepted rev 4", f.outcome == OUT_ACCEPTED && f.assignedRevision == 4);
   CommandResult cStored;
-  check("converged C stays ACCEPTED (not superseded)",
-        dispatcherResultFor("C", &cStored) && cStored.outcome == OUT_ACCEPTED);
+  check("converged C stays CONVERGED (not superseded)",
+        dispatcherResultFor("C", &cStored) && cStored.outcome == OUT_CONVERGED);
   check("N1 config now wake 30", dispatcherNodeConfig("N1")->wakeIntervalMin == 30);
 
   Serial.printf("=== SUITE: %d passed, %d failed (revision=%u) ===\n",
@@ -112,7 +118,7 @@ void loop() {
   if (ch == '\n' || ch == '\r') return;
   if (ch == 'r') {
     uint32_t rev = dispatcherRevision();
-    CommandResult m = dispatcherSubmit(mkCfg("persist-marker", SRC_DASHBOARD, rev, "P1", 7, 1));
+    CommandResult m = dispatcherSubmit(mkCfg("persist-marker", SRC_DASHBOARD, rev, "P1", 7, 2));
     Serial.printf("[persist] submitted marker: %s rev=%u -> rebooting...\n",
                   cmdOutcomeStr(m.outcome), m.assignedRevision);
     delay(600);

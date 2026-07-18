@@ -86,6 +86,43 @@ void setup() {
                "JSON contains numeric spectral_integration_ms");
   ok &= expect(json.body.indexOf("\"spectral_saturated\":0.000") >= 0,
                "JSON contains numeric spectral_saturated");
+  ok &= expect(json.csvBytesConsumed == row.length() + 1,
+               "cursor consumption excludes the synthetic CSV header");
+
+  // Reproduce the production multi-chunk boundary: after the first POST, the
+  // returned byte count is applied to the physical data portion. The next
+  // build must begin exactly at row 2 without skipping into it.
+  String secondRow = row;
+  secondRow.replace(",42,", ",43,");
+  String twoRowChunk = String(kCurrentCSVHeader30) + "\n" + row + "\n" +
+                       secondRow + "\n";
+  JsonPayload firstChunk = buildJsonUpload(twoRowChunk, 1, "cursor-test", nullptr,
+                                           header->nodeTimestamp);
+  const uint32_t firstDataOffset = strlen(kCurrentCSVHeader30) + 1;
+  const String remainingData = twoRowChunk.substring(
+      firstDataOffset + firstChunk.csvBytesConsumed);
+  const String secondChunkCsv = String(kCurrentCSVHeader30) + "\n" + remainingData;
+  JsonPayload secondChunk = buildJsonUpload(secondChunkCsv, 1, "cursor-test", nullptr,
+                                            header->nodeTimestamp);
+  ok &= expect(firstChunk.csvBytesConsumed == row.length() + 1,
+               "first multi-chunk cursor stops exactly after row 1");
+  ok &= expect(secondChunk.ok && secondChunk.rowCount == 1 &&
+               secondChunk.body.indexOf("\"seqNum\":43") >= 0,
+               "second multi-chunk build starts at the complete next row");
+
+  // The deployed queue already begins with a fragment left by the old
+  // over-advancing purge. It must be consumed locally without being emitted,
+  // while the following complete row remains uploadable.
+  const String truncated = "3.551,23.300,58.000,1.000,2.000,3.000,4.000\n";
+  const String recoveryCsv = String(kCurrentCSVHeader30) + "\n" + truncated +
+                             row + "\n";
+  JsonPayload recovered = buildJsonUpload(recoveryCsv, 100, "recovery-test", nullptr,
+                                          header->nodeTimestamp);
+  ok &= expect(recovered.ok && recovered.rowCount == 1 &&
+               recovered.body.indexOf("\"nodeId\":\"PAR_TEST\"") >= 0,
+               "truncated leading row is skipped and the next full row uploads");
+  ok &= expect(recovered.csvBytesConsumed == truncated.length() + row.length() + 1,
+               "recovery cursor consumes the fragment and complete uploaded row");
 
   Serial.printf("=== RESULT: %s ===\n", ok ? "PASS" : "FAIL");
 }

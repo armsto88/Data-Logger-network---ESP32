@@ -391,23 +391,14 @@ HttpsPostResult ModemDriver::httpsPost(const String& url,
   httpReq += "\r\n";
   httpReq += payload;
 
-  // 4. Try SSL (CCH* API) if URL is HTTPS, then TCP (CIP* API) as fallback
-  bool posted = false;
+  // 4. Preserve the URL's transport. An HTTPS upload carrying commands or
+  // credentials must never be retried in clear text after a TLS failure.
+  const bool posted = useSSL
+      ? httpsPostSSL(host, port, httpReq, result)
+      : httpsPostTCP(host, port, httpReq, result);
 
-  if (useSSL) {
-    posted = httpsPostSSL(host, port, httpReq, result);
-  }
-
-  // Only fall back to plaintext TCP when SSL produced NO HTTP response at all
-  // (transport failure: httpStatus stays <= 0). A real HTTP status — even a
-  // 4xx/5xx like 401 — is authoritative and must NOT be retried in clear text
-  // on port 80 (that would leak the payload and mask the real status code).
-  if (!posted && result.httpStatus <= 0) {
-    Serial.println("[Modem] SSL got no HTTP response, trying TCP...");
-    int tcpPort = useSSL ? 80 : port;
-    posted = httpsPostTCP(host, tcpPort, httpReq, result);
-  } else if (!posted) {
-    Serial.printf("[Modem] SSL returned HTTP %d — not falling back to plaintext\n",
+  if (useSSL && !posted) {
+    Serial.printf("[Modem] HTTPS failed (HTTP %d); plaintext fallback disabled\n",
                   result.httpStatus);
   }
 

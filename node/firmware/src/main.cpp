@@ -178,6 +178,9 @@ enum class RecoveryReason : uint8_t {
 
 static bool g_rtcReady = false;
 static bool g_rtcPowerLost = false;
+// Persistent identity/config is safety-critical. A failed NVS mount must never
+// be "repaired" by erasing the partition from a normal boot or OTA image.
+static bool g_nvsReady = false;
 static RecoveryReason g_recoveryReason = RecoveryReason::NONE;
 static bool g_alarmWakeVerified = false;
 static bool g_eventApplyActive = false;
@@ -331,19 +334,35 @@ static inline void formatTime(const DateTime& dt, char* out, size_t n) {
            dt.hour(), dt.minute(), dt.second());
 }
 
-static void initNVS()
-{
-  esp_err_t err = nvs_flash_init();
-  if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
-    Serial.printf("[NVS] init err: %s → erasing NVS partition...\n", esp_err_to_name(err));
-    ESP_ERROR_CHECK(nvs_flash_erase());
-    err = nvs_flash_init();
-  }
-  if (err == ESP_OK) {
+static bool initNVS() {
+  const esp_err_t err = nvs_flash_init();
+  g_nvsReady = err == ESP_OK;
+  if (g_nvsReady) {
     Serial.println("[NVS] init OK");
   } else {
-    Serial.printf("[NVS] init FAILED: %s\n", esp_err_to_name(err));
+    // Do not call nvs_flash_erase() here. A partition-table/schema mismatch or
+    // transient mount error must leave the deployed node's credentials intact
+    // for a later safe recovery, rather than silently orphaning it.
+    Serial.printf("[NVS] init FAILED: %s; preserving NVS (no automatic erase)\n",
+                  esp_err_to_name(err));
   }
+  return g_nvsReady;
+}
+
+// An OTA image is still pending verification on its first boot. If that image
+// cannot mount the existing NVS layout, roll it back without modifying NVS so
+// the previously working image and the node's identity remain recoverable.
+static bool rollbackPendingOtaForNvsFault() {
+  const esp_partition_t* running = esp_ota_get_running_partition();
+  esp_ota_img_states_t state = ESP_OTA_IMG_UNDEFINED;
+  if (!running || esp_ota_get_state_partition(running, &state) != ESP_OK ||
+      state != ESP_OTA_IMG_PENDING_VERIFY) {
+    return false;
+  }
+
+  Serial.println("[OTA] pending image cannot mount NVS; rolling back without erasing NVS");
+  esp_ota_mark_app_invalid_rollback_and_reboot();
+  return true;  // Unreachable after a successful rollback/reboot request.
 }
 
 // ---- DS3231 helpers ----
@@ -709,6 +728,10 @@ static bool g_postUnpairHold = false;
 #define RESCUE_BEACON_INTERVAL_MS 5000UL
 #endif
 
+#ifndef UNPAIRED_STATUS_INTERVAL_MS
+#define UNPAIRED_STATUS_INTERVAL_MS 30000UL
+#endif
+
 static bool g_espNowReady = false;
 static volatile uint32_t g_syncWindowMarkerMs = 0;
 static volatile bool g_lastSendDone = false;
@@ -883,6 +906,10 @@ static void debugState(const char* where) {
 // ---------- Persistent config (NVS) ----------
 static bool persistNodeConfig(uint16_t candidateConfigVersion = 0,
                               bool useCandidateConfigVersion = false) {
+  if (!g_nvsReady) {
+    Serial.println("[CFG] commit blocked: NVS is unavailable; existing flash contents were not changed");
+    return false;
+  }
   nodeState = currentNodeState();
   NodeConfigStoreRecord record{};
   memcpy(record.mothershipMac, mothershipMAC, sizeof(record.mothershipMac));
@@ -915,6 +942,23 @@ static bool persistNodeConfig(uint16_t candidateConfigVersion = 0,
 static void loadNodeConfig() {
   NodeConfigStoreRecord record{};
   NodeConfigLoadStatus loadStatus = NodeConfigLoadStatus::NoValidConfig;
+  if (!g_nvsReady) {
+    // RAM defaults let the node stay awake and announce its MAC-derived ID for
+    // recovery. They are deliberately not persisted over the real record.
+    Serial.println("[CFG] NVS unavailable; using non-persistent recovery defaults");
+    nodeState        = STATE_UNPAIRED;
+    rtcSynced        = false;
+    deployedFlag     = false;
+    g_intervalMin    = 1;
+    lastTimeSyncUnix = 0;
+    g_syncIntervalMin = 15;
+    g_syncPhaseUnix = 0;
+    g_lastSyncSlot = 0xFFFFFFFFUL;
+    g_appliedConfigVersion = 0;
+    g_recordingPaused = false;
+    memset(mothershipMAC, 0, sizeof(mothershipMAC));
+    return;
+  }
   if (!nodeConfigStoreLoad(record, &loadStatus)) {
     Serial.println("[CFG] no valid config record; using defaults");
     nodeState        = STATE_UNPAIRED;
@@ -975,7 +1019,6 @@ static void sendNodeHello(bool broadcastFallback = true);
 static uint16_t getNodeConfigVersion();
 static void setNodeConfigVersion(uint16_t v);
 static bool updateRescueBootStreak(uint32_t nowUnix);
-static void wipeNodeConfigToUnpaired();
 static void enterRescueMode();
 static bool bringupEspNow();
 static bool ensureEspNowPeer(const uint8_t* mac);
@@ -1769,6 +1812,10 @@ static void sendNodeStatusUpdate(const char* reason) {
 }
 
 static bool updateRescueBootStreak(uint32_t nowUnix) {
+  if (!g_nvsReady) {
+    Serial.println("[RESCUE] boot gesture disabled while NVS is unavailable");
+    return false;
+  }
   Preferences p;
   if (!p.begin("rescue_ctl", false)) {
     Serial.println("⚠️ Rescue streak: NVS open failed");
@@ -1801,26 +1848,6 @@ static bool updateRescueBootStreak(uint32_t nowUnix) {
   return trigger;
 }
 
-static void wipeNodeConfigToUnpaired() {
-  nodeState = STATE_UNPAIRED;
-  rtcSynced = false;
-  deployedFlag = false;
-  g_intervalMin = 1;
-  g_syncIntervalMin = 15;
-  g_syncPhaseUnix = 0;
-  g_lastSyncSlot = 0xFFFFFFFFUL;
-  lastTimeSyncUnix = 0;
-  memset(mothershipMAC, 0, sizeof(mothershipMAC));
-
-  ds3231DisableAlarmInterrupt();
-  ds3231DisableAlarm2Interrupt();
-  clearDS3231_AlarmFlags();
-
-  setNodeConfigVersion(0);
-  persistNodeConfig();
-  debugState("after RESCUE wipe");
-}
-
 static void enterRescueMode() {
   g_rescueModeActive = true;
   g_lastRescueBeaconMs = 0;
@@ -1828,11 +1855,10 @@ static void enterRescueMode() {
   Serial.println("==================================================");
   Serial.println("RESCUE MODE ACTIVE");
   Serial.println("- Trigger: rapid 3-boot gesture");
-  Serial.println("- Action: node config wiped to UNPAIRED");
+  Serial.println("- Action: node config is retained (no automatic wipe)");
   Serial.println("- Behavior: stay awake with radio listening");
   Serial.println("==================================================");
 
-  wipeNodeConfigToUnpaired();
   if (!bringupEspNow()) {
     Serial.println("⚠️ RESCUE: ESP-NOW bringup failed; retrying in loop");
   }
@@ -2103,6 +2129,132 @@ static bool applySyncReleaseAndAck(const sync_release_message_t& release) {
   return applied;
 }
 
+// Apply a deferred NODE_CONFIG from main-task context while ESP-NOW is still
+// available. The receive callback only enqueues the command; coordinated sync
+// loops call this helper immediately after draining events so CONFIG_ACK is
+// returned before the mothership closes the radio window.
+static bool servicePendingNodeConfig() {
+  if (!g_pendingNodeConfig) return false;
+
+  g_pendingNodeConfig = false;
+  const node_config_message_t cfg = g_pendingNodeConfigData;
+  uint8_t senderMac[6];
+  memcpy(senderMac, g_pendingNodeConfigMac, sizeof(senderMac));
+
+  if (cfg.targetState == 0 /*UNPAIRED*/) {
+    // ACK the desired version FIRST so the mothership can confirm removal,
+    // then wipe via the existing unpair path.
+    config_apply_ack_message_t ack{};
+    strcpy(ack.command, "CONFIG_ACK");
+    strncpy(ack.nodeId, NODE_ID, sizeof(ack.nodeId) - 1);
+    ack.appliedVersion = cfg.configVersion;
+    ack.ok = 1;
+    esp_err_t ackRes = sendEspNowAndWait(senderMac, &ack, sizeof(ack), 250).queueResult;
+    Serial.printf("🗑️ [CONFIG] NODE_CONFIG UNPAIRED v%u -> CONFIG_ACK %s, unpairing\n",
+                  cfg.configVersion, ackRes == ESP_OK ? "OK" : esp_err_to_name(ackRes));
+    g_pendingUnpair = true;   // reuse the existing wipe path
+  } else if (cfg.targetState == 2 /*DEPLOYED*/) {
+    uint16_t currentVer = getNodeConfigVersion();
+    Serial.printf("🧩 [CONFIG] NODE_CONFIG DEPLOYED applying: v%u (current v%u) wakeMin=%u syncMin=%u\n",
+                  cfg.configVersion, currentVer, cfg.wakeIntervalMin, cfg.syncIntervalMin);
+
+    config_apply_ack_message_t ack{};
+    strcpy(ack.command, "CONFIG_ACK");
+    strncpy(ack.nodeId, NODE_ID, sizeof(ack.nodeId) - 1);
+    ack.appliedVersion = cfg.configVersion;
+    ack.ok = 0;
+
+    if (cfg.configVersion > currentVer) {
+      const uint8_t  oldWake    = g_intervalMin;
+      const uint16_t oldVersion = g_appliedConfigVersion;
+      const bool     wasPaused  = g_recordingPaused;
+      bool wakeChanged = false;
+      // NODE_CONFIG governs the recording (wake / A1) interval + the active vs
+      // standby state. targetState=DEPLOYED means ACTIVE: (re)enable recording.
+      // The sync (A2) schedule is left to SET_SYNC_SCHED so its live phase
+      // negotiation is never disturbed.
+      if (cfg.wakeIntervalMin > 0 && cfg.wakeIntervalMin != g_intervalMin) {
+        g_intervalMin = cfg.wakeIntervalMin;
+        wakeChanged = true;
+        Serial.printf("   ↪ wake interval updated: %u min\n", g_intervalMin);
+      }
+      g_recordingPaused = false;  // active — resume recording
+      const bool configPersisted = persistNodeConfig(cfg.configVersion, true);
+      if (configPersisted) setNodeConfigVersion(cfg.configVersion);
+      // Persist the configured sensor mask alongside the version bump. Only an
+      // authoritative mask (NODE_SENSOR_MASK_VALID set) is stored, so a legacy
+      // mothership sending 0 in this field can't wipe a real selection. Takes
+      // effect at the next wake, when initSensors() re-reads it.
+      if (configPersisted && (cfg.sensorMask & NODE_SENSOR_MASK_VALID) &&
+          cfg.sensorMask != g_expectedSensorMask) {
+        if (nodeSensorMaskSave(cfg.sensorMask)) {
+          g_expectedSensorMask = cfg.sensorMask;
+          Serial.printf("   ↪ sensor mask 0x%04X saved (applies next wake)\n",
+                        (unsigned)cfg.sensorMask);
+        } else {
+          Serial.println("   ⚠️ sensor mask persist FAILED");
+        }
+      }
+      // Re-arm if the interval changed OR we just resumed from standby (to
+      // bring the recording alarm A1 back).
+      if ((wakeChanged || wasPaused) && configPersisted &&
+          currentNodeState() == STATE_DEPLOYED && rtcSynced) {
+        g_rearmAlarmsPending = true;
+      }
+      if (wasPaused && configPersisted) Serial.println("   ▶️ resumed from standby");
+      ack.ok = configPersisted ? 1 : 0;
+      if (!configPersisted) {
+        g_intervalMin = oldWake;
+        g_recordingPaused = wasPaused;
+        g_appliedConfigVersion = oldVersion;
+        ack.appliedVersion = oldVersion;
+      }
+    } else {
+      ack.ok = 1;  // already current — still ACK so the mothership converges
+    }
+    esp_err_t ackRes = sendEspNowAndWait(senderMac, &ack, sizeof(ack), 250).queueResult;
+    Serial.printf("   ↪ NODE_CONFIG CONFIG_ACK (v%u ok=%d): %s\n",
+                  ack.appliedVersion, ack.ok, ackRes == ESP_OK ? "OK" : esp_err_to_name(ackRes));
+  } else if (cfg.targetState == 3 /*STANDBY*/) {
+    // Pause recording but stay deployed and keep the sync (A2) check-ins so we
+    // remain remotely resumable. The re-arm (paused) drops the A1 alarm.
+    uint16_t currentVer = getNodeConfigVersion();
+    config_apply_ack_message_t ack{};
+    strcpy(ack.command, "CONFIG_ACK");
+    strncpy(ack.nodeId, NODE_ID, sizeof(ack.nodeId) - 1);
+    ack.appliedVersion = cfg.configVersion;
+    ack.ok = 0;
+    if (cfg.configVersion > currentVer) {
+      const bool     wasPaused  = g_recordingPaused;
+      const uint16_t oldVersion = g_appliedConfigVersion;
+      g_recordingPaused = true;
+      const bool configPersisted = persistNodeConfig(cfg.configVersion, true);
+      if (configPersisted) setNodeConfigVersion(cfg.configVersion);
+      if (!wasPaused && configPersisted &&
+          currentNodeState() == STATE_DEPLOYED && rtcSynced) {
+        g_rearmAlarmsPending = true;  // re-arm to drop the recording alarm
+      }
+      ack.ok = configPersisted ? 1 : 0;
+      if (!configPersisted) {
+        g_recordingPaused = wasPaused;
+        g_appliedConfigVersion = oldVersion;
+        ack.appliedVersion = oldVersion;
+      }
+      Serial.printf("⏸️ [CONFIG] NODE_CONFIG STANDBY v%u %s (recording paused)\n",
+                    cfg.configVersion, configPersisted ? "applied" : "persist FAILED");
+    } else {
+      ack.ok = 1;
+    }
+    esp_err_t ackRes = sendEspNowAndWait(senderMac, &ack, sizeof(ack), 250).queueResult;
+    Serial.printf("   ↪ NODE_CONFIG CONFIG_ACK (v%u ok=%d): %s\n",
+                  ack.appliedVersion, ack.ok, ackRes == ESP_OK ? "OK" : esp_err_to_name(ackRes));
+  } else {
+    Serial.printf("[CONFIG] NODE_CONFIG targetState=%u ignored (reserved)\n",
+                  (unsigned)cfg.targetState);
+  }
+  return true;
+}
+
 // -------------------- Per-alarm handler --------------------
 static void handleRtcWakeEvents(bool dataWake, bool syncWake) {
   DateTime fired = rtc.now();
@@ -2183,6 +2335,7 @@ static void handleRtcWakeEvents(bool dataWake, bool syncWake) {
       while (rtc.now().unixtime() < listenUntilUnix && !g_syncSessionOpenPending) {
         feedWatchdog();
         serviceNodeEvents(8);
+        servicePendingNodeConfig();
         if (g_syncWindowMarkerMs != 0 &&
             (int32_t)(millis() - legacyFallbackAtMs) >= 0) {
           break;
@@ -2204,6 +2357,7 @@ static void handleRtcWakeEvents(bool dataWake, bool syncWake) {
         while ((int32_t)(helloAtMs - millis()) > 0) {
           feedWatchdog();
           serviceNodeEvents(8);
+          servicePendingNodeConfig();
           delay(5);
         }
         sendNodeHello(false);
@@ -2214,6 +2368,7 @@ static void handleRtcWakeEvents(bool dataWake, bool syncWake) {
         while ((int32_t)(sessionDeadlineMs - millis()) > 0 && !released) {
           feedWatchdog();
           serviceNodeEvents(12);
+          servicePendingNodeConfig();
           // SYNC_SESSION is repeated during rendezvous; the first accepted
           // session owns this wake, so later copies are just beacons.
           g_syncSessionOpenPending = false;
@@ -2269,6 +2424,10 @@ static void handleRtcWakeEvents(bool dataWake, bool syncWake) {
         g_syncSessionOpenPending = false;
         g_dumpGrantPending = false;
         g_syncReleasePending = false;
+        // Catch a final NODE_CONFIG received while RELEASE/ACK traffic was in
+        // flight. Keep the radio available until its CONFIG_ACK is sent.
+        serviceNodeEvents(12);
+        servicePendingNodeConfig();
         shutdownEspNow();
       } else if (g_syncWindowMarkerMs != 0) {
         // Rolling-upgrade fallback: an older V2 mothership knows only the
@@ -2362,7 +2521,9 @@ void setup() {
 
   initNodeIdentity();
 
-  initNVS();
+  if (!initNVS() && rollbackPendingOtaForNvsFault()) {
+    return;
+  }
   loadNodeConfig();
   bootCount++;
 
@@ -2780,122 +2941,7 @@ void loop() {
                   ackRes == ESP_OK ? "OK" : esp_err_to_name(ackRes));
   }
 
-  if (g_pendingNodeConfig) {
-    g_pendingNodeConfig = false;
-    node_config_message_t& cfg = g_pendingNodeConfigData;
-
-    if (cfg.targetState == 0 /*UNPAIRED*/) {
-      // ACK the desired version FIRST so the mothership can confirm removal,
-      // then wipe via the existing unpair path.
-      config_apply_ack_message_t ack{};
-      strcpy(ack.command, "CONFIG_ACK");
-      strncpy(ack.nodeId, NODE_ID, sizeof(ack.nodeId) - 1);
-      ack.appliedVersion = cfg.configVersion;
-      ack.ok = 1;
-      esp_err_t ackRes = sendEspNowAndWait(g_pendingNodeConfigMac, &ack, sizeof(ack), 250).queueResult;
-      Serial.printf("🗑️ [LOOP] NODE_CONFIG UNPAIRED v%u -> CONFIG_ACK %s, unpairing\n",
-                    cfg.configVersion, ackRes == ESP_OK ? "OK" : esp_err_to_name(ackRes));
-      g_pendingUnpair = true;   // reuse the existing wipe path
-    } else if (cfg.targetState == 2 /*DEPLOYED*/) {
-      uint16_t currentVer = getNodeConfigVersion();
-      Serial.printf("🧩 [LOOP] NODE_CONFIG DEPLOYED applying: v%u (current v%u) wakeMin=%u syncMin=%u\n",
-                    cfg.configVersion, currentVer, cfg.wakeIntervalMin, cfg.syncIntervalMin);
-
-      config_apply_ack_message_t ack{};
-      strcpy(ack.command, "CONFIG_ACK");
-      strncpy(ack.nodeId, NODE_ID, sizeof(ack.nodeId) - 1);
-      ack.appliedVersion = cfg.configVersion;
-      ack.ok = 0;
-
-      if (cfg.configVersion > currentVer) {
-        const uint8_t  oldWake    = g_intervalMin;
-        const uint16_t oldVersion = g_appliedConfigVersion;
-        const bool     wasPaused  = g_recordingPaused;
-        bool wakeChanged = false;
-        // NODE_CONFIG governs the recording (wake / A1) interval + the active vs
-        // standby state. targetState=DEPLOYED means ACTIVE: (re)enable recording.
-        // The sync (A2) schedule is left to SET_SYNC_SCHED so its live phase
-        // negotiation is never disturbed.
-        if (cfg.wakeIntervalMin > 0 && cfg.wakeIntervalMin != g_intervalMin) {
-          g_intervalMin = cfg.wakeIntervalMin;
-          wakeChanged = true;
-          Serial.printf("   ↪ wake interval updated: %u min\n", g_intervalMin);
-        }
-        g_recordingPaused = false;  // active — resume recording
-        const bool configPersisted = persistNodeConfig(cfg.configVersion, true);
-        if (configPersisted) setNodeConfigVersion(cfg.configVersion);
-        // Persist the configured sensor mask alongside the version bump. Only an
-        // authoritative mask (NODE_SENSOR_MASK_VALID set) is stored, so a legacy
-        // mothership sending 0 in this field can't wipe a real selection. Takes
-        // effect at the next wake, when initSensors() re-reads it.
-        if (configPersisted && (cfg.sensorMask & NODE_SENSOR_MASK_VALID) &&
-            cfg.sensorMask != g_expectedSensorMask) {
-          if (nodeSensorMaskSave(cfg.sensorMask)) {
-            g_expectedSensorMask = cfg.sensorMask;
-            Serial.printf("   ↪ sensor mask 0x%04X saved (applies next wake)\n",
-                          (unsigned)cfg.sensorMask);
-          } else {
-            Serial.println("   ⚠️ sensor mask persist FAILED");
-          }
-        }
-        // Re-arm if the interval changed OR we just resumed from standby (to
-        // bring the recording alarm A1 back).
-        if ((wakeChanged || wasPaused) && configPersisted &&
-            currentNodeState() == STATE_DEPLOYED && rtcSynced) {
-          g_rearmAlarmsPending = true;
-        }
-        if (wasPaused && configPersisted) Serial.println("   ▶️ resumed from standby");
-        ack.ok = configPersisted ? 1 : 0;
-        if (!configPersisted) {
-          g_intervalMin = oldWake;
-          g_recordingPaused = wasPaused;
-          g_appliedConfigVersion = oldVersion;
-          ack.appliedVersion = oldVersion;
-        }
-      } else {
-        ack.ok = 1;  // already current — still ACK so the mothership converges
-      }
-      esp_err_t ackRes = sendEspNowAndWait(g_pendingNodeConfigMac, &ack, sizeof(ack), 250).queueResult;
-      Serial.printf("   ↪ NODE_CONFIG CONFIG_ACK (v%u ok=%d): %s\n",
-                    ack.appliedVersion, ack.ok, ackRes == ESP_OK ? "OK" : esp_err_to_name(ackRes));
-    } else if (cfg.targetState == 3 /*STANDBY*/) {
-      // Pause recording but stay deployed and keep the sync (A2) check-ins so we
-      // remain remotely resumable. The re-arm (paused) drops the A1 alarm.
-      uint16_t currentVer = getNodeConfigVersion();
-      config_apply_ack_message_t ack{};
-      strcpy(ack.command, "CONFIG_ACK");
-      strncpy(ack.nodeId, NODE_ID, sizeof(ack.nodeId) - 1);
-      ack.appliedVersion = cfg.configVersion;
-      ack.ok = 0;
-      if (cfg.configVersion > currentVer) {
-        const bool     wasPaused  = g_recordingPaused;
-        const uint16_t oldVersion = g_appliedConfigVersion;
-        g_recordingPaused = true;
-        const bool configPersisted = persistNodeConfig(cfg.configVersion, true);
-        if (configPersisted) setNodeConfigVersion(cfg.configVersion);
-        if (!wasPaused && configPersisted &&
-            currentNodeState() == STATE_DEPLOYED && rtcSynced) {
-          g_rearmAlarmsPending = true;  // re-arm to drop the recording alarm
-        }
-        ack.ok = configPersisted ? 1 : 0;
-        if (!configPersisted) {
-          g_recordingPaused = wasPaused;
-          g_appliedConfigVersion = oldVersion;
-          ack.appliedVersion = oldVersion;
-        }
-        Serial.printf("⏸️ [LOOP] NODE_CONFIG STANDBY v%u %s (recording paused)\n",
-                      cfg.configVersion, configPersisted ? "applied" : "persist FAILED");
-      } else {
-        ack.ok = 1;
-      }
-      esp_err_t ackRes = sendEspNowAndWait(g_pendingNodeConfigMac, &ack, sizeof(ack), 250).queueResult;
-      Serial.printf("   ↪ NODE_CONFIG CONFIG_ACK (v%u ok=%d): %s\n",
-                    ack.appliedVersion, ack.ok, ackRes == ESP_OK ? "OK" : esp_err_to_name(ackRes));
-    } else {
-      Serial.printf("[LOOP] NODE_CONFIG targetState=%u ignored (reserved)\n",
-                    (unsigned)cfg.targetState);
-    }
-  }
+  servicePendingNodeConfig();
 
   if (g_pendingPersistConfig) {
     g_pendingPersistConfig = false;
@@ -3075,6 +3121,16 @@ if (nowMs - lastA1Check > 1000UL) {
       // Keep ESP-NOW alive so the mothership can re-pair or issue commands.
       if (!g_espNowReady) {
         bringupEspNow();
+      }
+      // A node that has lost access to its config cannot send a normal HELLO,
+      // so announce the immutable MAC-derived ID while it is listening. The
+      // FieldHub only accepts this as a recovery request when the MAC and ID
+      // both match an already deployed registry entry.
+      static uint32_t lastUnpairedStatusMs = 0;
+      if (lastUnpairedStatusMs == 0 ||
+          (uint32_t)(nowMs - lastUnpairedStatusMs) >= UNPAIRED_STATUS_INTERVAL_MS) {
+        sendNodeStatusUpdate("unpaired-recovery");
+        lastUnpairedStatusMs = millis();
       }
       if (nowMs - lastAction > 15000UL) {
         debugState("loop");

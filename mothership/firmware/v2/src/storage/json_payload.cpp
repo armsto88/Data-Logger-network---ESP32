@@ -1,5 +1,8 @@
 #include "storage/json_payload.h"
 
+#include <ctype.h>
+#include <stdlib.h>
+
 // ---------------------------------------------------------------------------
 // CSV column index -> Supabase batch field key
 // ---------------------------------------------------------------------------
@@ -79,6 +82,80 @@ static bool isNanCell(const String& v) {
          (v[2] == 'n' || v[2] == 'N');
 }
 
+static bool isAsciiAlpha(char c) {
+  return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z');
+}
+
+static bool isAsciiDigit(char c) {
+  return c >= '0' && c <= '9';
+}
+
+static bool isIsoTimestampCell(const String& v) {
+  if (v.length() < 19) return false;
+  return isAsciiDigit(v[0]) && isAsciiDigit(v[1]) &&
+         isAsciiDigit(v[2]) && isAsciiDigit(v[3]) && v[4] == '-' &&
+         isAsciiDigit(v[5]) && isAsciiDigit(v[6]) && v[7] == '-' &&
+         isAsciiDigit(v[8]) && isAsciiDigit(v[9]) && v[10] == 'T' &&
+         isAsciiDigit(v[11]) && isAsciiDigit(v[12]) && v[13] == ':' &&
+         isAsciiDigit(v[14]) && isAsciiDigit(v[15]) && v[16] == ':' &&
+         isAsciiDigit(v[17]) && isAsciiDigit(v[18]);
+}
+
+static bool isMissingTimestampCell(const String& v) {
+  return v.length() == 0 || v.equalsIgnoreCase("unknown");
+}
+
+static bool isNodeIdCell(const String& v) {
+  if (v.length() == 0 || v.length() >= 16 || !isAsciiAlpha(v[0])) return false;
+  for (size_t i = 1; i < v.length(); ++i) {
+    const char c = v[i];
+    if (!isAsciiAlpha(c) && !isAsciiDigit(c) && c != '_' && c != '-') {
+      return false;
+    }
+  }
+  return true;
+}
+
+static bool isDecimalIntegerCell(const String& v) {
+  if (v.length() == 0) return false;
+  for (size_t i = 0; i < v.length(); ++i) {
+    if (!isAsciiDigit(v[i])) return false;
+  }
+  return true;
+}
+
+static bool isBase0IntegerCell(const String& v) {
+  if (v.length() == 0) return false;
+  char* end = nullptr;
+  (void)strtoul(v.c_str(), &end, 0);
+  return end != v.c_str() && end && *end == '\0';
+}
+
+static bool isFiniteNumberCell(const String& v) {
+  if (isNanCell(v)) return true;
+  char* end = nullptr;
+  const double parsed = strtod(v.c_str(), &end);
+  return end != v.c_str() && end && *end == '\0' && isfinite(parsed);
+}
+
+static bool validReadingRow(const String* fields, int count,
+                            bool fallbackTimestampAvailable) {
+  if (count < 6) return false;
+  const bool timestampOk = isIsoTimestampCell(fields[0]) ||
+      (fallbackTimestampAvailable && isMissingTimestampCell(fields[0]));
+  if (!timestampOk || !isNodeIdCell(fields[1]) ||
+      !isDecimalIntegerCell(fields[2]) ||
+      !isBase0IntegerCell(fields[3]) ||
+      !isBase0IntegerCell(fields[4]) ||
+      !isDecimalIntegerCell(fields[5])) {
+    return false;
+  }
+  for (int i = 6; i < count; ++i) {
+    if (!isFiniteNumberCell(fields[i])) return false;
+  }
+  return true;
+}
+
 static String escapeJsonString(const String& v) {
   String out;
   out.reserve(v.length() + 8);
@@ -117,11 +194,14 @@ static int splitCsvRow(const String& line, String* fields, int maxFields) {
 // ---------------------------------------------------------------------------
 
 static bool appendReadingObject(String& json, const String& line, bool& first,
-                                const String& fallbackIso, bool traceSpectral) {
+                                 const String& fallbackIso, bool traceSpectral) {
   String fields[kNumCsvColumns];
   const int n = splitCsvRow(line, fields, kNumCsvColumns);
-  if (n < 6) {
-    Serial.printf("[JSON] Skipping malformed CSV row (%d fields): %.60s\n",
+  // Validate the complete row before appending any JSON. This also recovers a
+  // queue whose prior buggy purge left a truncated row at the head: consume the
+  // fragment locally, then continue with the following complete rows.
+  if (!validReadingRow(fields, n, fallbackIso.length() > 0)) {
+    Serial.printf("[JSON] Skipping malformed/truncated CSV row (%d fields): %.60s\n",
                   n, line.c_str());
     return false;
   }
@@ -252,7 +332,8 @@ JsonPayload buildJsonUpload(const String& csvChunk,
   // so the caller can advance the cursor precisely. Malformed rows are skipped
   // (still consumed so the cursor moves past them).
   uint16_t emitted = 0;
-  uint32_t consumed = 0;
+  uint32_t dataStart = 0;
+  uint32_t dataBytesConsumed = 0;
   bool firstReading = true;
   int lineStart = 0;
   int lineNo = 0;
@@ -273,19 +354,25 @@ JsonPayload buildJsonUpload(const String& csvChunk,
         emitted++;
       }
     }
-    consumed = (nl >= 0) ? (uint32_t)(nl + 1) : (uint32_t)len;
-    lineStart = (nl >= 0) ? (nl + 1) : len;
+    const uint32_t nextLineStart =
+        (nl >= 0) ? static_cast<uint32_t>(nl + 1)
+                  : static_cast<uint32_t>(len);
     if (lineNo == 0) {
-      // The header line is already accounted for by the cursor's startOffset
-      // (which points past the header). csvBytesConsumed must count only
-      // data-row bytes so the cursor advances by the exact bytes uploaded.
-      consumed = 0;
+      // UploadQueue prepends a synthetic header that is not present at the
+      // physical cursor. Record its end so csvBytesConsumed remains strictly
+      // relative to the on-disk data portion.
+      dataStart = nextLineStart;
+    } else {
+      // Count complete data rows whether emitted or deliberately skipped as
+      // malformed. Never include the synthetic header in cursor advancement.
+      dataBytesConsumed = nextLineStart - dataStart;
     }
+    lineStart = static_cast<int>(nextLineStart);
     lineNo++;
   }
 
   result.rowCount = emitted;
-  result.csvBytesConsumed = consumed;
+  result.csvBytesConsumed = dataBytesConsumed;
 
   // Wrap readings in the canonical batch document:
   //   {"readings":[ ... ], "meta":{...}, "status":{...}}

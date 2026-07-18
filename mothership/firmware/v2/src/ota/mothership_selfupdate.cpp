@@ -97,18 +97,20 @@ String mothershipFirmwareStatusJson() {
   esp_ota_img_states_t st = ESP_OTA_IMG_UNDEFINED;
   if (run) esp_ota_get_state_partition(run, &st);
   const char* otaState =
-      (st == ESP_OTA_IMG_PENDING_VERIFY) ? "pending_verify" :
-      (st == ESP_OTA_IMG_VALID)          ? "confirmed" :
-      (st == ESP_OTA_IMG_INVALID)        ? "invalid" :
-      (st == ESP_OTA_IMG_ABORTED)        ? "aborted" : "undefined";
+      (st == ESP_OTA_IMG_PENDING_VERIFY) ? "PENDING_VERIFY" :
+      (st == ESP_OTA_IMG_VALID)          ? "CONFIRMED" :
+      (st == ESP_OTA_IMG_INVALID)        ? "INVALID" :
+      (st == ESP_OTA_IMG_ABORTED)        ? "ABORTED" : "IDLE";
 
-  String j = "{\"version\":\"";        j += id.semver;
+  String j = "{\"role\":\"";           j += id.role;
+  j += "\",\"version\":\"";           j += id.semver;
   j += "\",\"buildId\":\"";            j += id.buildId;
   j += "\",\"hwTarget\":\"";           j += id.hwTarget;
   j += "\",\"protocolVersion\":";      j += String(id.protocolVersion);
   j += ",\"releaseId\":null";          // populated once the OTA state store lands
   j += ",\"runningSlot\":\"";          j += (run ? run->label : "?");
   j += "\",\"otaState\":\"";           j += otaState;
+  j += "\",\"otaReason\":\"";          j += fwReasonStr(gLastReason);
   j += "\",\"lastOtaReason\":\"";      j += fwReasonStr(gLastReason);
   j += "\"}";
   return j;
