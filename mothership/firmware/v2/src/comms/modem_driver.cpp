@@ -5,6 +5,7 @@
 // tests/modem_at_helper.h (Tests 9-13 all passed on hardware).
 
 #include "modem_driver.h"
+#include "comms/http_response_parser.h"
 
 // ---------------------------------------------------------------------------
 // Constructor
@@ -143,6 +144,9 @@ int ModemDriver::readStatus() {
 void ModemDriver::startUart() {
   if (!m_uartStarted) {
     Serial.println("[Modem] startUart() — Serial2 @ 115200");
+    // Command-bearing responses exceed Arduino's default UART RX ring. This
+    // must be configured before begin() or a fast response is truncated.
+    Serial2.setRxBufferSize(16 * 1024);
     Serial2.begin(115200, SERIAL_8N1, PIN_MODEM_RX, PIN_MODEM_TX);
     Serial2.setTimeout(2000);
     Serial2.clearWriteError();
@@ -623,7 +627,8 @@ bool ModemDriver::httpsPostSSL(const String& host, int port,
     Serial.println("[Modem] " + result.errorDetail);
     return false;
   }
-  delay(2000);
+  // Start draining immediately; delaying here overflowed the UART RX ring for
+  // command-bearing responses.
 
   // 4. Bind SSL context
   sendAT("AT+CCHSSLCFG=0,0", resp, 5000);
@@ -696,11 +701,13 @@ bool ModemDriver::httpsPostSSL(const String& host, int port,
   bool gotData = false;
   bool gotCchRecv = false;
   bool peerClosed = false;
+  unsigned long lastResponseByteAt = start;
 
   while (millis() - start < 30000) {
     while (Serial2.available()) {
       char c = (char)Serial2.read();
       resp += c;
+      lastResponseByteAt = millis();
       // Detect any +CCHRECV: DATA URC — server sent data back
       if (resp.indexOf("+CCHRECV: DATA") >= 0) {
         gotCchRecv = true;
@@ -735,10 +742,13 @@ bool ModemDriver::httpsPostSSL(const String& host, int port,
       }
       if (resp.indexOf("+CCH_PEER_CLOSED") >= 0) {
         peerClosed = true;
-        break;
       }
     }
-    if (peerClosed) break;
+    const HttpResponseParseResult observed =
+        parseHttpResponseBytes(resp, peerClosed);
+    if (observed.bodyComplete &&
+        (observed.contentLength >= 0 || observed.chunked)) break;
+    if (peerClosed && millis() - lastResponseByteAt >= 500) break;
     delay(10);
   }
 
@@ -792,11 +802,33 @@ bool ModemDriver::httpsPostSSL(const String& host, int port,
     }
   }
 
+  const HttpResponseParseResult completeHttp =
+      parseHttpResponseBytes(resp, peerClosed);
+  result.responseWireBytes = resp.length();
+  result.responseHttpBytes = resp.indexOf("HTTP/1.") >= 0
+      ? resp.length() - static_cast<uint32_t>(resp.indexOf("HTTP/1.")) : 0;
+  result.responseComplete = completeHttp.headersComplete &&
+                            completeHttp.bodyComplete;
+  if (result.responseComplete) {
+    result.httpStatus = completeHttp.statusCode;
+    resp = completeHttp.body;
+    gotData = true;
+  } else {
+    gotData = false;
+    gotCchRecv = false;
+    peerClosed = false;
+    result.httpStatus = -1;
+    result.errorDetail = "Incomplete SSL HTTP response: " + completeHttp.error;
+  }
+
   if (gotData) {
     result.responseBody = resp;
     result.success = (result.httpStatus == 200 || result.httpStatus == 302);
-    Serial.printf("[Modem] SSL HTTP status: %d, success: %s\n",
-                  result.httpStatus, result.success ? "YES" : "NO");
+    Serial.printf("[Modem] SSL HTTP status=%d complete=1 wireBytes=%lu bodyBytes=%u success=%s\n",
+                  result.httpStatus,
+                  static_cast<unsigned long>(result.responseWireBytes),
+                  static_cast<unsigned>(result.responseBody.length()),
+                  result.success ? "YES" : "NO");
   } else if (gotCchRecv && !peerClosed) {
     // Got data but couldn't parse status — assume success (conservative)
     result.responseBody = resp;
@@ -810,7 +842,8 @@ bool ModemDriver::httpsPostSSL(const String& host, int port,
     result.success = true;
     Serial.println("[Modem] SSL: peer closed after successful chunked send — assuming success");
   } else {
-    result.errorDetail = "No SSL HTTP response received";
+    if (result.errorDetail.length() == 0)
+      result.errorDetail = "No SSL HTTP response received";
     Serial.println("[Modem] " + result.errorDetail);
   }
 

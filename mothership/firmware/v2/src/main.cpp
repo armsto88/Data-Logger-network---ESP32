@@ -104,6 +104,20 @@ static bool resolveBackendNodeConfig(const Command& requested,
   return controlResolveBackendNodeConfig(requested, resolved, rejection);
 }
 
+static BackendCommandApplyResult executeBackendRecordingInterval(
+    const Command& command) {
+  return configApplyBackendRecordingInterval(command);
+}
+
+static bool markControlConverged(const char* nodeId,
+                                 uint16_t configVersion) {
+  const bool nodeChanged =
+      controlMarkNodeConfigConverged(nodeId, configVersion);
+  const bool intervalChanged =
+      configMarkRecordingIntervalNodeConverged(nodeId, configVersion);
+  return nodeChanged || intervalChanged;
+}
+
 static void ingestBackendResponse(const String& responseBody) {
   const uint32_t rtcBefore = getRTCTime();
   const bool rtcTrusted = rtcBefore >= 1704067200UL;
@@ -111,15 +125,23 @@ static void ingestBackendResponse(const String& responseBody) {
                 static_cast<unsigned>(responseBody.length()));
   const BackendIngestResult result = backendIngestUploadResponse(
       responseBody, rtcBefore, rtcTrusted, resolveBackendNodeConfig,
-      executeBackendNodeConfig);
-  Serial.printf("[CONTROL] response=%s commands=%u processed=%u rejected=%u replayed=%u initialRevision=%lu cursor=%lu\n",
+      executeBackendNodeConfig, executeBackendRecordingInterval);
+  const uint32_t diagnosticUnix = result.serverTimeUnix >= 1704067200UL
+      ? result.serverTimeUnix : rtcBefore;
+  const bool diagnosticsDurable = backendControlRecordDiagnostics(
+      result, responseBody.length(), diagnosticUnix);
+  Serial.printf("[CONTROL] response=%s rejection=%s bytes=%u commands=%u processed=%u rejected=%u replayed=%u nextCursor=%lu initialRevision=%lu cursor=%lu diagnostics=%s\n",
                 backendIngestStatusStr(result.status),
+                backendIngestRejectionStr(result.rejection),
+                static_cast<unsigned>(responseBody.length()),
                 static_cast<unsigned>(result.commandCount),
                 static_cast<unsigned>(result.processedCount),
                 static_cast<unsigned>(result.rejectedCount),
                 static_cast<unsigned>(result.replayedCount),
+                static_cast<unsigned long>(result.responseNextCursor),
                 static_cast<unsigned long>(result.initialStateRevision),
-                static_cast<unsigned long>(result.persistedCursor));
+                static_cast<unsigned long>(result.persistedCursor),
+                diagnosticsDurable ? "durable" : "FAILED");
 
   // The backend-provided HTTPS response clock is the UTC authority. This also
   // repairs an RTC that was previously entered as browser-local wall time.
@@ -257,7 +279,7 @@ void processSnapshot(const DecodedSnapshot& decoded, const uint8_t* mac) {
   // CONFIG_ACK was lost. Map it back to the retained dashboard/local command
   // without adding another radio message.
   if (decoded.configVersion > 0) {
-    controlMarkNodeConfigConverged(decoded.nodeId, decoded.configVersion);
+    markControlConverged(decoded.nodeId, decoded.configVersion);
   }
 
   // Legacy sensor_data_message_t packets are intentionally ignored. All
@@ -470,8 +492,8 @@ static void runCoordinatedSyncWindow(
             hellos[i].hello.configVersion >= desired.configVersion) {
           const bool wasPending = authorizedNode->stateChangePending ||
               authorizedNode->configVersionApplied < desired.configVersion;
-          controlMarkNodeConfigConverged(hellos[i].hello.nodeId,
-                                         hellos[i].hello.configVersion);
+          markControlConverged(hellos[i].hello.nodeId,
+                               hellos[i].hello.configVersion);
           if (wasPending) {
             Serial.printf("[SYNC] HELLO converged %.15s v%u\n",
                           hellos[i].hello.nodeId,
@@ -1203,6 +1225,7 @@ void handleSyncWake() {
   // Load paired/deployed nodes from NVS so fleet counts and node metadata
   // are available for the JSON upload payload.
   loadPairedNodes();
+  configInitRecordingIntervalControl();
 
   // Init ESP-NOW in sync-only mode
   if (!initEspNowSyncOnly(ESPNOW_CHANNEL)) {
@@ -1302,8 +1325,7 @@ void handleSyncWake() {
       NodeDesiredConfig dc = getDesiredConfig(ackNodeId.c_str());
       if (dc.targetState == 0 /*UNPAIRED*/ && acks[i].ok == 1 &&
           acks[i].appliedVersion >= dc.configVersion) {
-        controlMarkNodeConfigConverged(ackNodeId.c_str(),
-                                       acks[i].appliedVersion);
+        markControlConverged(ackNodeId.c_str(), acks[i].appliedVersion);
         Serial.printf("[SYNC] CONFIG_ACK unpair confirmed: %s v%u — removing node\n",
                       ackNodeId.c_str(), (unsigned)acks[i].appliedVersion);
         for (auto it = registeredNodes.begin(); it != registeredNodes.end(); ++it) {
@@ -1321,8 +1343,7 @@ void handleSyncWake() {
         setNodeUserId(ackNodeId, ""); setNodeName(ackNodeId, ""); setNodeNotes(ackNodeId, "");
         savePairedNodes();
       } else if (acks[i].ok == 1 && acks[i].appliedVersion >= dc.configVersion) {
-        controlMarkNodeConfigConverged(ackNodeId.c_str(),
-                                       acks[i].appliedVersion);
+        markControlConverged(ackNodeId.c_str(), acks[i].appliedVersion);
         // Deployed/standby converged through the shared ACK/HELLO/snapshot path.
         const bool nowPaused = (dc.targetState == 3 /*STANDBY*/);
         Serial.printf("[SYNC] CONFIG_ACK converged: %s v%u (%s)\n",
@@ -1530,6 +1551,7 @@ void handleConfigWake() {
   Serial.println("[CFG-DBG] Step 3: loading paired nodes...");
   Serial.flush();
   loadPairedNodes();
+  configInitRecordingIntervalControl();
   Serial.println("[CFG-DBG] Step 3 done: loadPairedNodes OK");
   Serial.flush();
 

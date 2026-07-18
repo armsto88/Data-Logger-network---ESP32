@@ -82,6 +82,84 @@ static constexpr uint32_t kMinValidPhaseUnix = 1704067200UL;  // 2024-01-01 UTC
 static constexpr const char* kSyncAnchorA = "sync_anchor_a";
 static constexpr const char* kSyncAnchorB = "sync_anchor_b";
 
+struct RecordingIntervalMember {
+  char nodeId[CMD_NODEID_LEN];
+  uint16_t wireConfigVersion;
+  uint16_t sensorMask;
+  uint8_t targetState;
+  uint8_t converged;
+};
+
+struct RecordingIntervalPlan {
+  uint32_t magic;
+  uint16_t version;
+  uint16_t size;
+  uint32_t generation;
+  char commandId[CMD_ID_LEN];
+  uint32_t dispatcherRevision;
+  uint32_t syncPhaseUnix;
+  uint16_t syncIntervalMin;
+  uint8_t wakeIntervalMin;
+  uint8_t memberCount;
+  RecordingIntervalMember members[CMD_MAX_NODES];
+  uint32_t checksum;
+};
+
+static constexpr uint32_t kRecordingPlanMagic = 0x464D5249UL;  // FMRI
+static constexpr uint16_t kRecordingPlanVersion = 1;
+static constexpr const char* kRecordingPlanNs = "rec_interval";
+static constexpr const char* kRecordingPlanA = "plan_a";
+static constexpr const char* kRecordingPlanB = "plan_b";
+static RecordingIntervalPlan gRecordingPlan{};
+
+static uint32_t recordingPlanChecksum(RecordingIntervalPlan plan) {
+  plan.checksum = 0;
+  const uint8_t* bytes = reinterpret_cast<const uint8_t*>(&plan);
+  uint32_t hash = 2166136261UL;
+  for (size_t i = 0; i < sizeof(plan); ++i) {
+    hash ^= bytes[i];
+    hash *= 16777619UL;
+  }
+  return hash;
+}
+
+static bool recordingPlanValid(const RecordingIntervalPlan& plan) {
+  return plan.magic == kRecordingPlanMagic &&
+         plan.version == kRecordingPlanVersion &&
+         plan.size == sizeof(plan) && plan.memberCount <= CMD_MAX_NODES &&
+         plan.checksum == recordingPlanChecksum(plan);
+}
+
+static bool readRecordingPlan(Preferences& prefs, const char* key,
+                              RecordingIntervalPlan& plan) {
+  return prefs.getBytesLength(key) == sizeof(plan) &&
+         prefs.getBytes(key, &plan, sizeof(plan)) == sizeof(plan) &&
+         recordingPlanValid(plan);
+}
+
+static bool persistRecordingPlan() {
+  RecordingIntervalPlan candidate = gRecordingPlan;
+  candidate.magic = kRecordingPlanMagic;
+  candidate.version = kRecordingPlanVersion;
+  candidate.size = sizeof(candidate);
+  candidate.generation = gRecordingPlan.generation + 1U;
+  candidate.checksum = recordingPlanChecksum(candidate);
+  const char* key = (candidate.generation & 1U)
+      ? kRecordingPlanA : kRecordingPlanB;
+  Preferences prefs;
+  if (!prefs.begin(kRecordingPlanNs, false)) return false;
+  const bool wrote = prefs.putBytes(key, &candidate, sizeof(candidate)) ==
+                     sizeof(candidate);
+  prefs.end();
+  if (!wrote || !prefs.begin(kRecordingPlanNs, true)) return false;
+  RecordingIntervalPlan verify{};
+  const bool verified = readRecordingPlan(prefs, key, verify) &&
+                        memcmp(&candidate, &verify, sizeof(candidate)) == 0;
+  prefs.end();
+  if (verified) gRecordingPlan = candidate;
+  return verified;
+}
+
 static uint32_t syncAnchorCrc(const SyncAnchorRecord& record) {
   const uint8_t* data = reinterpret_cast<const uint8_t*>(&record);
   const size_t length = offsetof(SyncAnchorRecord, crc);
@@ -235,6 +313,11 @@ static bool resolveBackendNodeConfigFromUi(const Command& requested,
   return controlResolveBackendNodeConfig(requested, resolved, rejection);
 }
 
+static BackendCommandApplyResult executeBackendRecordingIntervalFromUi(
+    const Command& command) {
+  return configApplyBackendRecordingInterval(command);
+}
+
 static void ingestBackendResponseFromUi(const String& responseBody) {
   const uint32_t rtcBefore = getRTCTimeUnix();
   Serial.printf("[CONTROL] manual HTTP response body bytes=%u\n",
@@ -242,11 +325,23 @@ static void ingestBackendResponseFromUi(const String& responseBody) {
   const BackendIngestResult result = backendIngestUploadResponse(
       responseBody, rtcBefore, rtcBefore >= kMinValidPhaseUnix,
       resolveBackendNodeConfigFromUi,
-      executeBackendNodeConfigFromUi);
-  Serial.printf("[CONTROL] manual response=%s processed=%u cursor=%lu\n",
+      executeBackendNodeConfigFromUi,
+      executeBackendRecordingIntervalFromUi);
+  const uint32_t diagnosticUnix = result.serverTimeUnix >= kMinValidPhaseUnix
+      ? result.serverTimeUnix : rtcBefore;
+  const bool diagnosticsDurable = backendControlRecordDiagnostics(
+      result, responseBody.length(), diagnosticUnix);
+  Serial.printf("[CONTROL] manual response=%s rejection=%s bytes=%u commands=%u processed=%u rejected=%u replayed=%u nextCursor=%lu cursor=%lu diagnostics=%s\n",
                 backendIngestStatusStr(result.status),
+                backendIngestRejectionStr(result.rejection),
+                static_cast<unsigned>(responseBody.length()),
+                static_cast<unsigned>(result.commandCount),
                 static_cast<unsigned>(result.processedCount),
-                static_cast<unsigned long>(result.persistedCursor));
+                static_cast<unsigned>(result.rejectedCount),
+                static_cast<unsigned>(result.replayedCount),
+                static_cast<unsigned long>(result.responseNextCursor),
+                static_cast<unsigned long>(result.persistedCursor),
+                diagnosticsDurable ? "durable" : "FAILED");
   if (result.serverTimeUnix >= kMinValidPhaseUnix) {
     const int64_t delta = static_cast<int64_t>(result.serverTimeUnix) - rtcBefore;
     if (rtcBefore < kMinValidPhaseUnix || delta > 2 || delta < -2) {
@@ -339,11 +434,12 @@ void loadWakeIntervalFromNVS() {
   }
 }
 
-static void saveWakeIntervalToNVS(int mins) {
-  if (gPrefs.begin("ui", false)) {
-    gPrefs.putInt("wake_min", mins);
-    gPrefs.end();
-  }
+static bool saveWakeIntervalToNVS(int mins) {
+  if (!gPrefs.begin("ui", false)) return false;
+  const bool wrote = gPrefs.putInt("wake_min", mins) == sizeof(int32_t);
+  const int verify = gPrefs.getInt("wake_min", -1);
+  gPrefs.end();
+  return wrote && verify == mins;
 }
 
 void loadSyncModeFromNVS() {
@@ -604,6 +700,211 @@ static int readAnchorSyncIntervalMin() {
   return -1;
 }
 
+static uint32_t recordingTransitionPhaseUnix(uint16_t newSyncMin) {
+  const uint32_t oldPhaseUnix = static_cast<uint32_t>(gLastSyncBroadcastUnix);
+  const int oldAnchorInterval = readAnchorSyncIntervalMin();
+  const uint32_t nowUnix = getRTCTimeUnix();
+  uint32_t transition = 0;
+  if (gSyncMode == SYNC_MODE_INTERVAL && oldPhaseUnix > 0 &&
+      oldAnchorInterval > 0 && nowUnix > 946684800UL) {
+    const uint32_t oldPeriodSec = static_cast<uint32_t>(oldAnchorInterval) * 60UL;
+    if (nowUnix < oldPhaseUnix) {
+      transition = oldPhaseUnix;
+    } else {
+      const uint32_t slots = (nowUnix - oldPhaseUnix) / oldPeriodSec;
+      transition = oldPhaseUnix + (slots + 1UL) * oldPeriodSec;
+    }
+    transition -= transition % 60UL;
+  }
+  if (transition == 0) {
+    const int savedSync = gSyncIntervalMin;
+    gSyncIntervalMin = newSyncMin;
+    transition = computeNextSyncUnix(nowUnix);
+    gSyncIntervalMin = savedSync;
+  }
+  return transition;
+}
+
+void configInitRecordingIntervalControl() {
+  gRecordingPlan = {};
+  Preferences prefs;
+  if (!prefs.begin(kRecordingPlanNs, true)) return;
+  RecordingIntervalPlan a{}, b{};
+  const bool aValid = readRecordingPlan(prefs, kRecordingPlanA, a);
+  const bool bValid = readRecordingPlan(prefs, kRecordingPlanB, b);
+  prefs.end();
+  if (aValid && bValid) {
+    gRecordingPlan = static_cast<int32_t>(b.generation - a.generation) > 0
+        ? b : a;
+  } else if (aValid) {
+    gRecordingPlan = a;
+  } else if (bValid) {
+    gRecordingPlan = b;
+  }
+  // Repair a reset after the registry stored an applied version but before the
+  // aggregate command result was advanced.
+  for (const auto& node : registeredNodes) {
+    if (node.configVersionApplied > 0)
+      configMarkRecordingIntervalNodeConverged(
+          node.nodeId.c_str(), node.configVersionApplied);
+  }
+}
+
+BackendCommandApplyResult configApplyBackendRecordingInterval(
+    const Command& command) {
+  BackendCommandApplyResult out{};
+  if (command.type != CMD_SET_RECORDING_INTERVAL ||
+      (command.recordingIntervalMin != 1 &&
+       command.recordingIntervalMin != 5 &&
+       command.recordingIntervalMin != 10 &&
+       command.recordingIntervalMin != 20 &&
+       command.recordingIntervalMin != 30 &&
+       command.recordingIntervalMin != 60)) return out;
+
+  const bool known = dispatcherKnownCmd(command.cmdId);
+  if (!known && strncmp(gRecordingPlan.commandId, command.cmdId,
+                        CMD_ID_LEN) != 0) {
+    RecordingIntervalPlan plan{};
+    plan.magic = kRecordingPlanMagic;
+    plan.version = kRecordingPlanVersion;
+    plan.size = sizeof(plan);
+    strlcpy(plan.commandId, command.cmdId, CMD_ID_LEN);
+    plan.wakeIntervalMin = command.recordingIntervalMin;
+    plan.syncIntervalMin = gSyncMode == SYNC_MODE_INTERVAL
+        ? static_cast<uint16_t>(computeAutoSyncMin(command.recordingIntervalMin))
+        : 0;
+    plan.syncPhaseUnix = recordingTransitionPhaseUnix(plan.syncIntervalMin);
+
+    for (const auto& node : registeredNodes) {
+      if (node.state != PAIRED && node.state != DEPLOYED) continue;
+      if (plan.memberCount >= CMD_MAX_NODES) return out;
+      const NodeDesiredConfig desired = getDesiredConfig(node.nodeId.c_str());
+      if (desired.configVersion == UINT16_MAX) return out;
+      RecordingIntervalMember& member = plan.members[plan.memberCount++];
+      strlcpy(member.nodeId, node.nodeId.c_str(), CMD_NODEID_LEN);
+      member.wireConfigVersion = desired.configVersion == 0
+          ? 1 : static_cast<uint16_t>(desired.configVersion + 1U);
+      member.sensorMask = desired.sensorMask;
+      member.targetState = desired.targetState;
+    }
+    gRecordingPlan = plan;
+    if (!persistRecordingPlan()) return out;
+  }
+
+  if (strncmp(gRecordingPlan.commandId, command.cmdId, CMD_ID_LEN) != 0 ||
+      gRecordingPlan.wakeIntervalMin != command.recordingIntervalMin) return out;
+
+  // The old rendezvous anchor is intentionally untouched. Only the desired
+  // schedule changes; both sides meet at the next old slot and transition from
+  // the same syncPhaseUnix.
+  gWakeIntervalMin = gRecordingPlan.wakeIntervalMin;
+  gSyncIntervalMin = gRecordingPlan.syncIntervalMin;
+  if (!saveWakeIntervalToNVS(gWakeIntervalMin)) return out;
+
+  for (uint8_t i = 0; i < gRecordingPlan.memberCount; ++i) {
+    const RecordingIntervalMember& member = gRecordingPlan.members[i];
+    NodeDesiredConfig desired = getDesiredConfig(member.nodeId);
+    desired.configVersion = member.wireConfigVersion;
+    desired.wakeIntervalMin = gRecordingPlan.wakeIntervalMin;
+    desired.syncIntervalMin = gRecordingPlan.syncIntervalMin;
+    desired.syncPhaseUnix = gRecordingPlan.syncPhaseUnix;
+    desired.targetState = member.targetState;
+    desired.sensorMask = member.sensorMask;
+    if (!setDesiredConfig(member.nodeId, desired)) return out;
+    const NodeDesiredConfig verify = getDesiredConfig(member.nodeId);
+    if (verify.configVersion != desired.configVersion ||
+        verify.wakeIntervalMin != desired.wakeIntervalMin ||
+        verify.syncIntervalMin != desired.syncIntervalMin ||
+        verify.syncPhaseUnix != desired.syncPhaseUnix ||
+        verify.targetState != desired.targetState ||
+        verify.sensorMask != desired.sensorMask) return out;
+    for (auto& node : registeredNodes) {
+      if (node.nodeId != member.nodeId) continue;
+      node.stateChangePending = true;
+      node.pendingTargetState = PENDING_TO_DEPLOYED;
+      node.pendingSinceMs = millis();
+      node.pendingLastAttemptMs = 0;
+      break;
+    }
+  }
+  savePairedNodes();
+
+  // ACCEPTED becomes visible only after every desired config above has been
+  // written and read back. Redelivery calls dispatcherSubmit idempotently.
+  out.command = dispatcherSubmit(command);
+  CommandResult stored{};
+  if (!dispatcherResultFor(command.cmdId, &stored) ||
+      (stored.outcome != OUT_ACCEPTED && stored.outcome != OUT_CONVERGED))
+    return out;
+  uint32_t revision = 0;
+  if (!dispatcherCurrentGlobalCommand(command.cmdId, &revision)) return out;
+  if (gRecordingPlan.dispatcherRevision != revision) {
+    gRecordingPlan.dispatcherRevision = revision;
+    if (!persistRecordingPlan()) return out;
+  }
+
+  out.durable = dispatcherEnsureDurable();
+  out.applied = out.durable;
+  if (gRecordingPlan.memberCount == 0 && stored.outcome == OUT_ACCEPTED) {
+    dispatcherMarkGlobalConverged(revision);
+    out.durable = dispatcherEnsureDurable();
+  }
+  Serial.printf("[CONTROL] recording interval desired durable id=%s wake=%u sync=%u phase=%lu nodes=%u revision=%lu replay=%d\n",
+                command.cmdId,
+                static_cast<unsigned>(gRecordingPlan.wakeIntervalMin),
+                static_cast<unsigned>(gRecordingPlan.syncIntervalMin),
+                static_cast<unsigned long>(gRecordingPlan.syncPhaseUnix),
+                static_cast<unsigned>(gRecordingPlan.memberCount),
+                static_cast<unsigned long>(revision), known ? 1 : 0);
+  return out;
+}
+
+bool configMarkRecordingIntervalNodeConverged(const char* nodeId,
+                                              uint16_t configVersion) {
+  if (!nodeId || !nodeId[0] || !gRecordingPlan.commandId[0] ||
+      gRecordingPlan.dispatcherRevision == 0) return false;
+  bool changed = false;
+  for (uint8_t i = 0; i < gRecordingPlan.memberCount; ++i) {
+    RecordingIntervalMember& member = gRecordingPlan.members[i];
+    if (strncmp(member.nodeId, nodeId, CMD_NODEID_LEN) == 0 &&
+        configVersion >= member.wireConfigVersion && !member.converged) {
+      member.converged = 1;
+      changed = true;
+    }
+  }
+  if (changed && !persistRecordingPlan()) return false;
+  bool applicabilityChanged = false;
+  for (uint8_t i = 0; i < gRecordingPlan.memberCount; ++i) {
+    RecordingIntervalMember& member = gRecordingPlan.members[i];
+    if (member.converged) continue;
+    bool stillAssigned = false;
+    for (const auto& node : registeredNodes) {
+      if (node.nodeId == member.nodeId &&
+          (node.state == PAIRED || node.state == DEPLOYED)) {
+        stillAssigned = true;
+        break;
+      }
+    }
+    if (!stillAssigned) {
+      member.converged = 1;
+      applicabilityChanged = true;
+    }
+  }
+  if (applicabilityChanged && !persistRecordingPlan()) return false;
+  for (uint8_t i = 0; i < gRecordingPlan.memberCount; ++i) {
+    if (!gRecordingPlan.members[i].converged) return changed;
+  }
+  const bool converged = dispatcherMarkGlobalConverged(
+      gRecordingPlan.dispatcherRevision);
+  if (converged) {
+    Serial.printf("[CONTROL] recording interval CONVERGED id=%s revision=%lu nodes=%u\n",
+                  gRecordingPlan.commandId,
+                  static_cast<unsigned long>(gRecordingPlan.dispatcherRevision),
+                  static_cast<unsigned>(gRecordingPlan.memberCount));
+  }
+  return changed || applicabilityChanged || converged;
+}
+
 // Next time the mothership wakes on the OLD (current-fleet) schedule — i.e.
 // the moment it will next meet the sleeping nodes and hand over the new
 // schedule. Uses the preserved old phase anchor (gLastSyncBroadcastUnix).
@@ -817,6 +1118,18 @@ a{color:var(--primary);text-decoration:none}
 .node-status-cell{display:flex;flex-direction:column;align-items:flex-start;gap:3px;min-width:86px}
 .item--node .chip{font-weight:600}
 .item--node .chip{white-space:nowrap}
+.node-select-wrap{display:grid;grid-template-columns:44px minmax(0,1fr);gap:8px;align-items:stretch}
+.node-select-control{display:flex;align-items:center;justify-content:center;border:2px solid #c9d0c3;
+  border-radius:8px;background:#f7f8f4;cursor:pointer;min-height:86px}
+.node-select-control input{width:22px;height:22px;margin:0;accent-color:var(--primary)}
+.node-select-wrap.is-selected .node-select-control{border-color:var(--primary);background:rgba(122,155,112,.20)}
+.node-select-wrap.is-selected .item--node{border-color:var(--primary)}
+.batch-actions{position:sticky;top:74px;z-index:8;margin:0 0 12px;padding:12px;border:1px solid var(--border);
+  border-radius:10px;background:rgba(255,255,255,.96);box-shadow:var(--shadow);backdrop-filter:blur(5px)}
+.batch-actions__head{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:8px}
+.batch-actions__buttons{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px}
+.batch-actions__buttons .btn{margin:0;padding:10px 8px;min-height:44px}
+.batch-actions__buttons .btn--remove{background:#fff;color:#7a2a20;border-color:#c45a4a}
 
 /* Chips */
 .chip{display:inline-block;padding:2px 8px;border-radius:999px;border:1px solid var(--border);font-size:.85rem;color:var(--sub)}
@@ -917,6 +1230,9 @@ a{color:var(--primary);text-decoration:none}
   .node-row{grid-template-columns:1fr;gap:8px}
   .node-timing,.node-status{grid-template-columns:1fr 1fr;gap:6px}
   .node-timing-cell,.node-status-cell{min-width:0}
+  .node-select-wrap{grid-template-columns:42px minmax(0,1fr);gap:6px}
+  .batch-actions{top:66px}
+  .batch-actions__buttons{grid-template-columns:1fr}
 
   /* Small buttons: meet 44px touch target minimum */
   .btn--sm{min-height:44px;padding:10px 14px}
@@ -1122,7 +1438,10 @@ function flashBtn(btn, ok){
 }
 
 // --- Node cards: incremental, XSS-safe (textContent for device strings) ---
-function chipState(state, paused){
+function chipState(state, paused, pending, desiredTarget){
+  if (pending && Number(desiredTarget)===0) return ['chip chip--state-unpaired','Remove queued'];
+  if (state==='DEPLOYED' && pending && Number(desiredTarget)===3) return ['chip chip--state-paused','Pause queued'];
+  if (state==='DEPLOYED' && pending && Number(desiredTarget)===2) return ['chip chip--state-deployed','Resume queued'];
   if (state==='DEPLOYED') return paused ? ['chip chip--state-paused','Paused']
                                         : ['chip chip--state-deployed','Active'];
   if (state==='PAIRED')   return ['chip chip--state-paired','Connected'];
@@ -1144,7 +1463,8 @@ function nodeCell(parentClass, labelText, fieldName){
   d.appendChild(l); d.appendChild(v); return d;
 }
 function applyNodeFields(card, n){
-  var st=chipState(n.state, n.paused), s=card.querySelector('[data-f="status"]');
+  if (card && card.dataset){ card.dataset.state=n.state||''; card.dataset.paused=n.paused?'1':'0'; }
+  var st=chipState(n.state, n.paused, n.pending, n.desiredTarget), s=card.querySelector('[data-f="status"]');
   if (s){ s.className=st[0]; s.textContent=st[1]; }
   var bt=chipBatt(n.batV), b=card.querySelector('[data-f="batt"]');
   if (b){ b.className=bt[0]; b.textContent=bt[1]; }
@@ -1153,10 +1473,16 @@ function applyNodeFields(card, n){
   var lbl=card.querySelector('[data-f="label"]'); if (lbl) lbl.textContent = n.label || n.id;
 }
 function nodeCardEl(n){
+  var wrap=document.createElement('div'); wrap.className='node-select-wrap node-new';
+  wrap.setAttribute('data-node-id', n.id);
+  var pick=document.createElement('label'); pick.className='node-select-control'; pick.title='Select node';
+  var cb=document.createElement('input'); cb.type='checkbox'; cb.name='node_id'; cb.value=n.id;
+  cb.className='node-select'; cb.setAttribute('form','batch-node-actions'); cb.setAttribute('aria-label','Select '+(n.label||n.id));
+  cb.addEventListener('change',function(){ if(window.updateBatchSelection) window.updateBatchSelection(cb); });
+  pick.appendChild(cb); wrap.appendChild(pick);
   var a=document.createElement('a');
-  a.className='item item--node node-new';
+  a.className='item item--node';
   a.href='/station?id=' + encodeURIComponent(n.id);
-  a.setAttribute('data-node-id', n.id);
   var row=document.createElement('div'); row.className='node-row';
   var main=document.createElement('div'); main.className='node-main';
   var strong=document.createElement('strong'); strong.setAttribute('data-f','label'); main.appendChild(strong);
@@ -1167,7 +1493,7 @@ function nodeCardEl(n){
   timing.appendChild(nodeCell('node-timing-cell','Recording','rec'));
   timing.appendChild(nodeCell('node-timing-cell','Last seen','lastseen'));
   row.appendChild(main); row.appendChild(status); row.appendChild(timing);
-  a.appendChild(row); applyNodeFields(a, n); return a;
+  a.appendChild(row); wrap.appendChild(a); applyNodeFields(wrap, n); return wrap;
 }
 function findCard(list, id){
   var k=list.children;
@@ -1653,11 +1979,15 @@ static String buildLiveJson() {
     const DispatchNodeConfig* mirrored = dispatcherNodeConfig(n.nodeId.c_str());
     const bool mirroredPaused = mirrored
         ? mirrored->targetState == 3 : n.recordingPaused;
+    const uint8_t desiredTarget = mirrored ? mirrored->targetState
+        : (n.state == DEPLOYED ? (n.recordingPaused ? 3 : 2)
+                              : static_cast<uint8_t>(n.state));
     fp ^= (uint32_t)n.state + ((uint32_t)n.configVersionApplied << 4) +
           (n.lastSeen / 1000UL) + battCenti + (mirroredPaused ? 97U : 0U) +
           (uint32_t)(n.nodeId.length() * 131U) + (uint32_t)(n.name.length() * 17U) +
           ((uint32_t)n.expectedSensorMask << 9) + ((uint32_t)n.sensorFaultMask << 20) +
-          (mirrored ? ((uint32_t)mirrored->wakeIntervalMin << 24) : 0U);
+          (mirrored ? ((uint32_t)mirrored->wakeIntervalMin << 24) : 0U) +
+          ((uint32_t)desiredTarget * 2654435761UL);
     fp *= 16777619UL;  // FNV-style fold — cheap change detector, not a hash guarantee
   }
   fp ^= (gDiscovery.generation * 2654435761UL) + (gDiscovery.active ? 1UL : 0UL) +
@@ -1696,6 +2026,9 @@ static String buildLiveJson() {
         : ((obs > 0) ? (int)obs : (gWakeIntervalMin > 0 ? gWakeIntervalMin : 5));
     const bool mirroredPaused = mirrored
         ? mirrored->targetState == 3 : n.recordingPaused;
+    const uint8_t desiredTarget = mirrored ? mirrored->targetState
+        : (n.state == DEPLOYED ? (n.recordingPaused ? 3 : 2)
+                              : static_cast<uint8_t>(n.state));
     j += "{\"id\":\"";     j += jsonEscapeLocal(n.nodeId); j += "\"";
     j += ",\"label\":\"";  j += jsonEscapeLocal(disp);     j += "\"";
     j += ",\"userId\":\""; j += jsonEscapeLocal(n.userId); j += "\"";
@@ -1707,6 +2040,7 @@ static String buildLiveJson() {
     j += ",\"recMin\":";  j += String(recMin);
     j += ",\"paused\":";  j += mirroredPaused ? "true" : "false";
     j += ",\"pending\":"; j += (n.stateChangePending || n.deployPending) ? "true" : "false";
+    j += ",\"desiredTarget\":"; j += String((unsigned)desiredTarget);
     // Configured-sensor state for the deployment UI: which sensors are marked
     // installed, what reported last cycle, and which configured ones are faulted.
     j += ",\"expectedSensorMask\":"; j += String((unsigned)n.expectedSensorMask);
@@ -2435,6 +2769,17 @@ static void handleStationsPage() {
   html += F("<div class='section'>");
   html += F("<h3>Nodes</h3>");
 
+  html += F("<form id='batch-node-actions' class='batch-actions' action='/batch-node-action' method='POST' onsubmit='return confirmBatchNodeAction()'>"
+            "<input id='batch-action' type='hidden' name='action' value=''>"
+            "<div class='batch-actions__head'><div><strong id='batch-count'>0 selected</strong>"
+            "<div class='help' style='margin:0'>Select up to 8 nodes</div></div>"
+            "<button id='batch-select-all' type='button' class='btn btn--sm' onclick='toggleBatchSelection()'>Select all</button></div>"
+            "<div class='batch-actions__buttons'>"
+            "<button id='batch-pause' type='submit' class='btn btn--warn' disabled onclick=\"document.getElementById('batch-action').value='pause'\">Pause selected</button>"
+            "<button id='batch-resume' type='submit' class='btn btn--success' disabled onclick=\"document.getElementById('batch-action').value='resume'\">Resume selected</button>"
+            "<button id='batch-remove' type='submit' class='btn btn--remove' disabled onclick=\"document.getElementById('batch-action').value='remove'\">Remove selected</button>"
+            "</div></form>");
+
   // Empty-state hint (kept in the DOM, hidden by JS once nodes appear live).
   html += F("<p class='muted' id='node-empty'");
   if (!allNodes.empty()) html += F(" style='display:none'");
@@ -2460,12 +2805,20 @@ static void handleStationsPage() {
 
     String displayId = name.length() ? name : (userId.length() ? userId : node.nodeId);
 
-    const bool nodePaused = (node.state == DEPLOYED) && node.recordingPaused;
-    const char* stCls = nodePaused ? "chip chip--state-paused"
+    const bool desiredPending = node.stateChangePending &&
+        nodeDesired.configVersion > node.configVersionApplied;
+    const bool nodePaused = (node.state == DEPLOYED) &&
+        (desiredPending ? nodeDesired.targetState == 3 : node.recordingPaused);
+    const bool removePending = desiredPending && nodeDesired.targetState == 0;
+    const char* stCls = removePending ? "chip chip--state-unpaired"
+                       : nodePaused ? "chip chip--state-paused"
                        : (node.state == DEPLOYED) ? "chip chip--state-deployed"
                        : (node.state == PAIRED)   ? "chip chip--state-paired"
                        : "chip chip--state-unpaired";
-    const char* stTxt = nodePaused ? "Paused"
+    const char* stTxt = removePending ? "Remove queued"
+                       : (desiredPending && nodeDesired.targetState == 3) ? "Pause queued"
+                       : (desiredPending && nodeDesired.targetState == 2) ? "Resume queued"
+                       : nodePaused ? "Paused"
                        : (node.state == DEPLOYED) ? "Active"
                        : (node.state == PAIRED)   ? "Connected" : "New";
 
@@ -2487,11 +2840,21 @@ static void handleStationsPage() {
       seenTxt = String(ageMin) + F(" min ago");
     }
 
-    html += F("<a href='/station?id=");
-    html += node.nodeId;
-    html += F("' class='item item--node' data-node-id='");
+    html += F("<div class='node-select-wrap' data-node-id='");
     html += htmlEscape(node.nodeId);
-    html += F("'><div class='node-row'>"
+    html += F("' data-state='");
+    html += nodeStateToString(node.state);
+    html += F("' data-paused='");
+    html += nodePaused ? F("1") : F("0");
+    html += F("'><label class='node-select-control' title='Select node'>"
+              "<input class='node-select' type='checkbox' name='node_id' form='batch-node-actions' value='");
+    html += htmlEscape(node.nodeId);
+    html += F("' aria-label='Select ");
+    html += htmlEscape(displayId);
+    html += F("' onchange='updateBatchSelection(this)'></label>"
+              "<a href='/station?id=");
+    html += node.nodeId;
+    html += F("' class='item item--node'><div class='node-row'>"
               "<div class='node-main'><strong data-f='label'>");
     html += htmlEscape(displayId);
     html += F("</strong>");
@@ -2514,9 +2877,49 @@ static void handleStationsPage() {
               "<div class='node-timing-cell'><span class='node-timing-label'>Last seen</span>"
               "<span class='chip node-timing-value' data-f='lastseen'>");
     html += seenTxt;
-    html += F("</span></div></div></div></a>");
+    html += F("</span></div></div></div></a></div>");
   }
   html += F("</div>");
+  html += F(R"JS(<script>
+(function(){
+  var MAX_SELECTED=8;
+  function boxes(){ return Array.prototype.slice.call(document.querySelectorAll('.node-select')); }
+  window.updateBatchSelection=function(changed){
+    var all=boxes();
+    var selected=all.filter(function(b){return b.checked;});
+    if(changed && changed.checked && selected.length>MAX_SELECTED){
+      changed.checked=false;
+      alert('Select up to 8 nodes per action.');
+      selected=all.filter(function(b){return b.checked;});
+    }
+    all.forEach(function(b){var w=b.closest('.node-select-wrap');if(w)w.classList.toggle('is-selected',b.checked);});
+    var count=document.getElementById('batch-count');
+    if(count)count.textContent=selected.length+' selected';
+    ['batch-pause','batch-resume','batch-remove'].forEach(function(id){var e=document.getElementById(id);if(e)e.disabled=selected.length===0;});
+    var selectAll=document.getElementById('batch-select-all');
+    if(selectAll)selectAll.textContent=selected.length ? 'Clear' : 'Select all';
+  };
+  window.toggleBatchSelection=function(){
+    var all=boxes(), selected=all.filter(function(b){return b.checked;});
+    all.forEach(function(b,i){b.checked=selected.length ? false : i<MAX_SELECTED;});
+    updateBatchSelection();
+  };
+  window.confirmBatchNodeAction=function(){
+    var selected=boxes().filter(function(b){return b.checked;});
+    if(!selected.length){alert('Select at least one node.');return false;}
+    var action=(document.getElementById('batch-action')||{}).value||'';
+    if(action==='remove'){
+      return confirm('Remove '+selected.length+' selected node'+(selected.length===1?'':'s')+'? Deployed nodes will be removed after they confirm at their next sync. They must be paired again before reuse.');
+    }
+    if(action==='pause'||action==='resume'){
+      var label=action==='pause'?'Pause':'Resume';
+      return confirm(label+' recording on '+selected.length+' selected node'+(selected.length===1?'':'s')+'? Ineligible nodes will be left unchanged.');
+    }
+    return false;
+  };
+  updateBatchSelection();
+})();
+</script>)JS");
   html += F("</div>");
 
   // --- Add New node guided panel ---
@@ -2537,6 +2940,193 @@ static void handleStationsPage() {
 
   html += footCommon();
   server.send(200, "text/html", html);
+}
+
+static NodeInfo* registeredNodeForUi(const String& nodeId) {
+  for (auto& node : registeredNodes) {
+    if (node.nodeId == nodeId) return &node;
+  }
+  return nullptr;
+}
+
+static bool selectedNodeAlreadyAdded(const std::vector<String>& selected,
+                                     const String& nodeId) {
+  for (const String& existing : selected) {
+    if (existing == nodeId) return true;
+  }
+  return false;
+}
+
+static void handleBatchNodeAction() {
+  static constexpr size_t kMaxBatchNodes = 8;
+  const String action = server.arg("action");
+  std::vector<String> selected;
+  selected.reserve(kMaxBatchNodes + 1);
+  for (uint8_t i = 0; i < server.args(); ++i) {
+    if (server.argName(i) != "node_id") continue;
+    String nodeId = server.arg(i);
+    nodeId.trim();
+    if (!nodeId.length() || nodeId.length() >= CMD_NODEID_LEN ||
+        selectedNodeAlreadyAdded(selected, nodeId)) continue;
+    selected.push_back(nodeId);
+  }
+
+  const bool actionValid = action == "pause" || action == "resume" ||
+                           action == "remove";
+  if (!actionValid || selected.empty() || selected.size() > kMaxBatchNodes) {
+    String html = headCommon("Node action", "<a href='/stations' class='btn btn--sm'>Back</a>", 1);
+    html += F("<div class='section center'><h3>Nothing changed</h3><p class='muted'>");
+    if (!actionValid) html += F("Choose Pause, Resume, or Remove.");
+    else if (selected.empty()) html += F("Select at least one node.");
+    else html += F("Select no more than 8 nodes per action.");
+    html += F("</p><a href='/stations' class='btn btn--primary'>Back to Nodes</a></div>");
+    html += footCommon();
+    server.send(400, "text/html", html);
+    return;
+  }
+
+  uint8_t changed = 0;
+  uint8_t unchanged = 0;
+  uint8_t skipped = 0;
+  uint8_t failed = 0;
+  String rows;
+  rows.reserve(selected.size() * 150);
+
+  for (const String& nodeId : selected) {
+    NodeInfo* node = registeredNodeForUi(nodeId);
+    String label = getNodeName(nodeId);
+    if (!label.length()) label = getNodeUserId(nodeId);
+    if (!label.length()) label = nodeId;
+    const char* tone = "chip";
+    String outcome;
+
+    if (!node) {
+      ++skipped;
+      tone = "chip chip--state-unpaired";
+      outcome = F("Not registered - unchanged");
+    } else if (action == "pause" || action == "resume") {
+      if (node->state != DEPLOYED) {
+        ++skipped;
+        tone = "chip chip--state-paired";
+        outcome = F("Not deployed - unchanged");
+      } else {
+        const uint8_t requestedTarget = action == "pause" ? 3 : 2;
+        NodeDesiredConfig desired = getDesiredConfig(nodeId.c_str());
+        const bool reportsRequested = requestedTarget == 3
+            ? node->recordingPaused : !node->recordingPaused;
+        if (desired.targetState == requestedTarget &&
+            (node->stateChangePending || reportsRequested)) {
+          ++unchanged;
+          tone = requestedTarget == 3
+              ? "chip chip--state-paused" : "chip chip--state-deployed";
+          outcome = requestedTarget == 3
+              ? F("Already paused or queued") : F("Already active or queued");
+        } else {
+          desired.targetState = requestedTarget;
+          const NodeConfigApplyResult applied =
+              applyLocalDesiredConfig(nodeId, desired);
+          const bool ok = applied.durable && applied.registryApplied &&
+              (applied.command.outcome == OUT_ACCEPTED ||
+               applied.command.outcome == OUT_REPLAY);
+          if (ok) {
+            ++changed;
+            tone = requestedTarget == 3
+                ? "chip chip--state-paused" : "chip chip--state-deployed";
+            outcome = requestedTarget == 3
+                ? F("Pause queued for next sync")
+                : F("Resume queued for next sync");
+          } else {
+            ++failed;
+            tone = "chip chip--state-unpaired";
+            outcome = F("Could not save desired state");
+          }
+        }
+      }
+    } else if (node->state == DEPLOYED) {
+      NodeDesiredConfig desired = getDesiredConfig(nodeId.c_str());
+      if (desired.targetState == 0 && node->stateChangePending &&
+          node->pendingTargetState == PENDING_TO_UNPAIRED) {
+        ++unchanged;
+        tone = "chip chip--state-unpaired";
+        outcome = F("Removal already queued");
+      } else {
+        desired.targetState = 0;
+        const NodeConfigApplyResult applied =
+            applyLocalDesiredConfig(nodeId, desired, false, true);
+        const bool ok = applied.durable && applied.registryApplied &&
+            (applied.command.outcome == OUT_ACCEPTED ||
+             applied.command.outcome == OUT_REPLAY);
+        if (ok) {
+          ++changed;
+          tone = "chip chip--state-unpaired";
+          outcome = F("Removal queued - awaiting next-sync confirmation");
+        } else {
+          ++failed;
+          tone = "chip chip--state-unpaired";
+          outcome = F("Could not queue removal");
+        }
+      }
+    } else {
+      // New/connected nodes are awake in config mode, so preserve the existing
+      // immediate unpair path. A deployed node never uses this branch.
+      const bool sent = sendUnpairToNode(nodeId);
+      const bool local = unpairNode(nodeId);
+      if (local) {
+        setNodeUserId(nodeId, "");
+        setNodeName(nodeId, "");
+        setNodeNotes(nodeId, "");
+        NodeInfo* updated = registeredNodeForUi(nodeId);
+        if (updated) {
+          updated->userId = "";
+          updated->name = "";
+        }
+      }
+      if (sent && local) {
+        ++changed;
+        tone = "chip chip--state-unpaired";
+        outcome = F("Removed");
+      } else {
+        ++failed;
+        tone = "chip chip--state-unpaired";
+        outcome = local ? F("Removed locally; node did not confirm")
+                        : F("Removal failed");
+      }
+    }
+
+    Serial.printf("[BATCH] action=%s node=%s outcome=%s\n",
+                  action.c_str(), nodeId.c_str(), outcome.c_str());
+    rows += F("<div class='item item-row'><strong>");
+    rows += htmlEscape(label);
+    rows += F("</strong><span class='");
+    rows += tone;
+    rows += F("'>");
+    rows += htmlEscape(outcome);
+    rows += F("</span></div>");
+  }
+
+  const char* actionLabel = action == "pause" ? "Pause"
+      : action == "resume" ? "Resume" : "Remove";
+  Serial.printf("[BATCH] %s complete selected=%u changed=%u unchanged=%u skipped=%u failed=%u\n",
+                actionLabel, static_cast<unsigned>(selected.size()), changed,
+                unchanged, skipped, failed);
+
+  String html = headCommon("Node action", "<a href='/stations' class='btn btn--sm'>Back</a>", 1);
+  html += F("<div class='section'><h3>");
+  html += actionLabel;
+  html += F(" selected nodes</h3><p><strong>");
+  html += String(changed);
+  html += F(" queued/applied</strong> &middot; ");
+  html += String(unchanged);
+  html += F(" already set &middot; ");
+  html += String(skipped);
+  html += F(" skipped &middot; ");
+  html += String(failed);
+  html += F(" failed</p><div class='list'>");
+  html += rows;
+  html += F("</div><p class='muted'>Pause, resume, and deployed-node removal complete independently at each node&rsquo;s next normal sync.</p>"
+            "<a href='/stations' class='btn btn--primary'>Back to Nodes</a></div>");
+  html += footCommon();
+  server.send(failed ? 207 : 200, "text/html", html);
 }
 
 static void handleStationDetail() {
@@ -2717,8 +3307,9 @@ static void handleStationDetail() {
   }
   html += F("</div>");
 
-  html += F("<div class='action-choices'>"
-              "<label class='action-choice'><input type='radio' name='action' value='none' checked><span>No change</span></label>");
+  html += F("<label class='label'>Node action (optional)</label>"
+            "<div class='muted' style='font-size:12px'>Leave these unselected when only saving the node details above.</div>"
+            "<div class='action-choices'>");
   if (!isDeployed) {
     // New / Connected node — the in-hand deploy path.
     html += F("<label class='action-choice action-choice--start'><input type='radio' name='action' value='start'><span>Deploy (start recording)</span></label>");
@@ -3816,6 +4407,7 @@ void startConfigServer() {
   });
 
   server.on("/stations", HTTP_GET, handleStationsPage);
+  server.on("/batch-node-action", HTTP_POST, handleBatchNodeAction);
   server.on("/station", HTTP_GET, handleStationDetail);
   server.on("/station", HTTP_POST, handleNodeConfigSave);
   server.on("/node-sensors", HTTP_GET, handleNodeSensorsPage);

@@ -69,14 +69,25 @@ String commandId(uint8_t seed) {
 }
 
 String envelope(const String& commands, uint32_t nextCursor,
-                bool duplicateUpload = false) {
+                bool duplicateUpload = false, uint8_t protocol = 1) {
   String body = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n";
   body += "{\"success\":true,\"duplicate\":";
   body += duplicateUpload ? "true" : "false";
-  body += ",\"controlProtocolVersion\":1,\"serverTimeUnix\":1784217600";
+  body += ",\"controlProtocolVersion\":" + String(protocol) +
+          ",\"serverTimeUnix\":1784217600";
   body += ",\"nextCursor\":" + String(nextCursor);
   body += ",\"commands\":[" + commands + "]}";
   return body;
+}
+
+String intervalCommand(const String& id, uint32_t sequence,
+                       uint32_t expectedRevision, uint8_t interval) {
+  String item = "{\"commandId\":\"" + id + "\",\"sequence\":" +
+                String(sequence) + ",\"type\":\"SET_RECORDING_INTERVAL\"";
+  item += ",\"expectedStateRevision\":" + String(expectedRevision);
+  item += ",\"issuedAtUnix\":1784217500,\"expiresAtUnix\":1784303900";
+  item += ",\"payload\":{\"wakeIntervalMin\":" + String(interval) + "}}";
+  return item;
 }
 
 String setCommand(const String& id, uint32_t sequence, uint32_t expectedRevision,
@@ -183,6 +194,27 @@ BackendCommandApplyResult executeFake(const Command& command) {
   return out;
 }
 
+BackendCommandApplyResult executeFakeInterval(const Command& command) {
+  BackendCommandApplyResult out{};
+  const bool known = dispatcherKnownCmd(command.cmdId);
+  if (!known) {
+    for (auto& desired : gDesired) {
+      desired.wake = command.recordingIntervalMin;
+      ++desired.wireVersion;
+      ++gMutations;
+    }
+    if (!persistFakeDesired()) return out;
+  }
+  out.command = dispatcherSubmit(command);
+  CommandResult stored{};
+  out.durable = dispatcherResultFor(command.cmdId, &stored) &&
+                (stored.outcome == OUT_ACCEPTED ||
+                 stored.outcome == OUT_CONVERGED) &&
+                dispatcherEnsureDurable();
+  out.applied = out.durable;
+  return out;
+}
+
 BackendCommandApplyResult failBeforePersistence(const Command&) {
   return BackendCommandApplyResult{};
 }
@@ -197,7 +229,8 @@ BackendCommandApplyResult failAfterDispatcherPersistence(const Command& command)
 BackendIngestResult ingest(const String& body,
                            BackendCommandExecutor executor = executeFake) {
   return backendIngestUploadResponse(body, 1784217600, true,
-                                     resolveFake, executor);
+                                     resolveFake, executor,
+                                     executeFakeInterval);
 }
 
 void runSuite() {
@@ -287,6 +320,47 @@ void runSuite() {
         r.status == BackendIngestStatus::PROCESSED && r.replayedCount == 2 &&
         gMutations == batchMutations);
 
+  // Protocol 2 global interval: prepare every assigned desired config first,
+  // then expose one FieldHub-wide ACCEPTED result and cursor.
+  resetState();
+  const String globalIntervalId = commandId(24);
+  const String globalIntervalBody = envelope(
+      intervalCommand(globalIntervalId, 1, 0, 10), 1, false, 2);
+  r = ingest(globalIntervalBody);
+  desiredA = desiredFor(kNodeA);
+  desiredB = desiredFor(kNodeB);
+  CommandResult globalResult{};
+  uint32_t globalRevision = 0;
+  check("protocol 2 interval accepted only after all desired configs durable",
+        r.status == BackendIngestStatus::PROCESSED && r.processedCount == 1 &&
+        desiredA && desiredB && desiredA->wake == 10 && desiredB->wake == 10 &&
+        dispatcherResultFor(globalIntervalId.c_str(), &globalResult) &&
+        globalResult.outcome == OUT_ACCEPTED &&
+        dispatcherCurrentGlobalCommand(globalIntervalId.c_str(), &globalRevision) &&
+        backendControlLastCommandCursor() == 1);
+  check("global interval preserves each target and sensor mask",
+        desiredA && desiredB && desiredA->target == 2 && desiredB->target == 2 &&
+        desiredA->mask == 37 && desiredB->mask == 0x8123);
+  const uint32_t globalMutations = gMutations;
+  memset(gDesired, 0, sizeof(gDesired));
+  dispatcherInit();
+  backendControlInit();
+  check("global interval and cursor survive reboot",
+        loadFakeDesired() && desiredFor(kNodeA)->wake == 10 &&
+        desiredFor(kNodeB)->wake == 10 &&
+        backendControlLastCommandCursor() == 1);
+  r = ingest(globalIntervalBody);
+  check("global interval redelivery never applies twice",
+        r.status == BackendIngestStatus::PROCESSED && r.replayedCount == 1 &&
+        gMutations == globalMutations);
+  check("global interval remains ACCEPTED until all applicable ACKs",
+        dispatcherResultFor(globalIntervalId.c_str(), &globalResult) &&
+        globalResult.outcome == OUT_ACCEPTED);
+  check("global interval becomes CONVERGED after aggregate ACK proof",
+        dispatcherMarkGlobalConverged(globalRevision) &&
+        dispatcherResultFor(globalIntervalId.c_str(), &globalResult) &&
+        globalResult.outcome == OUT_CONVERGED);
+
   resetState();
   const String pauseId = commandId(2);
   r = ingest(envelope(setCommand(pauseId, 1, 0, kNodeA, 20, 3, 0xFFFF), 1));
@@ -374,7 +448,7 @@ void runSuite() {
         independentDataCursor == 48 && backendControlLastCommandCursor() == 0);
   String wrongProtocol = envelope("", 0);
   wrongProtocol.replace("\"controlProtocolVersion\":1",
-                        "\"controlProtocolVersion\":2");
+                        "\"controlProtocolVersion\":3");
   r = ingest(wrongProtocol);
   check("wrong protocol leaves control state untouched",
         r.status == BackendIngestStatus::UNSUPPORTED_PROTOCOL &&

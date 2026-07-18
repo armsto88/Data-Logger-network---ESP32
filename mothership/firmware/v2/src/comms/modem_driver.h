@@ -39,10 +39,13 @@ enum class ModemState {
 // ---------------------------------------------------------------------------
 
 struct HttpsPostResult {
-  bool success;
-  int httpStatus;       // 200, 4xx, 5xx, or -1 (no response / transport error)
-  String responseBody;  // body from AT+HTTPREAD
+  bool success = false;
+  int httpStatus = -1;  // 200, 4xx, 5xx, or -1 (no/incomplete response)
+  String responseBody;  // complete, de-framed and de-chunked HTTP entity body
   String errorDetail;   // human-readable error for logging
+  uint32_t responseWireBytes = 0;
+  uint32_t responseHttpBytes = 0;
+  bool responseComplete = false;
 };
 
 // ---------------------------------------------------------------------------

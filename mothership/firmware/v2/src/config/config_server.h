@@ -1,6 +1,7 @@
 #pragma once
 
 #include <Arduino.h>
+#include "control/backend_command_ingest.h"
 
 // Config-mode WiFi AP + web server for Mothership V1.
 // Slim extract from production main.cpp — adapted to use V1's rtc_alarm.h
@@ -26,6 +27,15 @@ void loadSyncModeFromNVS();
 void loadDailySyncTimeFromNVS();
 void loadSyncRuntimeGuardsFromNVS();
 void saveSyncRuntimeGuardsToNVS();
+
+// Durable control-protocol-2 FieldHub-wide schedule transaction. The executor
+// persists the global setting and every assigned node's desired config before
+// the dispatcher can expose ACCEPTED.
+void configInitRecordingIntervalControl();
+BackendCommandApplyResult configApplyBackendRecordingInterval(
+    const Command& command);
+bool configMarkRecordingIntervalNodeConverged(const char* nodeId,
+                                              uint16_t configVersion);
 
 int computeAutoSyncMin(int wakeMin);
 

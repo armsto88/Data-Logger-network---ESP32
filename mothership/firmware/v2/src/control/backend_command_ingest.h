@@ -3,7 +3,7 @@
 #include <Arduino.h>
 #include "command_dispatcher.h"
 
-static constexpr uint8_t BACKEND_CONTROL_PROTOCOL_VERSION = 1;
+static constexpr uint8_t BACKEND_CONTROL_PROTOCOL_VERSION = 2;
 static constexpr uint8_t BACKEND_MAX_COMMANDS_PER_RESPONSE = 8;
 
 struct BackendCommandApplyResult {
@@ -14,6 +14,7 @@ struct BackendCommandApplyResult {
 };
 
 using BackendCommandExecutor = BackendCommandApplyResult (*)(const Command&);
+using BackendIntervalExecutor = BackendCommandApplyResult (*)(const Command&);
 using BackendCommandResolver = bool (*)(const Command& requested,
                                         Command& resolved,
                                         CmdOutcome& rejection);
@@ -29,7 +30,28 @@ enum class BackendIngestStatus : uint8_t {
   PERSIST_FAILED,
 };
 
+enum class BackendIngestRejection : uint8_t {
+  NONE = 0,
+  RESPONSE_TOO_LARGE,
+  JSON_NOT_FOUND,
+  JSON_PARSE_FAILED,
+  ENVELOPE_INVALID,
+  PROTOCOL_UNSUPPORTED,
+  COMMAND_LIMIT,
+  SEQUENCE_ORDER,
+  CURSOR_INVALID,
+  REMOTE_DISABLED,
+  CALLBACK_MISSING,
+  COMMAND_ID_INVALID,
+  COMMAND_SCHEMA_INVALID,
+  MIXED_GLOBAL_BATCH,
+  DISPATCH_PERSIST_FAILED,
+  DESIRED_PERSIST_FAILED,
+  CURSOR_PERSIST_FAILED,
+};
+
 const char* backendIngestStatusStr(BackendIngestStatus status);
+const char* backendIngestRejectionStr(BackendIngestRejection rejection);
 
 struct BackendIngestResult {
   BackendIngestStatus status = BackendIngestStatus::LEGACY_NO_ENVELOPE;
@@ -41,6 +63,7 @@ struct BackendIngestResult {
   uint32_t responseNextCursor = 0;
   uint32_t initialStateRevision = 0;
   uint32_t persistedCursor = 0;
+  BackendIngestRejection rejection = BackendIngestRejection::NONE;
 };
 
 // Load the checksummed A/B control-state record. Defaults are cursor=0 and
@@ -50,6 +73,9 @@ uint32_t backendControlLastCommandCursor();
 bool     backendControlRemoteManagementEnabled();
 bool     backendControlSetRemoteManagementEnabled(bool enabled);
 void     backendControlResetForTest();
+bool     backendControlRecordDiagnostics(const BackendIngestResult& result,
+                                         uint32_t responseBytes,
+                                         uint32_t timestampUnix);
 
 // Canonical serializer for both local GET /api/control and cloud status.control.
 String backendControlStatusJson();
@@ -59,4 +85,5 @@ String backendControlStatusJson();
 // callers invoke this only after handling a successful HTTP 200 upload.
 BackendIngestResult backendIngestUploadResponse(
     const String& responseBody, uint32_t rtcNowUnix, bool rtcTrustworthy,
-    BackendCommandResolver resolver, BackendCommandExecutor executor);
+    BackendCommandResolver resolver, BackendCommandExecutor executor,
+    BackendIntervalExecutor intervalExecutor = nullptr);

@@ -10,7 +10,12 @@ std::vector<NodeInfo> registeredNodes;
 
 namespace {
 
-NodeDesiredConfig gDesired{};
+struct DesiredSlot {
+  String nodeId;
+  NodeDesiredConfig config{};
+};
+
+DesiredSlot gDesired[2];
 int gSaveCount = 0;
 int gPass = 0;
 int gFail = 0;
@@ -21,9 +26,17 @@ void check(const char* name, bool ok) {
   else ++gFail;
 }
 
-NodeInfo makeNode(bool paused, uint16_t appliedVersion, bool pending) {
+NodeDesiredConfig* desiredFor(const char* nodeId) {
+  for (auto& slot : gDesired) {
+    if (slot.nodeId == String(nodeId ? nodeId : "")) return &slot.config;
+  }
+  return nullptr;
+}
+
+NodeInfo makeNode(const char* nodeId, bool paused, uint16_t appliedVersion,
+                  bool pending) {
   NodeInfo node{};
-  node.nodeId = "ENV_D13F98";
+  node.nodeId = nodeId;
   node.state = DEPLOYED;
   node.recordingPaused = paused;
   node.configVersionApplied = appliedVersion;
@@ -54,13 +67,16 @@ void resetFixture(uint16_t desiredVersion, uint8_t targetState,
                   bool paused, uint16_t appliedVersion, bool pending) {
   dispatcherResetForTest();
   registeredNodes.clear();
-  registeredNodes.push_back(makeNode(paused, appliedVersion, pending));
-  gDesired = NodeDesiredConfig{};
-  gDesired.configVersion = desiredVersion;
-  gDesired.wakeIntervalMin = 20;
-  gDesired.syncIntervalMin = 18;
-  gDesired.targetState = targetState;
-  gDesired.sensorMask = 37;
+  registeredNodes.push_back(makeNode("ENV_D13F98", paused, appliedVersion,
+                                     pending));
+  gDesired[0] = DesiredSlot{};
+  gDesired[0].nodeId = "ENV_D13F98";
+  gDesired[0].config.configVersion = desiredVersion;
+  gDesired[0].config.wakeIntervalMin = 20;
+  gDesired[0].config.syncIntervalMin = 18;
+  gDesired[0].config.targetState = targetState;
+  gDesired[0].config.sensorMask = 37;
+  gDesired[1] = DesiredSlot{};
   gSaveCount = 0;
 }
 
@@ -81,7 +97,7 @@ void runSuite() {
 
   // Simulate the next FieldHub cold wake: dispatcher NVS still says CONVERGED,
   // but the RAM registry was restored stale. A repeated HELLO must repair it.
-  registeredNodes[0] = makeNode(true, 0, false);
+  registeredNodes[0] = makeNode("ENV_D13F98", true, 0, false);
   gSaveCount = 0;
   check("repeated HELLO remains a valid convergence observation",
         controlMarkNodeConfigConverged("ENV_D13F98", 7));
@@ -107,17 +123,75 @@ void runSuite() {
         registeredNodes[0].recordingPaused &&
         !registeredNodes[0].stateChangePending && gSaveCount == 1);
 
+  // Local Field UI multi-selection uses the same durable per-node helper for
+  // every selected node. Verify pause and removal preserve each node's other
+  // desired fields and create independent pending NODE_CONFIG records.
+  dispatcherResetForTest();
+  registeredNodes.clear();
+  registeredNodes.push_back(makeNode("ENV_D13F98", false, 3, false));
+  registeredNodes.push_back(makeNode("ENV_6C0AA0", false, 6, false));
+  gDesired[0] = DesiredSlot{};
+  gDesired[0].nodeId = "ENV_D13F98";
+  gDesired[0].config.configVersion = 3;
+  gDesired[0].config.wakeIntervalMin = 20;
+  gDesired[0].config.syncIntervalMin = 18;
+  gDesired[0].config.targetState = 2;
+  gDesired[0].config.sensorMask = 37;
+  gDesired[1] = DesiredSlot{};
+  gDesired[1].nodeId = "ENV_6C0AA0";
+  gDesired[1].config.configVersion = 6;
+  gDesired[1].config.wakeIntervalMin = 45;
+  gDesired[1].config.syncIntervalMin = 18;
+  gDesired[1].config.targetState = 2;
+  gDesired[1].config.sensorMask = 0x8123;
+
+  NodeConfigApplyResult pauseA = controlApplyLocalNodeConfig(
+      "ENV_D13F98", 20, 3, 37);
+  NodeConfigApplyResult pauseB = controlApplyLocalNodeConfig(
+      "ENV_6C0AA0", 45, 3, 0x8123);
+  check("multi-select pause queues both nodes durably",
+        pauseA.durable && pauseA.registryApplied &&
+        pauseB.durable && pauseB.registryApplied && dispatcherRevision() == 2);
+  check("multi-select pause preserves independent wake and sensor fields",
+        gDesired[0].config.targetState == 3 &&
+        gDesired[0].config.wakeIntervalMin == 20 &&
+        gDesired[0].config.sensorMask == 37 &&
+        gDesired[1].config.targetState == 3 &&
+        gDesired[1].config.wakeIntervalMin == 45 &&
+        gDesired[1].config.sensorMask == 0x8123);
+  check("multi-select pause leaves independent pending sync records",
+        registeredNodes[0].stateChangePending &&
+        registeredNodes[1].stateChangePending);
+
+  NodeConfigApplyOptions removeOptions{};
+  removeOptions.allowUnpair = true;
+  NodeConfigApplyResult removeA = controlApplyLocalNodeConfig(
+      "ENV_D13F98", 20, 0, 37, removeOptions);
+  NodeConfigApplyResult removeB = controlApplyLocalNodeConfig(
+      "ENV_6C0AA0", 45, 0, 0x8123, removeOptions);
+  check("multi-select remove queues both deployed nodes durably",
+        removeA.durable && removeA.registryApplied &&
+        removeB.durable && removeB.registryApplied && dispatcherRevision() == 4);
+  check("multi-select remove waits for independent unpair acknowledgements",
+        registeredNodes[0].pendingTargetState == PENDING_TO_UNPAIRED &&
+        registeredNodes[1].pendingTargetState == PENDING_TO_UNPAIRED &&
+        gDesired[0].config.targetState == 0 &&
+        gDesired[1].config.targetState == 0);
+
   Serial.printf("=== SUITE: %d passed, %d failed ===\n", gPass, gFail);
 }
 
 }  // namespace
 
-NodeDesiredConfig getDesiredConfig(const char*) {
-  return gDesired;
+NodeDesiredConfig getDesiredConfig(const char* nodeId) {
+  NodeDesiredConfig* desired = desiredFor(nodeId);
+  return desired ? *desired : NodeDesiredConfig{};
 }
 
-bool setDesiredConfig(const char*, const NodeDesiredConfig& cfg) {
-  gDesired = cfg;
+bool setDesiredConfig(const char* nodeId, const NodeDesiredConfig& cfg) {
+  NodeDesiredConfig* desired = desiredFor(nodeId);
+  if (!desired) return false;
+  *desired = cfg;
   return true;
 }
 

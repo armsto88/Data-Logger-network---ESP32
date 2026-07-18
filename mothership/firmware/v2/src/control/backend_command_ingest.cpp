@@ -10,12 +10,12 @@ static constexpr const char* kStateNamespace = "backend_ctrl";
 static constexpr const char* kStateA = "state_a";
 static constexpr const char* kStateB = "state_b";
 static constexpr uint32_t kStateMagic = 0x464D4354UL;  // FMCT
-static constexpr uint16_t kStateVersion = 1;
+static constexpr uint16_t kStateVersion = 2;
 static constexpr size_t kMaxRawResponseBytes = 12288;
 static constexpr uint32_t kMinTrustedUnix = 1704067200UL;  // 2024-01-01
 static constexpr uint32_t kMaxTrustedUnix = 4102444800UL;  // 2100-01-01
 
-struct ControlStateRecord {
+struct ControlStateRecordV1 {
   uint32_t magic;
   uint16_t version;
   uint16_t size;
@@ -26,9 +26,40 @@ struct ControlStateRecord {
   uint32_t checksum;
 };
 
+struct ControlStateRecord {
+  uint32_t magic;
+  uint16_t version;
+  uint16_t size;
+  uint32_t generation;
+  uint32_t lastCommandCursor;
+  uint8_t remoteManagementEnabled;
+  uint8_t lastIngestStatus;
+  uint8_t lastIngestRejection;
+  uint8_t lastCommandCount;
+  uint8_t lastProcessedCount;
+  uint8_t lastRejectedCount;
+  uint8_t lastReplayedCount;
+  uint8_t reserved;
+  uint32_t lastResponseBytes;
+  uint32_t lastResponseNextCursor;
+  uint32_t lastIngestUnix;
+  uint32_t checksum;
+};
+
 static ControlStateRecord gState{};
 
 uint32_t checksumFor(ControlStateRecord record) {
+  record.checksum = 0;
+  const uint8_t* bytes = reinterpret_cast<const uint8_t*>(&record);
+  uint32_t hash = 2166136261UL;
+  for (size_t i = 0; i < sizeof(record); ++i) {
+    hash ^= bytes[i];
+    hash *= 16777619UL;
+  }
+  return hash;
+}
+
+uint32_t checksumForV1(ControlStateRecordV1 record) {
   record.checksum = 0;
   const uint8_t* bytes = reinterpret_cast<const uint8_t*>(&record);
   uint32_t hash = 2166136261UL;
@@ -56,8 +87,16 @@ bool readRecord(Preferences& prefs, const char* key, ControlStateRecord& out) {
          validRecord(out);
 }
 
+bool readRecordV1(Preferences& prefs, const char* key, ControlStateRecordV1& out) {
+  if (prefs.getBytesLength(key) != sizeof(out)) return false;
+  return prefs.getBytes(key, &out, sizeof(out)) == sizeof(out) &&
+         out.magic == kStateMagic && out.version == 1 &&
+         out.size == sizeof(out) && out.remoteManagementEnabled <= 1 &&
+         out.checksum == checksumForV1(out);
+}
+
 bool persistState(uint32_t cursor, bool enabled) {
-  ControlStateRecord candidate{};
+  ControlStateRecord candidate = gState;
   candidate.magic = kStateMagic;
   candidate.version = kStateVersion;
   candidate.size = sizeof(candidate);
@@ -180,6 +219,29 @@ const char* backendIngestStatusStr(BackendIngestStatus status) {
   }
 }
 
+const char* backendIngestRejectionStr(BackendIngestRejection rejection) {
+  switch (rejection) {
+    case BackendIngestRejection::NONE: return "NONE";
+    case BackendIngestRejection::RESPONSE_TOO_LARGE: return "RESPONSE_TOO_LARGE";
+    case BackendIngestRejection::JSON_NOT_FOUND: return "JSON_NOT_FOUND";
+    case BackendIngestRejection::JSON_PARSE_FAILED: return "JSON_PARSE_FAILED";
+    case BackendIngestRejection::ENVELOPE_INVALID: return "ENVELOPE_INVALID";
+    case BackendIngestRejection::PROTOCOL_UNSUPPORTED: return "PROTOCOL_UNSUPPORTED";
+    case BackendIngestRejection::COMMAND_LIMIT: return "COMMAND_LIMIT";
+    case BackendIngestRejection::SEQUENCE_ORDER: return "SEQUENCE_ORDER";
+    case BackendIngestRejection::CURSOR_INVALID: return "CURSOR_INVALID";
+    case BackendIngestRejection::REMOTE_DISABLED: return "REMOTE_DISABLED";
+    case BackendIngestRejection::CALLBACK_MISSING: return "CALLBACK_MISSING";
+    case BackendIngestRejection::COMMAND_ID_INVALID: return "COMMAND_ID_INVALID";
+    case BackendIngestRejection::COMMAND_SCHEMA_INVALID: return "COMMAND_SCHEMA_INVALID";
+    case BackendIngestRejection::MIXED_GLOBAL_BATCH: return "MIXED_GLOBAL_BATCH";
+    case BackendIngestRejection::DISPATCH_PERSIST_FAILED: return "DISPATCH_PERSIST_FAILED";
+    case BackendIngestRejection::DESIRED_PERSIST_FAILED: return "DESIRED_PERSIST_FAILED";
+    case BackendIngestRejection::CURSOR_PERSIST_FAILED: return "CURSOR_PERSIST_FAILED";
+    default: return "UNKNOWN";
+  }
+}
+
 void backendControlInit() {
   gState = {};
   gState.magic = kStateMagic;
@@ -191,10 +253,29 @@ void backendControlInit() {
   ControlStateRecord a{}, b{};
   const bool aValid = readRecord(prefs, kStateA, a);
   const bool bValid = readRecord(prefs, kStateB, b);
+  if (aValid || bValid) {
+    gState = aValid && bValid
+        ? (generationNewer(b.generation, a.generation) ? b : a)
+        : (aValid ? a : b);
+    prefs.end();
+    return;
+  }
+  ControlStateRecordV1 oldA{}, oldB{};
+  const bool oldAValid = readRecordV1(prefs, kStateA, oldA);
+  const bool oldBValid = readRecordV1(prefs, kStateB, oldB);
+  if (oldAValid || oldBValid) {
+    const ControlStateRecordV1& old = oldAValid && oldBValid
+        ? (generationNewer(oldB.generation, oldA.generation) ? oldB : oldA)
+        : (oldAValid ? oldA : oldB);
+    gState.generation = old.generation;
+    gState.lastCommandCursor = old.lastCommandCursor;
+    gState.remoteManagementEnabled = old.remoteManagementEnabled;
+    prefs.end();
+    persistState(gState.lastCommandCursor,
+                 gState.remoteManagementEnabled != 0);
+    return;
+  }
   prefs.end();
-  if (aValid && bValid) gState = generationNewer(b.generation, a.generation) ? b : a;
-  else if (aValid) gState = a;
-  else if (bValid) gState = b;
 }
 
 uint32_t backendControlLastCommandCursor() {
@@ -222,6 +303,22 @@ void backendControlResetForTest() {
   gState.size = sizeof(gState);
 }
 
+bool backendControlRecordDiagnostics(const BackendIngestResult& result,
+                                     uint32_t responseBytes,
+                                     uint32_t timestampUnix) {
+  gState.lastIngestStatus = static_cast<uint8_t>(result.status);
+  gState.lastIngestRejection = static_cast<uint8_t>(result.rejection);
+  gState.lastCommandCount = result.commandCount;
+  gState.lastProcessedCount = result.processedCount;
+  gState.lastRejectedCount = result.rejectedCount;
+  gState.lastReplayedCount = result.replayedCount;
+  gState.lastResponseBytes = responseBytes;
+  gState.lastResponseNextCursor = result.responseNextCursor;
+  gState.lastIngestUnix = timestampUnix;
+  return persistState(gState.lastCommandCursor,
+                      gState.remoteManagementEnabled != 0);
+}
+
 String backendControlStatusJson() {
   CommandResult results[CMD_MAX_RESULTS]{};
   const uint8_t count = dispatcherRecentResults(results, CMD_MAX_RESULTS);
@@ -237,6 +334,27 @@ String backendControlStatusJson() {
   json += dispatcherLastChangeSource() == SRC_DASHBOARD ? "DASHBOARD" : "LOCAL_UI";
   json += "\",\"remoteManagementEnabled\":";
   json += backendControlRemoteManagementEnabled() ? "true" : "false";
+  json += ",\"lastIngest\":{\"responseBytes\":";
+  json += String(gState.lastResponseBytes);
+  json += ",\"commandCount\":";
+  json += String(gState.lastCommandCount);
+  json += ",\"processedCount\":";
+  json += String(gState.lastProcessedCount);
+  json += ",\"rejectedCount\":";
+  json += String(gState.lastRejectedCount);
+  json += ",\"replayedCount\":";
+  json += String(gState.lastReplayedCount);
+  json += ",\"nextCursor\":";
+  json += String(gState.lastResponseNextCursor);
+  json += ",\"ingestStatus\":\"";
+  json += backendIngestStatusStr(
+      static_cast<BackendIngestStatus>(gState.lastIngestStatus));
+  json += "\",\"rejection\":\"";
+  json += backendIngestRejectionStr(
+      static_cast<BackendIngestRejection>(gState.lastIngestRejection));
+  json += "\",\"timestampUnix\":";
+  json += String(gState.lastIngestUnix);
+  json += '}';
   json += ",\"results\":[";
   for (uint8_t i = 0; i < count; ++i) {
     if (i) json += ',';
@@ -254,7 +372,8 @@ String backendControlStatusJson() {
 
 BackendIngestResult backendIngestUploadResponse(
     const String& responseBody, uint32_t rtcNowUnix, bool rtcTrustworthy,
-    BackendCommandResolver resolver, BackendCommandExecutor executor) {
+    BackendCommandResolver resolver, BackendCommandExecutor executor,
+    BackendIntervalExecutor intervalExecutor) {
   BackendIngestResult result{};
   // This snapshot is the compare-and-set authority for the entire response.
   // Individual accepted commands may advance the live revision later, but no
@@ -263,6 +382,7 @@ BackendIngestResult backendIngestUploadResponse(
   result.persistedCursor = gState.lastCommandCursor;
   if (responseBody.length() > kMaxRawResponseBytes) {
     result.status = BackendIngestStatus::TOO_LARGE;
+    result.rejection = BackendIngestRejection::RESPONSE_TOO_LARGE;
     return result;
   }
 
@@ -273,6 +393,8 @@ BackendIngestResult backendIngestUploadResponse(
     result.status = responseBody.indexOf('{') < 0
         ? BackendIngestStatus::LEGACY_NO_ENVELOPE
         : BackendIngestStatus::MALFORMED;
+    if (result.status == BackendIngestStatus::MALFORMED)
+      result.rejection = BackendIngestRejection::JSON_NOT_FOUND;
     return result;
   }
 
@@ -281,6 +403,7 @@ BackendIngestResult backendIngestUploadResponse(
       doc, json.c_str(), json.length(), DeserializationOption::NestingLimit(8));
   if (error || !doc.is<JsonObject>()) {
     result.status = BackendIngestStatus::MALFORMED;
+    result.rejection = BackendIngestRejection::JSON_PARSE_FAILED;
     return result;
   }
   if (!envelopePresent(doc)) {
@@ -291,10 +414,12 @@ BackendIngestResult backendIngestUploadResponse(
   uint32_t protocol = 0;
   if (!readU32(doc["controlProtocolVersion"], protocol)) {
     result.status = BackendIngestStatus::MALFORMED;
+    result.rejection = BackendIngestRejection::ENVELOPE_INVALID;
     return result;
   }
-  if (protocol != BACKEND_CONTROL_PROTOCOL_VERSION) {
+  if (protocol != 1 && protocol != BACKEND_CONTROL_PROTOCOL_VERSION) {
     result.status = BackendIngestStatus::UNSUPPORTED_PROTOCOL;
+    result.rejection = BackendIngestRejection::PROTOCOL_UNSUPPORTED;
     return result;
   }
   if (!readU32(doc["serverTimeUnix"], result.serverTimeUnix) ||
@@ -302,12 +427,14 @@ BackendIngestResult backendIngestUploadResponse(
       !readU32(doc["nextCursor"], result.responseNextCursor) ||
       !doc["commands"].is<JsonArrayConst>()) {
     result.status = BackendIngestStatus::MALFORMED;
+    result.rejection = BackendIngestRejection::ENVELOPE_INVALID;
     return result;
   }
 
   JsonArrayConst commands = doc["commands"].as<JsonArrayConst>();
   if (commands.size() > BACKEND_MAX_COMMANDS_PER_RESPONSE) {
     result.status = BackendIngestStatus::TOO_LARGE;
+    result.rejection = BackendIngestRejection::COMMAND_LIMIT;
     return result;
   }
   result.commandCount = static_cast<uint8_t>(commands.size());
@@ -320,6 +447,7 @@ BackendIngestResult backendIngestUploadResponse(
     if (!readU32(item["sequence"], sequence) || sequence == 0 ||
         (!first && sequence <= previousSequence)) {
       result.status = BackendIngestStatus::MALFORMED;
+      result.rejection = BackendIngestRejection::SEQUENCE_ORDER;
       return result;
     }
     first = false;
@@ -328,6 +456,7 @@ BackendIngestResult backendIngestUploadResponse(
   if ((!first && result.responseNextCursor < previousSequence) ||
       result.responseNextCursor < gState.lastCommandCursor) {
     result.status = BackendIngestStatus::MALFORMED;
+    result.rejection = BackendIngestRejection::CURSOR_INVALID;
     return result;
   }
 
@@ -337,10 +466,12 @@ BackendIngestResult backendIngestUploadResponse(
   }
   if (!backendControlRemoteManagementEnabled()) {
     result.status = BackendIngestStatus::REMOTE_DISABLED;
+    result.rejection = BackendIngestRejection::REMOTE_DISABLED;
     return result;
   }
   if (!resolver || !executor) {
     result.status = BackendIngestStatus::MALFORMED;
+    result.rejection = BackendIngestRejection::CALLBACK_MISSING;
     return result;
   }
 
@@ -367,11 +498,13 @@ BackendIngestResult backendIngestUploadResponse(
     const char* commandId = item["commandId"].as<const char*>();
     if (!validDashboardCommandId(commandId)) {
       result.status = BackendIngestStatus::MALFORMED;
+      result.rejection = BackendIngestRejection::COMMAND_ID_INVALID;
       return result;
     }
     for (uint8_t i = 0; i < seenIdCount; ++i) {
       if (strncmp(seenIds[i], commandId, CMD_ID_LEN) == 0) {
         result.status = BackendIngestStatus::MALFORMED;
+        result.rejection = BackendIngestRejection::COMMAND_ID_INVALID;
         return result;
       }
     }
@@ -393,41 +526,52 @@ BackendIngestResult backendIngestUploadResponse(
 
     const char* type = item["type"].as<const char*>();
     uint32_t expectedRevision = 0, issuedAt = 0, expiresAt = 0;
-    const char* nodeId = item["target"]["nodeId"].as<const char*>();
-    const bool nodeIdShapeOk = nodeId && nodeId[0] &&
-                               strlen(nodeId) < CMD_NODEID_LEN;
-    const bool baseFieldsOk = type &&
-        strcmp(type, "SET_NODE_CONFIG") == 0 &&
+    const bool isNodeConfig = type && strcmp(type, "SET_NODE_CONFIG") == 0;
+    const bool isRecordingInterval = protocol >= 2 && type &&
+        strcmp(type, "SET_RECORDING_INTERVAL") == 0;
+    const bool baseFieldsOk = (isNodeConfig || isRecordingInterval) &&
         readU32(item["expectedStateRevision"], expectedRevision) &&
         readU32(item["issuedAtUnix"], issuedAt) && plausibleUnix(issuedAt) &&
         readU32(item["expiresAtUnix"], expiresAt) && plausibleUnix(expiresAt) &&
-        expiresAt > issuedAt && nodeIdShapeOk &&
+        expiresAt > issuedAt &&
         item["payload"].is<JsonObjectConst>();
     if (!baseFieldsOk) continue;
 
-    requested.type = CMD_SET_NODE_CONFIG;
     requested.expectedRevision = expectedRevision;
-    strlcpy(requested.payload.nodeId, nodeId, CMD_NODEID_LEN);
     JsonObjectConst payload = item["payload"].as<JsonObjectConst>();
 
-    uint8_t targetState = 0;
-    if (!readU8(payload["targetState"], targetState) ||
-        (targetState != 0 && targetState != 2 && targetState != 3)) continue;
-    requested.payload.targetState = targetState;
-    requested.configFields |= CFG_FIELD_TARGET_STATE;
+    if (isRecordingInterval) {
+      requested.type = CMD_SET_RECORDING_INTERVAL;
+      uint8_t interval = 0;
+      if (!readU8(payload["wakeIntervalMin"], interval) ||
+          (interval != 1 && interval != 5 && interval != 10 &&
+           interval != 20 && interval != 30 && interval != 60)) continue;
+      requested.recordingIntervalMin = interval;
+    } else {
+      const char* nodeId = item["target"]["nodeId"].as<const char*>();
+      if (!nodeId || !nodeId[0] || strlen(nodeId) >= CMD_NODEID_LEN) continue;
+      requested.type = CMD_SET_NODE_CONFIG;
+      strlcpy(requested.payload.nodeId, nodeId, CMD_NODEID_LEN);
 
-    if (!payload["wakeIntervalMin"].isNull()) {
-      uint8_t wake = 0;
-      if (!readU8(payload["wakeIntervalMin"], wake) || wake < 1 || wake > 240)
-        continue;
-      requested.payload.wakeIntervalMin = wake;
-      requested.configFields |= CFG_FIELD_WAKE_INTERVAL;
-    }
-    if (!payload["sensorMask"].isNull()) {
-      uint16_t sensorMask = 0;
-      if (!readU16(payload["sensorMask"], sensorMask)) continue;
-      requested.payload.sensorMask = sensorMask;
-      requested.configFields |= CFG_FIELD_SENSOR_MASK;
+      uint8_t targetState = 0;
+      if (!readU8(payload["targetState"], targetState) ||
+          (targetState != 0 && targetState != 2 && targetState != 3)) continue;
+      requested.payload.targetState = targetState;
+      requested.configFields |= CFG_FIELD_TARGET_STATE;
+
+      if (!payload["wakeIntervalMin"].isNull()) {
+        uint8_t wake = 0;
+        if (!readU8(payload["wakeIntervalMin"], wake) || wake < 1 || wake > 240)
+          continue;
+        requested.payload.wakeIntervalMin = wake;
+        requested.configFields |= CFG_FIELD_WAKE_INTERVAL;
+      }
+      if (!payload["sensorMask"].isNull()) {
+        uint16_t sensorMask = 0;
+        if (!readU16(payload["sensorMask"], sensorMask)) continue;
+        requested.payload.sensorMask = sensorMask;
+        requested.configFields |= CFG_FIELD_SENSOR_MASK;
+      }
     }
 
     const bool timeOk = validationNow == 0 ||
@@ -446,14 +590,16 @@ BackendIngestResult backendIngestUploadResponse(
       continue;
     }
 
-    Command resolved{};
-    CmdOutcome rejection = OUT_INVALID;
-    if (!resolver(requested, resolved, rejection)) {
-      entry.dispatch.outcome = rejection == OUT_REVISION_CONFLICT
-          ? OUT_REVISION_CONFLICT : OUT_INVALID;
-      continue;
+    if (requested.type == CMD_SET_NODE_CONFIG) {
+      Command resolved{};
+      CmdOutcome rejection = OUT_INVALID;
+      if (!resolver(requested, resolved, rejection)) {
+        entry.dispatch.outcome = rejection == OUT_REVISION_CONFLICT
+            ? OUT_REVISION_CONFLICT : OUT_INVALID;
+        continue;
+      }
+      entry.dispatch.command = resolved;
     }
-    entry.dispatch.command = resolved;
     entry.dispatch.outcome = OUT_ACCEPTED;
   }
 
@@ -462,10 +608,12 @@ BackendIngestResult backendIngestUploadResponse(
   // while unrelated nodes in the same response remain eligible.
   for (uint8_t i = 0; i < stagedCount; ++i) {
     if (staged[i].dispatch.outcome != OUT_ACCEPTED ||
-        dispatcherKnownCmd(staged[i].dispatch.command.cmdId)) continue;
+        dispatcherKnownCmd(staged[i].dispatch.command.cmdId) ||
+        staged[i].dispatch.command.type != CMD_SET_NODE_CONFIG) continue;
     for (uint8_t j = i + 1; j < stagedCount; ++j) {
       if (staged[j].dispatch.outcome == OUT_ACCEPTED &&
           !dispatcherKnownCmd(staged[j].dispatch.command.cmdId) &&
+          staged[j].dispatch.command.type == CMD_SET_NODE_CONFIG &&
           strncmp(staged[i].dispatch.command.payload.nodeId,
                   staged[j].dispatch.command.payload.nodeId,
                   CMD_NODEID_LEN) == 0) {
@@ -474,10 +622,28 @@ BackendIngestResult backendIngestUploadResponse(
       }
     }
   }
+
+  uint8_t globalCommands = 0;
   for (uint8_t i = 0; i < stagedCount; ++i) {
-    Serial.printf("[CONTROL] staged seq=%lu id=%s node=%s decision=%s\n",
+    if (staged[i].dispatch.command.type == CMD_SET_RECORDING_INTERVAL)
+      ++globalCommands;
+    if (staged[i].dispatch.outcome == OUT_INVALID &&
+        result.rejection == BackendIngestRejection::NONE)
+      result.rejection = BackendIngestRejection::COMMAND_SCHEMA_INVALID;
+  }
+  // A fleet-wide schedule transaction changes every assigned node. Keep it a
+  // single durable transaction rather than interleaving it with per-node
+  // changes that were validated against the same initial revision.
+  if (globalCommands > 0 && stagedCount != 1) {
+    for (uint8_t i = 0; i < stagedCount; ++i)
+      staged[i].dispatch.outcome = OUT_INVALID;
+    result.rejection = BackendIngestRejection::MIXED_GLOBAL_BATCH;
+  }
+  for (uint8_t i = 0; i < stagedCount; ++i) {
+    Serial.printf("[CONTROL] staged seq=%lu id=%s type=%u node=%s decision=%s\n",
                   static_cast<unsigned long>(staged[i].sequence),
                   staged[i].dispatch.command.cmdId,
+                  static_cast<unsigned>(staged[i].dispatch.command.type),
                   staged[i].dispatch.command.payload.nodeId,
                   cmdOutcomeStr(staged[i].dispatch.outcome));
   }
@@ -487,12 +653,51 @@ BackendIngestResult backendIngestUploadResponse(
     return result;
   }
 
+  if (stagedCount == 1 &&
+      staged[0].dispatch.command.type == CMD_SET_RECORDING_INTERVAL &&
+      staged[0].dispatch.outcome == OUT_ACCEPTED) {
+    if (!intervalExecutor) {
+      result.status = BackendIngestStatus::MALFORMED;
+      result.rejection = BackendIngestRejection::CALLBACK_MISSING;
+      return result;
+    }
+    const BackendCommandApplyResult applied =
+        intervalExecutor(staged[0].dispatch.command);
+    CommandResult stored{};
+    if (!applied.durable || !applied.applied ||
+        !dispatcherResultFor(staged[0].dispatch.command.cmdId, &stored) ||
+        (stored.outcome != OUT_ACCEPTED && stored.outcome != OUT_CONVERGED) ||
+        !dispatcherEnsureDurable()) {
+      result.status = BackendIngestStatus::PERSIST_FAILED;
+      result.rejection = BackendIngestRejection::DESIRED_PERSIST_FAILED;
+      return result;
+    }
+    if (applied.command.outcome == OUT_REPLAY) ++result.replayedCount;
+    ++result.processedCount;
+    const uint32_t oldCursor = gState.lastCommandCursor;
+    if (!advanceCursor(staged[0].sequence)) {
+      result.status = BackendIngestStatus::PERSIST_FAILED;
+      result.rejection = BackendIngestRejection::CURSOR_PERSIST_FAILED;
+      return result;
+    }
+    result.persistedCursor = gState.lastCommandCursor;
+    result.status = BackendIngestStatus::PROCESSED;
+    Serial.printf("[CONTROL] interval durable seq=%lu minutes=%u revision=%lu cursor=%lu->%lu\n",
+                  static_cast<unsigned long>(staged[0].sequence),
+                  static_cast<unsigned>(staged[0].dispatch.command.recordingIntervalMin),
+                  static_cast<unsigned long>(stored.assignedRevision),
+                  static_cast<unsigned long>(oldCursor),
+                  static_cast<unsigned long>(result.persistedCursor));
+    return result;
+  }
+
   DispatchBatchItem batch[BACKEND_MAX_COMMANDS_PER_RESPONSE]{};
   CommandResult decisions[BACKEND_MAX_COMMANDS_PER_RESPONSE]{};
   for (uint8_t i = 0; i < stagedCount; ++i) batch[i] = staged[i].dispatch;
   if (!dispatcherSubmitBatch(batch, stagedCount,
                              result.initialStateRevision, decisions)) {
     result.status = BackendIngestStatus::PERSIST_FAILED;
+    result.rejection = BackendIngestRejection::DISPATCH_PERSIST_FAILED;
     return result;
   }
   Serial.printf("[CONTROL] batch dispatcher durable count=%u revision=%lu\n",
@@ -506,6 +711,7 @@ BackendIngestResult backendIngestUploadResponse(
     CommandResult stored{};
     if (!dispatcherResultFor(batch[i].command.cmdId, &stored)) {
       result.status = BackendIngestStatus::PERSIST_FAILED;
+      result.rejection = BackendIngestRejection::DESIRED_PERSIST_FAILED;
       return result;
     }
     if (decisions[i].outcome == OUT_REPLAY) {
@@ -520,12 +726,14 @@ BackendIngestResult backendIngestUploadResponse(
       if (decisions[i].outcome == OUT_REPLAY &&
           !dispatcherCommandForResult(batch[i].command.cmdId, &applyCommand)) {
         result.status = BackendIngestStatus::PERSIST_FAILED;
+        result.rejection = BackendIngestRejection::DESIRED_PERSIST_FAILED;
         return result;
       }
       BackendCommandApplyResult applied = executor(applyCommand);
       if (!applied.durable || !applied.applied ||
           !dispatcherEnsureDurable()) {
         result.status = BackendIngestStatus::PERSIST_FAILED;
+        result.rejection = BackendIngestRejection::DESIRED_PERSIST_FAILED;
         return result;
       }
       Serial.printf("[CONTROL] desired durable seq=%lu node=%s version=%u\n",
@@ -540,6 +748,7 @@ BackendIngestResult backendIngestUploadResponse(
   const uint32_t committedSequence = staged[stagedCount - 1].sequence;
   if (!advanceCursor(committedSequence)) {
     result.status = BackendIngestStatus::PERSIST_FAILED;
+    result.rejection = BackendIngestRejection::CURSOR_PERSIST_FAILED;
     return result;
   }
   result.persistedCursor = gState.lastCommandCursor;

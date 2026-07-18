@@ -23,7 +23,11 @@
 #define CMD_ID_LEN       24
 #define CMD_NODEID_LEN   16
 
-enum CmdType : uint8_t { CMD_REQUEST_STATUS = 0, CMD_SET_NODE_CONFIG = 1 };
+enum CmdType : uint8_t {
+  CMD_REQUEST_STATUS = 0,
+  CMD_SET_NODE_CONFIG = 1,
+  CMD_SET_RECORDING_INTERVAL = 2,
+};
 enum CmdSource : uint8_t { SRC_LOCAL_UI = 0, SRC_DASHBOARD = 1 };
 
 enum CmdOutcome : uint8_t {
@@ -57,6 +61,9 @@ struct Command {
   // changing. The FieldHub resolves those fields from its durable desired
   // configuration before submitting. Local callers use CFG_FIELDS_ALL.
   uint8_t   configFields;
+  // FieldHub-wide recording interval for CMD_SET_RECORDING_INTERVAL. It is
+  // deliberately not attached to a node target.
+  uint8_t   recordingIntervalMin;
 };
 
 enum CommandConfigField : uint8_t {
@@ -119,9 +126,12 @@ bool          dispatcherCurrentCommandForNode(const char* nodeId,
                                               const char* cmdId,
                                               uint32_t* revision,
                                               uint16_t* configVersion);
+bool          dispatcherCurrentGlobalCommand(const char* cmdId,
+                                             uint32_t* revision);
 // Resolve CONFIG_ACK's wire configVersion back to the dispatcher revision.
 bool          dispatcherRevisionForConfigVersion(const char* nodeId,
                                                  uint16_t configVersion,
                                                  uint32_t* revision);
 // Marks the retained command result CONVERGED exactly once.
 bool          dispatcherMarkConverged(const char* nodeId, uint32_t revision);
+bool          dispatcherMarkGlobalConverged(uint32_t revision);

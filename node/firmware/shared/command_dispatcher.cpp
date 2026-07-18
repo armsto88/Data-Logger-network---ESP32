@@ -14,6 +14,14 @@ struct NodeSlot {
   bool     converged;
 };
 
+struct GlobalSlot {
+  char pendingCmdId[CMD_ID_LEN];
+  uint32_t pendingRevision;
+  uint8_t recordingIntervalMin;
+  bool inUse;
+  bool converged;
+};
+
 // Pre-wire-version layout used by the first dispatcher firmware. Kept only for
 // a one-way NVS migration so an in-field revision/result ring is not discarded.
 struct LegacyNodeSlot {
@@ -37,9 +45,9 @@ static const char*   kNs = "dispatch";
 static const char*   kStateA = "state_a";
 static const char*   kStateB = "state_b";
 static constexpr uint32_t kStateMagic = 0x464D4453UL;  // FMDS
-static constexpr uint16_t kStateVersion = 1;
+static constexpr uint16_t kStateVersion = 2;
 
-struct DispatcherStateRecord {
+struct DispatcherStateRecordV1 {
   uint32_t      magic;
   uint16_t      version;
   uint16_t      size;
@@ -54,6 +62,24 @@ struct DispatcherStateRecord {
   uint32_t      checksum;
 };
 
+struct DispatcherStateRecord {
+  uint32_t      magic;
+  uint16_t      version;
+  uint16_t      size;
+  uint32_t      generation;
+  uint32_t      revision;
+  NodeSlot      nodes[CMD_MAX_NODES];
+  GlobalSlot    global;
+  CommandResult results[CMD_MAX_RESULTS];
+  uint8_t       resultHead;
+  uint8_t       resultCount;
+  uint8_t       lastChangeSource;
+  uint8_t       reserved;
+  uint32_t      checksum;
+};
+
+static GlobalSlot gGlobal{};
+
 const char* cmdOutcomeStr(CmdOutcome o) {
   switch (o) {
     case OUT_ACCEPTED:          return "ACCEPTED";
@@ -67,6 +93,17 @@ const char* cmdOutcomeStr(CmdOutcome o) {
 }
 
 static uint32_t checksumFor(DispatcherStateRecord record) {
+  record.checksum = 0;
+  const uint8_t* bytes = reinterpret_cast<const uint8_t*>(&record);
+  uint32_t hash = 2166136261UL;
+  for (size_t i = 0; i < sizeof(record); ++i) {
+    hash ^= bytes[i];
+    hash *= 16777619UL;
+  }
+  return hash;
+}
+
+static uint32_t checksumForV1(DispatcherStateRecordV1 record) {
   record.checksum = 0;
   const uint8_t* bytes = reinterpret_cast<const uint8_t*>(&record);
   uint32_t hash = 2166136261UL;
@@ -93,6 +130,18 @@ static bool readRecord(Preferences& prefs, const char* key,
          validRecord(record);
 }
 
+static bool readRecordV1(Preferences& prefs, const char* key,
+                         DispatcherStateRecordV1& record) {
+  return prefs.getBytesLength(key) == sizeof(record) &&
+         prefs.getBytes(key, &record, sizeof(record)) == sizeof(record) &&
+         record.magic == kStateMagic && record.version == 1 &&
+         record.size == sizeof(record) &&
+         record.resultHead < CMD_MAX_RESULTS &&
+         record.resultCount <= CMD_MAX_RESULTS &&
+         record.lastChangeSource <= SRC_DASHBOARD &&
+         record.checksum == checksumForV1(record);
+}
+
 static bool generationNewer(uint32_t a, uint32_t b) {
   return static_cast<int32_t>(a - b) > 0;
 }
@@ -106,6 +155,7 @@ static bool persist() {
   candidate.generation = gGeneration + 1U;
   candidate.revision = gRevision;
   memcpy(candidate.nodes, gNodes, sizeof(gNodes));
+  candidate.global = gGlobal;
   memcpy(candidate.results, gResults, sizeof(gResults));
   candidate.resultHead = gResultHead;
   candidate.resultCount = gResultCount;
@@ -128,6 +178,7 @@ static bool persist() {
 
 void dispatcherInit() {
   memset(gNodes, 0, sizeof gNodes);
+  memset(&gGlobal, 0, sizeof gGlobal);
   memset(gResults, 0, sizeof gResults);
   gRevision = 0; gResultHead = 0; gResultCount = 0;
   gLastChangeSource = SRC_LOCAL_UI;
@@ -143,6 +194,7 @@ void dispatcherInit() {
                          : (aValid ? a : b);
     gRevision = selected.revision;
     memcpy(gNodes, selected.nodes, sizeof(gNodes));
+    gGlobal = selected.global;
     memcpy(gResults, selected.results, sizeof(gResults));
     gResultHead = selected.resultHead;
     gResultCount = selected.resultCount;
@@ -150,6 +202,29 @@ void dispatcherInit() {
         ? SRC_DASHBOARD : SRC_LOCAL_UI;
     gGeneration = selected.generation;
     gNvs.end();
+    return;
+  }
+
+  // One-way migration from the checksummed protocol-1 record. Preserve the
+  // authoritative revision/results/node mappings while introducing an empty
+  // FieldHub-wide command slot.
+  DispatcherStateRecordV1 oldA{}, oldB{};
+  const bool oldAValid = readRecordV1(gNvs, kStateA, oldA);
+  const bool oldBValid = readRecordV1(gNvs, kStateB, oldB);
+  if (oldAValid || oldBValid) {
+    const DispatcherStateRecordV1& selected = oldAValid && oldBValid
+        ? (generationNewer(oldB.generation, oldA.generation) ? oldB : oldA)
+        : (oldAValid ? oldA : oldB);
+    gRevision = selected.revision;
+    memcpy(gNodes, selected.nodes, sizeof(gNodes));
+    memcpy(gResults, selected.results, sizeof(gResults));
+    gResultHead = selected.resultHead;
+    gResultCount = selected.resultCount;
+    gLastChangeSource = selected.lastChangeSource == SRC_DASHBOARD
+        ? SRC_DASHBOARD : SRC_LOCAL_UI;
+    gGeneration = selected.generation;
+    gNvs.end();
+    persist();
     return;
   }
 
@@ -189,6 +264,7 @@ void dispatcherResetForTest() {
   gNvs.clear();
   gNvs.end();
   memset(gNodes, 0, sizeof gNodes);
+  memset(&gGlobal, 0, sizeof gGlobal);
   memset(gResults, 0, sizeof gResults);
   gRevision = 0; gResultHead = 0; gResultCount = 0;
   gLastChangeSource = SRC_LOCAL_UI;
@@ -236,6 +312,18 @@ bool dispatcherCommandForResult(const char* cmdId, Command* out) {
       out->expectedRevision = result->currentRevision;
       out->payload = gNodes[i].cfg;
       out->configFields = CFG_FIELDS_ALL;
+    }
+    return true;
+  }
+  if (gGlobal.inUse &&
+      strncmp(gGlobal.pendingCmdId, cmdId, CMD_ID_LEN) == 0) {
+    if (out) {
+      *out = {};
+      strlcpy(out->cmdId, cmdId, CMD_ID_LEN);
+      out->type = CMD_SET_RECORDING_INTERVAL;
+      out->source = SRC_DASHBOARD;
+      out->expectedRevision = result->currentRevision;
+      out->recordingIntervalMin = gGlobal.recordingIntervalMin;
     }
     return true;
   }
@@ -311,6 +399,13 @@ bool dispatcherCurrentCommandForNode(const char* nodeId, const char* cmdId,
   return true;
 }
 
+bool dispatcherCurrentGlobalCommand(const char* cmdId, uint32_t* revision) {
+  if (!gGlobal.inUse || !cmdId ||
+      strncmp(gGlobal.pendingCmdId, cmdId, CMD_ID_LEN) != 0) return false;
+  if (revision) *revision = gGlobal.pendingRevision;
+  return true;
+}
+
 bool dispatcherRevisionForConfigVersion(const char* nodeId,
                                         uint16_t configVersion,
                                         uint32_t* revision) {
@@ -331,8 +426,22 @@ bool dispatcherMarkConverged(const char* nodeId, uint32_t revision) {
   return persist();
 }
 
+bool dispatcherMarkGlobalConverged(uint32_t revision) {
+  if (!gGlobal.inUse || gGlobal.pendingRevision != revision ||
+      gGlobal.converged) return false;
+  gGlobal.converged = true;
+  CommandResult* result = findResult(gGlobal.pendingCmdId);
+  if (result && result->outcome == OUT_ACCEPTED) result->outcome = OUT_CONVERGED;
+  return persist();
+}
+
 static bool validPayload(const Command& c) {
   if (c.type == CMD_REQUEST_STATUS) return true;
+  if (c.type == CMD_SET_RECORDING_INTERVAL) {
+    return c.recordingIntervalMin == 1 || c.recordingIntervalMin == 5 ||
+           c.recordingIntervalMin == 10 || c.recordingIntervalMin == 20 ||
+           c.recordingIntervalMin == 30 || c.recordingIntervalMin == 60;
+  }
   if (c.type != CMD_SET_NODE_CONFIG) return false;
   if (c.payload.nodeId[0] == '\0') return false;
   if (c.payload.wakeIntervalMin < 1 || c.payload.wakeIntervalMin > 240) return false;
@@ -371,13 +480,21 @@ bool dispatcherSubmitBatch(const DispatchBatchItem* items, uint8_t count,
     if (!validPayload(command) || command.expectedRevision != initialRevision)
       return false;
     ++acceptedChanges;
-    if (!findNode(command.payload.nodeId)) ++newNodes;
-    for (uint8_t j = 0; j < i; ++j) {
-      if (items[j].outcome == OUT_ACCEPTED &&
-          !findResult(items[j].command.cmdId) &&
-          items[j].command.type == CMD_SET_NODE_CONFIG &&
-          strncmp(command.payload.nodeId, items[j].command.payload.nodeId,
-                  CMD_NODEID_LEN) == 0) return false;
+    if (command.type == CMD_SET_NODE_CONFIG) {
+      if (!findNode(command.payload.nodeId)) ++newNodes;
+      for (uint8_t j = 0; j < i; ++j) {
+        if (items[j].outcome == OUT_ACCEPTED &&
+            !findResult(items[j].command.cmdId) &&
+            items[j].command.type == CMD_SET_NODE_CONFIG &&
+            strncmp(command.payload.nodeId, items[j].command.payload.nodeId,
+                    CMD_NODEID_LEN) == 0) return false;
+      }
+    } else if (command.type == CMD_SET_RECORDING_INTERVAL) {
+      for (uint8_t j = 0; j < i; ++j) {
+        if (items[j].outcome == OUT_ACCEPTED &&
+            !findResult(items[j].command.cmdId) &&
+            items[j].command.type == CMD_SET_RECORDING_INTERVAL) return false;
+      }
     }
   }
   if (newNodes > freeNodes ||
@@ -388,6 +505,7 @@ bool dispatcherSubmitBatch(const DispatchBatchItem* items, uint8_t count,
   const uint8_t resultHeadBefore = gResultHead;
   const uint8_t resultCountBefore = gResultCount;
   const CmdSource sourceBefore = gLastChangeSource;
+  const GlobalSlot globalBefore = gGlobal;
   NodeSlot nodesBefore[CMD_MAX_NODES];
   CommandResult resultsBefore[CMD_MAX_RESULTS];
   memcpy(nodesBefore, gNodes, sizeof(gNodes));
@@ -419,6 +537,28 @@ bool dispatcherSubmitBatch(const DispatchBatchItem* items, uint8_t count,
     if (command.type == CMD_REQUEST_STATUS) {
       result.outcome = OUT_ACCEPTED;
       result.assignedRevision = gRevision;
+      recordResult(result);
+      batchResults[i] = result;
+      continue;
+    }
+
+    if (command.type == CMD_SET_RECORDING_INTERVAL) {
+      if (gGlobal.inUse && !gGlobal.converged &&
+          strncmp(gGlobal.pendingCmdId, command.cmdId, CMD_ID_LEN) != 0) {
+        CommandResult* superseded = findResult(gGlobal.pendingCmdId);
+        if (superseded && superseded->outcome == OUT_ACCEPTED)
+          superseded->outcome = OUT_SUPERSEDED;
+      }
+      ++gRevision;
+      gLastChangeSource = command.source;
+      gGlobal.inUse = true;
+      gGlobal.converged = false;
+      gGlobal.pendingRevision = gRevision;
+      gGlobal.recordingIntervalMin = command.recordingIntervalMin;
+      strlcpy(gGlobal.pendingCmdId, command.cmdId, CMD_ID_LEN);
+      result.outcome = OUT_ACCEPTED;
+      result.assignedRevision = gRevision;
+      result.currentRevision = gRevision;
       recordResult(result);
       batchResults[i] = result;
       continue;
@@ -459,6 +599,7 @@ rollback:
   gResultHead = resultHeadBefore;
   gResultCount = resultCountBefore;
   gLastChangeSource = sourceBefore;
+  gGlobal = globalBefore;
   memcpy(gNodes, nodesBefore, sizeof(gNodes));
   memcpy(gResults, resultsBefore, sizeof(gResults));
   return false;
