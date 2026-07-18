@@ -86,15 +86,18 @@ static void onEspNowRecv(const uint8_t* mac_addr, const uint8_t* data, int len) 
     return;
   }
 
-  // FW_CAPS — additive node firmware/OTA identity, sent after NODE_HELLO.
-  // Exact-length + tag match; older nodes never send it. Enqueue for the main
-  // loop to fold into the registry (never touch the registry from the callback).
+  // FW_CAPS — additive node firmware/OTA identity + A/B slot state, sent after
+  // NODE_HELLO. Accept BOTH the v1 (96 B) and v2 (with slot fields) lengths so a
+  // mixed-firmware fleet degrades gracefully: a v1 packet leaves the v2 slot
+  // fields zero (runningSlot "" => no slot info). Older nodes never send it.
+  // Enqueue for the main loop (never touch the registry from the callback).
   if (gCapsQueue && mac_addr && data &&
-      len == static_cast<int>(sizeof(fw_caps_message_t)) &&
+      (len == static_cast<int>(sizeof(fw_caps_message_t)) ||
+       len == static_cast<int>(FW_CAPS_V1_BYTES)) &&
       strncmp(reinterpret_cast<const char*>(data), "FW_CAPS", 7) == 0) {
     SyncCapsSlot slot{};
     memcpy(slot.mac, mac_addr, sizeof(slot.mac));
-    memcpy(&slot.caps, data, sizeof(slot.caps));
+    memcpy(&slot.caps, data, len);  // v1: leaves v2 slot fields zero-initialised
     xQueueSendToBack(gCapsQueue, &slot, 0);
     return;
   }

@@ -143,16 +143,13 @@ static BackendIngestResult ingestBackendResponse(const String& responseBody) {
                 static_cast<unsigned long>(result.persistedCursor),
                 diagnosticsDurable ? "durable" : "FAILED");
 
-  // The backend-provided HTTPS response clock is the UTC authority. This also
-  // repairs an RTC that was previously entered as browser-local wall time.
-  if (result.serverTimeUnix >= 1704067200UL) {
-    const int64_t delta = static_cast<int64_t>(result.serverTimeUnix) - rtcBefore;
-    if (!rtcTrusted || delta > 2 || delta < -2) {
-      setRTCTime(result.serverTimeUnix);
-      Serial.printf("[TIME] RTC corrected from backend UTC (delta=%lld s)\n",
-                    static_cast<long long>(delta));
-    }
-  }
+  // The battery-backed DS3231 (set from the browser-UTC field in config mode)
+  // is the sole UTC authority for the fleet's sync schedule. We deliberately DO
+  // NOT let the backend response clock override it: the backend's serverTimeUnix
+  // was observed carrying LOCAL wall time (not UTC), and adopting it dragged the
+  // RTC +2h off true UTC and desynced every deployed node. serverTimeUnix is
+  // still surfaced above for diagnostics only. Re-enable an RTC correction here
+  // ONLY once the backend guarantees serverTimeUnix is true UTC epoch seconds.
   return result;
 }
 

@@ -188,6 +188,11 @@ void setNodeFirmwareCaps(const fw_caps_message_t& caps) {
   char ver[sizeof(caps.fwVersion) + 1];   memcpy(ver, caps.fwVersion, sizeof(caps.fwVersion)); ver[sizeof(caps.fwVersion)] = '\0';
   char bld[sizeof(caps.buildId) + 1];     memcpy(bld, caps.buildId, sizeof(caps.buildId));     bld[sizeof(caps.buildId)] = '\0';
   char hw[sizeof(caps.hwTarget) + 1];     memcpy(hw, caps.hwTarget, sizeof(caps.hwTarget));    hw[sizeof(caps.hwTarget)] = '\0';
+  // v2 slot fields. A v1 FW_CAPS leaves runningSlot zeroed by the dispatcher, so
+  // an empty runningSlot signals "no slot info from this node".
+  char rslot[sizeof(caps.runningSlot) + 1]; memcpy(rslot, caps.runningSlot, sizeof(caps.runningSlot)); rslot[sizeof(caps.runningSlot)] = '\0';
+  char over[sizeof(caps.otherVersion) + 1]; memcpy(over, caps.otherVersion, sizeof(caps.otherVersion)); over[sizeof(caps.otherVersion)] = '\0';
+  const bool slotInfo = rslot[0] != '\0';
 
   for (auto& n : registeredNodes) {
     if (strncmp(n.nodeId.c_str(), nid, 16) == 0) {
@@ -198,6 +203,13 @@ void setNodeFirmwareCaps(const fw_caps_message_t& caps) {
       n.otaMaxImageSize    = caps.maxImageSize;
       n.rollbackCapable    = caps.rollbackCapable != 0;
       n.hasFirmwareCaps    = true;
+      if (slotInfo) {
+        n.otaRunningSlot   = rslot;
+        n.otaRunningState  = caps.runningOtaState;
+        n.otaOtherState    = caps.otherSlotState;
+        n.otaOtherVersion  = over;
+        n.hasSlotInfo      = true;
+      }
       return;
     }
   }
@@ -748,6 +760,18 @@ static String jsonEscapeStr(const String& v) {
   return out;
 }
 
+// Map the FW_CAPS wire OTA-state enum to the dashboard string.
+static const char* fwOtaStateStr(uint8_t s) {
+  switch (s) {
+    case FW_OTA_PENDING_VERIFY: return "PENDING_VERIFY";
+    case FW_OTA_CONFIRMED:      return "CONFIRMED";
+    case FW_OTA_INVALID:        return "INVALID";
+    case FW_OTA_ABORTED:        return "ABORTED";
+    case FW_OTA_EMPTY:          return "EMPTY";
+    default:                    return "IDLE";
+  }
+}
+
 String buildNodesStatusJson(uint32_t nowUnix) {
   String out = "[";
   char nb[16];
@@ -793,6 +817,22 @@ String buildNodesStatusJson(uint32_t nowUnix) {
       out += ",\"otaMaxImageSize\":";     out += String((unsigned long)n.otaMaxImageSize);
       out += ",\"rollbackCapable\":";     out += n.rollbackCapable ? "true" : "false";
       out += ",\"otaCapable\":true";
+      // A/B slot table (FW_CAPS v2). Absent for nodes on older firmware.
+      if (n.hasSlotInfo) {
+        const bool app0 = (n.otaRunningSlot == "app0");
+        const char* otherLabel = app0 ? "app1" : "app0";
+        out += ",\"activeSlot\":\""; out += jsonEscapeStr(n.otaRunningSlot); out += "\"";
+        out += ",\"firmwareSlots\":[";
+        out += "{\"label\":\"";     out += jsonEscapeStr(n.otaRunningSlot);
+        out += "\",\"version\":\""; out += jsonEscapeStr(n.fwVersion);
+        out += "\",\"buildId\":\""; out += jsonEscapeStr(n.fwBuildId);
+        out += "\",\"state\":\"";   out += fwOtaStateStr(n.otaRunningState);
+        out += "\",\"active\":true}";
+        out += ",{\"label\":\"";    out += otherLabel;
+        out += "\",\"version\":\""; out += jsonEscapeStr(n.otaOtherVersion);
+        out += "\",\"state\":\"";   out += fwOtaStateStr(n.otaOtherState);
+        out += "\",\"active\":false}]";
+      }
     } else {
       out += ",\"firmwareVersion\":null,\"hardwareRevision\":null,\"otaCapable\":false";
     }

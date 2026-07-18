@@ -3,6 +3,9 @@
 #include "firmware_identity.h"
 #include "firmware_manifest.h"
 #include "ota_installer.h"
+#include "esp_ota_ops.h"        // esp_ota_get_*_partition, get_partition_description
+#include "esp_partition.h"      // esp_partition_find / _next / _get
+#include "esp_app_format.h"     // esp_app_desc_t
 
 // ---------------------------------------------------------------------------
 // Release verification public key (Ed25519, 32 bytes).
@@ -91,16 +94,91 @@ MothershipOtaStatus mothershipOtaGetStatus() {
   return s;
 }
 
+// Human-readable OTA image state (shared by the running-slot summary field and
+// the per-slot table below).
+const char* otaImgStateStr(esp_ota_img_states_t st) {
+  return (st == ESP_OTA_IMG_PENDING_VERIFY) ? "PENDING_VERIFY" :
+         (st == ESP_OTA_IMG_VALID)          ? "CONFIRMED" :
+         (st == ESP_OTA_IMG_INVALID)        ? "INVALID" :
+         (st == ESP_OTA_IMG_ABORTED)        ? "ABORTED" : "IDLE";
+}
+
+// (OtaSlotInfo is declared in the header so fixture tests can build slots[].)
+
+// Enumerate the OTA app slots (app0/app1). The RUNNING slot's identity comes
+// from the compiled-in firmware_identity (authoritative). The other slot's
+// version is read from its on-flash app descriptor (esp_app_desc_t) — accurate
+// for what physically sits there; buildId for the inactive slot is left empty
+// until the NVS release store (releaseId) lands. Returns the slot count.
+static int readOtaSlots(OtaSlotInfo out[], int maxSlots, const FirmwareIdentity& runId) {
+  const esp_partition_t* run  = esp_ota_get_running_partition();
+  const esp_partition_t* boot = esp_ota_get_boot_partition();
+  int n = 0;
+  esp_partition_iterator_t it =
+      esp_partition_find(ESP_PARTITION_TYPE_APP, ESP_PARTITION_SUBTYPE_ANY, nullptr);
+  while (it != nullptr) {
+    const esp_partition_t* p = esp_partition_get(it);
+    // Only the OTA app slots — skip factory/test partitions.
+    if (p && n < maxSlots &&
+        p->subtype >= ESP_PARTITION_SUBTYPE_APP_OTA_0 &&
+        p->subtype <= ESP_PARTITION_SUBTYPE_APP_OTA_15) {
+      OtaSlotInfo& s = out[n];
+      memset(&s, 0, sizeof(s));
+      strncpy(s.label, p->label, sizeof(s.label) - 1);
+      s.active   = (run  && p->address == run->address);
+      s.nextBoot = (boot && p->address == boot->address);
+
+      esp_ota_img_states_t st = ESP_OTA_IMG_UNDEFINED;
+      if (esp_ota_get_state_partition(p, &st) != ESP_OK) st = ESP_OTA_IMG_UNDEFINED;
+      esp_app_desc_t desc{};
+      s.present = (esp_ota_get_partition_description(p, &desc) == ESP_OK);
+
+      if (s.active) {
+        strncpy(s.version, runId.semver,  sizeof(s.version) - 1);
+        strncpy(s.buildId, runId.buildId, sizeof(s.buildId) - 1);
+        s.state = otaImgStateStr(st);
+      } else if (s.present) {
+        strncpy(s.version, desc.version, sizeof(s.version) - 1);
+        s.state = otaImgStateStr(st);
+      } else {
+        s.state = "EMPTY";
+      }
+      n++;
+    }
+    it = esp_partition_next(it);  // releases the current handle
+  }
+  return n;
+}
+
+// Append the slots[] array. Split out so the JSON shape can be exercised with
+// fixture data (see tests/test_firmware_slots.cpp) independent of esp_ota.
+String mothershipFwSlotsJson(const OtaSlotInfo* slots, int n) {
+  String j = "[";
+  for (int i = 0; i < n; ++i) {
+    if (i) j += ",";
+    j += "{\"label\":\"";     j += slots[i].label;
+    j += "\",\"version\":\""; j += slots[i].version;
+    j += "\",\"buildId\":\""; j += slots[i].buildId;
+    j += "\",\"state\":\"";   j += slots[i].state;
+    j += "\",\"active\":";    j += slots[i].active   ? "true" : "false";
+    j += ",\"nextBoot\":";    j += slots[i].nextBoot ? "true" : "false";
+    j += ",\"present\":";     j += slots[i].present  ? "true" : "false";
+    j += "}";
+  }
+  j += "]";
+  return j;
+}
+
 String mothershipFirmwareStatusJson() {
   FirmwareIdentity id = fwIdentity(NODE_PROTOCOL_VERSION);
-  const esp_partition_t* run = esp_ota_get_running_partition();
+  const esp_partition_t* run  = esp_ota_get_running_partition();
+  const esp_partition_t* boot = esp_ota_get_boot_partition();
   esp_ota_img_states_t st = ESP_OTA_IMG_UNDEFINED;
   if (run) esp_ota_get_state_partition(run, &st);
-  const char* otaState =
-      (st == ESP_OTA_IMG_PENDING_VERIFY) ? "PENDING_VERIFY" :
-      (st == ESP_OTA_IMG_VALID)          ? "CONFIRMED" :
-      (st == ESP_OTA_IMG_INVALID)        ? "INVALID" :
-      (st == ESP_OTA_IMG_ABORTED)        ? "ABORTED" : "IDLE";
+  const char* otaState = otaImgStateStr(st);
+
+  OtaSlotInfo slots[4];
+  const int nslots = readOtaSlots(slots, 4, id);
 
   String j = "{\"role\":\"";           j += id.role;
   j += "\",\"version\":\"";           j += id.semver;
@@ -112,7 +190,12 @@ String mothershipFirmwareStatusJson() {
   j += "\",\"otaState\":\"";           j += otaState;
   j += "\",\"otaReason\":\"";          j += fwReasonStr(gLastReason);
   j += "\",\"lastOtaReason\":\"";      j += fwReasonStr(gLastReason);
-  j += "\"}";
+  // A/B slot visibility: which slot is active, which boots next, and what each
+  // holds. Additive — pre-existing consumers ignore the new keys.
+  j += "\",\"activeSlot\":\"";         j += (run  ? run->label  : "?");
+  j += "\",\"nextBootSlot\":\"";       j += (boot ? boot->label : "?");
+  j += "\",\"slots\":";                j += mothershipFwSlotsJson(slots, nslots);
+  j += "}";
   return j;
 }
 

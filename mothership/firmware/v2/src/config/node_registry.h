@@ -74,6 +74,13 @@ struct NodeInfo {
   uint32_t  otaMaxImageSize;    // inactive-slot capacity (bytes); 0 = unknown
   bool      rollbackCapable;
   bool      hasFirmwareCaps;    // true once a FW_CAPS has been received
+  // OTA A/B slot state from FW_CAPS v2 (empty otaRunningSlot = not reported by
+  // this node's firmware, e.g. an older v1 FW_CAPS).
+  String    otaRunningSlot;     // "app0" / "app1"
+  uint8_t   otaRunningState;    // FwOtaState of the running slot
+  uint8_t   otaOtherState;      // FwOtaState of the inactive slot
+  String    otaOtherVersion;    // inactive slot's app-desc version
+  bool      hasSlotInfo;        // true once a FW_CAPS v2 (slot fields) arrived
 };
 
 struct NodeDesiredConfig {

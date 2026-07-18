@@ -30,8 +30,22 @@ FwReason mothershipOtaImageFinish();
 void mothershipOtaAbort();
 
 // Pre-built status.firmware{} JSON for the cloud upload payload: identity
-// (version/build/hw/protocol), running slot, and OTA state.
+// (version/build/hw/protocol), running slot, OTA state, and the A/B slots[]
+// table (label/version/buildId/state/active/nextBoot/present per slot).
 String mothershipFirmwareStatusJson();
+
+// One row of the A/B slot table. Exposed for fixture-based JSON-shape tests.
+struct OtaSlotInfo {
+  char        label[8];
+  char        version[24];
+  char        buildId[24];
+  const char* state;
+  bool        active;
+  bool        nextBoot;
+  bool        present;
+};
+// Serialise a slots[] array (pure string assembly; no esp_ota dependency).
+String mothershipFwSlotsJson(const OtaSlotInfo* slots, int n);
 
 struct MothershipOtaStatus {
   bool     manifestReady;

@@ -343,14 +343,11 @@ static void ingestBackendResponseFromUi(const String& responseBody) {
                 static_cast<unsigned long>(result.responseNextCursor),
                 static_cast<unsigned long>(result.persistedCursor),
                 diagnosticsDurable ? "durable" : "FAILED");
-  if (result.serverTimeUnix >= kMinValidPhaseUnix) {
-    const int64_t delta = static_cast<int64_t>(result.serverTimeUnix) - rtcBefore;
-    if (rtcBefore < kMinValidPhaseUnix || delta > 2 || delta < -2) {
-      setRTCTime(result.serverTimeUnix);
-      Serial.printf("[TIME] RTC corrected from backend UTC (delta=%lld s)\n",
-                    static_cast<long long>(delta));
-    }
-  }
+  // Do NOT let the backend response clock override the RTC (see the matching
+  // note in main.cpp ingestBackendResponse): the DS3231 set from browser-UTC is
+  // the authority. The backend's serverTimeUnix was observed to be LOCAL wall
+  // time and clobbered a correct UTC RTC, desyncing the fleet. Diagnostics above
+  // still record serverTimeUnix; the RTC is left untouched here.
 }
 
 static NodeConfigApplyResult applyLocalDesiredConfig(

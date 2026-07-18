@@ -140,19 +140,44 @@ typedef struct node_hello_message {
 // exact length + "FW_CAPS" tag, so older mothership firmware ignores it and
 // older nodes simply never send it. Must stay within the 250-byte ESP-NOW
 // ceiling (asserted below).
+// OTA image state, portable across the wire (mirrors esp_ota_img_states_t but
+// role-independent). Used in FW_CAPS slot fields and mapped to strings for the
+// dashboard on the mothership.
+enum FwOtaState : uint8_t {
+    FW_OTA_IDLE           = 0,  // no probation state / unknown
+    FW_OTA_PENDING_VERIFY = 1,  // just-installed image on first-boot probation
+    FW_OTA_CONFIRMED      = 2,  // valid / confirmed good
+    FW_OTA_INVALID        = 3,  // marked invalid (rolled back)
+    FW_OTA_ABORTED        = 4,  // aborted install
+    FW_OTA_EMPTY          = 5,  // no readable image in the slot
+};
+
 typedef struct fw_caps_message {
     char     command[16];      // "FW_CAPS"
     char     nodeId[16];
     uint16_t protocolVersion;  // NODE_PROTOCOL_VERSION the node speaks
-    char     fwVersion[12];    // semantic version, e.g. "0.1.0"
-    char     buildId[24];      // git short hash (+ "-dirty")
+    char     fwVersion[12];    // running semantic version, e.g. "0.1.0"
+    char     buildId[24];      // running git short hash (+ "-dirty")
     char     hwTarget[16];     // hardware target, e.g. "node-v3"
     uint32_t maxImageSize;     // inactive OTA slot capacity (bytes)
     uint8_t  rollbackCapable;  // 1 = deferred-verify rollback available
-    uint8_t  reserved[3];      // future use / alignment
+    uint8_t  reserved[3];      // (v1 payload ended here — 96 bytes)
+    // --- v2 additions: OTA A/B slot visibility. Older nodes send a 96-byte
+    //     FW_CAPS without these; the mothership accepts both lengths and treats
+    //     absent fields as unknown/empty. Do NOT reorder the fields above. ---
+    char     runningSlot[6];    // "app0" / "app1" (running slot label)
+    uint8_t  runningOtaState;   // FwOtaState of the running slot
+    uint8_t  otherSlotState;    // FwOtaState of the inactive slot
+    char     otherVersion[12];  // inactive slot's app-desc version ("" if empty)
 } fw_caps_message_t;
 static_assert(sizeof(fw_caps_message_t) <= 250,
               "FW_CAPS exceeds the ESP-NOW v1 payload ceiling");
+
+// Wire size of the v1 FW_CAPS (before the v2 slot fields). The mothership
+// accepts either length so a mixed-firmware fleet degrades gracefully.
+#define FW_CAPS_V1_BYTES 96
+static_assert(offsetof(fw_caps_message_t, runningSlot) == FW_CAPS_V1_BYTES,
+              "FW_CAPS v1 layout changed — update FW_CAPS_V1_BYTES / backend");
 
 // Node -> Mothership: asynchronous status push (used by rescue and field recovery flows)
 typedef struct node_status_message {

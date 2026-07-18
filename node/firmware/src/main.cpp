@@ -1879,6 +1879,17 @@ static void setNodeConfigVersion(uint16_t v) {
 // The node cold-boots each wake, so the static guard resets — exactly one
 // send per wake regardless of hello retries. Additive: the mothership matches
 // on exact length + tag, so legacy mothership firmware ignores it.
+// Map the ESP-IDF OTA image state to the role-independent wire enum.
+static uint8_t fwOtaStateFromEsp(esp_ota_img_states_t st) {
+  switch (st) {
+    case ESP_OTA_IMG_PENDING_VERIFY: return FW_OTA_PENDING_VERIFY;
+    case ESP_OTA_IMG_VALID:          return FW_OTA_CONFIRMED;
+    case ESP_OTA_IMG_INVALID:        return FW_OTA_INVALID;
+    case ESP_OTA_IMG_ABORTED:        return FW_OTA_ABORTED;
+    default:                         return FW_OTA_IDLE;
+  }
+}
+
 static void sendFwCaps() {
   static bool sentThisWake = false;
   if (sentThisWake) return;
@@ -1897,12 +1908,29 @@ static void sendFwCaps() {
   caps.maxImageSize    = next ? next->size : 0;
   caps.rollbackCapable = 1;  // stock bootloader supports deferred-verify rollback
 
+  // --- v2: OTA A/B slot visibility ---
+  const esp_partition_t* running = esp_ota_get_running_partition();
+  if (running) strncpy(caps.runningSlot, running->label, sizeof(caps.runningSlot) - 1);
+  esp_ota_img_states_t rst = ESP_OTA_IMG_UNDEFINED;
+  caps.runningOtaState = (running && esp_ota_get_state_partition(running, &rst) == ESP_OK)
+      ? fwOtaStateFromEsp(rst) : FW_OTA_IDLE;
+  esp_app_desc_t odesc{};
+  if (next && esp_ota_get_partition_description(next, &odesc) == ESP_OK) {
+    strncpy(caps.otherVersion, odesc.version, sizeof(caps.otherVersion) - 1);
+    esp_ota_img_states_t ost = ESP_OTA_IMG_UNDEFINED;
+    caps.otherSlotState = (esp_ota_get_state_partition(next, &ost) == ESP_OK)
+        ? fwOtaStateFromEsp(ost) : FW_OTA_IDLE;
+  } else {
+    caps.otherSlotState = FW_OTA_EMPTY;  // no readable image staged
+  }
+
   sendEspNowAndWait(mothershipMAC, &caps, sizeof(caps), 250);
   sendEspNowAndWait(broadcastAddress, &caps, sizeof(caps), 250);
   sentThisWake = true;
-  Serial.printf("📦 FW_CAPS sent: v%s build=%s hw=%s maxImg=%u\n",
+  Serial.printf("📦 FW_CAPS sent: v%s build=%s hw=%s maxImg=%u slot=%s otherState=%u\n",
                 caps.fwVersion, caps.buildId, caps.hwTarget,
-                (unsigned)caps.maxImageSize);
+                (unsigned)caps.maxImageSize, caps.runningSlot,
+                (unsigned)caps.otherSlotState);
 }
 
 // Send NODE_HELLO to mothership at top of each wake cycle (before data flush)
