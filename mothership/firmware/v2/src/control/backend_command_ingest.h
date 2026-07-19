@@ -48,6 +48,8 @@ enum class BackendIngestRejection : uint8_t {
   DISPATCH_PERSIST_FAILED,
   DESIRED_PERSIST_FAILED,
   CURSOR_PERSIST_FAILED,
+  RELEASE_ID_INVALID,
+  OTA_ALREADY_PENDING,
 };
 
 const char* backendIngestStatusStr(BackendIngestStatus status);
@@ -83,7 +85,14 @@ String backendControlStatusJson();
 // Parse the optional command envelope from either a pure JSON body or the raw
 // modem HTTP/URC response. Data-upload durability is intentionally external;
 // callers invoke this only after handling a successful HTTP 200 upload.
+// Executor for a lone CMD_DEPLOY_RELEASE command: durably stage the requested
+// releaseId (via dispatcherSubmit for CAS/idempotency + the OTA release store),
+// returning durable/applied like the other executors. Optional — a nullptr
+// simply rejects DEPLOY_RELEASE commands as unsupported on this build.
+using BackendReleaseExecutor = BackendCommandApplyResult (*)(const Command&);
+
 BackendIngestResult backendIngestUploadResponse(
     const String& responseBody, uint32_t rtcNowUnix, bool rtcTrustworthy,
     BackendCommandResolver resolver, BackendCommandExecutor executor,
-    BackendIntervalExecutor intervalExecutor = nullptr);
+    BackendIntervalExecutor intervalExecutor = nullptr,
+    BackendReleaseExecutor releaseExecutor = nullptr);

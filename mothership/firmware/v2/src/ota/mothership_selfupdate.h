@@ -24,8 +24,14 @@ FwReason mothershipOtaVerifyManifest(const uint8_t* json, size_t len,
 FwReason mothershipOtaImageChunk(const uint8_t* data, size_t len);
 
 // Finalise: size + SHA-256 + image validation, then set the boot partition.
-// FW_NONE means armed — the caller should reboot to apply.
+// FW_NONE means armed — the caller should reboot to apply. On success the
+// release is recorded ARMED in the NVS release store for post-reboot promotion.
 FwReason mothershipOtaImageFinish();
+
+// releaseSequence of the manifest currently staged (0 if none verified). The
+// cloud-fetch orchestrator reads this to record the ARMED release alongside its
+// releaseId.
+uint32_t mothershipOtaTargetSequence();
 
 void mothershipOtaAbort();
 

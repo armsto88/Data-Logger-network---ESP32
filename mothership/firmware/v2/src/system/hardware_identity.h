@@ -73,3 +73,8 @@ const char* hwProvisionResultStr(ProvisionParseResult r);
 // and a host matching FM_APPROVED_ENDPOINT_HOST. A development build may widen
 // this by compiling with -D FM_ALLOW_ANY_ENDPOINT=1.
 bool hwEndpointAllowed(const String& endpoint);
+
+// The single approved endpoint host (FM_APPROVED_ENDPOINT_HOST). Used to build
+// release-artifact URLs so an OTA download can only ever target the approved
+// host, then be re-validated with hwEndpointAllowed().
+const char* hwApprovedEndpointHost();

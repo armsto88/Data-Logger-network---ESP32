@@ -1,4 +1,5 @@
 #include "ota/mothership_selfupdate.h"
+#include "ota/mothership_ota_release_store.h"
 #include "protocol.h"           // NODE_PROTOCOL_VERSION
 #include "firmware_identity.h"
 #include "firmware_manifest.h"
@@ -27,11 +28,17 @@ static uint32_t            gExpectedSize  = 0;
 static char                gExpectedSha[65];
 static char                gTargetVersion[16];
 static char                gTargetReleaseId[40];
+static uint32_t            gTargetSequence = 0;
 static FwReason            gLastReason    = FW_NONE;
 
-// TODO: source from persisted NVS once the OTA state store lands. Until then a
-// fresh device has no recorded sequence, so anti-downgrade is not yet enforced.
-static uint32_t installedReleaseSequence() { return 0; }
+// Anti-downgrade source: the monotonic releaseSequence of the confirmed-running
+// release, persisted in the NVS release store and promoted on a confirmed first
+// boot. A never-cloud-updated device reads 0 here (store empty), which leaves
+// anti-downgrade inert exactly as before — enforcement only kicks in once a
+// release has actually been installed-and-confirmed through the store.
+static uint32_t installedReleaseSequence() {
+  return otaReleaseStoreInstalledSequence();
+}
 
 FwReason mothershipOtaVerifyManifest(const uint8_t* json, size_t len,
                                      const uint8_t sig[64]) {
@@ -54,6 +61,7 @@ FwReason mothershipOtaVerifyManifest(const uint8_t* json, size_t len,
   strlcpy(gExpectedSha, art->sha256, sizeof gExpectedSha);
   strlcpy(gTargetVersion, art->version, sizeof gTargetVersion);
   strlcpy(gTargetReleaseId, m.releaseId, sizeof gTargetReleaseId);
+  gTargetSequence = m.releaseSequence;
   gManifestReady = true;
   gLastReason = FW_NONE;
   return FW_NONE;
@@ -75,8 +83,19 @@ FwReason mothershipOtaImageFinish() {
   if (!gInstalling) { gLastReason = FW_IMAGE_INVALID; return gLastReason; }
   gInstalling = false;
   gLastReason = otaInstallFinish(gInstall);
+  // On a successful finish the inactive slot is flashed and set as the next
+  // boot target. Record it as ARMED (awaiting first-boot confirmation) so that,
+  // after the cold-boot into the new slot wipes RAM, mothershipOtaFirstBootCheck()
+  // knows which release/sequence to promote to INSTALLED. Shared by both the
+  // local-AP and cloud install paths — additive NVS bookkeeping only; the
+  // reboot/confirm behaviour operators already rely on is unchanged.
+  if (gLastReason == FW_NONE && gTargetReleaseId[0] != '\0') {
+    otaReleaseStoreSetArmed(gTargetReleaseId, gTargetSequence);
+  }
   return gLastReason;
 }
+
+uint32_t mothershipOtaTargetSequence() { return gTargetSequence; }
 
 void mothershipOtaAbort() {
   if (gInstalling) { otaInstallAbort(gInstall); gInstalling = false; }
@@ -185,7 +204,26 @@ String mothershipFirmwareStatusJson() {
   j += "\",\"buildId\":\"";            j += id.buildId;
   j += "\",\"hwTarget\":\"";           j += id.hwTarget;
   j += "\",\"protocolVersion\":";      j += String(id.protocolVersion);
-  j += ",\"releaseId\":null";          // populated once the OTA state store lands
+  // releaseId of the confirmed-running release, from the NVS release store
+  // (null until the device has installed-and-confirmed a release through OTA).
+  char installedRid[40] = {0};
+  const bool haveRid = otaReleaseStoreInstalledReleaseId(installedRid, sizeof(installedRid));
+  if (haveRid) { j += ",\"releaseId\":\""; j += installedRid; j += "\""; }
+  else         { j += ",\"releaseId\":null"; }
+  // Cloud-OTA lifecycle visibility (additive). `pendingReleaseId` = a staged
+  // DEPLOY_RELEASE fetch intent not yet installed; `armedReleaseId` = an image
+  // flashed and boot-armed, awaiting first-boot confirmation. If armedReleaseId
+  // is set but the running releaseId differs on a later check-in, the dashboard
+  // can infer a rollback occurred.
+  char pendingRid[40] = {0};
+  const bool havePending = otaReleaseStoreGetPending(pendingRid, sizeof(pendingRid));
+  if (havePending) { j += ",\"pendingReleaseId\":\""; j += pendingRid; j += "\""; }
+  else             { j += ",\"pendingReleaseId\":null"; }
+  char armedRid[40] = {0};
+  uint32_t armedSeq = 0;
+  const bool haveArmed = otaReleaseStoreGetArmed(armedRid, sizeof(armedRid), &armedSeq);
+  if (haveArmed) { j += ",\"armedReleaseId\":\""; j += armedRid; j += "\""; }
+  else           { j += ",\"armedReleaseId\":null"; }
   j += ",\"runningSlot\":\"";          j += (run ? run->label : "?");
   j += "\",\"otaState\":\"";           j += otaState;
   j += "\",\"otaReason\":\"";          j += fwReasonStr(gLastReason);
@@ -204,5 +242,17 @@ bool mothershipOtaFirstBootCheck() {
   esp_err_t err = otaConfirmImage();
   Serial.printf("[OTA] first-boot self-test passed; image confirmed: %s\n",
                 esp_err_to_name(err));
+  if (err == ESP_OK) {
+    // The image we just confirmed is the ARMED release — promote it to
+    // INSTALLED so anti-downgrade (installedReleaseSequence) reflects it and
+    // the status upload can report a real releaseId for the active slot.
+    if (otaReleaseStorePromoteArmed()) {
+      char rid[40] = {0};
+      otaReleaseStoreInstalledReleaseId(rid, sizeof(rid));
+      Serial.printf("[OTA] release promoted to installed: %s (seq %lu)\n",
+                    rid[0] ? rid : "(none)",
+                    (unsigned long)otaReleaseStoreInstalledSequence());
+    }
+  }
   return err == ESP_OK;
 }

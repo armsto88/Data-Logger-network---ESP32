@@ -107,6 +107,10 @@ static bool base64UrlDecode(const String& in, String& out) {
 // Endpoint allow-list
 // ---------------------------------------------------------------------------
 
+const char* hwApprovedEndpointHost() {
+  return FM_APPROVED_ENDPOINT_HOST;
+}
+
 bool hwEndpointAllowed(const String& endpoint) {
 #ifdef FM_ALLOW_ANY_ENDPOINT
   return endpoint.length() > 0;

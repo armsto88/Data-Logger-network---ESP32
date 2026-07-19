@@ -34,6 +34,8 @@
 #include "protocol.h"
 #include "firmware_identity.h"  // role/version/build/hw identity (FW_GIT injected)
 #include "ota/mothership_selfupdate.h"
+#include "ota/mothership_ota_release_store.h"
+#include "ota/mothership_ota_cloud_fetch.h"
 #include "command_dispatcher.h"
 #include "control/backend_command_ingest.h"
 #include "control/node_config_control.h"
@@ -110,6 +112,32 @@ static BackendCommandApplyResult executeBackendRecordingInterval(
   return configApplyBackendRecordingInterval(command);
 }
 
+// Stage a CMD_DEPLOY_RELEASE: register it with the dispatcher (CAS/idempotency +
+// result/revision) and, on a fresh accept, persist the requested releaseId as
+// the pending OTA intent. The actual fetch/verify/install runs later this wake
+// (mothershipOtaCloudFetchAndInstall), driven from the check-in flow — never
+// inside this executor, which must return promptly.
+static BackendCommandApplyResult executeBackendDeployRelease(
+    const Command& command) {
+  BackendCommandApplyResult out{};
+  const CommandResult r = dispatcherSubmit(command);
+  out.command = r;
+  out.wireConfigVersion = 0;
+  if (r.outcome == OUT_ACCEPTED) {
+    // Fresh accept: stage the fetch intent (durable across wakes).
+    const bool staged = otaReleaseStoreSetPending(command.releaseId);
+    out.durable = staged;
+    out.applied = staged;
+  } else {
+    // REPLAY (already handled once — must NOT re-stage, or a completed install
+    // would re-trigger) or a durable terminal decision (INVALID/CONFLICT).
+    // Either way the dispatcher result is recorded; nothing more to persist.
+    out.durable = true;
+    out.applied = true;
+  }
+  return out;
+}
+
 static bool markControlConverged(const char* nodeId,
                                  uint16_t configVersion) {
   const bool nodeChanged =
@@ -126,7 +154,8 @@ static BackendIngestResult ingestBackendResponse(const String& responseBody) {
                 static_cast<unsigned>(responseBody.length()));
   const BackendIngestResult result = backendIngestUploadResponse(
       responseBody, rtcBefore, rtcTrusted, resolveBackendNodeConfig,
-      executeBackendNodeConfig, executeBackendRecordingInterval);
+      executeBackendNodeConfig, executeBackendRecordingInterval,
+      executeBackendDeployRelease);
   const uint32_t diagnosticUnix = result.serverTimeUnix >= 1704067200UL
       ? result.serverTimeUnix : rtcBefore;
   const bool diagnosticsDurable = backendControlRecordDiagnostics(
@@ -768,6 +797,39 @@ static void runCoordinatedSyncWindow(
 // ---------------------------------------------------------------------------
 // Modem upload sequence (called from handleSyncWake when txSettings.enabled)
 // ---------------------------------------------------------------------------
+// If a DEPLOY_RELEASE intent is staged and enough session budget remains, run
+// the cloud OTA fetch+verify+install on the already-live modem. On a successful
+// install the new image is boot-armed; we do NOT reboot here — the normal
+// end-of-wake power-down happens and the next scheduled RTC-alarm wake cold-
+// boots into the new slot, where mothershipOtaFirstBootCheck() confirms it (or
+// the bootloader auto-rolls back). Deferrals/transient failures keep the intent
+// staged for the next wake; terminal failures clear it.
+static void maybeRunCloudOta(ModemDriver& modem, uint32_t sessionStartMs) {
+  char pendingRel[40] = {0};
+  if (!otaReleaseStoreGetPending(pendingRel, sizeof(pendingRel))) return;
+
+  const uint32_t elapsed = millis() - sessionStartMs;
+  const uint32_t remaining = (elapsed < kSyncSessionLimitMs) ? kSyncSessionLimitMs - elapsed : 0;
+  if (remaining < OTA_MIN_BUDGET_MS) {
+    Serial.printf("[OTA] pending release %s but only %lums budget left — deferring to next wake\n",
+                  pendingRel, (unsigned long)remaining);
+    return;
+  }
+
+  Serial.printf("[OTA] pending release %s — starting cloud fetch (%lums budget)\n",
+                pendingRel, (unsigned long)remaining);
+  const float batV = readBatteryVoltage();
+  OtaCloudFetchResult r = mothershipOtaCloudFetchAndInstall(
+      modem, batV, sessionStartMs, kSyncSessionLimitMs);
+  Serial.printf("[OTA] cloud fetch result: state=%s reason=%s written=%lu/%lu rebootPending=%d transient=%d\n",
+                otaLifecycleStateStr(r.state), r.reasonStr,
+                (unsigned long)r.bytesWritten, (unsigned long)r.expectedSize,
+                r.rebootPending, r.transient);
+  if (r.rebootPending) {
+    Serial.println("[OTA] image armed — next RTC-alarm wake will boot the new slot");
+  }
+}
+
 void performModemUpload(const TransmissionSettings& txSettings, uint32_t sessionStartMs) {
   Serial.println("[UPLOAD] === Starting modem upload sequence ===");
 
@@ -1107,6 +1169,12 @@ void performModemUpload(const TransmissionSettings& txSettings, uint32_t session
     if (anyJsonSuccess) {
       uploadQueue.resetRetryCount();
     }
+
+    // Cloud OTA: if a DEPLOY_RELEASE was staged (this wake or a prior one that
+    // deferred), fetch+verify+install now while the modem is live and the
+    // session budget allows. Runs only after the status/control upload above,
+    // so a slow ~1 MB download never risks the readings upload or command ACKs.
+    maybeRunCloudOta(modem, sessionStartMs);
 
     // Emergency purge + graceful shutdown.
     uploadQueue.emergencyPurgeIfFull(80);
@@ -1890,6 +1958,10 @@ void setup() {
   if (sources.rtcAlarm && !clearAlarmFlag()) {
     Serial.println("[WAKE] Warning: failed to clear RTC alarm flag");
   }
+
+  // Load the persistent OTA release store (INSTALLED/ARMED/PENDING) before the
+  // first-boot check, which may promote an ARMED release to INSTALLED.
+  otaReleaseStoreInit();
 
   // First-boot OTA self-test: reaching here means PWR_HOLD, NVS/registry, RTC,
   // and wake classification all succeeded on this boot. If the running image is
