@@ -110,9 +110,18 @@ that check-in lands, enqueue + monitor is a 5-minute exercise.
 ## What's NOT done ❌
 
 ### Enqueue (blocked on one hub check-in)
-- `enqueue_deploy_release` needs `mothership_control_state.state_revision`
-  for CAS. That table is **empty for this hub** because the hub has never done
-  an LTE check-in to this backend.
+- `enqueue_deploy_release` does `select state_revision ... from
+  mothership_control_state where mothership_id = <hub> for update`; if that
+  row is null it raises `FM_CONTROL_STATE_UNAVAILABLE`. The row only exists
+  after the hub's first LTE check-in that includes a `status.control{}` block
+  (the ingest function upserts the row from `status.control{}`).
+- **Check-in gates (backend-confirmed):** the check-in MUST include
+  `status.control{}` with:
+  - `stateRevision` (the CAS value the RPC reads)
+  - `remoteManagementEnabled: true` (else `FM_REMOTE_MANAGEMENT_DISABLED`)
+  - `controlProtocolVersion: 2` (else `FM_FIRMWARE_UPDATE_REQUIRED`)
+  If the hub reports protocol < 2 or `remoteManagementEnabled: false`, the RPC
+  raises those deliberate gates, not bugs.
 - **Fix:** trigger one LTE sync wake (RTC alarm or manual) so the hub uploads
   `status.control{}` and populates `state_revision`. Then re-run:
   ```
@@ -121,6 +130,26 @@ that check-in lands, enqueue + monitor is a 5-minute exercise.
     --mothershipId 64a5082f-83e8-47fc-943a-2ff968358e1b
   ```
   (the `--enqueue-only` flag I added skips re-signing/re-uploading).
+
+### GRANT posture — REVERT our widening (backend team flagged)
+We ran `GRANT EXECUTE ON FUNCTION enqueue_deploy_release TO anon, authenticated,
+service_role;` to unblock the bench. The backend's intended posture is
+**service_role only** (the function is `SECURITY DEFINER`; the dashboard invokes
+it via the `enqueue-deploy-release` edge function with the service-role key).
+**Re-run this in the Supabase SQL Editor to reset to the intended posture:**
+```sql
+revoke all on function public.enqueue_deploy_release(
+  uuid, uuid, uuid, text, text, bigint, timestamptz
+) from public, anon, authenticated;
+grant execute on function public.enqueue_deploy_release(
+  uuid, uuid, uuid, text, text, bigint, timestamptz
+) to service_role;
+```
+(The `service_role`-only grant is what the original migration had; our `anon`/
+`authenticated` grant widened it and should be undone before returning the
+project to use. The RPC body does its own ownership check (`p_user_id` must be
+the project owner), so this is defense-in-depth, not a wide-open hole — but
+reset it regardless.)
 
 ### On-air monitor + boot-confirm trace
 - After enqueue, run `pio device monitor -p COM4 -b 115200` and watch for:
@@ -170,34 +199,44 @@ that check-in lands, enqueue + monitor is a 5-minute exercise.
 - **Nothing is committed.** Suggested commit message:
   `feat: cloud-triggered mothership OTA (DEPLOY_RELEASE) — fetch/verify/install + bench publish script`
 
-## Security ⚠️
+## Security 🔴 URGENT
 
-- The **Supabase service-role JWT was accidentally pasted in chat** during the
-  bench. It bypasses RLS on the whole project. **Rotate it** in Dashboard →
-  Project Settings → API → Revoke/rotate before returning the project to use.
+- **The Supabase service-role JWT was accidentally pasted in chat** during the
+  bench. It bypasses RLS on the whole project (read+write every table/row +
+  Storage). **Rotate it NOW** in Dashboard → Project Settings → API → API Keys →
+  Secret → ... → Rotate (or "Generate new key"). The old key becomes invalid
+  instantly. Then update `$env:SUPABASE_SERVICE_ROLE_KEY` in the terminal and
+  re-run the bench.
 - The bench keypair is a throwaway; delete `scripts/ota-bench/keys/` +
   `bench-key.json` after the bench.
 
 ## How to resume (for the next agent)
 
-1. Read `/memories/session/bench-ota-state.md` for the full bench state.
-2. **Trigger one LTE check-in** on COM4 (RTC alarm or manual sync wake).
-3. After the check-in, verify `mothership_control_state` has a row:
+1. **🔴 Rotate the leaked service-role JWT NOW** (see Security above). Update
+   `$env:SUPABASE_SERVICE_ROLE_KEY` in the terminal with the new key.
+2. **Revert the GRANT widening** — run the `revoke ... grant execute ... to
+   service_role` SQL block (see "GRANT posture" above) in the Supabase SQL Editor.
+3. Read `/memories/session/bench-ota-state.md` for the full bench state.
+4. **Trigger one LTE check-in** on COM4 (RTC alarm or manual sync wake). The
+   check-in MUST include `status.control{}` with `stateRevision`,
+   `remoteManagementEnabled: true`, `controlProtocolVersion: 2` (see "Enqueue"
+   above for the gates).
+5. After the check-in, verify `mothership_control_state` has a row:
    ```powershell
    $h = @{ "apikey" = $env:SUPABASE_SERVICE_ROLE_KEY; "Authorization" = "Bearer " + $env:SUPABASE_SERVICE_ROLE_KEY }
    Invoke-RestMethod -Uri "$env:SUPABASE_URL/rest/v1/mothership_control_state?mothership_id=eq.64a5082f-83e8-47fc-943a-2ff968358e1b&select=state_revision,updated_at&order=updated_at.desc&limit=1" -Headers $h -Method Get | ConvertTo-Json
    ```
-4. Enqueue the command:
+6. Enqueue the command:
    ```powershell
    py -3 scripts\ota-bench\publish_bench_release.py `
      --releaseId fieldmesh-bench-2026.07.0 --enqueue-only `
      --mothershipId 64a5082f-83e8-47fc-943a-2ff968358e1b
    ```
-5. Monitor COM4: `pio device monitor -p COM4 -b 115200` — watch the trace
+7. Monitor COM4: `pio device monitor -p COM4 -b 115200` — watch the trace
    described in "On-air monitor" above.
-6. After the hub boots 0.2.0, revert `kReleasePubKey` to production + confirm
+8. After the hub boots 0.2.0, revert `kReleasePubKey` to production + confirm
    `FW_SEMVER=0.1.0`, then commit.
-7. Rotate the leaked service-role key.
+9. Delete the bench keypair (`scripts/ota-bench/keys/` + `bench-key.json`).
 
 ## Key files to read first
 - `/memories/session/bench-ota-state.md` — full bench state + the production
