@@ -68,6 +68,45 @@ static void runFreshStateMachine() {
   ok(otaReleaseStoreInstalledSequence() == 12, "installed still 12 after clear armed");
 }
 
+static void runRetryAccounting() {
+  otaReleaseStoreResetForTest();
+  otaReleaseStoreInit();
+
+  // No pending -> counters read 0 and mutators are no-ops.
+  ok(otaReleaseStorePendingAttempts() == 0, "retry: no pending -> 0 attempts");
+  ok(otaReleaseStorePendingWakesSinceAttempt() == 0, "retry: no pending -> 0 wakes");
+  ok(!otaReleaseStoreRecordPendingAttempt(nullptr), "retry: record no-op without pending");
+
+  // Fresh pending starts the retry budget at zero.
+  ok(otaReleaseStoreSetPending("rel-retry"), "retry: set pending");
+  ok(otaReleaseStorePendingAttempts() == 0, "retry: fresh pending 0 attempts");
+  ok(otaReleaseStorePendingWakesSinceAttempt() == 0, "retry: fresh pending 0 wakes");
+
+  // A skipped wake bumps the wakes-since gate but not the attempt count.
+  ok(otaReleaseStoreNotePendingWakeSkipped(), "retry: note wake skipped");
+  ok(otaReleaseStorePendingWakesSinceAttempt() == 1, "retry: wakes-since 1");
+  ok(otaReleaseStorePendingAttempts() == 0, "retry: skip did not add an attempt");
+
+  // A failed attempt bumps the count and resets the wakes-since gate.
+  uint8_t n = 0;
+  ok(otaReleaseStoreRecordPendingAttempt(&n) && n == 1, "retry: attempt -> 1");
+  ok(otaReleaseStorePendingWakesSinceAttempt() == 0, "retry: attempt reset wakes-since");
+  ok(otaReleaseStoreRecordPendingAttempt(&n) && n == 2, "retry: attempt -> 2");
+
+  // Counters survive a reload (persisted in the A/B record).
+  otaReleaseStoreInit();
+  ok(otaReleaseStorePendingAttempts() == 2, "retry: attempts survive reload");
+
+  // Re-pointing the pending intent resets the retry budget.
+  ok(otaReleaseStoreSetPending("rel-retry-2"), "retry: re-point pending");
+  ok(otaReleaseStorePendingAttempts() == 0, "retry: re-point reset attempts");
+
+  // Clearing pending zeroes the counters too.
+  ok(otaReleaseStoreRecordPendingAttempt(nullptr), "retry: one more attempt");
+  ok(otaReleaseStoreClearPending(), "retry: clear pending");
+  ok(otaReleaseStorePendingAttempts() == 0, "retry: cleared -> 0 attempts");
+}
+
 static void checkPersistenceAcrossBoot() {
   // Seed a known installed release, then reload from NVS as if freshly booted.
   otaReleaseStoreRecordInstalled("rel-persist-7", 7);
@@ -86,6 +125,7 @@ void setup() {
   Serial.println("\n[TEST] OTA release store");
 
   runFreshStateMachine();
+  runRetryAccounting();
   checkPersistenceAcrossBoot();
 
   Serial.printf("\n[TEST] %s (failures=%d)\n", failures == 0 ? "PASS" : "FAIL", failures);

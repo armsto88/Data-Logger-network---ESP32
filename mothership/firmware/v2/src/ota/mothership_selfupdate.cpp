@@ -41,7 +41,8 @@ static uint32_t installedReleaseSequence() {
 }
 
 FwReason mothershipOtaVerifyManifest(const uint8_t* json, size_t len,
-                                     const uint8_t sig[64]) {
+                                     const uint8_t sig[64],
+                                     bool allowDowngrade) {
   gManifestReady = false;
   gInstalling = false;
   gExpectedSize = 0;
@@ -54,7 +55,8 @@ FwReason mothershipOtaVerifyManifest(const uint8_t* json, size_t len,
 
   const ManifestArtifact* art = nullptr;
   FwReason r = manifestCheckCompatibility(m, fwIdentity(NODE_PROTOCOL_VERSION),
-                                          installedReleaseSequence(), &art);
+                                          installedReleaseSequence(), &art,
+                                          allowDowngrade);
   if (r != FW_NONE || !art) { gLastReason = r; return r; }
 
   gExpectedSize = art->size;
@@ -101,6 +103,8 @@ void mothershipOtaAbort() {
   if (gInstalling) { otaInstallAbort(gInstall); gInstalling = false; }
   gManifestReady = false;
 }
+
+void mothershipOtaSetLastReason(FwReason r) { gLastReason = r; }
 
 MothershipOtaStatus mothershipOtaGetStatus() {
   MothershipOtaStatus s{};

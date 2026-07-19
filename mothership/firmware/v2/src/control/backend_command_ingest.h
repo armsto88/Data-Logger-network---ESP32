@@ -49,7 +49,6 @@ enum class BackendIngestRejection : uint8_t {
   DESIRED_PERSIST_FAILED,
   CURSOR_PERSIST_FAILED,
   RELEASE_ID_INVALID,
-  OTA_ALREADY_PENDING,
 };
 
 const char* backendIngestStatusStr(BackendIngestStatus status);

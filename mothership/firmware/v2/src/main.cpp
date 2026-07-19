@@ -123,15 +123,29 @@ static BackendCommandApplyResult executeBackendDeployRelease(
   const CommandResult r = dispatcherSubmit(command);
   out.command = r;
   out.wireConfigVersion = 0;
-  if (r.outcome == OUT_ACCEPTED) {
-    // Fresh accept: stage the fetch intent (durable across wakes).
+  if (r.outcome == OUT_ACCEPTED || r.outcome == OUT_REPLAY) {
+    // (Re)stage the fetch intent on BOTH a fresh accept and a redelivery.
+    // Rationale: on the first attempt dispatcherSubmit() durably records the
+    // commandId before we stage the OTA intent, so if otaReleaseStoreSetPending()
+    // fails transiently the fast-path returns PERSIST_FAILED and the cursor is
+    // NOT advanced. The backend then redelivers the same commandId — but now
+    // dispatcherSubmit() returns OUT_REPLAY, and if we skipped staging here the
+    // OTA would be silently and permanently dropped (dispatcher/cursor report
+    // success, yet nothing is ever staged). Re-staging is safe: the ingest skips
+    // any command whose sequence is <= the durable cursor (backend_command_ingest.cpp
+    // line ~524) BEFORE this executor runs, so a completed release (cursor already
+    // advanced) never reaches here; and re-staging the same releaseId is
+    // idempotent, with mothershipOtaVerifyManifest() short-circuiting via
+    // FW_ALREADY_INSTALLED (before the image download) in the edge case where the
+    // image is already installed. Mirrors controlApplyNodeConfig /
+    // configApplyBackendRecordingInterval: side effects are re-derived from durable
+    // command identity, not gated on a single dispatcherSubmit() call's outcome.
     const bool staged = otaReleaseStoreSetPending(command.releaseId);
     out.durable = staged;
     out.applied = staged;
   } else {
-    // REPLAY (already handled once — must NOT re-stage, or a completed install
-    // would re-trigger) or a durable terminal decision (INVALID/CONFLICT).
-    // Either way the dispatcher result is recorded; nothing more to persist.
+    // A durable terminal decision (INVALID / REVISION_CONFLICT). The dispatcher
+    // result is already recorded; there is nothing to stage or retry.
     out.durable = true;
     out.applied = true;
   }

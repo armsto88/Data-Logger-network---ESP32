@@ -76,8 +76,8 @@ void setup() {
   }
   appendStr(uart, "\r\n+CCH_PEER_CLOSED\r\n");
 
-  // Each reader is ~2 KB; keep only one live at a time (loopTask stack is 8 KB)
-  // by scoping each test — heap-allocate to be extra safe.
+  // Each reader is ~8 KB (heap-allocated); keep only one live at a time by
+  // scoping each test so its head buffer never lands on the loopTask stack.
 
   // --- Test 1: feed the whole UART stream in one go ---
   { g_body.clear(); g_abortAfter = false;
@@ -120,6 +120,33 @@ void setup() {
     ok(r->bodyDelivered() == 100, "trunc: only 100 body bytes");
     ok(!r->peerClosed(), "trunc: no peer close");
     // caller detects incompleteness: delivered(100) < content-length(268)
+    delete r; }
+
+  // --- Test 5: header block larger than the reader's head buffer (kMaxHead) ---
+  // Regression guard. A real Supabase Storage response can carry CORS +
+  // Cache-Control + ETag + security headers. Before the rolling-tail fix, once
+  // head_ filled to kMaxHead the last-4-written bytes froze, so the \r\n\r\n
+  // terminator could never be detected — the reader stayed stuck "in headers"
+  // forever and every body byte was silently dropped. Prove a header block
+  // well past kMaxHead (8192) is still detected and the body flows.
+  { g_body.clear(); g_abortAfter = false;
+    String bigHeaders = "HTTP/1.1 200 OK\r\nContent-Length: 64\r\n";
+    bigHeaders += "X-Padding: ";
+    while (bigHeaders.length() < 9000) bigHeaders += "abcdefghij";  // > kMaxHead
+    bigHeaders += "\r\n\r\n";
+    std::vector<uint8_t> bigFull;
+    for (size_t k = 0; k < bigHeaders.length(); ++k) bigFull.push_back((uint8_t)bigHeaders[k]);
+    std::vector<uint8_t> bigBody;
+    for (int i = 0; i < 64; ++i) bigBody.push_back((uint8_t)(i & 0xFF));
+    for (uint8_t b : bigBody) bigFull.push_back(b);
+    std::vector<uint8_t> bigUart;
+    appendFrame(bigUart, bigFull.data(), bigFull.size());
+    appendStr(bigUart, "\r\n+CCH_PEER_CLOSED\r\n");
+    CchStreamReader* r = new CchStreamReader();
+    r->feed(bigUart.data(), bigUart.size(), sink, nullptr);
+    ok(r->headComplete(), "big-head: terminator detected past kMaxHead");
+    ok(r->bodyDelivered() == 64, "big-head: 64 body bytes delivered (not swallowed as head)");
+    ok(g_body.size() == 64 && g_body == bigBody, "big-head: body bytes match exactly");
     delete r; }
 
   Serial.printf("\n[TEST] %s (failures=%d)\n", failures == 0 ? "PASS" : "FAIL", failures);

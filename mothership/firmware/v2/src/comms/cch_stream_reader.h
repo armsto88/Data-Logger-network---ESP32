@@ -93,14 +93,27 @@ class CchStreamReader {
     isBody = false;
     if (headComplete_) { isBody = true; return; }
     if (headLen_ < kMaxHead) head_[headLen_++] = (char)b;
-    if (headLen_ >= 4 &&
-        head_[headLen_-4] == '\r' && head_[headLen_-3] == '\n' &&
-        head_[headLen_-2] == '\r' && head_[headLen_-1] == '\n') {
+    // Roll the 4-byte terminator window over EVERY header byte seen, not just
+    // the ones that fit in head_. If the scan looked at the last 4 *written*
+    // bytes instead, then once head_ fills to kMaxHead those bytes freeze and
+    // \r\n\r\n could never be (re)detected — wedging the reader in "still in
+    // headers" forever, so every body byte gets misclassified as head and
+    // silently dropped. Supabase Storage responses can carry CORS +
+    // Cache-Control + ETag + security headers, so head_ is generous (kMaxHead),
+    // but terminator detection must not depend on the byte fitting in it.
+    tail_[0] = tail_[1]; tail_[1] = tail_[2]; tail_[2] = tail_[3]; tail_[3] = (char)b;
+    if (tail_[0] == '\r' && tail_[1] == '\n' &&
+        tail_[2] == '\r' && tail_[3] == '\n') {
       headComplete_ = true;
     }
   }
 
-  static constexpr size_t kMaxHead = 2048;
+  // Generous cap so realistic response headers are captured in full for the
+  // status/Content-Length parse. If a header block ever exceeds this, head_ is
+  // truncated (missing its \r\n\r\n), so parseHttpResponseHead reports
+  // "headers incomplete" and the transfer fails cleanly as retryable — never
+  // the old silent infinite-header wedge (guaranteed by the rolling tail_).
+  static constexpr size_t kMaxHead = 8192;
 
   Mode     mode_ = SEEK;
   size_t   mkPos_ = 0;
@@ -116,4 +129,5 @@ class CchStreamReader {
   char     head_[kMaxHead];
   size_t   headLen_ = 0;
   bool     headComplete_ = false;
+  char     tail_[4] = {0, 0, 0, 0};   // rolling \r\n\r\n scan, independent of head_ capacity
 };

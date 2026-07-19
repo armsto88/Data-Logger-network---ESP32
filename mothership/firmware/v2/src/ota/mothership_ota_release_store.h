@@ -47,6 +47,18 @@ bool     otaReleaseStoreSetPending(const char* releaseId);
 bool     otaReleaseStoreGetPending(char* out, size_t outLen);
 bool     otaReleaseStoreClearPending();
 
+// ---- PENDING retry accounting (transient-failure backoff + terminal cap) ----
+// Transient failures recorded so far for the current pending fetch (0 if none
+// pending / never attempted).
+uint8_t  otaReleaseStorePendingAttempts();
+// Wakes elapsed since the last real attempt (backoff gate).
+uint8_t  otaReleaseStorePendingWakesSinceAttempt();
+// Note that this wake was skipped under backoff (bumps the wakes-since counter).
+bool     otaReleaseStoreNotePendingWakeSkipped();
+// Record a failed attempt: bump the attempt count, reset the wakes-since gate.
+// Writes the new attempt count to *outAttempts (may be null).
+bool     otaReleaseStoreRecordPendingAttempt(uint8_t* outAttempts);
+
 // ---- ARMED (flashed + set-boot, awaiting first-boot confirmation) ----
 bool     otaReleaseStoreSetArmed(const char* releaseId, uint32_t sequence);
 // Copies the armed releaseId + sequence; returns false if nothing armed.

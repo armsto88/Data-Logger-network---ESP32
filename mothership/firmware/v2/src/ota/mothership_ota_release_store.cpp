@@ -27,7 +27,13 @@ struct ReleaseRecord {
   // Fetch intent.
   char     pendingReleaseId[kReleaseIdLen];
   uint8_t  pendingValid;
-  uint8_t  reserved[2];
+  // Retry accounting for the CURRENT pending fetch. Repurposed from the former
+  // reserved[2] padding — same struct size and kVersion=1, so records written
+  // by firmware predating this field round-trip cleanly (old firmware always
+  // wrote these two bytes as 0, which is exactly the correct "never attempted"
+  // default). Reset to 0 whenever pending is (re)staged or cleared.
+  uint8_t  pendingAttempts;      // transient failures so far (was reserved[0])
+  uint8_t  pendingWakesSkipped;  // wakes elapsed since last real attempt (was reserved[1])
   uint32_t checksum;
 };
 
@@ -70,7 +76,9 @@ bool persist() {
   candidate.version = kVersion;
   candidate.size = sizeof(candidate);
   candidate.generation = gRec.generation + 1U;
-  candidate.reserved[0] = candidate.reserved[1] = 0;
+  // NOTE: do NOT zero pendingAttempts/pendingWakesSkipped here — they are live
+  // retry state carried in gRec, not padding. (They used to be reserved[] and
+  // were zeroed on every write; that line was removed when they became fields.)
   candidate.checksum = checksumFor(candidate);
   const char* key = (candidate.generation & 1U) ? kKeyA : kKeyB;
 
@@ -137,8 +145,15 @@ bool otaReleaseStoreRecordInstalled(const char* releaseId, uint32_t sequence) {
 bool otaReleaseStoreSetPending(const char* releaseId) {
   ensureLoaded();
   if (!releaseId || releaseId[0] == '\0') return false;
+  // Deliberately overwrites any existing pending release. An operator issuing a
+  // new DEPLOY_RELEASE while one is mid-download is a supported "change my mind"
+  // flow: the fetch loop always restarts from byte 0 every wake, so there is no
+  // partial/resumable download state to corrupt by switching targets. Re-staging
+  // the SAME releaseId (e.g. Finding-4 redelivery repair) is likewise safe.
   strlcpy(gRec.pendingReleaseId, releaseId, sizeof(gRec.pendingReleaseId));
   gRec.pendingValid = 1;
+  gRec.pendingAttempts = 0;       // fresh (or re-pointed) intent: reset retry budget
+  gRec.pendingWakesSkipped = 0;
   return persist();
 }
 
@@ -153,6 +168,34 @@ bool otaReleaseStoreClearPending() {
   if (!gRec.pendingValid) return true;
   gRec.pendingValid = 0;
   memset(gRec.pendingReleaseId, 0, sizeof(gRec.pendingReleaseId));
+  gRec.pendingAttempts = 0;
+  gRec.pendingWakesSkipped = 0;
+  return persist();
+}
+
+uint8_t otaReleaseStorePendingAttempts() {
+  ensureLoaded();
+  return gRec.pendingValid ? gRec.pendingAttempts : 0;
+}
+
+uint8_t otaReleaseStorePendingWakesSinceAttempt() {
+  ensureLoaded();
+  return gRec.pendingValid ? gRec.pendingWakesSkipped : 0;
+}
+
+bool otaReleaseStoreNotePendingWakeSkipped() {
+  ensureLoaded();
+  if (!gRec.pendingValid) return false;
+  if (gRec.pendingWakesSkipped < 0xFF) gRec.pendingWakesSkipped++;
+  return persist();
+}
+
+bool otaReleaseStoreRecordPendingAttempt(uint8_t* outAttempts) {
+  ensureLoaded();
+  if (!gRec.pendingValid) { if (outAttempts) *outAttempts = 0; return false; }
+  if (gRec.pendingAttempts < 0xFF) gRec.pendingAttempts++;
+  gRec.pendingWakesSkipped = 0;   // restart the backoff window from this attempt
+  if (outAttempts) *outAttempts = gRec.pendingAttempts;
   return persist();
 }
 

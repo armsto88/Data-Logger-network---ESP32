@@ -1071,7 +1071,7 @@ bool ModemDriver::httpsGetStreamSSL(const String& host, int port,
     return s->cb(d, n, s->ctx);
   };
 
-  // Heap-allocate the reader (its ~2 KB head buffer stays off this deep stack).
+  // Heap-allocate the reader (its ~8 KB head buffer stays off this deep stack).
   CchStreamReader* rp = new CchStreamReader();
   if (!rp) {
     result.errorDetail = "OOM (stream reader)";

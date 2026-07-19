@@ -220,7 +220,7 @@ Firmware rules: missing envelope = legacy upload, no commands; persist a command
 ### 5.5 Vocabularies (use these exact codes)
 **Command outcomes** (config changes): `ACCEPTED`, `REVISION_CONFLICT`, `INVALID`, `SUPERSEDED`, `REPLAY`.
 **Command lifecycle** (§3.2): `QUEUED`, `RECEIVED`, `ACCEPTED`, `REJECTED`, `WAITING_FOR_SYNC`, `SENT_TO_NODE`, `CONVERGED`, `SUPERSEDED`, `FAILED`, `CANCELLED`.
-**OTA / release reasons:** `NONE`, `COMMAND_EXPIRED`, `COMMAND_DUPLICATE`, `REVISION_CONFLICT`, `SUPERSEDED`, `DEFERRED_LOW_BATTERY`, `DEFERRED_BUSY`, `LOCAL_SERVICE_LOCK`, `INCOMPATIBLE_ROLE`, `INCOMPATIBLE_HARDWARE`, `INCOMPATIBLE_PROTOCOL`, `DOWNGRADE_REJECTED`, `SD_MISSING`, `SD_FULL`, `MANIFEST_INVALID`, `SIGNATURE_INVALID`, `IMAGE_TOO_LARGE`, `SIZE_MISMATCH`, `HASH_MISMATCH`, `IMAGE_INVALID`, `FLASH_WRITE_FAILED`, `DOWNLOAD_TIMEOUT`, `DOWNLOAD_TRUNCATED`, `BOOT_VALIDATION_FAILED`, `ROLLED_BACK`, `DATA_BACKLOG_BLOCKED`, `OPERATOR_CANCELLED`.
+**OTA / release reasons:** `NONE`, `COMMAND_EXPIRED`, `COMMAND_DUPLICATE`, `REVISION_CONFLICT`, `SUPERSEDED`, `DEFERRED_LOW_BATTERY`, `DEFERRED_BUSY`, `DEFERRED_BACKOFF`, `LOCAL_SERVICE_LOCK`, `INCOMPATIBLE_ROLE`, `INCOMPATIBLE_HARDWARE`, `INCOMPATIBLE_PROTOCOL`, `DOWNGRADE_REJECTED`, `SD_MISSING`, `SD_FULL`, `MANIFEST_INVALID`, `SIGNATURE_INVALID`, `IMAGE_TOO_LARGE`, `SIZE_MISMATCH`, `HASH_MISMATCH`, `IMAGE_INVALID`, `FLASH_WRITE_FAILED`, `DOWNLOAD_TIMEOUT`, `DOWNLOAD_TRUNCATED`, `RETRY_LIMIT_EXCEEDED`, `BOOT_VALIDATION_FAILED`, `ROLLED_BACK`, `DATA_BACKLOG_BLOCKED`, `OPERATOR_CANCELLED`.
 
 ### 5.6 Release manifest + signature (what the release service serves)
 ```json
@@ -416,10 +416,10 @@ Source: `mothershipFirmwareStatusJson()` in `mothership/firmware/v2/src/ota/moth
 
 ### B.4 Reason vocabulary + retry semantics — **IMPLEMENTED**
 Lifecycle/reason strings follow §5.5. Firmware distinguishes **transient** (retried automatically next wake, intent stays staged — the backend need not re-issue) from **terminal** (intent cleared — the backend must issue a fresh `commandId` to retry):
-- **Transient / deferred:** `DEFERRED_LOW_BATTERY`, `DEFERRED_BUSY` (session budget too low), `DOWNLOAD_TIMEOUT`, `DOWNLOAD_TRUNCATED`, `DOWNLOAD_FAILED`*, `MODEM_UNAVAILABLE`*.
-- **Terminal:** `MANIFEST_INVALID`, `SIGNATURE_INVALID`, `INCOMPATIBLE_ROLE`, `INCOMPATIBLE_HARDWARE`, `INCOMPATIBLE_PROTOCOL`, `DOWNGRADE_REJECTED`, `SIZE_MISMATCH`, `HASH_MISMATCH`, `IMAGE_INVALID`, `IMAGE_TOO_LARGE`, `FLASH_WRITE_FAILED`.
+- **Transient / deferred:** `DEFERRED_LOW_BATTERY`, `DEFERRED_BUSY` (session budget too low), `DEFERRED_BACKOFF`* (skipping this wake under retry backoff after a prior failure), `DOWNLOAD_TIMEOUT`, `DOWNLOAD_TRUNCATED`, `DOWNLOAD_FAILED`*, `MODEM_UNAVAILABLE`*.
+- **Terminal:** `MANIFEST_INVALID`, `SIGNATURE_INVALID`, `INCOMPATIBLE_ROLE`, `INCOMPATIBLE_HARDWARE`, `INCOMPATIBLE_PROTOCOL`, `DOWNGRADE_REJECTED`, `SIZE_MISMATCH`, `HASH_MISMATCH`, `IMAGE_INVALID`, `IMAGE_TOO_LARGE`, `FLASH_WRITE_FAILED`, `RETRY_LIMIT_EXCEEDED`* (gave up after repeated transient download failures — operator must issue a fresh command).
 
-  *`DOWNLOAD_FAILED`/`MODEM_UNAVAILABLE` are firmware extensions beyond §5.5's list; treat any unrecognised reason as a non-fatal "will retry / see detail" state.
+  *`DOWNLOAD_FAILED`/`MODEM_UNAVAILABLE`/`DEFERRED_BACKOFF`/`RETRY_LIMIT_EXCEEDED` are firmware extensions beyond §5.5's list. Treat any unrecognised reason as a non-fatal "will retry / see detail" state — **except** `RETRY_LIMIT_EXCEEDED`, which is terminal (see the Terminal list): the intent is cleared and the release will NOT retry until the operator issues a fresh `commandId`.
 
 ### B.5 Anti-downgrade — **IMPLEMENTED (now enforced)**
 Previously inert (`installedReleaseSequence()` returned 0). Now the confirmed-running release's `releaseSequence` is persisted in NVS and advanced only after a confirmed first boot, so a `DEPLOY_RELEASE` whose manifest `releaseSequence` is lower than the installed one is rejected `DOWNGRADE_REJECTED`. Keep `releaseSequence` monotonic per role in the release catalog.

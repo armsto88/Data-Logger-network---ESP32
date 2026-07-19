@@ -242,7 +242,6 @@ const char* backendIngestRejectionStr(BackendIngestRejection rejection) {
     case BackendIngestRejection::DESIRED_PERSIST_FAILED: return "DESIRED_PERSIST_FAILED";
     case BackendIngestRejection::CURSOR_PERSIST_FAILED: return "CURSOR_PERSIST_FAILED";
     case BackendIngestRejection::RELEASE_ID_INVALID: return "RELEASE_ID_INVALID";
-    case BackendIngestRejection::OTA_ALREADY_PENDING: return "OTA_ALREADY_PENDING";
     default: return "UNKNOWN";
   }
 }

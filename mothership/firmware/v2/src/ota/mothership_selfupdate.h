@@ -17,8 +17,14 @@
 // verifyRollbackLater()=true and calls mothershipOtaFirstBootCheck() only after
 // its subsystems init, so a bad image that hangs at boot auto-rolls back.
 
+// Verify a signed manifest and stage its mothership artifact for install.
+// allowDowngrade defaults to false (full anti-downgrade enforcement) — the
+// cloud OTA path always uses the default. Only the deliberate local-AP
+// emergency-rollback path passes true, which bypasses ONLY the anti-downgrade
+// sequence gate (signature/role/hardware checks still apply).
 FwReason mothershipOtaVerifyManifest(const uint8_t* json, size_t len,
-                                     const uint8_t sig[64]);
+                                     const uint8_t sig[64],
+                                     bool allowDowngrade = false);
 
 // Call repeatedly with ordered image bytes. First call begins the install.
 FwReason mothershipOtaImageChunk(const uint8_t* data, size_t len);
@@ -34,6 +40,14 @@ FwReason mothershipOtaImageFinish();
 uint32_t mothershipOtaTargetSequence();
 
 void mothershipOtaAbort();
+
+// Set the module's last-reason (the value surfaced as status.firmware.otaReason).
+// The cloud-fetch orchestrator calls this on every exit path — including its
+// download-phase transport failures and deferrals, which the verify/chunk/finish
+// core never touches — so the dashboard sees a truthful current OTA reason
+// instead of a stale one. A subsequent successful mothershipOtaVerifyManifest()
+// resets it to FW_NONE, so a completed install still reports "NONE".
+void mothershipOtaSetLastReason(FwReason r);
 
 // Pre-built status.firmware{} JSON for the cloud upload payload: identity
 // (version/build/hw/protocol), running slot, OTA state, and the A/B slots[]
