@@ -57,6 +57,11 @@ typedef struct deployment_command {
     uint16_t syncIntervalMin;   // desired sync interval to apply immediately
     uint32_t syncPhaseUnix;     // desired sync phase anchor to apply immediately
     char mothership_id[16];
+    uint16_t sensorMask;       // operator-selected sensors (SNAP_PRESENT_* +
+                               // NODE_SENSOR_MASK_VALID). 0 without VALID = auto.
+                               // Applied immediately so the first capture after
+                               // deploy respects the operator's selection, not
+                               // just auto-detect.
 } deployment_command_t;
 
 // Node -> mothership deployment confirmation (sent immediately after apply)
@@ -198,7 +203,11 @@ typedef struct config_snapshot_message {
     uint8_t  wakeIntervalMin;
     uint16_t syncIntervalMin;
     uint32_t syncPhaseUnix;
-    uint8_t  reserved[2];       // padding for future fields
+    // Operator-selected sensor mask (SNAP_PRESENT_* bits + NODE_SENSOR_MASK_VALID).
+    // Reuses the 2 bytes previously labelled "reserved" — the struct stays 52
+    // bytes, so older nodes that don't read this field are unaffected (they just
+    // keep auto-detecting sensors). 0 without NODE_SENSOR_MASK_VALID = auto.
+    uint16_t sensorMask;
 } config_snapshot_message_t;
 
 // Node -> Mothership: ACK after applying a CONFIG_SNAPSHOT
@@ -447,7 +456,7 @@ typedef struct __attribute__((packed)) node_snapshot {
 static_assert(sizeof(node_snapshot_t) == 124, "node_snapshot_t size mismatch");
 static_assert(sizeof(pairing_command_t) == 52, "pairing_command_t size mismatch");
 static_assert(sizeof(config_snapshot_message_t) == 52, "config_snapshot_message_t size mismatch");
-static_assert(sizeof(deployment_command_t) == 88, "deployment_command_t size mismatch");
+static_assert(sizeof(deployment_command_t) == 92, "deployment_command_t size mismatch");
 static_assert(sizeof(unpair_command_t) == 48, "unpair_command_t size mismatch");
 static_assert(sizeof(node_config_message_t) == 60, "node_config_message_t size mismatch");
 static_assert(sizeof(time_sync_response_t) == 56, "time_sync_response_t size mismatch");

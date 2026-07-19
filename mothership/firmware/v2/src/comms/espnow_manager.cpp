@@ -401,6 +401,7 @@ static bool pushDesiredConfigSnapshot(const uint8_t* senderMac,
     snap.wakeIntervalMin  = desired.wakeIntervalMin;
     snap.syncIntervalMin  = desired.syncIntervalMin;
     snap.syncPhaseUnix    = desired.syncPhaseUnix;
+    snap.sensorMask       = desired.sensorMask;  // 0 = auto; else SNAP_PRESENT_* + VALID
 
     ensurePeerOnChannel(senderMac, ESPNOW_CHANNEL);
     esp_wifi_set_channel(ESPNOW_CHANNEL, WIFI_SECOND_CHAN_NONE);
@@ -1649,6 +1650,7 @@ void handleNodeHello(const uint8_t* senderMac, const node_hello_message_t& hello
     snap.wakeIntervalMin  = desired.wakeIntervalMin;
     snap.syncIntervalMin  = desired.syncIntervalMin;
     snap.syncPhaseUnix    = desired.syncPhaseUnix;
+    snap.sensorMask       = desired.sensorMask;  // 0 = auto; else SNAP_PRESENT_* + VALID
 
     ensurePeerOnChannel(senderMac, ESPNOW_CHANNEL);
     esp_wifi_set_channel(ESPNOW_CHANNEL, WIFI_SECOND_CHAN_NONE);

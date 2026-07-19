@@ -394,6 +394,7 @@ static bool buildRecoveryDeploy(const NodeInfo& node, uint16_t activeSyncMin,
       : (node.wakeIntervalMin ? node.wakeIntervalMin : DEFAULT_WAKE_INTERVAL_MINUTES);
   deploy.syncIntervalMin = activeSyncMin;
   deploy.syncPhaseUnix = activeSyncPhase;
+  deploy.sensorMask = desired.sensorMask;  // 0 = auto; else SNAP_PRESENT_* + VALID
   return true;
 }
 
@@ -608,6 +609,14 @@ static void runCoordinatedSyncWindow(
     sessionTimedOut = true;
     return;
   }
+
+  // Push a fleet TIME_SYNC at the start of the rendezvous. The coordinated
+  // window broadcasts NODE_CONFIG and SET_SYNC_SCHED but neither carries a
+  // wall-clock field, so a node that missed its initial imperative DEPLOY_NODE
+  // + TIME_SYNC (or whose RTC has drifted) would otherwise leave the window
+  // without a clock correction. SYNC_RELEASE.mothershipUnix only reaches nodes
+  // that joined the responder roster, so this broadcast covers the rest.
+  broadcastTimeSyncAll();
 
   // Bounded rendezvous. Control/config frames are paced by the ESP-NOW send
   // callback; no node receives permission to dump during this collection phase.

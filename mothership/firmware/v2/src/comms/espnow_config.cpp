@@ -8,6 +8,13 @@
 #include <esp_wifi.h>
 #include <freertos/FreeRTOS.h>
 
+// Fleet sync phase anchor + persistence (defined in config_server.cpp). Used
+// by deploySelectedNodes() so a fresh-erased mothership promotes the first
+// deploy's phase to its own anchor, keeping the mothership and nodes on the
+// same sync slot. See the deploy-phase fix in deploySelectedNodes().
+extern unsigned long gLastSyncBroadcastUnix;
+void saveSyncRuntimeGuardsToNVS();
+
 // Config-mode ESP-NOW command layer for Mothership V1.
 // Slim extract from production espnow_manager.cpp.
 
@@ -248,6 +255,27 @@ static void onEspNowRecv(const uint8_t* mac, const uint8_t* data, int len) {
       handleNodeHello(mac, hello);
     } else {
       Serial.printf("[ESPNOW-CFG] NODE_HELLO too short: %d < %u\n", len, (unsigned)sizeof(node_hello_message_t));
+    }
+    return;
+  }
+
+  // --- FW_CAPS (firmware/OTA identity + A/B slot state) ---
+  // The node sends this right after NODE_HELLO on every wake, including the
+  // deploy bootstrap. Parsing it here (config mode) means the operator sees
+  // firmware/slot info in the wizard immediately, instead of waiting for the
+  // first sync window's drainSyncCaps path. Accepts both v1 (96 B) and v2
+  // (116 B) lengths — the registry helper handles absent slot fields.
+  if (cmdMatches(cmd0, "FW_CAPS")) {
+    if (len >= (int)FW_CAPS_V1_BYTES) {
+      fw_caps_message_t caps{};
+      memcpy(&caps, data, (len < (int)sizeof(caps)) ? len : (int)sizeof(caps));
+      caps.nodeId[sizeof(caps.nodeId) - 1] = '\0';
+      setNodeFirmwareCaps(caps);
+      Serial.printf("[FW-CAPS] %.15s v%.11s build=%.24s hw=%.15s proto=%u slot=%.6s\n",
+                    caps.nodeId, caps.fwVersion, caps.buildId, caps.hwTarget,
+                    (unsigned)caps.protocolVersion, caps.runningSlot);
+    } else {
+      Serial.printf("[ESPNOW-CFG] FW_CAPS too short: %d < %u\n", len, (unsigned)FW_CAPS_V1_BYTES);
     }
     return;
   }
@@ -605,9 +633,32 @@ bool deploySelectedNodes(const std::vector<String>& nodeIds) {
         if (deployCmd.syncIntervalMin == 0 && desired.syncPhaseUnix == 0) {
           deployCmd.syncIntervalMin = 15;
         }
-        deployCmd.syncPhaseUnix = (desired.syncPhaseUnix > 0)
-            ? desired.syncPhaseUnix
-            : (nowUnix - (nowUnix % 60UL));
+        // Use a single fleet-wide phase anchor for every deploy in this
+        // session so all nodes wake on the same slot. If the mothership
+        // already has a valid anchor (gLastSyncBroadcastUnix), honour it —
+        // that's the slot the mothership will wake on too. If the anchor is
+        // still 0 (fresh-erased NVS, first-ever deploy), derive one from the
+        // current time, promote it to the fleet anchor, and persist it so the
+        // mothership's "Sync & Power Down" arms its alarm to the same slot
+        // the nodes will wake on. Without this, each deploy computed its own
+        // per-minute phase (nowUnix % 60) and the mothership kept anchor=0,
+        // so the fleet never met in the same sync window.
+        if (gLastSyncBroadcastUnix >= 1704067200UL) {
+          deployCmd.syncPhaseUnix = (uint32_t)gLastSyncBroadcastUnix;
+        } else if (desired.syncPhaseUnix >= 1704067200UL) {
+          deployCmd.syncPhaseUnix = desired.syncPhaseUnix;
+          gLastSyncBroadcastUnix = deployCmd.syncPhaseUnix;
+          saveSyncRuntimeGuardsToNVS();
+          Serial.printf("[DEPLOY] promoted fleet phase anchor to %lu (was unset)\n",
+                        (unsigned long)gLastSyncBroadcastUnix);
+        } else {
+          deployCmd.syncPhaseUnix = nowUnix - (nowUnix % 60UL);
+          gLastSyncBroadcastUnix = deployCmd.syncPhaseUnix;
+          saveSyncRuntimeGuardsToNVS();
+          Serial.printf("[DEPLOY] promoted fleet phase anchor to %lu (derived from now)\n",
+                        (unsigned long)gLastSyncBroadcastUnix);
+        }
+        deployCmd.sensorMask = desired.sensorMask;  // 0 = auto; else SNAP_PRESENT_* + VALID
 
         Serial.printf("[DEPLOY] %s: cfgV=%u wakeMin=%u syncMin=%u phase=%lu\n",
                       nodeId.c_str(),
@@ -823,6 +874,7 @@ bool sendConfigSnapshot(const uint8_t* mac, const char* nodeId) {
   snap.wakeIntervalMin  = desired.wakeIntervalMin;
   snap.syncIntervalMin  = desired.syncIntervalMin;
   snap.syncPhaseUnix    = desired.syncPhaseUnix;
+  snap.sensorMask       = desired.sensorMask;  // 0 = auto; else SNAP_PRESENT_* + VALID
 
   ensurePeerOnChannel(mac, ESPNOW_CHANNEL);
   esp_wifi_set_channel(ESPNOW_CHANNEL, WIFI_SECOND_CHAN_NONE);
@@ -833,11 +885,39 @@ bool sendConfigSnapshot(const uint8_t* mac, const char* nodeId) {
   return (res == ESP_OK);
 }
 
+// A node that wakes with a stale or unset RTC but a current configVersion
+// would otherwise leave handleNodeHello without any time correction — the
+// pull handshake only sends CONFIG_SNAPSHOT, which carries no wall-clock
+// field. If the HELLO's rtcUnix is clearly unset or has drifted beyond
+// STALE_RTC_DRIFT_SEC from the mothership clock, push TIME_SYNC now so a
+// freshly-deployed node (whose initial imperative DEPLOY_NODE + TIME_SYNC
+// may have been lost) does not run on a stale RTC until the 24h fleet sync.
+static constexpr uint32_t STALE_RTC_DRIFT_SEC = 120UL;
+static void maybePushTimeSyncOnHello(const uint8_t* senderMac,
+                                      const node_hello_message_t& hello) {
+  const uint32_t mothershipUnix = getRTCTimeUnix();
+  if (mothershipUnix < 1704067200UL) return;  // our own RTC invalid
+  const uint32_t nodeUnix = hello.rtcUnix;
+  const bool unset  = (nodeUnix < 1704067200UL);
+  const bool drifted = (nodeUnix >= 1704067200UL) &&
+      (nodeUnix > mothershipUnix + STALE_RTC_DRIFT_SEC ||
+       nodeUnix + STALE_RTC_DRIFT_SEC < mothershipUnix);
+  if (!unset && !drifted) return;
+  Serial.printf("[HELLO] %s RTC %s (node=%lu mothership=%lu) -> pushing TIME_SYNC\n",
+                hello.nodeId,
+                unset ? "unset" : "drifted",
+                (unsigned long)nodeUnix,
+                (unsigned long)mothershipUnix);
+  sendTimeSync(senderMac, hello.nodeId);
+}
+
 void handleNodeHello(const uint8_t* senderMac, const node_hello_message_t& hello) {
   Serial.printf("[HELLO] %s cfgV=%u wakeMin=%u qDepth=%u rtcUnix=%lu\n",
-                hello.nodeId, (unsigned)hello.configVersion,
+                hello.nodeId, hello.configVersion,
                 (unsigned)hello.wakeIntervalMin, (unsigned)hello.queueDepth,
                 (unsigned long)hello.rtcUnix);
+
+  maybePushTimeSyncOnHello(senderMac, hello);
 
   NodeState helloState = DEPLOYED;
   for (const auto& n : registeredNodes) {

@@ -2857,6 +2857,20 @@ void loop() {
     } else {
       Serial.println("⚠️ DEPLOY config persist failed; config version not advanced");
     }
+    // Apply the operator-selected sensor mask immediately so the first capture
+    // after deploy respects it. Mirrors the NODE_CONFIG/CONFIG_SNAPSHOT path.
+    // Only an authoritative mask (NODE_SENSOR_MASK_VALID set) is stored, so an
+    // older mothership sending 0 here can't wipe a real selection.
+    if (deployConfigPersisted && (dc.sensorMask & NODE_SENSOR_MASK_VALID) &&
+        dc.sensorMask != g_expectedSensorMask) {
+      if (nodeSensorMaskSave(dc.sensorMask)) {
+        g_expectedSensorMask = dc.sensorMask;
+        Serial.printf("   ↪ sensor mask 0x%04X saved (applies next wake)\n",
+                      (unsigned)dc.sensorMask);
+      } else {
+        Serial.println("   ⚠️ sensor mask persist FAILED");
+      }
+    }
 
     Serial.print("RTC synchronized to: ");
     Serial.println(rtc.now().timestamp());
@@ -2940,6 +2954,20 @@ void loop() {
       const bool configPersisted = persistNodeConfig(snap.configVersion, true);
       if (configPersisted) {
         setNodeConfigVersion(snap.configVersion);
+      }
+      // Apply the operator-selected sensor mask, mirroring the NODE_CONFIG
+      // path. Only an authoritative mask (NODE_SENSOR_MASK_VALID set) is stored,
+      // so an older mothership sending 0 here can't wipe a real selection. The
+      // mask takes effect at the next wake, when initSensors() re-reads it.
+      if (configPersisted && (snap.sensorMask & NODE_SENSOR_MASK_VALID) &&
+          snap.sensorMask != g_expectedSensorMask) {
+        if (nodeSensorMaskSave(snap.sensorMask)) {
+          g_expectedSensorMask = snap.sensorMask;
+          Serial.printf("   ↪ sensor mask 0x%04X saved (applies next wake)\n",
+                         (unsigned)snap.sensorMask);
+        } else {
+          Serial.println("   ⚠️ sensor mask persist FAILED");
+        }
       }
       if (scheduleChanged && configPersisted &&
           currentNodeState() == STATE_DEPLOYED && rtcSynced) {

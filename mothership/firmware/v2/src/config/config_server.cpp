@@ -63,6 +63,11 @@ long gLastSyncBroadcastEpochDay = -1;
 int gSyncMode = SYNC_MODE_INTERVAL;
 unsigned long gLastSyncBroadcastMs = 0;
 unsigned long gLastSyncBroadcastUnix = 0;
+// UTC offset (minutes) for DISPLAY ONLY. The DS3231 RTC stays on UTC unix
+// seconds — this offset is applied solely in getRTCTimeString() and
+// formatDateTimeDisplay() so the operator sees local time. Scheduling, sync
+// phase math, uploads, and the daily-sync HH:MM stay UTC. Range: -720..+840.
+int gUtcOffsetMin = 0;
 long long gLastSyncIntervalSlot = -1;
 const int kAllowedIntervals[] = {1, 5, 10, 20, 30, 60};
 const size_t kAllowedCount = sizeof(kAllowedIntervals) / sizeof(kAllowedIntervals[0]);
@@ -218,6 +223,12 @@ WebServer server(80);
 DNSServer dnsServer;
 
 volatile bool gShutdownRequested = false;
+
+// Set true when a node was deployed this config-mode session. handleShutdown
+// uses it to decide whether to run a blocking dashboard sync before powering
+// down, so the operator sees the freshly deployed fleet without waiting for
+// the next sync window. Reset to false at config-mode entry (handleConfigWake).
+static bool gDeployedThisSession = false;
 
 // Upload queue instance for config-mode UI (separate from the sync-wake
 // global in main.cpp, which is only active during a sync wake).
@@ -404,7 +415,9 @@ static void getRTCTimeString(char* buf, size_t bufLen) {
     snprintf(buf, bufLen, "RTC unset");
     return;
   }
-  DateTime dt(u);
+  // Apply the display-only UTC offset. The RTC itself stays UTC; only the
+  // rendered string is shifted so the operator sees local time.
+  DateTime dt((uint32_t)(u + (int32_t)gUtcOffsetMin * 60UL));
   uint8_t m = dt.month();
   if (m < 1) m = 1; if (m > 12) m = 12;
   // Format: "14:32 · 26 Jun 2026"
@@ -414,11 +427,15 @@ static void getRTCTimeString(char* buf, size_t bufLen) {
 
 static String formatDateTimeDisplay(const DateTime& dt) {
   char b[24];
-  uint8_t m = dt.month();
+  // Apply the display-only UTC offset to a UTC DateTime. The caller passes a
+  // UTC unix-derived DateTime (e.g. next sync slot); we shift it for display.
+  const uint32_t localUnix = (uint32_t)((int64_t)dt.unixtime() + (int64_t)gUtcOffsetMin * 60LL);
+  DateTime local(localUnix);
+  uint8_t m = local.month();
   if (m < 1) m = 1; if (m > 12) m = 12;
   // Format: "14:32 · 26 Jun 2026"
   snprintf(b, sizeof(b), "%02d:%02d \xc2\xb7 %02d %s %04d",
-           dt.hour(), dt.minute(), dt.day(), kMonthShort[m], dt.year());
+           local.hour(), local.minute(), local.day(), kMonthShort[m], local.year());
   return String(b);
 }
 
@@ -478,11 +495,14 @@ void loadDailySyncTimeFromNVS() {
   if (gPrefs.begin("ui", true)) {
     int hh = gPrefs.getInt("sync_hh", gSyncDailyHour);
     int mm = gPrefs.getInt("sync_mm", gSyncDailyMinute);
+    int off = gPrefs.getInt("utc_off", 0);  // display-only UTC offset (minutes)
     gPrefs.end();
     if (hh < 0 || hh > 23) hh = 6;
     if (mm < 0 || mm > 59) mm = 0;
     gSyncDailyHour = hh;
     gSyncDailyMinute = mm;
+    if (off < -720) off = -720; if (off > 840) off = 840;
+    gUtcOffsetMin = off;
   }
 }
 
@@ -490,6 +510,16 @@ static void saveDailySyncTimeToNVS(int hh, int mm) {
   if (gPrefs.begin("ui", false)) {
     gPrefs.putInt("sync_hh", hh);
     gPrefs.putInt("sync_mm", mm);
+    gPrefs.end();
+  }
+}
+
+void saveUtcOffsetToNVS(int offsetMin) {
+  if (offsetMin < -720) offsetMin = -720;
+  if (offsetMin > 840) offsetMin = 840;
+  gUtcOffsetMin = offsetMin;
+  if (gPrefs.begin("ui", false)) {
+    gPrefs.putInt("utc_off", offsetMin);
     gPrefs.end();
   }
 }
@@ -1677,11 +1707,16 @@ function wireAsyncForms(){
         if (btn && btn.disabled) return;  // prevent duplicate submission
         var action = form.getAttribute('action') || '';
         var isFind = action.indexOf('find-stations')>=0 || action.indexOf('discover')>=0;
+        var isStart = action.indexOf('/start')>=0;
         setBtnLoading(btn, btnLabelFor(form, btn));
         if (isFind) FM.startDiscoveryUi();  // immediate panel + fast polling
+        if (isStart) showUiStatus('Syncing to dashboard… this takes 30-60s', 'progress');
 
         var ctrl = fmAbort();
-        var to = ctrl ? setTimeout(function(){ ctrl.abort(); }, 15000) : null;
+        // /start runs a blocking modem upload (30-60s) before responding — the
+        // default 15s timeout would abort it mid-upload. Give it 120s.
+        var timeoutMs = isStart ? 120000 : 15000;
+        var to = ctrl ? setTimeout(function(){ ctrl.abort(); }, timeoutMs) : null;
         fetch(form.action, {method:'POST', body:asFormBody(form),
               headers:{'Content-Type':'application/x-www-form-urlencoded'},
               signal: ctrl?ctrl.signal:undefined})
@@ -1695,6 +1730,18 @@ function wireAsyncForms(){
               // panel and node list. No full-page reload.
               showUiStatus(ok ? 'Searching for nodes…' : ('Discovery failed: '+msg), ok?'progress':'err');
               if (!ok) clearBtnLoading(btn);
+              FM.bump();
+            } else if (isStart) {
+              // Finish & Start Recording: the upload + shutdown is done. Show a
+              // persistent "Finished" state on the button so the operator knows
+              // the board is about to power down, and a clear status message.
+              showUiStatus(msg, ok?'ok':'err');
+              if (btn){
+                btn.classList.remove('is-loading');
+                btn.classList.add(ok ? 'is-ok' : 'is-err');
+                btn.textContent = ok ? '✓ Finished — powering down' : '✗ Sync failed — powering down';
+                btn.disabled = true;  // stay disabled — the board is shutting down
+              }
               FM.bump();
             } else {
               showUiStatus(msg, ok?'ok':'err');
@@ -1981,6 +2028,9 @@ static String buildStatusJson() {
   json += "\"syncMode\":\"";
   json += (gSyncMode == SYNC_MODE_INTERVAL) ? "interval" : "daily";
   json += "\",";
+  json += "\"utcOffsetMin\":";
+  json += String(gUtcOffsetMin);
+  json += ",";
   json += "\"nextSyncLocal\":\"";
   json += computeNextCollectionIsoLocal();
   json += "\",";
@@ -3633,6 +3683,7 @@ static void handleNodeConfigSave() {
     ids.push_back(nodeId);
     deployOk = deploySelectedNodes(ids);
     Serial.printf("[CONFIG] %s start -> deploy: %s\n", nodeId.c_str(), deployOk ? "OK" : "FAIL");
+    if (deployOk) gDeployedThisSession = true;  // triggers dashboard sync at Finish
   } else if (action == "stop") {
     if (target) {
       target->state = PAIRED;
@@ -4240,32 +4291,46 @@ static void handleSetTransmission() {
   server.send(200, "text/html", html);
 }
 
-static void handleManualUpload() {
+// POST /set-utc-offset?offset=<minutes> — display-only UTC offset for the
+// mothership UI. The RTC stays UTC; only the rendered strings shift. Stored
+// in NVS so it survives power cycles. Range -720..+840 (UTC-12..UTC+14).
+static void handleSetUtcOffset() {
+  if (!server.hasArg("offset")) {
+    if (isAjaxRequest()) { sendAjaxResult(false, "offset (minutes) required"); return; }
+    server.send(400, "text/plain", "offset required");
+    return;
+  }
+  const int off = server.arg("offset").toInt();
+  saveUtcOffsetToNVS(off);
+  Serial.printf("[UI] UTC display offset set to %+d min\n", gUtcOffsetMin);
+  if (isAjaxRequest()) {
+    char buf[32];
+    snprintf(buf, sizeof(buf), "UTC offset set to %+d min", gUtcOffsetMin);
+    sendAjaxResult(true, String(buf));
+    return;
+  }
+  server.sendHeader("Location", "/");
+  server.send(303, "text/plain", "");
+}
+
+// Core upload logic shared by handleManualUpload and the post-deploy sync in
+// handleShutdown. Performs the blocking modem upload sequence and returns the
+// result message + ok flag. Does NOT touch the HTTP response — the caller
+// decides how to present the result (AJAX, page, or shutdown flow).
+static void performManualUpload(String& resultMsg, bool& ok) {
   TransmissionSettings tx;
   loadTransmissionSettings(tx);
 
+  resultMsg = "";
+  ok = false;
+
   if (!tx.allowManualUpload) {
-    if (isAjaxRequest()) {
-      sendAjaxResult(false, "Manual upload is disabled in settings");
-      return;
-    }
-    String html = headCommon("Settings", "<a href='/settings' class='btn btn--sm'>Back</a>");
-    html += F("<div class='section center'><h3>Manual upload disabled</h3>"
-              "<p class='muted'>Enable manual upload in advanced settings first.</p>"
-              "<a href='/settings' class='btn btn--primary'>Back</a></div>");
-    html += footCommon();
-    server.send(400, "text/html", html);
+    resultMsg = "Manual upload is disabled in settings";
     return;
   }
 
-  // NOTE: This is a blocking handler — the web request hangs for 30-60s
-  // while the modem powers on, registers, and uploads.  This could be
-  // improved later with a background task + status polling, but for V1
-  // field use the blocking approach is acceptable.
-  Serial.println("[UI] Manual upload requested — starting blocking sequence");
-
-  String resultMsg;
-  bool ok = false;
+  // NOTE: This is a blocking call — the modem powers on, registers, and
+  // uploads. Takes 30-60s. Acceptable for V1 field use.
 
   if (!flashIsReady()) {
     resultMsg = "Storage not ready — cannot read data";
@@ -4425,6 +4490,12 @@ static void handleManualUpload() {
   }
 
   Serial.printf("[UI] Manual upload result: %s\n", resultMsg.c_str());
+}
+
+static void handleManualUpload() {
+  String resultMsg;
+  bool ok = false;
+  performManualUpload(resultMsg, ok);
 
   if (isAjaxRequest()) {
     sendAjaxResult(ok, resultMsg);
@@ -4891,14 +4962,43 @@ static void handleSetupWizard() {
 }
 
 static void handleShutdown() {
+  // If a node was deployed this session, push the freshly captured first
+  // snapshots + fleet status to the dashboard before powering down. This
+  // gives the operator immediate visibility without waiting for the next
+  // sync window. Blocking (~30-60s for modem power-on + upload). Skipped
+  // when nothing was deployed or if manual upload is disabled in settings.
+  String syncMsg;
+  bool syncOk = false;
+  const bool deployedThisSession = gDeployedThisSession;
+  if (deployedThisSession) {
+    Serial.println("[UI] Deploy detected this session — syncing to dashboard before shutdown");
+    performManualUpload(syncMsg, syncOk);
+    if (syncOk) {
+      Serial.printf("[UI] Post-deploy sync: %s\n", syncMsg.c_str());
+    } else {
+      Serial.printf("[UI] Post-deploy sync skipped/failed: %s\n", syncMsg.c_str());
+    }
+  }
+  gDeployedThisSession = false;  // reset for the next config session
+
   gShutdownRequested = true;
   if (isAjaxRequest()) {
-    sendAjaxResult(true, "Sync & power down — arming sync alarm");
+    String msg = "Sync & power down — arming sync alarm";
+    if (deployedThisSession) {
+      msg = syncOk ? (String("Synced to dashboard: ") + syncMsg + " — powering down")
+                   : String("Deployed but sync skipped — powering down");
+    }
+    sendAjaxResult(true, msg);
     return;
   }
   String html = headCommon("Shutting Down");
-  html += F("<div class='section center'><h3>Sync &amp; Power Down</h3>"
-            "<p>Arming phase-aligned sync alarm and powering off...</p>"
+  html += F("<div class='section center'><h3>Sync &amp; Power Down</h3>");
+  if (syncOk && syncMsg.length() > 0) {
+    html += F("<p><strong>Dashboard sync:</strong> ");
+    html += htmlEscape(syncMsg);
+    html += F("</p>");
+  }
+  html += F("<p>Arming phase-aligned sync alarm and powering off...</p>"
             "<p class='muted'>The board will wake at the next sync time.</p></div>");
   html += footCommon();
   server.send(200, "text/html", html);
@@ -5190,6 +5290,7 @@ void startConfigServer() {
   server.on("/set-wake-interval", HTTP_POST, handleSetWakeInterval);
   server.on("/set-sync-mode", HTTP_POST, handleSetSyncMode);
   server.on("/set-sync-time", HTTP_POST, handleSetSyncTime);
+  server.on("/set-utc-offset", HTTP_POST, handleSetUtcOffset);
   server.on("/ui-status", HTTP_GET, []() {
     server.send(200, "application/json", buildStatusJson());
   });
