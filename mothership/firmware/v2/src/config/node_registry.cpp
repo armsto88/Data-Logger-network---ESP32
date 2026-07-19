@@ -159,6 +159,16 @@ static String desiredConfigKeyPrefix(const char* nodeId) {
 NodeDesiredConfig getDesiredConfig(const char* nodeId) {
   Preferences prefs;
   NodeDesiredConfig cfg{};
+  // Seed the "no stored value" defaults up front so they also apply on the
+  // early-return path below. A truly fresh device has never written the
+  // "node_dcfg" namespace, so the read-only begin() fails and we return here —
+  // it MUST carry the same defaults as the read path. In particular
+  // targetState=2 (DEPLOYED): the zero-init default of 0 (UNPAIRED) makes the
+  // command dispatcher reject the first node-config write as INVALID
+  // (allowedTarget requires 2/3), which broke the node deploy wizard's first
+  // save on a freshly-wiped fleet.
+  cfg.syncIntervalMin = 15;
+  cfg.targetState     = 2;
   const String key = desiredConfigKeyPrefix(nodeId);
   if (!prefs.begin("node_dcfg", true)) return cfg;
   cfg.configVersion   = prefs.getUShort((key + "v").c_str(), 0);

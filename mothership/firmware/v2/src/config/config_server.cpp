@@ -360,9 +360,22 @@ static NodeConfigApplyResult applyLocalDesiredConfig(
   options.overrideSyncSchedule = overrideSyncSchedule;
   options.syncIntervalMin = desired.syncIntervalMin;
   options.syncPhaseUnix = desired.syncPhaseUnix;
-  const NodeConfigApplyResult result = controlApplyLocalNodeConfig(
-      nodeId.c_str(), desired.wakeIntervalMin ? desired.wakeIntervalMin : 1,
-      desired.targetState, desired.sensorMask, options);
+  // Compare-and-set against the shared dispatcher revision. ESP-NOW RX runs on
+  // the WiFi task, so a node's NODE_HELLO/CONFIG_ACK can bump the revision
+  // between the read and our submit, yielding OUT_REVISION_CONFLICT — a normal,
+  // retryable outcome, not a real failure. Retry once; controlApplyLocalNodeConfig
+  // re-reads the live dispatcherRevision() each call, so the second attempt uses
+  // the post-conflict revision. Capped at 2 attempts so a pathological ESP-NOW
+  // hot-loop can't stall the HTTP handler.
+  NodeConfigApplyResult result{};
+  for (int attempt = 0; attempt < 2; ++attempt) {
+    result = controlApplyLocalNodeConfig(
+        nodeId.c_str(), desired.wakeIntervalMin ? desired.wakeIntervalMin : 1,
+        desired.targetState, desired.sensorMask, options);
+    if (result.command.outcome != OUT_REVISION_CONFLICT) break;
+    Serial.printf("[CTRL] %s revision conflict on attempt %d — retrying\n",
+                  nodeId.c_str(), attempt + 1);
+  }
   Serial.printf("[CTRL] %s local config -> %s rev=%lu wireV=%u durable=%d applied=%d\n",
                 nodeId.c_str(), cmdOutcomeStr(result.command.outcome),
                 static_cast<unsigned long>(
@@ -2899,11 +2912,17 @@ static void handleStationsPage() {
   html += F("<div class='section'>");
   html += F("<h3>Nodes</h3>");
 
-  html += F("<form id='batch-node-actions' class='batch-actions' action='/batch-node-action' method='POST' onsubmit='return confirmBatchNodeAction()'>"
+  // Bulk actions are opt-in: a single "Select multiple" button by default,
+  // revealing the full action bar only when the user wants to act on several
+  // nodes. Keeps the list header uncluttered for the common single-node case.
+  html += F("<button id='batch-toggle' type='button' class='btn btn--sm' style='margin-bottom:10px' onclick='showBatchBar(true)'>Select multiple</button>");
+  html += F("<form id='batch-node-actions' class='batch-actions' action='/batch-node-action' method='POST' onsubmit='return confirmBatchNodeAction()' hidden>"
             "<input id='batch-action' type='hidden' name='action' value=''>"
             "<div class='batch-actions__head'><div><strong id='batch-count'>0 selected</strong>"
             "<div class='help' style='margin:0'>Select up to 8 nodes</div></div>"
-            "<button id='batch-select-all' type='button' class='btn btn--sm' onclick='toggleBatchSelection()'>Select all</button></div>"
+            "<div style='display:flex;gap:6px'>"
+            "<button id='batch-select-all' type='button' class='btn btn--sm' onclick='toggleBatchSelection()'>Select all</button>"
+            "<button id='batch-done' type='button' class='btn btn--sm' onclick='showBatchBar(false)'>Done</button></div></div>"
             "<div class='batch-actions__buttons'>"
             "<button id='batch-pause' type='submit' class='btn btn--warn' disabled onclick=\"document.getElementById('batch-action').value='pause'\">Pause selected</button>"
             "<button id='batch-resume' type='submit' class='btn btn--success' disabled onclick=\"document.getElementById('batch-action').value='resume'\">Resume selected</button>"
@@ -3014,6 +3033,16 @@ static void handleStationsPage() {
 (function(){
   var MAX_SELECTED=8;
   function boxes(){ return Array.prototype.slice.call(document.querySelectorAll('.node-select')); }
+  // Bulk-action bar is opt-in. Show it via the "Select multiple" button, or
+  // auto-reveal it the moment a node checkbox is ticked (so nothing is
+  // unreachable); hiding it clears the current selection.
+  window.showBatchBar=function(show){
+    var bar=document.getElementById('batch-node-actions');
+    var tog=document.getElementById('batch-toggle');
+    if(bar)bar.hidden=!show;
+    if(tog)tog.style.display=show?'none':'';
+    if(!show){ boxes().forEach(function(b){b.checked=false;}); updateBatchSelection(); }
+  };
   window.updateBatchSelection=function(changed){
     var all=boxes();
     var selected=all.filter(function(b){return b.checked;});
@@ -3021,6 +3050,11 @@ static void handleStationsPage() {
       changed.checked=false;
       alert('Select up to 8 nodes per action.');
       selected=all.filter(function(b){return b.checked;});
+    }
+    if(selected.length>0){
+      var bar=document.getElementById('batch-node-actions');
+      var tog=document.getElementById('batch-toggle');
+      if(bar&&bar.hidden){bar.hidden=false;if(tog)tog.style.display='none';}
     }
     all.forEach(function(b){var w=b.closest('.node-select-wrap');if(w)w.classList.toggle('is-selected',b.checked);});
     var count=document.getElementById('batch-count');
@@ -3266,6 +3300,17 @@ static void handleStationDetail() {
   NodeInfo* target = nullptr;
   for (auto& n : registeredNodes) {
     if (n.nodeId == nodeId) { target = &n; break; }
+  }
+
+  // A node that hasn't been deployed yet goes through the guided deploy wizard
+  // instead of this dense management form. Once DEPLOYED it renders here as
+  // normal (edit/pause/resume/remove). deploySelectedNodes() sets DEPLOYED
+  // synchronously, so the wizard's post-deploy redirect lands on this view, not
+  // back in the wizard.
+  if (target && target->state != DEPLOYED) {
+    server.sendHeader("Location", String("/station-setup?id=") + nodeId, true);
+    server.send(302, "text/plain", "");
+    return;
   }
 
   String actionsHtml = String("<a href='/stations' class='btn btn--sm'>Back</a><a href='/station?id=")
@@ -3552,8 +3597,12 @@ static void handleNodeConfigSave() {
     }
   }
   if (newDesiredConfig) cfgChanged = true;
+  bool configSaveOk = true;  // metadata/schedule save outcome (for AJAX callers)
   if (cfgChanged) {
-    applyLocalDesiredConfig(nodeId, dc, true);
+    const NodeConfigApplyResult applied = applyLocalDesiredConfig(nodeId, dc, true);
+    configSaveOk = applied.durable && applied.registryApplied &&
+                   (applied.command.outcome == OUT_ACCEPTED ||
+                    applied.command.outcome == OUT_REPLAY);
     dc = getDesiredConfig(nodeId.c_str());
   }
   if (target) target->wakeIntervalMin = (uint8_t)interval;
@@ -3664,6 +3713,24 @@ static void handleNodeConfigSave() {
     target->name   = finalName;
   }
 
+  // AJAX branch (node-deploy wizard / async callers): stay on the page with a
+  // JSON result instead of the standalone confirmation page. Metadata-only saves
+  // (action=none) report the config-persist outcome; lifecycle actions report
+  // their own. (Reporting a blind true here previously masked a failed metadata
+  // save so the wizard sailed past a broken step.)
+  if (isAjaxRequest()) {
+    bool ajaxOk = configSaveOk;
+    if      (action == "start")  ajaxOk = deployOk;
+    else if (action == "pause")  ajaxOk = pauseOk;
+    else if (action == "resume") ajaxOk = resumeOk;
+    else if (action == "unpair") ajaxOk = unpairOk;
+    String j = String("{\"ok\":") + (ajaxOk ? "true" : "false") +
+               ",\"deploy\":" + (deployOk ? "true" : "false") +
+               ",\"pair\":"   + (pairOk ? "true" : "false") + "}";
+    server.send(ajaxOk ? 200 : 500, "application/json", j);
+    return;
+  }
+
   String actionsHtml = String("<a href='/stations' class='btn btn--sm'>Back</a><a href='/station?id=")
     + nodeId
     + String("' class='btn btn--sm'>Refresh</a>");
@@ -3703,6 +3770,185 @@ static void handleNodeConfigSave() {
             "</div>");
 
   html += footCommon();
+  server.send(200, "text/html", html);
+}
+
+// GET /station-setup?id=X — guided node deployment wizard. Entered by clicking a
+// not-yet-deployed node in the node manager (handleStationDetail 302s here).
+// Structurally identical to the hub /setup wizard (client-side .wz-step show/
+// hide, data-wz controller). Every step POSTs to an endpoint that already
+// exists — /station (handleNodeConfigSave, action=none for metadata, action=
+// start to deploy) and /set-node-sensors — so there is no new persistence logic.
+//   1 Identify (ID + name)  2 Sensors  3 Location  4 Deploy.
+static void handleStationSetupWizard() {
+  String nodeId = server.arg("id");
+  if (nodeId.length() == 0) nodeId = server.arg("node_id");
+
+  NodeInfo* target = nullptr;
+  for (auto& n : registeredNodes) {
+    if (n.nodeId == nodeId) { target = &n; break; }
+  }
+
+  String html = headCommon("Set up node", F("<a href='/stations' class='btn btn--sm'>Exit</a>"));
+  if (!target) {
+    html += F("<div class='section'><h3>Node not found</h3>"
+              "<a href='/stations' class='btn btn--primary'>Back to Nodes</a></div>");
+    html += footCommon();
+    server.send(404, "text/html", html);
+    return;
+  }
+  // Already deployed → nothing to onboard; send to the management view.
+  if (target->state == DEPLOYED) {
+    server.sendHeader("Location", String("/station?id=") + nodeId, true);
+    server.send(302, "text/plain", "");
+    return;
+  }
+
+  const String userId = getNodeUserId(nodeId);
+  const String name   = getNodeName(nodeId);
+  const NodeDesiredConfig dc = getDesiredConfig(nodeId.c_str());
+  const uint16_t sensorMask = (dc.sensorMask & NODE_SENSOR_MASK_VALID)
+      ? (uint16_t)(dc.sensorMask & ~NODE_SENSOR_MASK_VALID) : 0;
+  const bool hasIdentity = userId.length() > 0 || name.length() > 0;
+  const int startStep = hasIdentity ? 2 : 1;  // resume past identity if already named
+
+  html += F("<div class='section'>"
+            "<p class='muted' style='margin:0 0 10px'>Node setup &middot; step <span id='wz-cur'>1</span> of 4</p>");
+
+  // Step 1 — Identify
+  html += F("<div class='wz-step' data-step='1'>"
+            "<h3>1. Name this node</h3>"
+            "<p class='muted'>Give the node a short ID and a name so you can recognise it.</p>"
+            "<label class='label'>Node ID (numeric, e.g. 001)</label>"
+            "<input class='input' id='wz-uid' type='text' maxlength='3' inputmode='numeric' placeholder='001' value='");
+  html += htmlEscape(userId);
+  html += F("'><label class='label'>Name</label>"
+            "<input class='input' id='wz-name' type='text' placeholder='e.g. North Hedge 01' value='");
+  html += htmlEscape(name);
+  html += F("'><div id='wz-id-result' class='help' style='margin-top:8px'></div>"
+            "<div style='margin-top:14px'><button type='button' class='btn btn--primary' id='wz-id-next'>Save &amp; continue</button></div>"
+            "</div>");
+
+  // Step 2 — Sensors (reuses the same toggle picker as /node-sensors)
+  html += F("<div class='wz-step' data-step='2' style='display:none'>"
+            "<h3>2. Sensors installed</h3>"
+            "<p class='muted'>Tap the sensors fitted to this node.</p>"
+            "<div class='sensor-grid' id='wz-sensor-grid'>");
+  struct SensorOption { uint16_t bit; const char* label; const char* grp; };
+  static const SensorOption kOpts[] = {
+    { (uint16_t)(SNAP_PRESENT_AIR_TEMP | SNAP_PRESENT_AIR_RH), "Air (SHT41)",        "" },
+    { SNAP_PRESENT_SPECTRAL,                                   "Spectral (AS7343)",  "" },
+    { SNAP_PRESENT_SOIL1,                                      "Soil Probe 1",       "" },
+    { SNAP_PRESENT_SOIL2,                                      "Soil Probe 2",       "" },
+    { SNAP_PRESENT_WIND,                                       "Wind (Reed cup)",    "wind" },
+    { NODE_SENSOR_CFG_WIND_ULTRASONIC,                         "Wind (Ultrasonic)",  "wind" },
+    { SNAP_PRESENT_AUX1,                                       "Aux 1",              "" },
+    { SNAP_PRESENT_AUX2,                                       "Aux 2",              "" },
+  };
+  for (const auto& opt : kOpts) {
+    const bool sel = (sensorMask & opt.bit) != 0;
+    html += F("<button type='button' class='sbtn");
+    if (sel) html += F(" sbtn--on");
+    html += F("' data-bit='"); html += String((unsigned)opt.bit); html += F("'");
+    if (opt.grp[0]) { html += F(" data-grp='"); html += opt.grp; html += F("'"); }
+    html += F(">"); html += opt.label; html += F("</button>");
+  }
+  html += F("</div><div id='wz-sensor-result' class='help' style='margin-top:8px'></div>"
+            "<div style='margin-top:14px'><button type='button' class='btn btn--sm' data-wz='back'>Back</button> "
+            "<button type='button' class='btn' data-wz='skip'>Skip</button> "
+            "<button type='button' class='btn btn--primary' id='wz-sensor-next'>Save &amp; continue</button></div>"
+            "</div>");
+
+  // Step 3 — Location
+  html += F("<div class='wz-step' data-step='3' style='display:none'>"
+            "<h3>3. Location</h3>"
+            "<p class='muted'>Find this node's coordinates in your phone's Maps app "
+            "(long-press your location, copy the numbers), then enter them.</p>"
+            "<label class='label'>Latitude</label>"
+            "<input class='input' id='wz-lat' type='text' inputmode='decimal' placeholder='-27.469771' value='");
+  if (!isnan(target->latitude)) { char b[16]; snprintf(b, sizeof(b), "%.6f", target->latitude); html += b; }
+  html += F("'><label class='label'>Longitude</label>"
+            "<input class='input' id='wz-lon' type='text' inputmode='decimal' placeholder='153.025124' value='");
+  if (!isnan(target->longitude)) { char b[16]; snprintf(b, sizeof(b), "%.6f", target->longitude); html += b; }
+  html += F("'><div id='wz-loc-result' class='help' style='margin-top:8px'></div>"
+            "<div style='margin-top:14px'><button type='button' class='btn btn--sm' data-wz='back'>Back</button> "
+            "<button type='button' class='btn' data-wz='skip'>Skip</button> "
+            "<button type='button' class='btn btn--primary' id='wz-loc-next'>Save &amp; continue</button></div>"
+            "</div>");
+
+  // Step 4 — Deploy
+  html += F("<div class='wz-step' data-step='4' style='display:none'>"
+            "<h3>4. Deploy</h3>"
+            "<p class='muted'>Start recording on this node. It joins the fleet on the current recording schedule.</p>"
+            "<div id='wz-deploy-result' class='help' style='margin-top:8px'></div>"
+            "<div style='margin-top:14px'><button type='button' class='btn btn--sm' data-wz='back'>Back</button> "
+            "<button type='button' class='btn btn--success' id='wz-deploy-go' style='min-width:160px'>Deploy node</button></div>"
+            "</div>");
+
+  html += F("</div>");  // .section
+
+  // Sensor picker styling (same as /node-sensors).
+  html += F("<style>"
+    ".sensor-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:8px}"
+    ".sbtn{padding:16px 10px;border:2px solid #cbd5e1;border-radius:12px;background:#fff;"
+    "font-size:15px;font-weight:600;color:#333;cursor:pointer;text-align:center;min-height:60px;line-height:1.25}"
+    ".sbtn--on{background:#1f9d55;border-color:#1a8548;color:#fff}"
+    "</style>");
+
+  // Controller — mirrors the hub /setup wizard.
+  html += F("<script>(function(){");
+  html += F("var NODE=\""); html += htmlEscape(nodeId); html += F("\";");
+  html += F("var startStep="); html += String(startStep); html += F(";");
+  html += F(
+    "var TOTAL=4,cur=startStep||1;"
+    "var steps=[].slice.call(document.querySelectorAll('.wz-step'));"
+    "function post(u,d){var b=Object.keys(d).map(function(k){return encodeURIComponent(k)+'='+encodeURIComponent(d[k]);}).join('&')+'&ajax=1';"
+    "return fetch(u,{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:b}).then(function(r){return r.json();});}"
+    "function chip(ok,txt){return \"<span class='chip \"+(ok?'chip--cfg-ok':'chip--bat-low')+\"' style='font-weight:600'>\"+txt+\"</span>\";}"
+    "function show(n){cur=Math.max(1,Math.min(TOTAL,n));"
+    "steps.forEach(function(s){s.style.display=(parseInt(s.dataset.step,10)===cur)?'block':'none';});"
+    "document.getElementById('wz-cur').textContent=cur;window.scrollTo(0,0);}"
+    "window.wzGo=show;"
+    "document.addEventListener('click',function(e){var t=e.target;while(t&&t!==document&&!t.getAttribute('data-wz'))t=t.parentNode;"
+    "if(!t||t===document)return;var a=t.getAttribute('data-wz');"
+    "if(a==='next'||a==='skip')show(cur+1);else if(a==='back')show(cur-1);});"
+    // Step 1 identify
+    "document.getElementById('wz-id-next').addEventListener('click',function(){"
+    "var uid=document.getElementById('wz-uid').value,nm=document.getElementById('wz-name').value;"
+    "post('/station',{node_id:NODE,user_id:uid,name:nm,action:'none'}).then(function(j){"
+    "document.getElementById('wz-id-result').innerHTML=chip(j.ok,j.ok?'Saved':'Save failed');"
+    "if(j.ok)show(2);});});"
+    // Step 2 sensors
+    "var sbtns=[].slice.call(document.querySelectorAll('#wz-sensor-grid .sbtn'));"
+    "sbtns.forEach(function(b){b.addEventListener('click',function(){"
+    "var on=!b.classList.contains('sbtn--on');"
+    "if(on&&b.dataset.grp){sbtns.forEach(function(o){if(o!==b&&o.dataset.grp===b.dataset.grp)o.classList.remove('sbtn--on');});}"
+    "b.classList.toggle('sbtn--on',on);});});"
+    "function sensorMask(){var v=0;sbtns.forEach(function(b){if(b.classList.contains('sbtn--on'))v|=parseInt(b.dataset.bit,10);});return v;}"
+    "document.getElementById('wz-sensor-next').addEventListener('click',function(){"
+    "post('/set-node-sensors',{node_id:NODE,mask:sensorMask()}).then(function(j){"
+    "document.getElementById('wz-sensor-result').innerHTML=chip(j.ok,j.ok?'Sensors saved':(j.error||'Save failed'));"
+    "if(j.ok)show(3);});});"
+    // Step 3 location
+    "document.getElementById('wz-loc-next').addEventListener('click',function(){"
+    "var lat=document.getElementById('wz-lat').value,lon=document.getElementById('wz-lon').value;"
+    "post('/station',{node_id:NODE,lat:lat,lon:lon,action:'none'}).then(function(j){"
+    "document.getElementById('wz-loc-result').innerHTML=chip(j.ok,j.ok?'Location saved':'Save failed');"
+    "if(j.ok)show(4);});});"
+    // Step 4 deploy
+    "document.getElementById('wz-deploy-go').addEventListener('click',function(){"
+    "var btn=this;btn.disabled=true;btn.textContent='Deploying...';"
+    "post('/station',{node_id:NODE,action:'start'}).then(function(j){"
+    "if(j.ok){document.getElementById('wz-deploy-result').innerHTML=chip(true,'Deployed');"
+    "setTimeout(function(){location.href='/station?id='+encodeURIComponent(NODE);},600);}"
+    "else{btn.disabled=false;btn.textContent='Deploy node';"
+    "document.getElementById('wz-deploy-result').innerHTML=chip(false,'Deploy failed — try again');}"
+    "}).catch(function(){btn.disabled=false;btn.textContent='Deploy node';"
+    "document.getElementById('wz-deploy-result').innerHTML=chip(false,'Network error — try again');});});"
+    "show(cur);"
+    "})();</script>");
+  html += footCommon();
+  server.sendHeader("Cache-Control", "no-store");
   server.send(200, "text/html", html);
 }
 
@@ -4566,17 +4812,14 @@ static void handleSetupWizard() {
             "</div>");
 
   // Step 8 — Done. The wizard only sets the hub up; it deliberately does NOT
-  // power down here (that would drop the AP and block node deployment). It hands
-  // the user back to the main overview, where they add nodes via the node
-  // manager and press the existing "Finish & Start Recording" button when ready.
+  // power down here (that would drop the AP). It hands the user back to the main
+  // overview, where they press the existing "Finish & Start Recording" button
+  // when ready. Node deployment has its own dedicated flow in the node manager,
+  // so the hub wizard makes no mention of it.
   html += F("<div class='wz-step' data-step='8' style='display:none'>"
             "<h3><span class='chip chip--cfg-ok' style='font-weight:700'>FieldHub ready</span></h3>"
-            "<p class='muted'>Your FieldHub is connected and configured. Next:</p>"
-            "<ol style='margin:8px 0 14px 18px;line-height:1.6'>"
-            "<li>Add your nodes — power them on, then open the node manager.</li>"
-            "<li>When everything's in place, press <strong>Finish &amp; Start Recording</strong> on the home screen.</li>"
-            "</ol>"
-            "<a href='/stations' class='btn' style='width:100%;text-align:center;margin-bottom:8px'>Add nodes</a>"
+            "<p class='muted'>Your FieldHub is connected and configured. When everything's in place, "
+            "press <strong>Finish &amp; Start Recording</strong> on the home screen.</p>"
             "<a href='/' class='btn btn--primary' style='width:100%;text-align:center'>Go to overview</a>"
             "<div style='margin-top:10px'><button type='button' class='btn btn--sm' data-wz='back'>Back</button></div>"
             "</div>");
@@ -4961,6 +5204,7 @@ void startConfigServer() {
   server.on("/batch-node-action", HTTP_POST, handleBatchNodeAction);
   server.on("/station", HTTP_GET, handleStationDetail);
   server.on("/station", HTTP_POST, handleNodeConfigSave);
+  server.on("/station-setup", HTTP_GET, handleStationSetupWizard);
   server.on("/node-sensors", HTTP_GET, handleNodeSensorsPage);
   server.on("/set-node-sensors", HTTP_POST, handleSetNodeSensors);
   server.on("/revert-node", HTTP_POST, handleRevertNode);
