@@ -812,6 +812,24 @@ surfaced up.
 
 ## Node OTA — proposed plan (2026-07-23, PLAN ONLY — nothing below is implemented)
 
+> **🔴 BLOCKED — needs an SD-equipped mothership.** Working through the
+> design surfaced a real capacity wall on current hardware: relaying a node
+> image requires caching it somewhere on the mothership first, and the
+> mothership's only local storage today (LittleFS on the `spiffs` partition)
+> is **768 KB total, already partly occupied** by the upload queue/snapshot
+> storage — a node image anywhere near the mothership's own ~1.3 MB simply
+> cannot fit, and actual node image size isn't even confirmed yet. The
+> alternative (stream a fresh byte-range from the cloud every sync round
+> instead of caching the whole image) is workable but adds real complexity
+> for hardware that's about to be superseded. **Decision (2026-07-23): wait
+> for the next mothership board revision with a working SD card** — SD makes
+> this trivial (ample room, no partition-table changes, no per-round
+> re-fetch workaround) — rather than build around the current constraint.
+> Everything below is unaffected by this and remains the plan for when that
+> hardware exists; only the "Mothership-side image cache" item changes (now
+> SD-backed, not LittleFS-backed) and Phase 1 shouldn't start until the SD
+> board is available to bench against.
+
 With mothership cloud OTA proven, the next question is delivering firmware to
 the battery-powered **sensor nodes**. This is a genuinely different problem,
 not a smaller version of the mothership one — nodes have no modem, so the
@@ -893,12 +911,19 @@ battery budget, resumable across many wakes. Proposed shape:
    record already survives the mothership's own cold boots. Mirror that
    design (versioned record, checksum, A/B NVS slots) rather than inventing
    a new persistence scheme.
-3. **Mothership-side image cache.** The mothership should fetch the node
-   image from the cloud **once** (via the now-fixed HTTPS pipeline above)
-   and cache it locally (LittleFS/flash — node images are almost certainly
-   far smaller than the ~1.3 MB mothership image), then relay cached bytes
-   to the node across as many sync windows as it takes, without re-fetching
-   from the cloud every wake.
+3. **Mothership-side image cache — SD-backed (blocked until that hardware
+   exists, see banner above).** The mothership should fetch the node image
+   from the cloud **once** (via the now-fixed HTTPS pipeline above) and
+   cache it to SD, then relay cached bytes to the node across as many sync
+   windows as it takes, without re-fetching from the cloud every wake.
+   **Not LittleFS** — the mothership's `spiffs` partition is only 768 KB
+   total and already partly occupied by the upload queue/snapshot storage,
+   which can't reliably hold a node image of unconfirmed size on top of its
+   existing job. (The alternative considered — stream a fresh byte-range
+   from the cloud each round instead of caching the whole image — would
+   sidestep the storage limit entirely, but the SD wait was chosen instead
+   to avoid building extra complexity around soon-to-be-superseded
+   hardware.)
 4. **Apply tonight's exact lesson: pre-erase before the transfer starts.**
    The mothership bug was the OTA-partition erase stalling a live transfer
    session. The same principle applies here even though the specific failure
@@ -947,13 +972,86 @@ battery budget, resumable across many wakes. Proposed shape:
   chunk/grant/resume protocol can be iterated in a normal edit-flash-observe
   loop, not real sync-interval wake cycles.
 
+### UI/workflow decisions (locked 2026-07-23, working backwards from these into the design below)
+
+- **Operator picks one node at a time** — no fleet-wide auto-sequencer. The
+  operator explicitly targets a node and a release; the system does not queue
+  up "update the whole fleet" on its own.
+- **Only one node-firmware transfer in flight per hub, at any time** — not
+  per-node independence. Starting a second node's update while one is active
+  is blocked, not merely discouraged.
+- **Progress shown as bytes/percent + a last-progress timestamp**, not just a
+  coarse "Updating…" — e.g. "38% (340 KB / 900 KB) — last progress 4 min
+  ago." This is a deliberate departure from the mothership's UI (which never
+  shows progress, since its download completes within one check-in): a node
+  transfer can span many wakes, so an operator needs to tell "slowly
+  progressing" from "stalled" at a glance.
+- **Lives inline in the existing node list/table**, as a "Firmware" column —
+  not a separate dedicated screen. Same place operators already check node
+  health.
+- **On failure: halt and require manual acknowledgement/retry** — no silent
+  auto-retry loop for node OTA (this is a deliberate difference from the
+  mothership's own backoff-and-auto-retry behavior; see "What counts as a
+  failure" below for why that distinction matters).
+- **Retry resumes from the last confirmed offset**, it does not restart from
+  byte 0 — this falls out for free from item 2 in "What's genuinely new"
+  above (the node's own NVS-persisted receive offset): a retry is just
+  re-issuing the same node-release command, and the existing grant/round
+  protocol picks up wherever the node's own state says it left off.
+
+### Node table UI states (mirrors the mothership's 4-state pattern)
+
+| State | Shown | Action available |
+|---|---|---|
+| Up to date | "v0.1.0 ✓" | none |
+| Update available | "v0.1.0 → v0.2.0" | "Update" button |
+| Updating | "38% (340 KB / 900 KB) — last progress 4 min ago" | none (disabled while any node update is active fleet-wide — see lock below) |
+| Failed | "Update failed: <plain-English reason>" | "Retry" button |
+
+**Fleet-wide lock, not per-node.** Because only one transfer may be active
+per hub, every *other* node's "Update" button must be disabled (not just
+rejected server-side if clicked) while one is in progress — the dashboard
+needs a single hub-level "current node-OTA target" field to gate this,
+mirroring how the mothership's own `DEPLOY_RELEASE` already enforces "one
+per hub" via `ALREADY_UPDATING`, just scoped one level down to "one per hub
+across all its nodes" rather than "one for the hub itself."
+
+**What counts as a "failure" that halts and waits for the operator** (this
+needs a precise definition or the halt policy will trigger on normal,
+expected hiccups):
+- **Not a failure:** a single dropped ESP-NOW packet within a round — already
+  self-heals via `sendControlPacket`'s proven 3-attempt radio-layer-confirmed
+  retry.
+- **Not a failure:** a round that doesn't finish before the sync window
+  closes — the transfer simply continues next wake from the node's persisted
+  offset; this is normal operation of a multi-wake transfer, not an error
+  state.
+- **Is a failure (halt + surface to operator):** the node reports a terminal
+  reason (bad signature/hash/image — reusing the same `fw_reason.h`
+  vocabulary already used for the mothership, since it's role-agnostic), or
+  the transfer makes **zero forward progress across some number of
+  consecutive wakes** — a node-OTA-specific analogue of the mothership's
+  `RETRY_LIMIT_EXCEEDED`, except here it halts and waits for the operator
+  instead of auto-giving-up and clearing the intent.
+
+**Wire/backend implication:** to render bytes/percent + last-progress-time,
+the mothership needs to track and report, per active node transfer:
+`nodeId`, `releaseId`, `bytesWritten`, `totalBytes`, `lastProgressUnix`, and
+an `otaReason` (same shared vocabulary) — a small additive status block
+(e.g. `status.nodeOta{}`), reported on the mothership's own normal check-in
+cadence like everything else. This state should be durable (survives the
+mothership's own cold power-cut) — natural fit inside the same per-node
+release-store record already planned in "What's genuinely new" item 2 above,
+rather than a new persistence mechanism.
+
 ### Suggested build order
 
 | Phase | What | Scope |
 |---|---|---|
+| 0 | **Blocking prerequisite:** mothership board revision with a working SD card, confirmed mountable (current hardware's `SD.begin()` fails — "no card or wiring issue" — this whole plan is on hold until that's resolved) | Hardware |
 | 1 | New wire messages + node-side resumable receive state machine (reusing `ota_installer.h`) + mothership-side relay loop (reusing `sendControlPacket` + the grant/done round pattern) + two-board bench rig; prove one full node image transfer, including a forced-bad-image rollback, entirely on the bench | Firmware only, no backend/dashboard |
-| 2 | `CMD_DEPLOY_NODE_RELEASE` dispatcher type; per-node release-store (mirrors the mothership's PENDING/ARMED/INSTALLED store, keyed by nodeId); publish flow extended to include `role:"node"` artifacts; backend "update available" comparison extended per-node | Firmware + backend |
-| 3 | Dashboard UI — same 4-state pattern already designed for the mothership (see "Production workflow" above), extended to a per-node list within the existing fleet/node view | Frontend |
+| 2 | `CMD_DEPLOY_NODE_RELEASE` dispatcher type (with the fleet-wide one-active-transfer lock); per-node release-store carrying progress fields (mirrors the mothership's PENDING/ARMED/INSTALLED store, keyed by nodeId); publish flow extended to include `role:"node"` artifacts; backend "update available" comparison extended per-node | Firmware + backend |
+| 3 | Dashboard UI — the node-table "Firmware" column + 4 states above, the fleet-wide lock disabling other nodes' Update buttons, and the Retry action | Frontend |
 | 4 | Field rollout: one real deployed node first, confirm rollback + resumability under real RF conditions, then expand | Ops |
 
 ### Open questions (flag, don't guess)
