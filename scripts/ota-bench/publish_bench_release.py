@@ -453,14 +453,19 @@ def publish_direct(url, headers, role, release_id, release_sequence, version, bu
     upload (the firmware verifies the same bytes — no re-serialization).
     """
     manifest_sha = hashlib.sha256(manifest_bytes).hexdigest()
-    sig_bytes = bytes.fromhex(sig_hex)
-    sig_sha = hashlib.sha256(sig_bytes).hexdigest()
+    # The firmware reads the .sig file as TEXT (128 hex chars) and converts to
+    # 64 raw bytes via fwHexToBytes(). So we must upload the hex-text form,
+    # NOT raw bytes — uploading raw bytes gives a 64-byte file that fails
+    # `sigBody.length() < 128` with SIGNATURE_INVALID. Match the edge-function
+    # path (which uploads sig_hex.encode("utf-8")).
+    sig_text_bytes = sig_hex.encode("utf-8")  # 128 bytes of ASCII hex
+    sig_sha = hashlib.sha256(sig_text_bytes).hexdigest()
 
     cache_headers = {"cacheControl": "public, max-age=31536000, immutable"}
     base_path = f"releases/{role}/{release_id}"
     uploads = [
         (f"{base_path}/manifest.json", manifest_bytes, "application/json"),
-        (f"{base_path}/manifest.json.sig", sig_bytes, "text/plain"),
+        (f"{base_path}/manifest.json.sig", sig_text_bytes, "text/plain"),
         (f"{base_path}/image.bin", image_bytes, "application/octet-stream"),
     ]
     for path, content, ctype in uploads:

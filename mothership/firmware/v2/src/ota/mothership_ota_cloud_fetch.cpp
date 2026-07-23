@@ -80,20 +80,31 @@ const char* otaFwReasonToBrief(int fwReason, bool* isTransient) {
 
 namespace {
 
-// Context for the small text-body downloads (manifest / signature). Carries an
-// overall wall-clock deadline: httpsGetStream()'s own "timeout" is only an
-// idle/inactivity gap timeout (resets on every byte), so a modem trickling
-// bytes just under that gap could stall a small download near-indefinitely.
-// The ~1 MB image download is already deadline-bounded via ImageCtx; this gives
-// the two <1 KB pre-download fetches the same protection.
+// Context for the small text-body downloads (manifest / signature). Carries a
+// budget measured from the FIRST body byte received, not from call time: the
+// modem driver's connection setup (NTP sync, AT+CCHSTART, AT+CCHOPEN, the
+// chunked CCHSEND of the request) all happen inside httpsGetStream() before
+// this sink is ever invoked, and can easily consume several real seconds of
+// AT-command/network round-trip on a live cellular link. A deadline captured
+// before that call (as this originally shipped) gets front-run by setup
+// latency and can abort a transfer before a single body byte arrives — this
+// was caught on-air: a 327-byte manifest.json aborted at 100 bytes delivered
+// under an 8s from-call-time budget. Measuring from first-byte-received keeps
+// the intended protection (bound the small-body TRANSFER, distinct from the
+// already-tolerant 20s idle timeout) without being sensitive to connection
+// setup time. The ~1 MB image download's ImageCtx budget is unaffected by
+// this — it's already correctly measured from the wake's session start.
 struct SmallCtx {
   String*  out;
-  uint32_t deadlineMs;   // absolute millis() past which the fetch aborts
+  uint32_t firstByteAtMs;   // 0 = not yet received a byte (set explicitly at construction)
+  uint32_t budgetMs;        // measured from firstByteAtMs, once set
 };
 
 bool appendSink(const uint8_t* d, size_t n, void* ctx) {
   SmallCtx* c = static_cast<SmallCtx*>(ctx);
-  if (millis() > c->deadlineMs) return false;   // overall wall-clock cap
+  const uint32_t now = millis();
+  if (c->firstByteAtMs == 0) c->firstByteAtMs = now;
+  if (now - c->firstByteAtMs > c->budgetMs) return false;   // transfer-phase cap
   for (size_t i = 0; i < n; ++i) *c->out += (char)d[i];
   return c->out->length() < 4096;   // guard: these bodies are < ~1 KB
 }
@@ -121,10 +132,20 @@ bool imageSink(const uint8_t* d, size_t n, void* ctx) {
 // (terminal RETRY_LIMIT_EXCEEDED) so a persistently flaky link stops
 // re-downloading the full ~1 MB image every wake forever.
 constexpr uint8_t kOtaMaxAttempts = 8;
-// Overall wall-clock cap for each small (<1 KB) manifest/signature fetch. The
-// 20 s passed to httpsGetStream is only an idle gap timeout, not an end-to-end
-// bound; 8 s is ample for <1 KB even on a slow link.
+// Cap on the BODY-TRANSFER phase of each small (<1 KB) manifest/signature
+// fetch, measured from the first body byte received (see SmallCtx) — not from
+// call time, since connection setup (NTP sync, CCHOPEN, CCHSEND) happens
+// before any body byte and can itself take several real seconds on a live
+// cellular link. The 20 s passed to httpsGetStream is only an idle gap
+// timeout, not an end-to-end bound; 8 s is ample for <1 KB of transfer time
+// even on a slow link.
 constexpr uint32_t kOtaSmallFetchDeadlineMs = 8000;
+// Image download chunk size for Range-request downloading. Bench-observed
+// truncation (2026-07-21/22) happened at a consistent 1,292,354 bytes
+// (~1.23 MiB) regardless of client-side receive strategy (auto-push vs
+// flow-controlled manual pull) — a session-scoped limit, not an ESP32-side
+// pacing issue. 512 KiB per chunk gives comfortable margin under that.
+constexpr uint32_t kOtaImageChunkBytes = 512UL * 1024UL;
 uint8_t otaBackoffWakes(uint8_t attempts) {   // wakes to skip before next attempt
   if (attempts == 0) return 0;                // first attempt: immediate
   uint8_t shift = static_cast<uint8_t>(attempts - 1);
@@ -209,12 +230,12 @@ OtaCloudFetchResult mothershipOtaCloudFetchAndInstall(ModemDriver& modem,
   }
 
   String manifestBody, sigBody;
-  SmallCtx mctx{&manifestBody, millis() + kOtaSmallFetchDeadlineMs};
+  SmallCtx mctx{&manifestBody, 0, kOtaSmallFetchDeadlineMs};
   HttpsGetStreamResult mr = modem.httpsGetStream(manifestUrl, appendSink, &mctx, 20000);
   if (!mr.success)
     return retryable(mr.httpStatus == 200 ? "DOWNLOAD_TRUNCATED" : "DOWNLOAD_FAILED",
                      mr.httpStatus == 200 ? FW_DOWNLOAD_TRUNCATED : FW_DOWNLOAD_FAILED);
-  SmallCtx sctx{&sigBody, millis() + kOtaSmallFetchDeadlineMs};
+  SmallCtx sctx{&sigBody, 0, kOtaSmallFetchDeadlineMs};
   HttpsGetStreamResult sr = modem.httpsGetStream(sigUrl, appendSink, &sctx, 20000);
   if (!sr.success)
     return retryable(sr.httpStatus == 200 ? "DOWNLOAD_TRUNCATED" : "DOWNLOAD_FAILED",
@@ -244,25 +265,74 @@ OtaCloudFetchResult mothershipOtaCloudFetchAndInstall(ModemDriver& modem,
     return t ? retryable(reason, vr) : terminal(reason, vr);
   }
 
-  // 4. DOWNLOAD image, streamed straight into the install core.
+  // 4. DOWNLOAD image, in bounded Range-request chunks, each streamed straight
+  // into the install core. On-air evidence (2026-07-21/22 bench) ruled out
+  // flow control as the cause of a persistent truncation: switching the whole
+  // transport from auto-push to a flow-controlled manual AT+CCHRECV pull loop
+  // made ZERO difference — the connection was torn down at the exact same
+  // byte count (1,292,354 of 1,311,520) either way. That rules out an
+  // ESP32-side UART/back-pressure problem and points at a session-scoped
+  // limit (modem CCH/TLS buffer, or a server/CDN-side cap) that no amount of
+  // client-side pacing can avoid. Splitting the download into HTTP Range
+  // requests, each its own CCHOPEN/CCHSEND/CCHCLOSE session, sidesteps either
+  // cause: no single session ever asks for more than kOtaImageChunkBytes.
+  // A 60s idle timeout (vs 20s for the small manifest/sig fetches) tolerates
+  // a transient LTE stall within a chunk; the session-limit budget check in
+  // imageSink still bounds the overall time across all chunks.
   out.state = OtaLifecycleState::DOWNLOADING;
   ImageCtx ictx{sessionStartMs, sessionLimitMs, FW_NONE, false};
   MothershipOtaStatus st0 = mothershipOtaGetStatus();
   out.expectedSize = st0.expectedSize;
-  HttpsGetStreamResult ir = modem.httpsGetStream(imageUrl, imageSink, &ictx, 20000);
-  MothershipOtaStatus st1 = mothershipOtaGetStatus();
-  out.bytesWritten = st1.written;
 
-  if (ictx.budgetHit) return deferred("DEFERRED_BUSY", FW_DEFERRED_BUSY);
-  if (ictx.lastFwReason != FW_NONE) {
-    bool t = false; const char* reason = otaFwReasonToBrief(ictx.lastFwReason, &t);
-    const FwReason fw = static_cast<FwReason>(ictx.lastFwReason);
-    return t ? retryable(reason, fw) : terminal(reason, fw);
+  // Pre-erase the target partition BEFORE opening any download session. Left to
+  // run lazily on the first imageSink write, esp_ota_begin's full-partition erase
+  // (~200 ms) stalls the modem receive loop and the A7670G drops the TLS session
+  // mid-chunk — bench-proven 2026-07-22, where every chunk size truncated on
+  // chunk 0. Running it here moves the erase out of the session window, after
+  // which every in-session flash write measured <=1 ms and the full 1.3 MB image
+  // downloaded cleanly (see CLOUD_OTA_BENCH_TEST_RESULTS_2026-07-22.md, Test 4).
+  {
+    FwReason br = mothershipOtaImageBegin();
+    if (br != FW_NONE) {
+      bool t = false; const char* reason = otaFwReasonToBrief(br, &t);
+      return t ? retryable(reason, br) : terminal(reason, br);
+    }
   }
-  if (!ir.success) {
-    // Transport ended before the full declared body -> truncated (retryable).
-    return retryable(ir.aborted ? "DOWNLOAD_TIMEOUT" : "DOWNLOAD_TRUNCATED",
-                     ir.aborted ? FW_DOWNLOAD_TIMEOUT : FW_DOWNLOAD_TRUNCATED);
+
+  for (uint32_t chunkStart = 0; chunkStart < st0.expectedSize; chunkStart += kOtaImageChunkBytes) {
+    const uint32_t chunkEndExclusive =
+        min(chunkStart + kOtaImageChunkBytes, st0.expectedSize);
+    const uint32_t chunkLen = chunkEndExclusive - chunkStart;
+    String range = "bytes=" + String(chunkStart) + "-" + String(chunkEndExclusive - 1);
+
+    HttpsGetStreamResult ir = modem.httpsGetStream(imageUrl, imageSink, &ictx, 60000,
+                                                   "", range);
+    MothershipOtaStatus st1 = mothershipOtaGetStatus();
+    out.bytesWritten = st1.written;
+
+    if (ictx.budgetHit) return deferred("DEFERRED_BUSY", FW_DEFERRED_BUSY);
+    if (ictx.lastFwReason != FW_NONE) {
+      bool t = false; const char* reason = otaFwReasonToBrief(ictx.lastFwReason, &t);
+      const FwReason fw = static_cast<FwReason>(ictx.lastFwReason);
+      return t ? retryable(reason, fw) : terminal(reason, fw);
+    }
+    // Server ignored the Range request and sent something other than the
+    // requested slice (a properly-ranged 206's Content-Length is the SLICE
+    // length, not the whole resource) — chunking cannot help against a server
+    // that won't honor Range, so don't spin retrying it forever.
+    if (ir.httpStatus != 206 || ir.declaredContentLength != chunkLen) {
+      Serial.printf("[OTA] Range not honored: status=%d declared=%lu expected=%lu\n",
+                    ir.httpStatus, (unsigned long)ir.declaredContentLength,
+                    (unsigned long)chunkLen);
+      return terminal("DOWNLOAD_FAILED", FW_DOWNLOAD_FAILED);
+    }
+    if (!ir.success) {
+      // Transport ended before this chunk's declared body -> truncated
+      // (retryable; the whole install restarts from chunk 0 next wake — the
+      // install core has no partial-image resume, same as before chunking).
+      return retryable(ir.aborted ? "DOWNLOAD_TIMEOUT" : "DOWNLOAD_TRUNCATED",
+                       ir.aborted ? FW_DOWNLOAD_TIMEOUT : FW_DOWNLOAD_TRUNCATED);
+    }
   }
 
   // 5. FINISH (size + SHA-256 + esp_ota_end + set-boot). Arms the release.

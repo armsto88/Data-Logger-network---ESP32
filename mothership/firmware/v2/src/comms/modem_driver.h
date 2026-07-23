@@ -119,11 +119,17 @@ class ModemDriver {
   // buffering it, so a large (~1 MB) firmware image never lives in RAM at
   // once. HTTPS only (uses the CCH* TLS path); a non-https:// URL is rejected.
   // idleTimeoutMs: abort if no new bytes arrive for this long.
+  // rangeHeader: if non-empty, sent verbatim as "Range: <rangeHeader>" (e.g.
+  // "bytes=0-524287") for chunked downloads. A successful ranged response is
+  // HTTP 206; the caller must check result.httpStatus, since a server that
+  // ignores Range silently returns 200 with the WHOLE body instead of the
+  // requested slice.
   HttpsGetStreamResult httpsGetStream(const String& url,
                                       HttpsStreamChunkCallback chunkCallback,
                                       void* callbackCtx,
                                       uint32_t idleTimeoutMs = 20000,
-                                      const String& authToken = "");
+                                      const String& authToken = "",
+                                      const String& rangeHeader = "");
 
   // AT+CPOF -> wait STATUS LOW -> PWRKEY 2.5s fallback -> rail off.
   void gracefulShutdown();

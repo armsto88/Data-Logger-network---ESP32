@@ -26,7 +26,21 @@ FwReason mothershipOtaVerifyManifest(const uint8_t* json, size_t len,
                                      const uint8_t sig[64],
                                      bool allowDowngrade = false);
 
-// Call repeatedly with ordered image bytes. First call begins the install.
+// Begin the install (allocate the inactive slot + ERASE it) up front, before any
+// image bytes arrive. The cloud OTA path MUST call this after a successful verify
+// and BEFORE opening the image download session. esp_ota_begin() erases the whole
+// target partition (~200 ms); if left to run lazily inside the first
+// mothershipOtaImageChunk() call, that erase stalls the modem receive loop long
+// enough that the A7670G drops the TLS session mid-download (bench-proven
+// 2026-07-22 — every chunk size truncated on chunk 0). Running it here moves the
+// erase out of the session window so every in-session flash write is <=1 ms.
+// Idempotent (no-op if already begun); requires a prior successful
+// mothershipOtaVerifyManifest().
+FwReason mothershipOtaImageBegin();
+
+// Call repeatedly with ordered image bytes. Lazily begins the install on the
+// first call if mothershipOtaImageBegin() was not called first (keeps the local
+// self-update path working unchanged).
 FwReason mothershipOtaImageChunk(const uint8_t* data, size_t len);
 
 // Finalise: size + SHA-256 + image validation, then set the boot partition.
