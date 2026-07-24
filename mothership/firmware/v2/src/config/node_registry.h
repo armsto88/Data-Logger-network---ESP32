@@ -65,6 +65,8 @@ struct NodeInfo {
   bool      syncStale;
   uint8_t   staleMissCount;
   uint32_t  lastStaleAssistMs;
+  bool      lastRescueMode;       // last NODE_STATUS.rescueMode reported by the
+                                  // node (RAM only, mirrors syncStale's lifecycle)
   // Firmware / OTA capability reported by the node via FW_CAPS (RAM only; empty
   // strings / 0 = not yet reported). Refreshed each sync window a node is heard.
   String    fwVersion;          // node firmware semver, e.g. "0.1.0"
@@ -119,6 +121,13 @@ String    getMothershipsMAC();
 // millis-based lastSeen into an absolute lastSeenUnix.  Returns "[]" when the
 // registry is empty.  Field names/casing match the backend spec exactly.
 String buildNodesStatusJson(uint32_t nowUnix);
+
+// Recompute syncStale/staleMissCount for every PAIRED/DEPLOYED node from
+// lastSeen age vs. its expected contact cadence. Detection + reporting only
+// — no assist-retry (see espnow_manager.cpp:1309-1354 for the fuller
+// dead-code algorithm this is ported from). Call once per sync wake, after
+// the ESP-NOW window closes, so lastSeen reflects this cycle.
+void updateStaleNodeStatus(uint32_t nowMs);
 
 // -----------------------------------------------------------------------------
 // Persistence (NVS)
