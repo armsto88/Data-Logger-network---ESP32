@@ -95,10 +95,16 @@ static inline const ManifestArtifact* manifestArtifactForRole(const Manifest& m,
 // --- Step 3: compatibility policy (plan §5.3/§5.4/§7.4) ---
 // installedSequence: the release sequence currently installed on this device
 // (0 if unknown / factory). On FW_NONE, *matched points at the chosen artifact.
+// allowDowngrade: opt-in bypass of the anti-downgrade gate ONLY. Reserved for
+// the deliberate local-AP emergency-rollback path (an operator physically at the
+// hub choosing to reflash an older known-good build); the cloud OTA path always
+// passes false so a remote DEPLOY_RELEASE can never move a fleet backwards.
+// Signature/role/hardware checks are NOT bypassed — only the sequence check.
 static inline FwReason manifestCheckCompatibility(const Manifest& m,
                                                   const FirmwareIdentity& self,
                                                   uint32_t installedSequence,
-                                                  const ManifestArtifact** matched) {
+                                                  const ManifestArtifact** matched,
+                                                  bool allowDowngrade = false) {
   if (matched) *matched = nullptr;
 
   const ManifestArtifact* art = manifestArtifactForRole(m, self.role);
@@ -110,7 +116,8 @@ static inline FwReason manifestCheckCompatibility(const Manifest& m,
   if (!hwOk) return FW_INCOMPATIBLE_HARDWARE;
 
   // Anti-downgrade: never move to an older release sequence via routine OTA.
-  if (installedSequence != 0 && m.releaseSequence < installedSequence)
+  // An explicit local-operator override (allowDowngrade) skips only this gate.
+  if (!allowDowngrade && installedSequence != 0 && m.releaseSequence < installedSequence)
     return FW_DOWNGRADE_REJECTED;
 
   // Same sequence + same version = nothing to do.

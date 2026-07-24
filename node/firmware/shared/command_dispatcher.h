@@ -27,7 +27,15 @@ enum CmdType : uint8_t {
   CMD_REQUEST_STATUS = 0,
   CMD_SET_NODE_CONFIG = 1,
   CMD_SET_RECORDING_INTERVAL = 2,
+  // Mothership self-update: install a signed firmware release identified by
+  // releaseId. Global (not node-targeted). The dispatcher provides only
+  // CAS/revision + idempotency + result tracking; the releaseId itself is
+  // staged durably in the separate OTA release store, so nothing here is added
+  // to the persisted DispatcherStateRecord (no fleet NVS reset on upgrade).
+  CMD_DEPLOY_RELEASE = 3,
 };
+
+#define CMD_RELEASE_ID_LEN 40
 enum CmdSource : uint8_t { SRC_LOCAL_UI = 0, SRC_DASHBOARD = 1 };
 
 enum CmdOutcome : uint8_t {
@@ -64,6 +72,10 @@ struct Command {
   // FieldHub-wide recording interval for CMD_SET_RECORDING_INTERVAL. It is
   // deliberately not attached to a node target.
   uint8_t   recordingIntervalMin;
+  // Release identifier for CMD_DEPLOY_RELEASE. Transient (carried to the
+  // executor, which stages it in the OTA release store); never persisted in the
+  // dispatcher NVS record, so adding it does not change DispatcherStateRecord.
+  char      releaseId[CMD_RELEASE_ID_LEN];
 };
 
 enum CommandConfigField : uint8_t {

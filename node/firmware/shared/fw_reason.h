@@ -22,6 +22,25 @@ enum FwReason : uint8_t {
   FW_HASH_MISMATCH,
   FW_IMAGE_INVALID,
   FW_FLASH_WRITE_FAILED,
+  // Cloud-fetch transport (appended — never renumber the above; these are
+  // adjacent to persisted/reported values). DOWNLOAD_TIMEOUT/DOWNLOAD_TRUNCATED
+  // reuse the exact strings from the dashboard integration brief §5.5;
+  // DOWNLOAD_FAILED/MODEM_UNAVAILABLE are firmware-internal diagnostics (the
+  // orchestration layer surfaces a brief-compliant lifecycle reason string
+  // separately — see mothership_ota_cloud_fetch).
+  FW_DOWNLOAD_FAILED,
+  FW_DOWNLOAD_TIMEOUT,
+  FW_DOWNLOAD_TRUNCATED,
+  FW_MODEM_UNAVAILABLE,
+  // Terminal: a cloud OTA hit its transient-retry cap without ever completing
+  // (persistently flaky link). Appended — never renumber the above.
+  FW_RETRY_LIMIT_EXCEEDED,
+  // Transient/deferred cloud-fetch states, promoted to real enum values so the
+  // cloud-fetch orchestrator can surface them in status.firmware.otaReason
+  // (previously they existed only as brief §5.5 string literals). Appended.
+  FW_DEFERRED_LOW_BATTERY,
+  FW_DEFERRED_BUSY,
+  FW_DEFERRED_BACKOFF,   // skipping this wake under retry backoff after a failure
 };
 
 static inline const char* fwReasonStr(FwReason r) {
@@ -39,6 +58,14 @@ static inline const char* fwReasonStr(FwReason r) {
     case FW_HASH_MISMATCH:          return "HASH_MISMATCH";
     case FW_IMAGE_INVALID:          return "IMAGE_INVALID";
     case FW_FLASH_WRITE_FAILED:     return "FLASH_WRITE_FAILED";
+    case FW_DOWNLOAD_FAILED:        return "DOWNLOAD_FAILED";
+    case FW_DOWNLOAD_TIMEOUT:       return "DOWNLOAD_TIMEOUT";
+    case FW_DOWNLOAD_TRUNCATED:     return "DOWNLOAD_TRUNCATED";
+    case FW_MODEM_UNAVAILABLE:      return "MODEM_UNAVAILABLE";
+    case FW_RETRY_LIMIT_EXCEEDED:   return "RETRY_LIMIT_EXCEEDED";
+    case FW_DEFERRED_LOW_BATTERY:   return "DEFERRED_LOW_BATTERY";
+    case FW_DEFERRED_BUSY:          return "DEFERRED_BUSY";
+    case FW_DEFERRED_BACKOFF:       return "DEFERRED_BACKOFF";
     default:                        return "??";
   }
 }

@@ -4,6 +4,11 @@
 #include "command_dispatcher.h"
 #include "control/backend_command_ingest.h"
 
+// runSuite() is a single very large function with many local String objects;
+// give the loop task extra stack so its frame fits (test-only — production has
+// no equivalent monolithic function).
+SET_LOOP_TASK_STACK_SIZE(24 * 1024);
+
 namespace {
 
 static int gPass = 0;
@@ -215,6 +220,32 @@ BackendCommandApplyResult executeFakeInterval(const Command& command) {
   return out;
 }
 
+// Fake OTA release "store": a single pending releaseId (no NVS), so the ingest
+// path can be exercised without pulling in mothership_ota_release_store.cpp.
+static char gPendingReleaseId[CMD_RELEASE_ID_LEN] = {0};
+
+BackendCommandApplyResult executeFakeRelease(const Command& command) {
+  BackendCommandApplyResult out{};
+  const CommandResult r = dispatcherSubmit(command);
+  out.command = r;
+  if (r.outcome == OUT_ACCEPTED) {   // fresh accept only (never re-stage on replay)
+    strlcpy(gPendingReleaseId, command.releaseId, sizeof(gPendingReleaseId));
+  }
+  out.durable = true;
+  out.applied = true;
+  return out;
+}
+
+String releaseCommand(const String& id, uint32_t sequence,
+                      uint32_t expectedRevision, const char* releaseId) {
+  String item = "{\"commandId\":\"" + id + "\",\"sequence\":" +
+                String(sequence) + ",\"type\":\"DEPLOY_RELEASE\"";
+  item += ",\"expectedStateRevision\":" + String(expectedRevision);
+  item += ",\"issuedAtUnix\":1784217500,\"expiresAtUnix\":1784303900";
+  item += ",\"payload\":{\"releaseId\":\"" + String(releaseId) + "\"}}";
+  return item;
+}
+
 BackendCommandApplyResult failBeforePersistence(const Command&) {
   return BackendCommandApplyResult{};
 }
@@ -230,7 +261,7 @@ BackendIngestResult ingest(const String& body,
                            BackendCommandExecutor executor = executeFake) {
   return backendIngestUploadResponse(body, 1784217600, true,
                                      resolveFake, executor,
-                                     executeFakeInterval);
+                                     executeFakeInterval, executeFakeRelease);
 }
 
 void runSuite() {
@@ -509,6 +540,79 @@ void runSuite() {
   Serial.printf("=== SUITE: %d passed, %d failed ===\n", gPass, gFail);
 }
 
+// Separate function so its locals get a fresh stack frame — runSuite() is
+// already near the loopTask stack limit.
+void runReleaseSuite() {
+  BackendIngestResult r;
+  // --- CMD_DEPLOY_RELEASE (mothership self-update intent) ---
+  resetState();
+  gPendingReleaseId[0] = '\0';
+  const String relId = commandId(30);
+  const char* kRelease = "fieldmesh-2026.08.0";
+  r = ingest(envelope(releaseCommand(relId, 1, 0, kRelease), 1, false, 2));
+  CommandResult relResult{};
+  check("deploy-release accepted and staged",
+        r.status == BackendIngestStatus::PROCESSED && r.processedCount == 1 &&
+        strcmp(gPendingReleaseId, kRelease) == 0 &&
+        dispatcherResultFor(relId.c_str(), &relResult) &&
+        relResult.outcome == OUT_ACCEPTED &&
+        backendControlLastCommandCursor() == 1);
+
+  // Redelivery is idempotent: same commandId replays, does not re-stage anew.
+  gPendingReleaseId[0] = '\0';
+  r = ingest(envelope(releaseCommand(relId, 1, 0, kRelease), 1, false, 2));
+  check("deploy-release redelivery replays (no re-execute)",
+        r.status == BackendIngestStatus::PROCESSED && r.replayedCount == 1);
+
+  // Empty releaseId is a durable rejection.
+  resetState();
+  gPendingReleaseId[0] = '\0';
+  const String relEmptyId = commandId(31);
+  r = ingest(envelope(releaseCommand(relEmptyId, 1, 0, ""), 1, false, 2));
+  check("deploy-release empty releaseId rejected",
+        r.rejection == BackendIngestRejection::RELEASE_ID_INVALID &&
+        gPendingReleaseId[0] == '\0');
+
+  // Oversized releaseId (>= CMD_RELEASE_ID_LEN) is rejected.
+  resetState();
+  gPendingReleaseId[0] = '\0';
+  String longRel; for (int i = 0; i < CMD_RELEASE_ID_LEN + 4; ++i) longRel += 'x';
+  const String relLongId = commandId(32);
+  r = ingest(envelope(releaseCommand(relLongId, 1, 0, longRel.c_str()), 1, false, 2));
+  check("deploy-release oversized releaseId rejected",
+        r.rejection == BackendIngestRejection::RELEASE_ID_INVALID &&
+        gPendingReleaseId[0] == '\0');
+
+  // A DEPLOY_RELEASE mixed with any other command in one response is rejected
+  // (lone global command), like SET_RECORDING_INTERVAL.
+  resetState();
+  gPendingReleaseId[0] = '\0';
+  const String relMixId = commandId(33);
+  const String mixId = commandId(34);
+  const String mixed = releaseCommand(relMixId, 1, 0, kRelease) + "," +
+                       setCommand(mixId, 2, 0, kNodeA);
+  r = ingest(envelope(mixed, 2, false, 2));
+  check("deploy-release cannot be mixed with other commands",
+        r.rejection == BackendIngestRejection::MIXED_GLOBAL_BATCH &&
+        gPendingReleaseId[0] == '\0');
+
+  // A stale expectedRevision yields a durable REVISION_CONFLICT, not a stage.
+  resetState();
+  gPendingReleaseId[0] = '\0';
+  // Bump the revision once so expectedRevision=0 is stale.
+  const String bumpId = commandId(35);
+  ingest(envelope(setCommand(bumpId, 1, 0, kNodeA), 1));
+  const String relStaleId = commandId(36);
+  r = ingest(envelope(releaseCommand(relStaleId, 2, 0, kRelease), 2, false, 2));
+  CommandResult staleRel{};
+  check("deploy-release stale revision -> REVISION_CONFLICT, not staged",
+        dispatcherResultFor(relStaleId.c_str(), &staleRel) &&
+        staleRel.outcome == OUT_REVISION_CONFLICT &&
+        gPendingReleaseId[0] == '\0');
+
+  Serial.printf("=== SUITE: %d passed, %d failed ===\n", gPass, gFail);
+}
+
 }  // namespace
 
 void setup() {
@@ -518,6 +622,7 @@ void setup() {
   dispatcherInit();
   backendControlInit();
   runSuite();
+  runReleaseSuite();
 }
 
 void loop() {

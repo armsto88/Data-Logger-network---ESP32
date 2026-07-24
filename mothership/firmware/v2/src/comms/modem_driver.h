@@ -49,6 +49,26 @@ struct HttpsPostResult {
 };
 
 // ---------------------------------------------------------------------------
+// HTTPS GET streaming download (for large bodies — e.g. an OTA firmware image)
+// ---------------------------------------------------------------------------
+
+// Called with each contiguous run of received body bytes as they arrive off the
+// modem. `data`/`len` point into a driver-owned buffer valid only for the call —
+// copy out anything needed beyond it. Return false to abort the transfer early
+// (e.g. the OTA install rejected a chunk, or a time budget was exceeded).
+using HttpsStreamChunkCallback = bool (*)(const uint8_t* data, size_t len, void* ctx);
+
+struct HttpsGetStreamResult {
+  bool     success = false;            // 2xx + body fully delivered + not aborted
+  int      httpStatus = -1;
+  uint32_t declaredContentLength = 0;  // from Content-Length (0 if absent)
+  uint32_t bytesDelivered = 0;         // total body bytes handed to the callback
+  bool     complete = false;           // declared length fully received
+  bool     aborted = false;            // callback asked to stop
+  String   errorDetail;
+};
+
+// ---------------------------------------------------------------------------
 // Modem diagnostics — link-quality / identity snapshot for the status payload.
 // Populated by getDiagnostics() while the modem is registered.  Values that
 // could not be read are left at their "unknown" sentinel (0 dBm / 99 BER / "").
@@ -94,6 +114,22 @@ class ModemDriver {
                             const String& payload,
                             const String& contentType = "text/csv",
                             const String& authToken = "");
+
+  // HTTPS GET that streams the response body to a callback instead of
+  // buffering it, so a large (~1 MB) firmware image never lives in RAM at
+  // once. HTTPS only (uses the CCH* TLS path); a non-https:// URL is rejected.
+  // idleTimeoutMs: abort if no new bytes arrive for this long.
+  // rangeHeader: if non-empty, sent verbatim as "Range: <rangeHeader>" (e.g.
+  // "bytes=0-524287") for chunked downloads. A successful ranged response is
+  // HTTP 206; the caller must check result.httpStatus, since a server that
+  // ignores Range silently returns 200 with the WHOLE body instead of the
+  // requested slice.
+  HttpsGetStreamResult httpsGetStream(const String& url,
+                                      HttpsStreamChunkCallback chunkCallback,
+                                      void* callbackCtx,
+                                      uint32_t idleTimeoutMs = 20000,
+                                      const String& authToken = "",
+                                      const String& rangeHeader = "");
 
   // AT+CPOF -> wait STATUS LOW -> PWRKEY 2.5s fallback -> rail off.
   void gracefulShutdown();
@@ -153,6 +189,13 @@ class ModemDriver {
                     const String& httpReq, HttpsPostResult& result);
   bool httpsPostTCP(const String& host, int port,
                     const String& httpReq, HttpsPostResult& result);
+
+  // SSL/TLS streaming GET via CCH* API. Opens the connection, sends the GET
+  // request, then drives the incremental frame reader that forwards body
+  // bytes to the callback. Fills `result`; returns result.success.
+  bool httpsGetStreamSSL(const String& host, int port, const String& httpReq,
+                         HttpsStreamChunkCallback chunkCallback, void* ctx,
+                         uint32_t idleTimeoutMs, HttpsGetStreamResult& result);
 };
 
 // Serialise a ModemDiagnostics snapshot as the status.modem{} JSON object.

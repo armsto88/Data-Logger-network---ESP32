@@ -120,9 +120,8 @@ bool extractA7670CchPayload(const String& uartBytes, String& httpBytes,
   return true;
 }
 
-HttpResponseParseResult parseHttpResponseBytes(const String& httpBytes,
-                                               bool peerClosed) {
-  HttpResponseParseResult out{};
+HttpResponseHead parseHttpResponseHead(const String& httpBytes) {
+  HttpResponseHead out{};
   const int statusStart = httpBytes.indexOf("HTTP/1.");
   if (statusStart < 0) {
     out.error = "HTTP status line missing";
@@ -153,7 +152,7 @@ HttpResponseParseResult parseHttpResponseBytes(const String& httpBytes,
     return out;
   }
   out.headersComplete = true;
-  const size_t bodyStart = static_cast<size_t>(headerEnd + 4);
+  out.bodyStart = static_cast<size_t>(headerEnd + 4);
   String headers = httpBytes.substring(statusStart, headerEnd);
   headers.toLowerCase();
   out.chunked = headers.indexOf("transfer-encoding: chunked") >= 0;
@@ -182,8 +181,24 @@ HttpResponseParseResult parseHttpResponseBytes(const String& httpBytes,
     }
     out.contentLength = static_cast<int32_t>(parsed);
   }
+  return out;
+}
 
-  const String encodedBody = httpBytes.substring(bodyStart);
+HttpResponseParseResult parseHttpResponseBytes(const String& httpBytes,
+                                               bool peerClosed) {
+  HttpResponseParseResult out{};
+  const HttpResponseHead head = parseHttpResponseHead(httpBytes);
+  out.statusCode      = head.statusCode;
+  out.headersComplete = head.headersComplete;
+  out.chunked         = head.chunked;
+  out.contentLength   = head.contentLength;
+  out.error           = head.error;
+  // Any head-level failure (missing/incomplete status line, incomplete
+  // headers, bad Content-Length) short-circuits with the same error the
+  // monolithic parser produced.
+  if (!head.headersComplete || head.error.length() > 0) return out;
+
+  const String encodedBody = httpBytes.substring(head.bodyStart);
   if (out.chunked) {
     out.bodyComplete = decodeChunked(encodedBody, out.body, out.error);
     if (!out.bodyComplete && out.error.length() == 0)

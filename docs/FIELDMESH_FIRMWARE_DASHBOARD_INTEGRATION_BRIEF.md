@@ -220,7 +220,7 @@ Firmware rules: missing envelope = legacy upload, no commands; persist a command
 ### 5.5 Vocabularies (use these exact codes)
 **Command outcomes** (config changes): `ACCEPTED`, `REVISION_CONFLICT`, `INVALID`, `SUPERSEDED`, `REPLAY`.
 **Command lifecycle** (§3.2): `QUEUED`, `RECEIVED`, `ACCEPTED`, `REJECTED`, `WAITING_FOR_SYNC`, `SENT_TO_NODE`, `CONVERGED`, `SUPERSEDED`, `FAILED`, `CANCELLED`.
-**OTA / release reasons:** `NONE`, `COMMAND_EXPIRED`, `COMMAND_DUPLICATE`, `REVISION_CONFLICT`, `SUPERSEDED`, `DEFERRED_LOW_BATTERY`, `DEFERRED_BUSY`, `LOCAL_SERVICE_LOCK`, `INCOMPATIBLE_ROLE`, `INCOMPATIBLE_HARDWARE`, `INCOMPATIBLE_PROTOCOL`, `DOWNGRADE_REJECTED`, `SD_MISSING`, `SD_FULL`, `MANIFEST_INVALID`, `SIGNATURE_INVALID`, `IMAGE_TOO_LARGE`, `SIZE_MISMATCH`, `HASH_MISMATCH`, `IMAGE_INVALID`, `FLASH_WRITE_FAILED`, `DOWNLOAD_TIMEOUT`, `DOWNLOAD_TRUNCATED`, `BOOT_VALIDATION_FAILED`, `ROLLED_BACK`, `DATA_BACKLOG_BLOCKED`, `OPERATOR_CANCELLED`.
+**OTA / release reasons:** `NONE`, `COMMAND_EXPIRED`, `COMMAND_DUPLICATE`, `REVISION_CONFLICT`, `SUPERSEDED`, `DEFERRED_LOW_BATTERY`, `DEFERRED_BUSY`, `DEFERRED_BACKOFF`, `LOCAL_SERVICE_LOCK`, `INCOMPATIBLE_ROLE`, `INCOMPATIBLE_HARDWARE`, `INCOMPATIBLE_PROTOCOL`, `DOWNGRADE_REJECTED`, `SD_MISSING`, `SD_FULL`, `MANIFEST_INVALID`, `SIGNATURE_INVALID`, `IMAGE_TOO_LARGE`, `SIZE_MISMATCH`, `HASH_MISMATCH`, `IMAGE_INVALID`, `FLASH_WRITE_FAILED`, `DOWNLOAD_TIMEOUT`, `DOWNLOAD_TRUNCATED`, `RETRY_LIMIT_EXCEEDED`, `BOOT_VALIDATION_FAILED`, `ROLLED_BACK`, `DATA_BACKLOG_BLOCKED`, `OPERATOR_CANCELLED`.
 
 ### 5.6 Release manifest + signature (what the release service serves)
 ```json
@@ -374,6 +374,55 @@ The mothership folds it into the registry and emits per node in `status.nodes[]`
 - **`CMD_ID_LEN = 24`** (bytes incl. NUL → **≤23 usable chars**). ⚠️ A full UUID (36 chars) will be **truncated** by `strlcpy`, which can break idempotency if two IDs share the first 23 chars. Either keep backend IDs ≤23 chars (e.g. a base62 ULID prefix) **or** ask firmware to widen `CMD_ID_LEN` before UUIDs are used.
 - **`expiresAtUnix`:** in the envelope contract but **NOT enforced by firmware yet** (ingestion isn't built). When it lands, expired commands are dropped as `COMMAND_EXPIRED`.
 - **Bounded commands per check-in:** **not enforced yet.** Existing constants: `CMD_MAX_RESULTS = 8` (result ring), `CMD_MAX_NODES = 16`. Propose a small per-check-in cap (e.g. 8) so a check-in can't extend the powered session — open decision §7 Q2.
+
+---
+
+## Appendix B — Cloud-triggered mothership OTA: as-built (`DEPLOY_RELEASE`)
+
+Added when the cloud OTA path was implemented. **This section supersedes §4.2's sketch** where they differ (the command carries a `releaseId`, and the firmware derives the fetch URLs — the backend never sends a URL or binary). Marked **IMPLEMENTED** below means the firmware side is built and unit/component-tested on hardware; the end-to-end on-air download is proven separately with a real hosted release.
+
+### B.1 `DEPLOY_RELEASE` command — **IMPLEMENTED** (firmware side)
+Rides the existing check-in response envelope (§5.4), protocol ≥ 2. It is a **lone global command**: it must be the **only** command in its response (mixed with any other command → the whole response is rejected `MIXED_GLOBAL_BATCH`, exactly like `SET_RECORDING_INTERVAL`).
+```json
+{
+  "commandId": "018f-example", "sequence": 131,
+  "type": "DEPLOY_RELEASE",
+  "expectedStateRevision": 43,
+  "issuedAtUnix": 1784217500, "expiresAtUnix": 1784303900,
+  "payload": { "releaseId": "fieldmesh-2026.08.0" }
+}
+```
+- **`releaseId`**: required, non-empty, **≤ 39 chars** (`CMD_RELEASE_ID_LEN = 40` incl. NUL). Empty/oversized → durable `RELEASE_ID_INVALID`. Never a URL or binary.
+- CAS/idempotency identical to other commands: stale `expectedStateRevision` → `REVISION_CONFLICT`; a repeated `commandId` replays its stored result and never re-installs.
+- On accept the mothership durably stages the intent (survives power-cycles) and reports `ACCEPTED` in `status.control{}.results[]`. Install progress is reported separately in `status.firmware{}` (B.3), not in the command result.
+
+### B.2 Release artifact hosting — **BACKEND MUST PROVIDE**
+The firmware **derives** the fetch URLs from its pinned approved host + role + `releaseId`; the backend must serve exactly these paths (all HTTPS, on `FM_APPROVED_ENDPOINT_HOST`). The firmware fetches the **Supabase Storage public-read URLs** (bytes served verbatim — no re-serialization, so no `SIGNATURE_INVALID`; CDN-cached + immutable; no edge-function cold start in the LTE hot path):
+```
+https://<approved-host>/storage/v1/object/public/releases/<role>/<releaseId>/manifest.json
+https://<approved-host>/storage/v1/object/public/releases/<role>/<releaseId>/manifest.json.sig
+https://<approved-host>/storage/v1/object/public/releases/<role>/<releaseId>/image.bin
+```
+`<role>` = `mothership`. The `.sig` is the detached Ed25519 signature (128 lowercase hex) over the exact `manifest.json` bytes; `manifest.json`/`image.bin` are produced by `scripts/release_sign.py`. **The URL path template is firmware-side and can change** — confirm it against `otaBuildManifestUrl()`/`otaBuildImageUrl()` in `mothership/firmware/v2/src/ota/mothership_ota_cloud_fetch.cpp` before wiring the release store. Each URL is re-checked against the approved host (`hwEndpointAllowed`) before any fetch; a URL that escapes the host aborts the install.
+- **TLS gives you no identity assurance here** — the modem does not verify server certs. Integrity rests entirely on the manifest Ed25519 signature + per-artifact SHA-256. Do not rely on TLS to authenticate the release.
+- **The image URL must stay fetchable across multiple check-ins.** There is **no mid-transfer resume**: every wake is a cold boot, so an interrupted or budget-truncated download restarts from byte 0 next wake. Use a stable/long-lived URL (or a signed URL valid for the whole install window), not a single-use one. At LTE rates a ~1 MB image may take more than one wake to land — do not promise fast turnaround.
+
+### B.3 `status.firmware{}` additive fields — **IMPLEMENTED**
+Source: `mothershipFirmwareStatusJson()` in `mothership/firmware/v2/src/ota/mothership_selfupdate.cpp`. New keys (all additive):
+- **`releaseId`**: releaseId of the confirmed-running image (was always `null`; now populated once a release has been installed-and-confirmed through OTA).
+- **`pendingReleaseId`**: a staged `DEPLOY_RELEASE` intent not yet installed (`null` if none). Non-null across wakes means a download is pending/retrying.
+- **`armedReleaseId`**: an image flashed and boot-armed, awaiting first-boot confirmation (`null` if none). **Rollback inference:** if `armedReleaseId` is set on one check-in but a later check-in shows the running `releaseId` ≠ `armedReleaseId` (and `armedReleaseId` cleared), the trial image failed to boot and the bootloader auto-reverted — render `ROLLED_BACK`.
+- Existing `activeSlot`/`nextBootSlot`/`slots[]`/`otaState` are unchanged; `otaState=CONFIRMED` on the active slot after a confirmed boot is the "Active" signal.
+
+### B.4 Reason vocabulary + retry semantics — **IMPLEMENTED**
+Lifecycle/reason strings follow §5.5. Firmware distinguishes **transient** (retried automatically next wake, intent stays staged — the backend need not re-issue) from **terminal** (intent cleared — the backend must issue a fresh `commandId` to retry):
+- **Transient / deferred:** `DEFERRED_LOW_BATTERY`, `DEFERRED_BUSY` (session budget too low), `DEFERRED_BACKOFF`* (skipping this wake under retry backoff after a prior failure), `DOWNLOAD_TIMEOUT`, `DOWNLOAD_TRUNCATED`, `DOWNLOAD_FAILED`*, `MODEM_UNAVAILABLE`*.
+- **Terminal:** `MANIFEST_INVALID`, `SIGNATURE_INVALID`, `INCOMPATIBLE_ROLE`, `INCOMPATIBLE_HARDWARE`, `INCOMPATIBLE_PROTOCOL`, `DOWNGRADE_REJECTED`, `SIZE_MISMATCH`, `HASH_MISMATCH`, `IMAGE_INVALID`, `IMAGE_TOO_LARGE`, `FLASH_WRITE_FAILED`, `RETRY_LIMIT_EXCEEDED`* (gave up after repeated transient download failures — operator must issue a fresh command).
+
+  *`DOWNLOAD_FAILED`/`MODEM_UNAVAILABLE`/`DEFERRED_BACKOFF`/`RETRY_LIMIT_EXCEEDED` are firmware extensions beyond §5.5's list. Treat any unrecognised reason as a non-fatal "will retry / see detail" state — **except** `RETRY_LIMIT_EXCEEDED`, which is terminal (see the Terminal list): the intent is cleared and the release will NOT retry until the operator issues a fresh `commandId`.
+
+### B.5 Anti-downgrade — **IMPLEMENTED (now enforced)**
+Previously inert (`installedReleaseSequence()` returned 0). Now the confirmed-running release's `releaseSequence` is persisted in NVS and advanced only after a confirmed first boot, so a `DEPLOY_RELEASE` whose manifest `releaseSequence` is lower than the installed one is rejected `DOWNGRADE_REJECTED`. Keep `releaseSequence` monotonic per role in the release catalog.
 
 ---
 *Questions? Talk to the firmware team — and see `FIELDMESH_OTA_FIRMWARE_UPDATE_PLAN.md` §4 (control model), §5 (release/manifest), §13 (status model), and §0 (what's built).*

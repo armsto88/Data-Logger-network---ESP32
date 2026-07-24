@@ -241,6 +241,7 @@ const char* backendIngestRejectionStr(BackendIngestRejection rejection) {
     case BackendIngestRejection::DISPATCH_PERSIST_FAILED: return "DISPATCH_PERSIST_FAILED";
     case BackendIngestRejection::DESIRED_PERSIST_FAILED: return "DESIRED_PERSIST_FAILED";
     case BackendIngestRejection::CURSOR_PERSIST_FAILED: return "CURSOR_PERSIST_FAILED";
+    case BackendIngestRejection::RELEASE_ID_INVALID: return "RELEASE_ID_INVALID";
     default: return "UNKNOWN";
   }
 }
@@ -379,7 +380,8 @@ String backendControlStatusJson() {
 BackendIngestResult backendIngestUploadResponse(
     const String& responseBody, uint32_t rtcNowUnix, bool rtcTrustworthy,
     BackendCommandResolver resolver, BackendCommandExecutor executor,
-    BackendIntervalExecutor intervalExecutor) {
+    BackendIntervalExecutor intervalExecutor,
+    BackendReleaseExecutor releaseExecutor) {
   BackendIngestResult result{};
   // This snapshot is the compare-and-set authority for the entire response.
   // Individual accepted commands may advance the live revision later, but no
@@ -535,7 +537,9 @@ BackendIngestResult backendIngestUploadResponse(
     const bool isNodeConfig = type && strcmp(type, "SET_NODE_CONFIG") == 0;
     const bool isRecordingInterval = protocol >= 2 && type &&
         strcmp(type, "SET_RECORDING_INTERVAL") == 0;
-    const bool baseFieldsOk = (isNodeConfig || isRecordingInterval) &&
+    const bool isDeployRelease = protocol >= 2 && type &&
+        strcmp(type, "DEPLOY_RELEASE") == 0;
+    const bool baseFieldsOk = (isNodeConfig || isRecordingInterval || isDeployRelease) &&
         readU32(item["expectedStateRevision"], expectedRevision) &&
         readU32(item["issuedAtUnix"], issuedAt) && plausibleUnix(issuedAt) &&
         readU32(item["expiresAtUnix"], expiresAt) && plausibleUnix(expiresAt) &&
@@ -546,7 +550,18 @@ BackendIngestResult backendIngestUploadResponse(
     requested.expectedRevision = expectedRevision;
     JsonObjectConst payload = item["payload"].as<JsonObjectConst>();
 
-    if (isRecordingInterval) {
+    if (isDeployRelease) {
+      requested.type = CMD_DEPLOY_RELEASE;
+      // The dashboard supplies a release *ID*, never a URL or binary (the
+      // mothership derives the fetch URLs against its pinned approved host).
+      const char* releaseId = payload["releaseId"].as<const char*>();
+      if (!releaseId || !releaseId[0] || strlen(releaseId) >= CMD_RELEASE_ID_LEN) {
+        if (result.rejection == BackendIngestRejection::NONE)
+          result.rejection = BackendIngestRejection::RELEASE_ID_INVALID;
+        continue;
+      }
+      strlcpy(requested.releaseId, releaseId, CMD_RELEASE_ID_LEN);
+    } else if (isRecordingInterval) {
       requested.type = CMD_SET_RECORDING_INTERVAL;
       uint8_t interval = 0;
       if (!readU8(payload["wakeIntervalMin"], interval) ||
@@ -631,7 +646,8 @@ BackendIngestResult backendIngestUploadResponse(
 
   uint8_t globalCommands = 0;
   for (uint8_t i = 0; i < stagedCount; ++i) {
-    if (staged[i].dispatch.command.type == CMD_SET_RECORDING_INTERVAL)
+    if (staged[i].dispatch.command.type == CMD_SET_RECORDING_INTERVAL ||
+        staged[i].dispatch.command.type == CMD_DEPLOY_RELEASE)
       ++globalCommands;
     if (staged[i].dispatch.outcome == OUT_INVALID &&
         result.rejection == BackendIngestRejection::NONE)
@@ -691,6 +707,48 @@ BackendIngestResult backendIngestUploadResponse(
     Serial.printf("[CONTROL] interval durable seq=%lu minutes=%u revision=%lu cursor=%lu->%lu\n",
                   static_cast<unsigned long>(staged[0].sequence),
                   static_cast<unsigned>(staged[0].dispatch.command.recordingIntervalMin),
+                  static_cast<unsigned long>(stored.assignedRevision),
+                  static_cast<unsigned long>(oldCursor),
+                  static_cast<unsigned long>(result.persistedCursor));
+    return result;
+  }
+
+  // Lone CMD_DEPLOY_RELEASE: mirror the recording-interval fast path. The
+  // executor stages the releaseId (dispatcherSubmit for CAS/idempotency + the
+  // OTA release store); the actual fetch/verify/install runs later in the wake,
+  // driven from main.cpp, not here (this call must stay bounded-latency).
+  if (stagedCount == 1 &&
+      staged[0].dispatch.command.type == CMD_DEPLOY_RELEASE &&
+      staged[0].dispatch.outcome == OUT_ACCEPTED) {
+    if (!releaseExecutor) {
+      result.status = BackendIngestStatus::MALFORMED;
+      result.rejection = BackendIngestRejection::CALLBACK_MISSING;
+      return result;
+    }
+    const BackendCommandApplyResult applied =
+        releaseExecutor(staged[0].dispatch.command);
+    CommandResult stored{};
+    if (!applied.durable || !applied.applied ||
+        !dispatcherResultFor(staged[0].dispatch.command.cmdId, &stored) ||
+        (stored.outcome != OUT_ACCEPTED && stored.outcome != OUT_CONVERGED) ||
+        !dispatcherEnsureDurable()) {
+      result.status = BackendIngestStatus::PERSIST_FAILED;
+      result.rejection = BackendIngestRejection::DESIRED_PERSIST_FAILED;
+      return result;
+    }
+    if (applied.command.outcome == OUT_REPLAY) ++result.replayedCount;
+    ++result.processedCount;
+    const uint32_t oldCursor = gState.lastCommandCursor;
+    if (!advanceCursor(staged[0].sequence)) {
+      result.status = BackendIngestStatus::PERSIST_FAILED;
+      result.rejection = BackendIngestRejection::CURSOR_PERSIST_FAILED;
+      return result;
+    }
+    result.persistedCursor = gState.lastCommandCursor;
+    result.status = BackendIngestStatus::PROCESSED;
+    Serial.printf("[CONTROL] deploy-release durable seq=%lu releaseId=%s revision=%lu cursor=%lu->%lu\n",
+                  static_cast<unsigned long>(staged[0].sequence),
+                  staged[0].dispatch.command.releaseId,
                   static_cast<unsigned long>(stored.assignedRevision),
                   static_cast<unsigned long>(oldCursor),
                   static_cast<unsigned long>(result.persistedCursor));

@@ -6,6 +6,7 @@
 
 #include "modem_driver.h"
 #include "comms/http_response_parser.h"
+#include "comms/cch_stream_reader.h"
 
 // ---------------------------------------------------------------------------
 // Constructor
@@ -983,6 +984,312 @@ bool ModemDriver::httpsPostTCP(const String& host, int port,
   sendAT("AT+CIPCLOSE=0", resp, 2000);
 
   return result.success;
+}
+
+// ---------------------------------------------------------------------------
+// httpsGetStream — streaming HTTPS GET for large bodies (OTA image download)
+//
+// Unlike httpsPost(), the response body is never accumulated in RAM. The CCH*
+// TLS connection is opened exactly like httpsPostSSL(), the GET request line is
+// sent, then an incremental, binary-safe state machine pulls each
+// "+CCHRECV: DATA,0,<len>\r\n<payload>" frame out of the UART stream and hands
+// its payload straight to the caller's callback. Only the HTTP head (status +
+// headers) is buffered — bounded to a few KB — so Content-Length can be read;
+// every byte after the header blank line is forwarded and forgotten.
+// ---------------------------------------------------------------------------
+
+// Receive strategy for the streaming GET.
+//   1 (default) = manual/cache pull: the modem buffers received TLS data and
+//     only hands it over when we ask (AT+CCHRECV), so it applies TCP flow
+//     control and never overruns our UART during flash writes. This fixes the
+//     consistent ~98.5% truncation seen with auto-push, where the modem's
+//     internal buffer backed up behind our inline esp_ota_write() stalls and it
+//     tore the TLS session down (+CCH_PEER_CLOSED) at a deterministic byte count.
+//   0 = legacy auto-push (AT+CCHSET=0,0): retained for A/B on the bench.
+#ifndef MODEM_MANUAL_RECV
+#define MODEM_MANUAL_RECV 1
+#endif
+
+bool ModemDriver::httpsGetStreamSSL(const String& host, int port,
+                                    const String& httpReq,
+                                    HttpsStreamChunkCallback chunkCallback,
+                                    void* ctx, uint32_t idleTimeoutMs,
+                                    HttpsGetStreamResult& result) {
+  Serial.println("[Modem] === SSL GET (streaming) via CCH* API ===");
+  String resp;
+
+  // 1. NTP + SSL context (identical to the POST path).
+  sendAT("AT+CNTP=\"pool.ntp.org\",32", resp, 5000);
+  sendAT("AT+CNTP", resp, 15000);
+  delay(3000);
+  sendAT("AT+CCLK?", resp, 2000);
+  sendAT("AT+CSSLCFG=\"sslversion\",0,4", resp, 2000);
+  sendAT("AT+CSSLCFG=\"authmode\",0,0", resp, 2000);
+  sendAT("AT+CSSLCFG=\"ignorelocaltime\",0,1", resp, 2000);
+  sendAT("AT+CSSLCFG=\"enableSNI\",0,1", resp, 2000);
+  sendAT("AT+CSSLCFG=\"negotiatetime\",0,300", resp, 2000);
+
+  if (!sendAT("AT+CCHSTART", resp, 30000)) {
+    result.errorDetail = "AT+CCHSTART failed: " + resp;
+    return false;
+  }
+  sendAT("AT+CCHSSLCFG=0,0", resp, 5000);
+#if MODEM_MANUAL_RECV
+  // Cache mode: modem buffers RX data; we pull it with AT+CCHRECV (flow control).
+  sendAT("AT+CCHSET=1,1", resp, 2000);
+#else
+  sendAT("AT+CCHSET=0,0", resp, 2000);   // auto-receive: modem pushes DATA frames
+#endif
+
+  // 2. Open the TLS connection.
+  String openCmd = "AT+CCHOPEN=0,\"" + host + "\"," + String(port) + ",2";
+  Serial.printf("[Modem] CCHOPEN: %s\n", openCmd.c_str());
+  while (Serial2.available()) { Serial2.read(); }
+  Serial2.print(openCmd);
+  Serial2.print("\r\n");
+  Serial2.flush();
+
+  unsigned long start = millis();
+  bool cchOpenOk = false;
+  resp = "";
+  while (millis() - start < 30000) {
+    while (Serial2.available()) resp += (char)Serial2.read();
+    if (resp.indexOf("+CCHOPEN: 0,0") >= 0) { cchOpenOk = true; break; }
+    int urcIdx = resp.indexOf("+CCHOPEN: 0,");
+    if (urcIdx >= 0 && urcIdx + 12 < (int)resp.length()) {
+      char e = resp.charAt(urcIdx + 12);
+      if (e != '0' && e >= '0' && e <= '9') break;
+    }
+    delay(10);
+  }
+  if (!cchOpenOk) {
+    result.errorDetail = "CCHOPEN failed: " + resp;
+    sendAT("AT+CCHSTOP", resp, 5000);
+    return false;
+  }
+  Serial.println("[Modem] SSL connection opened (GET)");
+  m_state = ModemState::UPLOAD_ACTIVE;
+  delay(500);
+
+  // 3. Send the GET request (small — reuse the proven chunked sender).
+  if (!chunkedCchSend(httpReq, 1024)) {
+    result.errorDetail = "CCHSEND (GET request) failed";
+    sendAT("AT+CCHCLOSE=0", resp, 2000);
+    sendAT("AT+CCHSTOP", resp, 5000);
+    return false;
+  }
+
+  // 4. Stream the response body straight to the callback. The framing state
+  // machine lives in CchStreamReader (unit-tested separately). Wrap the caller's
+  // callback so we can capture an abort without threading extra state through.
+  struct SinkCtx { HttpsStreamChunkCallback cb; void* ctx; } sink{chunkCallback, ctx};
+  CchStreamReader::BodySink bodySink = [](const uint8_t* d, size_t n, void* c) -> bool {
+    SinkCtx* s = static_cast<SinkCtx*>(c);
+    return s->cb(d, n, s->ctx);
+  };
+
+  // Heap-allocate the reader (its ~8 KB head buffer stays off this deep stack).
+  CchStreamReader* rp = new CchStreamReader();
+  if (!rp) {
+    result.errorDetail = "OOM (stream reader)";
+    sendAT("AT+CCHCLOSE=0", resp, 2000);
+    sendAT("AT+CCHSTOP", resp, 5000);
+    return false;
+  }
+  CchStreamReader& r = *rp;
+  int32_t  contentLength = -1;
+  bool     headParsed = false;
+  bool     statusOk = false;
+  unsigned long lastByteAt = millis();
+  uint8_t scratch[512];
+
+  // Parse the HTTP head once its terminator has been seen (shared by both the
+  // manual-pull and auto-push receive strategies below).
+  auto tryParseHead = [&]() {
+    if (!headParsed && r.headComplete()) {
+      String headStr;
+      headStr.reserve(r.headLen());
+      for (size_t k = 0; k < r.headLen(); ++k) headStr += r.head()[k];
+      HttpResponseHead h = parseHttpResponseHead(headStr);
+      headParsed = true;
+      result.httpStatus = h.statusCode;
+      contentLength = h.contentLength;
+      result.declaredContentLength = (h.contentLength >= 0) ? (uint32_t)h.contentLength : 0;
+      statusOk = (h.statusCode >= 200 && h.statusCode < 300);
+      if (!statusOk) result.errorDetail = "HTTP status " + String(h.statusCode);
+    }
+  };
+  auto fullyDelivered = [&]() -> bool {
+    return headParsed && contentLength >= 0 &&
+           r.bodyDelivered() >= (uint32_t)contentLength;
+  };
+
+#if MODEM_MANUAL_RECV
+  // Manual/cache receive: actively pull cached data with AT+CCHRECV so the modem
+  // paces the server via TCP flow control instead of blasting the UART at line
+  // rate while we're mid-flash-write. Each pull's raw response is fed through the
+  // SAME binary-safe frame reader — the "+CCHRECV: DATA,0,<n>" frame format is
+  // identical to auto-push (already proven up to the truncation point), so only
+  // the pacing changes, not the parsing. The pull command echo, the trailing
+  // OK, and any "+CCHRECV: 0,<len>" availability / "+CCH_PEER_CLOSED" URCs are
+  // all harmless to the reader (ignored in SEEK; peer-closed still latched).
+  Serial.println("[Modem] streaming GET via manual AT+CCHRECV pull (flow-controlled)");
+  const int kReqLen = 1400;   // bytes requested per pull (tunable)
+  int emptyPulls = 0;
+  while (true) {
+    if (result.aborted) break;
+    if (!statusOk && headParsed) break;   // non-2xx: stop early
+    if (fullyDelivered()) break;
+    if (millis() - lastByteAt > idleTimeoutMs) {
+      result.errorDetail = "idle timeout waiting for body";
+      break;
+    }
+
+    Serial2.print("AT+CCHRECV=0,");
+    Serial2.print(kReqLen);
+    Serial2.print("\r\n");
+    Serial2.flush();
+
+    const uint32_t before = r.bodyDelivered();
+    unsigned long lastRx = millis();
+    bool sawAny = false;
+    while (true) {
+      int avail = Serial2.available();
+      if (avail > 0) {
+        int got = Serial2.readBytes(scratch, (size_t)min(avail, (int)sizeof(scratch)));
+        r.feed(scratch, (size_t)got, bodySink, &sink);
+        tryParseHead();
+        sawAny = true;
+        lastRx = millis();
+        lastByteAt = millis();
+        if (r.aborted() || fullyDelivered()) break;
+      } else {
+        // Inter-byte gap delimits this pull's response. The DATA frame streams
+        // contiguously; the only long gap is after the trailing OK.
+        if (sawAny && millis() - lastRx > 60) break;
+        if (!sawAny && millis() - lastRx > 3000) break;   // no response to this pull
+        delay(2);
+      }
+    }
+    result.bytesDelivered = r.bodyDelivered();
+    result.aborted = r.aborted();
+
+    if (r.bodyDelivered() == before) {
+      // No payload this pull: modem cache momentarily empty (more TLS data still
+      // arriving) or the transfer is genuinely finished. Only conclude "done"
+      // once the peer has closed AND the cache has drained across a few pulls.
+      if (r.peerClosed() && ++emptyPulls >= 3) break;
+      delay(30);   // let more data arrive into the modem cache
+    } else {
+      emptyPulls = 0;
+    }
+  }
+#else
+  while (true) {
+    int avail = Serial2.available();
+    if (avail <= 0) {
+      // Don't break on peerClosed() alone — buffered +CCHRECV frames may still
+      // be in the UART. Break only on full delivery or idle timeout.
+      if (fullyDelivered()) break;
+      if (millis() - lastByteAt > idleTimeoutMs) {
+        result.errorDetail = "idle timeout waiting for body";
+        break;
+      }
+      delay(2);
+      continue;
+    }
+    int got = Serial2.readBytes(scratch, (size_t)min(avail, (int)sizeof(scratch)));
+    lastByteAt = millis();
+    r.feed(scratch, (size_t)got, bodySink, &sink);
+    result.bytesDelivered = r.bodyDelivered();
+    result.aborted = r.aborted();
+    tryParseHead();
+    if (result.aborted) break;
+    if (!statusOk && headParsed) break;   // non-2xx: stop early
+    if (fullyDelivered()) break;
+  }
+#endif
+
+  // 5. Close the connection.
+  sendAT("AT+CCHCLOSE=0", resp, 2000);
+  sendAT("AT+CCHSTOP", resp, 5000);
+  result.bytesDelivered = r.bodyDelivered();
+  const bool peerClosed = r.peerClosed();
+  (void)peerClosed;
+  delete rp;
+
+  result.complete = headParsed && contentLength >= 0 &&
+                    result.bytesDelivered >= (uint32_t)contentLength;
+  result.success  = statusOk && result.complete && !result.aborted;
+  if (result.success) {
+    result.errorDetail = "";
+  } else if (result.errorDetail.length() == 0) {
+    result.errorDetail = result.aborted ? "aborted by callback"
+                       : !headParsed     ? "no HTTP response head"
+                       : "body incomplete";
+  }
+  Serial.printf("[Modem] GET stream: status=%d declared=%lu delivered=%lu complete=%d aborted=%d\n",
+                result.httpStatus, (unsigned long)result.declaredContentLength,
+                (unsigned long)result.bytesDelivered, result.complete, result.aborted);
+  return result.success;
+}
+
+HttpsGetStreamResult ModemDriver::httpsGetStream(const String& url,
+                                                 HttpsStreamChunkCallback chunkCallback,
+                                                 void* callbackCtx,
+                                                 uint32_t idleTimeoutMs,
+                                                 const String& authToken,
+                                                 const String& rangeHeader) {
+  Serial.println("=== ModemDriver::httpsGetStream() ===");
+  Serial.printf("[Modem] URL: %s\n", url.c_str());
+  HttpsGetStreamResult result;
+
+  if (!url.startsWith("https://")) {
+    result.errorDetail = "GET stream requires https://";
+    return result;
+  }
+  String host = url.substring(8);
+  int port = 443;
+  String path = "/";
+  int slashIdx = host.indexOf('/');
+  if (slashIdx >= 0) { path = host.substring(slashIdx); host = host.substring(0, slashIdx); }
+  int colonIdx = host.indexOf(':');
+  if (colonIdx >= 0) { port = host.substring(colonIdx + 1).toInt(); host = host.substring(0, colonIdx); }
+  Serial.printf("[Modem] Parsed GET: host=%s port=%d path=%s\n", host.c_str(), port, path.c_str());
+
+  // PDP context + NETOPEN (mirrors httpsPost()).
+  {
+    String resp;
+#ifndef MODEM_APN
+#define MODEM_APN "TM"
+#endif
+    String cgdcont = "AT+CGDCONT=1,\"IP\",\"" MODEM_APN "\"";
+    sendAT(cgdcont.c_str(), resp, 5000);
+    sendAT("AT+CGACT=1,1", resp, 10000);
+    if (!sendAT("AT+NETOPEN", resp, 15000)) {
+      // NETOPEN reports an error if already open — tolerate that, fail otherwise.
+      if (resp.indexOf("+NETOPEN: 0") < 0 && resp.indexOf("already") < 0) {
+        result.errorDetail = "AT+NETOPEN failed: " + resp;
+        return result;
+      }
+    }
+    delay(2000);
+    m_state = ModemState::TRANSPORT_OPEN;
+  }
+
+  // Build the GET request. Connection: close so the server delimits the body.
+  String httpReq = "GET " + path + " HTTP/1.1\r\n";
+  httpReq += "Host: " + host + "\r\n";
+  if (authToken.length() > 0) httpReq += "Authorization: Bearer " + authToken + "\r\n";
+  if (rangeHeader.length() > 0) httpReq += "Range: " + rangeHeader + "\r\n";
+  httpReq += "Connection: close\r\n\r\n";
+
+  httpsGetStreamSSL(host, port, httpReq, chunkCallback, callbackCtx, idleTimeoutMs, result);
+
+  { String resp; sendAT("AT+NETCLOSE", resp, 5000); }
+  m_state = ModemState::REGISTERED;
+  Serial.println("=== httpsGetStream() complete ===");
+  return result;
 }
 
 // ---------------------------------------------------------------------------

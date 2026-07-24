@@ -457,6 +457,7 @@ bool dispatcherMarkGlobalConverged(uint32_t revision) {
 
 static bool validPayload(const Command& c) {
   if (c.type == CMD_REQUEST_STATUS) return true;
+  if (c.type == CMD_DEPLOY_RELEASE) return c.releaseId[0] != '\0';
   if (c.type == CMD_SET_RECORDING_INTERVAL) {
     return c.recordingIntervalMin == 1 || c.recordingIntervalMin == 5 ||
            c.recordingIntervalMin == 10 || c.recordingIntervalMin == 20 ||
@@ -557,6 +558,21 @@ bool dispatcherSubmitBatch(const DispatchBatchItem* items, uint8_t count,
     if (command.type == CMD_REQUEST_STATUS) {
       result.outcome = OUT_ACCEPTED;
       result.assignedRevision = gRevision;
+      recordResult(result);
+      batchResults[i] = result;
+      continue;
+    }
+
+    if (command.type == CMD_DEPLOY_RELEASE) {
+      // Assign a revision + record the result so the command is idempotent and
+      // visible in the control status. No node/global desired-state slot is
+      // touched — the releaseId is staged in the OTA release store by the
+      // executor, keeping the persisted dispatcher record byte-unchanged.
+      ++gRevision;
+      gLastChangeSource = command.source;
+      result.outcome = OUT_ACCEPTED;
+      result.assignedRevision = gRevision;
+      result.currentRevision = gRevision;
       recordResult(result);
       batchResults[i] = result;
       continue;

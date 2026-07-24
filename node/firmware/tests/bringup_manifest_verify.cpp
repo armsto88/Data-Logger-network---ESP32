@@ -102,6 +102,20 @@ void setup() {
   r = manifestCheckCompatibility(m, mkId("node", "0.1.0", "node-v3"), 5, &matched);
   check("older release seq -> DOWNGRADE_REJECTED", r == FW_DOWNGRADE_REJECTED);
 
+  // allowDowngrade (local emergency-rollback opt-in) bypasses ONLY the sequence
+  // gate — the same older-sequence case now passes.
+  r = manifestCheckCompatibility(m, mkId("node", "0.1.0", "node-v3"), 5, &matched,
+                                 /*allowDowngrade=*/true);
+  check("older release seq + allowDowngrade -> NONE", r == FW_NONE && matched != nullptr);
+
+  // ...but it must NOT weaken hardware/role checks.
+  r = manifestCheckCompatibility(m, mkId("node", "0.1.0", "node-v2"), 5, &matched,
+                                 /*allowDowngrade=*/true);
+  check("allowDowngrade still enforces hardware", r == FW_INCOMPATIBLE_HARDWARE);
+  r = manifestCheckCompatibility(m, mkId("mothership", "0.1.0", "mothership-v1"), 5, &matched,
+                                 /*allowDowngrade=*/true);
+  check("allowDowngrade still enforces role", r == FW_NO_ARTIFACT_FOR_DEVICE);
+
   r = manifestCheckCompatibility(m, mkId("node", "0.1.0", "node-v2"), 1, &matched);
   check("wrong hardware -> INCOMPATIBLE_HARDWARE", r == FW_INCOMPATIBLE_HARDWARE);
 

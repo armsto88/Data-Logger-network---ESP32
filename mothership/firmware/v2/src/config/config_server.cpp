@@ -5159,6 +5159,8 @@ static void handleControlStatus() {
 // ---------------------------------------------------------------------------
 // Local mothership self-update (/firmware) — plan §7.1
 // Step 1: POST /firmware/manifest  (body = manifest.json, ?sig=<128 hex>)
+//           optional &allowDowngrade=1 to bypass ONLY the anti-downgrade gate
+//           (local emergency rollback; signature/role/hw still enforced).
 // Step 2: POST /firmware/image     (multipart file = matching mothership.bin)
 // ---------------------------------------------------------------------------
 static void handleFirmwarePage() {
@@ -5196,7 +5198,18 @@ static void handleFirmwareManifest() {
     server.send(400, "application/json", "{\"error\":\"bad signature hex\"}");
     return;
   }
-  FwReason r = mothershipOtaVerifyManifest((const uint8_t*)body.c_str(), body.length(), sig);
+  // Local-operator emergency-rollback opt-in. Bypasses ONLY the anti-downgrade
+  // sequence gate (signature/role/hardware are still enforced). This is a
+  // deliberate override for someone physically at the hub reflashing an older
+  // known-good build after a bad release; the remote cloud OTA path never sets
+  // it. Log every use as an audit trail.
+  const bool allowDowngrade = server.arg("allowDowngrade") == "1";
+  if (allowDowngrade) {
+    Serial.println("[OTA] local manifest verify: ANTI-DOWNGRADE BYPASS requested "
+                   "(operator opt-in, local AP only)");
+  }
+  FwReason r = mothershipOtaVerifyManifest((const uint8_t*)body.c_str(), body.length(),
+                                           sig, allowDowngrade);
   MothershipOtaStatus s = mothershipOtaGetStatus();
   String resp = String("{\"reason\":\"") + fwReasonStr(r) +
                 "\",\"ready\":" + (s.manifestReady ? "true" : "false") +
