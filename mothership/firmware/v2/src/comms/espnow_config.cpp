@@ -291,6 +291,7 @@ static void onEspNowRecv(const uint8_t* mac, const uint8_t* data, int len) {
         if (memcmp(n.mac, mac, 6) == 0 || n.nodeId == String(st.nodeId)) {
           n.lastSeen = millis();
           n.isActive = true;
+          n.lastRescueMode = (st.rescueMode != 0);
           const bool reportsUndeployed = reported != DEPLOYED || st.deployed == 0;
           if (reportsUndeployed && shouldRecoverKnownDeployedNode(n)) {
             // A transient/corrupt node-side NVS record must not downgrade the

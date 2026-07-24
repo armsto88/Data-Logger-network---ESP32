@@ -1492,6 +1492,10 @@ void handleSyncWake() {
   // Stop the WiFi-task producer before upload or purge code touches files.
   deinitEspNowSync();
 
+  // Recompute per-node stale status now the window has closed and lastSeen
+  // reflects this cycle, before any status.nodes[] JSON is built for upload.
+  updateStaleNodeStatus(millis());
+
   // --- LTE upload phase ---
   // Entirely conditional on txSettings.enabled — a complete no-op when
   // disabled, with no serial spam.  Upload failure never blocks the sync

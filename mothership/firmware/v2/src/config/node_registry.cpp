@@ -13,6 +13,16 @@ std::vector<NodeInfo> registeredNodes;
 // Defined here so the config layer is self-contained.
 static const char* kDeviceId = "001";
 
+// Mothership-side stale inference thresholds (ported from the dead-code
+// reference in comms/espnow_manager.cpp:61-65; only the detection-relevant
+// two are needed here — no assist-retry in this pass).
+static const uint8_t  STALE_MISS_THRESHOLD = 3;
+static const uint32_t STALE_MIN_AGE_MS = 24UL * 60UL * 60UL * 1000UL;
+
+static bool isReasonableWakeInterval(uint8_t mins) {
+  return mins >= 1 && mins <= 60;
+}
+
 // -----------------------------------------------------------------------------
 // Helpers
 // -----------------------------------------------------------------------------
@@ -180,6 +190,31 @@ NodeDesiredConfig getDesiredConfig(const char* nodeId) {
   cfg.sensorMask      = prefs.getUShort((key + "m").c_str(), 0);  // 0 = auto
   prefs.end();
   return cfg;
+}
+
+void updateStaleNodeStatus(uint32_t nowMs) {
+  for (auto& n : registeredNodes) {
+    if (!(n.state == PAIRED || n.state == DEPLOYED)) continue;
+
+    NodeDesiredConfig desired = getDesiredConfig(n.nodeId.c_str());
+    uint16_t cadenceMin = 0;
+    if (n.state == DEPLOYED && desired.syncIntervalMin > 0) {
+      cadenceMin = desired.syncIntervalMin;
+    } else if (desired.wakeIntervalMin > 0) {
+      cadenceMin = desired.wakeIntervalMin;
+    } else if (n.wakeIntervalMin > 0) {
+      cadenceMin = n.wakeIntervalMin;
+    } else if (n.inferredWakeIntervalMin > 0) {
+      cadenceMin = n.inferredWakeIntervalMin;
+    }
+    if (!isReasonableWakeInterval((uint8_t)cadenceMin)) continue;
+
+    const uint32_t periodMs = (uint32_t)cadenceMin * 60000UL;
+    const uint32_t ageMs = (nowMs >= n.lastSeen) ? (nowMs - n.lastSeen) : 0;
+    const uint32_t missed = ageMs / periodMs;
+    n.staleMissCount = (uint8_t)((missed > 255UL) ? 255UL : missed);
+    n.syncStale = (missed >= (uint32_t)STALE_MISS_THRESHOLD) || (ageMs >= STALE_MIN_AGE_MS);
+  }
 }
 
 void setNodeExpectedSensorMask(const char* nodeId, uint16_t capabilityBits) {
@@ -361,6 +396,7 @@ void registerNode(const uint8_t* mac,
   n.syncStale = false;
   n.staleMissCount = 0;
   n.lastStaleAssistMs = 0;
+  n.lastRescueMode = false;
   n.userId = getNodeUserId(n.nodeId);
   n.name   = getNodeName(n.nodeId);
 
@@ -698,6 +734,7 @@ void loadPairedNodes() {
     newNode.syncStale            = false;
     newNode.staleMissCount       = 0;
     newNode.lastStaleAssistMs    = 0;
+    newNode.lastRescueMode       = false;
     // userId and name are populated after prefs.end() below.
 
     validatedNodes.push_back(newNode);
@@ -805,6 +842,8 @@ String buildNodesStatusJson(uint32_t nowUnix) {
     out += ",\"lastSeenUnix\":";            out += String(lastSeenUnix);
     out += ",\"wakeIntervalMin\":";         out += String((unsigned)n.wakeIntervalMin);
     out += ",\"inferredWakeIntervalMin\":"; out += String((unsigned)n.inferredWakeIntervalMin);
+    out += ",\"syncStale\":";       out += n.syncStale ? "true" : "false";
+    out += ",\"staleMissCount\":";  out += String((unsigned)n.staleMissCount);
     out += ",\"lastReportedBatV\":";
     if (isnan(n.lastReportedBatV)) { out += "null"; }
     else { dtostrf(n.lastReportedBatV, 1, 2, nb); out += nb; }
@@ -851,6 +890,7 @@ String buildNodesStatusJson(uint32_t nowUnix) {
     out += ",\"deployPending\":";       out += n.deployPending ? "true" : "false";
     out += ",\"stateChangePending\":";  out += n.stateChangePending ? "true" : "false";
     out += ",\"pendingTargetState\":\""; out += pendingTargetToStr(n.pendingTargetState); out += "\"";
+    out += ",\"rescueMode\":"; out += n.lastRescueMode ? "true" : "false";
     out += ",\"latitude\":";
     if (isnan(n.latitude)) { out += "null"; }
     else { dtostrf(n.latitude, 1, 5, nb); out += nb; }
