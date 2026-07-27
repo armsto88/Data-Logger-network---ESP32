@@ -1,0 +1,4 @@
+Stevenson Shield (mini) by commonslabgr on Thingiverse: https://www.thingiverse.com/thing:4915068
+
+Summary:
+This is a remix of the https://www.thingiverse.com/thing:3486326 Stevenson shield.We needed a small shield that can stand abuse and fit inside it a small case with a BME280 sensor for our Troglometer project.We needed a way to have easy assembly and ease of removing the sensor to be replaced so we we did a small slit at the base to accommodate this featureCan be fitted on a surface with screws but also has a slit to secure a cable tie.It has been printed successfully with PLA economy. The editing is done using Blender 3D

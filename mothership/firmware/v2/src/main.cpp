@@ -844,6 +844,36 @@ static void maybeRunCloudOta(ModemDriver& modem, uint32_t sessionStartMs) {
   }
 }
 
+// Is this HTTP status a client error that retrying cannot fix?
+//
+// Any 4xx means the request itself is wrong — a bad payload, or a credential
+// the backend will never accept — so re-sending it unchanged only burns
+// cellular data and battery on a deployed hub. Two 4xx codes are exceptions
+// and ARE worth retrying: 408 (the server timed out waiting for the request)
+// and 429 (rate limited, retry after backoff).
+//
+// This previously tested only 400/401, which missed the code the backend
+// actually returns for an invalid, revoked, or MAC-mismatched connection key:
+// 403. A hub whose key had been revoked therefore fell into the retryable
+// branch and retried indefinitely under cooldown instead of stopping.
+static bool isNonRetryableHttpStatus(int status) {
+  if (status < 400 || status >= 500) return false;  // 2xx/3xx/5xx/transport(-1)
+  if (status == 408 || status == 429) return false; // transient by definition
+  return true;
+}
+
+// Short operator-facing reason for a non-retryable status, for the serial log.
+static const char* nonRetryableHttpReason(int status) {
+  switch (status) {
+    case 400: return "bad payload";
+    case 401: return "unauthorised — check the connection key";
+    case 403: return "forbidden — key revoked, or MAC does not match the registered FieldHub";
+    case 404: return "endpoint not found — check the cloud URL";
+    case 413: return "payload too large";
+    default:  return "client error";
+  }
+}
+
 void performModemUpload(const TransmissionSettings& txSettings, uint32_t sessionStartMs) {
   Serial.println("[UPLOAD] === Starting modem upload sequence ===");
 
@@ -1035,10 +1065,10 @@ void performModemUpload(const TransmissionSettings& txSettings, uint32_t session
           anyJsonSuccess = true;
           firstChunk = false;
           continue;
-        } else if (result.httpStatus == 400 || result.httpStatus == 401) {
+        } else if (isNonRetryableHttpStatus(result.httpStatus)) {
           Serial.printf("[UPLOAD] CSV fallback non-retryable HTTP %d (%s) — stopping\n",
                         result.httpStatus,
-                        result.httpStatus == 401 ? "credentials" : "bad payload");
+                        nonRetryableHttpReason(result.httpStatus));
           break;  // not transient — do not increment retry counter
         } else {
           Serial.printf("[UPLOAD] CSV fallback retryable HTTP %d, %s\n",
@@ -1085,12 +1115,12 @@ void performModemUpload(const TransmissionSettings& txSettings, uint32_t session
             ingestBackendResponse(result.responseBody);
         controlReportDirty = controlReportDirty || ingest.commandCount > 0;
         // Continue loop for next chunk if more rows remain.
-      } else if (result.httpStatus == 400 || result.httpStatus == 401) {
+      } else if (isNonRetryableHttpStatus(result.httpStatus)) {
         // Not transient: bad payload or bad credentials.  Do NOT advance the
         // cursor and do NOT increment the retry counter — retrying won't help.
         Serial.printf("[UPLOAD] JSON non-retryable HTTP %d (%s) — not advancing cursor, not retrying\n",
                       result.httpStatus,
-                      result.httpStatus == 401 ? "auth/credential issue" : "bad payload");
+                      nonRetryableHttpReason(result.httpStatus));
         break;
       } else {
         // 429, 5xx, or transport error (-1): retry with backoff next window.
@@ -1125,10 +1155,10 @@ void performModemUpload(const TransmissionSettings& txSettings, uint32_t session
           const BackendIngestResult ingest =
               ingestBackendResponse(result.responseBody);
           controlReportDirty = controlReportDirty || ingest.commandCount > 0;
-        } else if (result.httpStatus == 400 || result.httpStatus == 401) {
+        } else if (isNonRetryableHttpStatus(result.httpStatus)) {
           Serial.printf("[UPLOAD] Status heartbeat non-retryable HTTP %d (%s)\n",
                         result.httpStatus,
-                        result.httpStatus == 401 ? "auth/credential issue" : "bad payload");
+                        nonRetryableHttpReason(result.httpStatus));
         } else {
           Serial.printf("[UPLOAD] Status heartbeat retryable HTTP %d, %s\n",
                         result.httpStatus, result.errorDetail.c_str());

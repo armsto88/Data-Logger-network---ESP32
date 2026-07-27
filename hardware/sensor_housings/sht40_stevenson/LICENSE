@@ -1,0 +1,65 @@
+Creative Commons Attribution 4.0 International (CC BY 4.0)
+==========================================================
+
+The SHT4x Stevenson radiation shield in this directory is a derivative work.
+It is distributed under the Creative Commons Attribution 4.0 International
+licence, inherited from the upstream works it is derived from.
+
+Full licence text: https://creativecommons.org/licenses/by/4.0/legalcode
+Human-readable summary: https://creativecommons.org/licenses/by/4.0/
+
+You are free to share and adapt this material for any purpose, including
+commercially, provided you give appropriate credit, provide a link to the
+licence, and indicate if changes were made.
+
+
+Attribution chain
+-----------------
+
+This work builds on two prior published models. Both must be credited when
+this design is redistributed or adapted.
+
+1. "Stevenson Screen" by Thingiverse user raingel
+   https://www.thingiverse.com/thing:3486326
+   Licence: CC BY 4.0
+
+2. "Stevenson Shield (mini)" by Thingiverse user commonslabgr
+   https://www.thingiverse.com/thing:4915068
+   Licence: Creative Commons - Attribution (per LICENSE.txt supplied in the
+   downloaded package, reproduced verbatim in upstream/LICENSE.txt)
+   A remix of (1), reduced in size and reworked for field robustness and
+   sensor serviceability.
+
+3. This work — SHT4x Stevenson radiation shield (FieldMesh)
+   Modified from (2). Changes are listed below.
+   Licence: CC BY 4.0
+
+
+Changes made in this work
+-------------------------
+
+Starting from the `stevenson_cap.stl` mesh of (2), applied by script
+(`modify_thingiverse_stevenson_sht40.py`, run under Blender):
+
+- Added a top collar to the original cap to receive a separate PG7 clamp
+  flange.
+- Bored the collar to clear the SHT4x probe body and the already-tightened
+  under-flange gland nut envelope.
+- Added a printed PG7 retainer flange as a new separate part
+  (`sht40_pg7_retainer_flange.stl`) — a plain clamp plate, not a hex nut trap.
+- Added a right-angle bracket adapter as a new separate part
+  (`sht40_right_angle_bracket_adapter.stl`) for horizontal mounting.
+- Added unified mount feet matching the FieldMesh shared sensor deck
+  (64 mm two-hole M3 interface).
+
+The original `stevenson_base.stl` of (2) is not used in the normal two-piece
+build; it is retained in `upstream/` for reference only.
+
+
+Provenance of the upstream files
+--------------------------------
+
+The unmodified source meshes and the licence and readme text supplied by the
+upstream author are reproduced in `upstream/`, so this design can be
+regenerated from source without a manual download. Redistribution of those
+files is permitted by CC BY, subject to the attribution above.

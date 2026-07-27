@@ -4,18 +4,23 @@ Code-driven STL modifier for the Thingiverse mini Stevenson shield.
 
 Run from Blender, not regular Python:
 
-    blender --background --python hardware/sensor_housings/sht40_stevenson/modify_thingiverse_stevenson_sht40.py -- ^
-      --source-dir "C:\\Users\\thoma\\Downloads\\Stevenson Shield (mini) - 4915068\\files"
+    blender --background --python hardware/sensor_housings/sht40_stevenson/modify_thingiverse_stevenson_sht40.py -- --export-stl
 
-The script starts from the actual downloaded STL meshes and applies parametric
-boolean edits. It previews by default; pass --export-stl only when you are ready
-to write modified STL files. This keeps the Thingiverse mesh as the starting
-point while making the changes repeatable and LLM-editable.
+The source meshes ship in `upstream/` next to this script, so no manual
+download is required; --source-dir only needs passing to point at a different
+copy. The script starts from the actual upstream STL meshes and applies
+parametric boolean edits. It previews by default; pass --export-stl only when
+you are ready to write modified STL files. This keeps the upstream mesh as the
+starting point while making the changes repeatable and LLM-editable.
+
+Licence: CC BY 4.0. See the LICENSE file in this directory for the full
+attribution chain and the list of changes made.
 
 Attribution:
-  Adapted from "Stevenson Shield (mini)" by Thingiverse user commonslabgr:
-  https://www.thingiverse.com/thing:4915068
-  License supplied in downloaded package: Creative Commons - Attribution
+  Adapted from "Stevenson Shield (mini)" by Thingiverse user commonslabgr
+  (https://www.thingiverse.com/thing:4915068), itself a remix of "Stevenson
+  Screen" by Thingiverse user raingel
+  (https://www.thingiverse.com/thing:3486326, CC BY 4.0).
 """
 
 from __future__ import annotations
@@ -32,8 +37,10 @@ import bpy
 # Parameters an LLM/user should edit first
 # =============================================================================
 
-# Source Thingiverse files.
-DEFAULT_SOURCE_DIR = Path(r"C:\Users\thoma\Downloads\Stevenson Shield (mini) - 4915068\files")
+# Source upstream meshes, vendored next to this script so the build is
+# reproducible without a manual Thingiverse download (permitted by CC BY —
+# see LICENSE in this directory).
+DEFAULT_SOURCE_DIR = Path(__file__).resolve().parent / "upstream"
 SOURCE_CAP = "stevenson_cap.stl"
 SOURCE_BASE = "stevenson_base.stl"  # legacy/reference only; normal two-piece build does not use it
 
@@ -696,10 +703,23 @@ def modify_base(base_path: Path) -> bpy.types.Object:
 
 def write_attribution(output_dir: Path) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
-    (output_dir / "ATTRIBUTION_thingiverse_4915068.txt").write_text(
-        "Modified from Stevenson Shield (mini) by Thingiverse user commonslabgr:\n"
-        "https://www.thingiverse.com/thing:4915068\n"
-        "License supplied in downloaded package: Creative Commons - Attribution\n",
+    (output_dir / "ATTRIBUTION.txt").write_text(
+        "FieldMesh SHT4x Stevenson radiation shield\n"
+        "Licence: CC BY 4.0 — https://creativecommons.org/licenses/by/4.0/\n"
+        "\n"
+        "This is a modified version of prior published work. Attribution chain:\n"
+        "\n"
+        '  1. "Stevenson Screen" by Thingiverse user raingel\n'
+        "     https://www.thingiverse.com/thing:3486326  (CC BY 4.0)\n"
+        '  2. "Stevenson Shield (mini)" by Thingiverse user commonslabgr\n'
+        "     https://www.thingiverse.com/thing:4915068  (Creative Commons - Attribution)\n"
+        "     A remix of (1).\n"
+        "  3. This work — modified from (2).\n"
+        "\n"
+        "Changes were made: a top collar and probe bore for an SHT4x probe and\n"
+        "PG7 gland, a separate PG7 clamp flange, a right-angle bracket adapter,\n"
+        "and mount feet for the FieldMesh shared sensor deck. See the LICENSE\n"
+        "file in the source directory for the full list.\n",
         encoding="utf-8",
     )
 

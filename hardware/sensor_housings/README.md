@@ -3,6 +3,29 @@
 This folder contains the current standalone sensor-housing builds. Edit the
 Python source files first, then regenerate the STL outputs.
 
+## Toolchain
+
+Geometry is script-generated, so a regenerated part is only reproducible
+against a known generator version. These builds were produced with:
+
+- **FreeCAD 1.0** (`freecadcmd`) — AS7341 PAR housing, node box sensor deck
+- **Blender 5.1** — SHT40 Stevenson shield (mesh-derived)
+
+The commands below assume `freecadcmd` and `blender` are on `PATH`. On Windows
+they are typically at `C:\Program Files\FreeCAD 1.0\bin\freecadcmd.exe` and
+`C:\Program Files\Blender Foundation\Blender 5.1\blender.exe`; invoke those
+paths directly with `&` if they are not on `PATH`.
+
+## Licensing
+
+- **AS7341 PAR housing** and **node box sensor deck** are original work.
+- **SHT40 Stevenson shield** is a derivative work under **CC BY 4.0**, built on
+  published models by Thingiverse users commonslabgr and raingel. Its upstream
+  source meshes, the upstream licence text, the full attribution chain, and the
+  list of changes made are in `sht40_stevenson/upstream/` and
+  `sht40_stevenson/LICENSE`. That attribution must travel with the part
+  whenever it is redistributed or adapted.
+
 ## AS7341 PAR spectral housing
 
 Source:
@@ -61,8 +84,15 @@ Generated STL outputs:
 - `sht40_stevenson/stl/sht40_pg7_retainer_flange.stl`
 - `sht40_stevenson/stl/sht40_right_angle_bracket_adapter.stl`
 
-The body starts from the downloaded Thingiverse mini Stevenson shield STL and
-is modified in Blender so the mesh-derived design remains repeatable.
+Upstream source meshes (vendored, so no manual download is needed):
+
+- `sht40_stevenson/upstream/stevenson_cap.stl` — the mesh the shield body is built from
+- `sht40_stevenson/upstream/stevenson_base.stl` — reference only; not used in the normal two-piece build
+- `sht40_stevenson/upstream/LICENSE.txt`, `README.txt` — upstream author's text, reproduced verbatim
+
+The body starts from the upstream mini Stevenson shield STL and is modified in
+Blender so the mesh-derived design remains repeatable. See
+`sht40_stevenson/LICENSE` for the attribution chain and the list of changes.
 
 Current measured probe/gland assumptions:
 
@@ -84,19 +114,23 @@ nut.
 Preview in Blender without writing STL files:
 
 ```powershell
-& "C:\Program Files\Blender Foundation\Blender 5.1\blender.exe" --python hardware\sensor_housings\sht40_stevenson\modify_thingiverse_stevenson_sht40.py -- --source-dir "C:\Users\thoma\Downloads\Stevenson Shield (mini) - 4915068\files"
+blender --python hardware\sensor_housings\sht40_stevenson\modify_thingiverse_stevenson_sht40.py
 ```
 
 Regenerate STL outputs only after the Blender preview looks right:
 
 ```powershell
-& "C:\Program Files\Blender Foundation\Blender 5.1\blender.exe" --background --python hardware\sensor_housings\sht40_stevenson\modify_thingiverse_stevenson_sht40.py -- --source-dir "C:\Users\thoma\Downloads\Stevenson Shield (mini) - 4915068\files" --export-stl
+blender --background --python hardware\sensor_housings\sht40_stevenson\modify_thingiverse_stevenson_sht40.py -- --export-stl
 ```
+
+Both commands read the vendored meshes in `sht40_stevenson/upstream/` by
+default; pass `-- --source-dir <path>` only to point at a different copy.
+Exporting also writes `ATTRIBUTION.txt` alongside the STLs — keep it with them.
 
 Open the generated STLs in a FreeCAD document:
 
 ```powershell
-& "C:\Program Files\FreeCAD 1.0\bin\freecadcmd.exe" hardware\sensor_housings\sht40_stevenson\SHT40_STEVENSON_BLENDER_STL_VIEWER.py
+freecadcmd hardware\sensor_housings\sht40_stevenson\SHT40_STEVENSON_BLENDER_STL_VIEWER.py
 ```
 
 ## Node box sensor deck

@@ -1791,8 +1791,19 @@ function toggleInfoPanel(){
   const showing=panel.style.display==='block';
   panel.style.display = showing ? 'none' : 'block';
 }
+// Silently tell the hub what the browser's local UTC offset is, so
+// getRTCTimeString()/formatDateTimeDisplay() render local time. Display-only:
+// the RTC itself is never touched here (that's the separate /set-time flow).
+// Fires on every load so a DST change corrects itself on the next visit.
+function syncLocalDisplayOffset(){
+  const offsetMin = -(new Date().getTimezoneOffset());
+  const b = 'offset=' + encodeURIComponent(offsetMin) + '&ajax=1';
+  fetch('/set-utc-offset', {method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'}, body:b})
+    .catch(function(){});
+}
 window.addEventListener('DOMContentLoaded', () => {
   setCurrentTime();
+  syncLocalDisplayOffset();
   wireAsyncForms();
   FM.start();   // begin adaptive /api/live polling (drives KPIs, nodes, discovery, connection)
 });
@@ -2334,7 +2345,9 @@ static void handleRoot() {
   }
 
   // --- Mothership time bar ---
-  html += F("<div class='top-time'><span class='top-time__label'>Mothership time (UTC)</span><span id='rtc-now' class='top-time__value'>");
+  // Rendered value already has the display-only UTC offset applied (see
+  // getRTCTimeString()) — the RTC/scheduling underneath stays UTC.
+  html += F("<div class='top-time'><span class='top-time__label'>Mothership time (local)</span><span id='rtc-now' class='top-time__value'>");
   html += currentTime;
   html += F("</span></div>");
 
@@ -2342,7 +2355,7 @@ static void handleRoot() {
   html += F("<details style='margin:4px 0 12px 0'>"
             "<summary style='font-size:14px;color:var(--sub);cursor:pointer;padding:4px 8px'>Set time</summary>"
             "<div style='margin-top:8px;padding:12px;border:1px solid var(--border);border-radius:8px;background:var(--panel)'>"
-            "<p class='muted' style='margin:0 0 8px 0'>Only needed for initial setup or clock correction. Stored time is UTC.</p>"
+            "<p class='muted' style='margin:0 0 8px 0'>Only needed for initial setup or clock correction. Time above is shown in your browser's local time zone; it is stored internally as UTC.</p>"
             "<form action='/set-time' method='POST'>"
             "<label class='label' for='datetime'><strong>Set new time</strong></label>"
             "<input class='input' id='datetime' name='datetime' type='text' "
