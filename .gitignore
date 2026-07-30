@@ -53,3 +53,8 @@ desktop.ini
 *.swp
 *.swo
 *~
+
+# Raw per-run serial logs from scripts/node_test_harness.sh. Throwaway bench
+# artifacts (one per board, per run) — curated findings belong in the
+# NODE_V*_BRINGUP_RESULTS.md files instead.
+node/firmware/tests/results/

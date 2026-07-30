@@ -2555,8 +2555,13 @@ void setup() {
   loadNodeConfig();
   bootCount++;
 
+  // Banner doubles as the production-firmware marker that
+  // scripts/node_test_harness.sh greps for to confirm a node came up on the
+  // real image rather than the self-test one. Keep "FieldMesh Node" stable.
   Serial.println("====================================");
-  Serial.print("🌡️ Air Temperature Node: "); Serial.println(NODE_ID);
+  Serial.printf("FieldMesh Node: %s\n", NODE_ID);
+  Serial.printf("Firmware: v%s build %s (protocol %u)\n",
+                FW_SEMVER, FW_BUILD, static_cast<unsigned>(NODE_PROTOCOL_VERSION));
   Serial.print("Boot #"); Serial.println(bootCount);
   Serial.print("MAC: "); Serial.println(WiFi.macAddress());
   debugState("after setup load");
