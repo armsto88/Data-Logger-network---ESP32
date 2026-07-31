@@ -262,6 +262,9 @@ bool formatDecodedSnapshotCSVRow(const DecodedSnapshot& decoded, String& outRow)
   n += appendSensor(row, sizeof(row), n, decoded, SENSOR_ID_SPECTRAL_GAIN);  n += snprintf(row + n, sizeof(row) - n, ",");
   n += appendSensor(row, sizeof(row), n, decoded, SENSOR_ID_SPECTRAL_ATIME); n += snprintf(row + n, sizeof(row) - n, ",");
   n += appendSensor(row, sizeof(row), n, decoded, SENSOR_ID_SPECTRAL_SAT);
+  // Deployment epoch (column 31, appended so every existing index is stable).
+  // Integer, not a sensor value: 0 means legacy/unresolved.
+  n += snprintf(row + n, sizeof(row) - n, ",%u", (unsigned)decoded.deploymentEpoch);
 
   if (n <= 0 || n >= static_cast<int>(sizeof(row))) return false;
   outRow = String(row);
@@ -291,7 +294,7 @@ bool logDecodedSnapshot(const DecodedSnapshot& decoded) {
 // Columns: datetime, nodeId, seqNum, sensorPresent, qualityFlags, configVersion,
 //          batVoltage, airTemp, airHumidity, spectral[8], windSpeed, windDir,
 //          soil1Vwc, soil1Temp, soil2Vwc, soil2Temp, aux1, aux2
-static const char* kCSVHeader = kCurrentCSVHeader30;
+static const char* kCSVHeader = kCurrentCSVHeader31;
 
 static bool gFlashReady = false;
 static bool gFlashMountFailed = false;
@@ -349,11 +352,19 @@ bool initFlash() {
     firstLine.trim();
     f.close();
 
-    if (firstLine == String(kLegacyCSVHeader25)) {
+    // EVERY legacy header must be recognised here. An unrecognised header sets
+    // gFlashReady = false and stops all logging, so omitting the 30-column case
+    // when the current header became 31 columns would brick logging on every
+    // hub that upgrades.
+    const bool isLegacy25 = (firstLine == String(kLegacyCSVHeader25));
+    const bool isLegacy30 = (firstLine == String(kLegacyCSVHeader30));
+    if (isLegacy25 || isLegacy30) {
       if (hasDataRows) {
-        Serial.println("[FLASH] Legacy 25-column CSV has queued rows; preserving until upload drain");
+        Serial.printf("[FLASH] Legacy %d-column CSV has queued rows; preserving until upload drain\n",
+                      isLegacy25 ? 25 : 30);
       } else {
-        Serial.println("[FLASH] Empty legacy CSV; upgrading header to 30 columns");
+        Serial.printf("[FLASH] Empty legacy %d-column CSV; upgrading header to %u columns\n",
+                      isLegacy25 ? 25 : 30, (unsigned)kCurrentCSVColumnCount);
         if (!flashCreateCSVHeader()) {
           gFlashReady = false;
           return false;
@@ -380,6 +391,19 @@ bool flashCreateCSVHeader() {
   f.close();
   Serial.println("[FLASH] CSV header created");
   return true;
+}
+
+bool flashCsvSchemaIsCurrent() {
+  // Read the on-disk header rather than trusting a cached flag: purgeUploaded()
+  // upgrades the header mid-session once the queue drains, and the answer must
+  // follow that within the same session.
+  if (!LittleFS.exists(kFlashFile)) return true;  // will be created current
+  File f = LittleFS.open(kFlashFile, "r");
+  if (!f) return false;                            // unknown — assume not current
+  String header = f.readStringUntil('\n');
+  f.close();
+  header.trim();
+  return header == String(kCSVHeader);
 }
 
 bool logSnapshotRow(const node_snapshot_t* snap) {
@@ -427,7 +451,9 @@ bool logSnapshotRow(const node_snapshot_t* snap) {
   n += appendFloat(row, sizeof(row), n, snap->aux1);         n += snprintf(row + n, sizeof(row) - n, ",");
   n += appendFloat(row, sizeof(row), n, snap->aux2);
   // Extended AS7341 columns — absent in the V1 snapshot struct, emit nan.
-  n += snprintf(row + n, sizeof(row) - n, ",nan,nan,nan,nan,nan");
+  // Trailing 0 is deploymentEpoch: this path has no registry lookup, so the
+  // epoch is unresolved and the backend falls back.
+  n += snprintf(row + n, sizeof(row) - n, ",nan,nan,nan,nan,nan,0");
 
   if (n <= 0) return false;
   return flashLogCSVRow(String(row));

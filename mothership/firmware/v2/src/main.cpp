@@ -25,6 +25,8 @@
 #include "storage/sd_logger.h"
 #include "storage/flash_logger.h"
 #include "config/node_registry.h"
+#include "config/deployment_store.h"
+#include "config/deployment_epoch.h"
 #include "comms/espnow_config.h"
 #include "config/config_server.h"
 #include "config/transmission_settings.h"
@@ -161,7 +163,96 @@ static bool markControlConverged(const char* nodeId,
   return nodeChanged || intervalChanged;
 }
 
+// Drain deploymentEventAcks[] / deploymentEventConflicts[] from an upload
+// response.
+//
+// The two lists are handled DIFFERENTLY:
+//   acked     -> the backend committed it; remove from the outbox.
+//   conflicted-> it did NOT commit; keep it queued and record the reason for the
+//                operator. The common case is a number still held by another
+//                node's active deployment, which clears itself once that node's
+//                End event lands — dropping the event would permanently lose the
+//                deployment record for a condition that resolves on its own.
+//   neither   -> never reached us; stays queued and is resent. Safe because the
+//                eventId is deterministic and the backend upserts on
+//                (project, node, epoch).
+//
+// Deliberately a hand-rolled scan rather than a JSON parse: the response can be
+// several KB and this runs on the modem path where heap is tight, matching how
+// the rest of this file reads responses.
+static void ingestDeploymentEventAcks(const String& body) {
+  if (body.length() == 0 || deploymentOutboxCount() == 0) return;
+
+  bool dirty = false;
+
+  // --- Acks: bare quoted ids ---------------------------------------------
+  const int ackAt = body.indexOf("\"deploymentEventAcks\"");
+  if (ackAt >= 0) {
+    const int arrStart = body.indexOf('[', ackAt);
+    const int arrEnd   = arrStart >= 0 ? body.indexOf(']', arrStart) : -1;
+    int scan = arrStart;
+    while (arrStart >= 0 && arrEnd > arrStart && scan < arrEnd) {
+      const int q1 = body.indexOf('"', scan);
+      if (q1 < 0 || q1 > arrEnd) break;
+      const int q2 = body.indexOf('"', q1 + 1);
+      if (q2 < 0 || q2 > arrEnd) break;
+      const String token = body.substring(q1 + 1, q2);
+      scan = q2 + 1;
+      if (token.length() && deploymentOutboxRemove(token.c_str())) {
+        Serial.printf("[DEPLOY] Event %s acked — cleared from outbox\n", token.c_str());
+        dirty = true;
+      }
+    }
+  }
+
+  // --- Conflicts: {"eventId":"...","reason":"..."} objects ----------------
+  const int confAt = body.indexOf("\"deploymentEventConflicts\"");
+  if (confAt >= 0) {
+    const int arrStart = body.indexOf('[', confAt);
+    const int arrEnd   = arrStart >= 0 ? body.indexOf(']', arrStart) : -1;
+    int scan = arrStart;
+    while (arrStart >= 0 && arrEnd > arrStart && scan < arrEnd) {
+      const int idKey = body.indexOf("\"eventId\"", scan);
+      if (idKey < 0 || idKey > arrEnd) break;
+      const int idq1 = body.indexOf('"', body.indexOf(':', idKey) + 1);
+      if (idq1 < 0 || idq1 > arrEnd) break;
+      const int idq2 = body.indexOf('"', idq1 + 1);
+      if (idq2 < 0 || idq2 > arrEnd) break;
+      const String eventId = body.substring(idq1 + 1, idq2);
+
+      String reason;
+      const int rKey = body.indexOf("\"reason\"", idq2);
+      if (rKey > 0 && rKey < arrEnd) {
+        const int rq1 = body.indexOf('"', body.indexOf(':', rKey) + 1);
+        int rq2 = rq1 + 1;
+        while (rq2 > 0 && rq2 < arrEnd) {          // honour \" inside the reason
+          rq2 = body.indexOf('"', rq2);
+          if (rq2 < 0) break;
+          if (body[rq2 - 1] != '\\') break;
+          rq2++;
+        }
+        if (rq1 > 0 && rq2 > rq1) reason = body.substring(rq1 + 1, rq2);
+      }
+      scan = idq2 + 1;
+
+      if (eventId.length() &&
+          deploymentOutboxNoteConflict(eventId.c_str(), reason.c_str())) {
+        Serial.printf("[DEPLOY] Event %s CONFLICT (still queued): %s\n",
+                      eventId.c_str(), reason.c_str());
+        dirty = true;
+      }
+    }
+  }
+
+  if (dirty && !deploymentStoreCommit()) {
+    // The commit failed, so the events are still on flash and will be resent.
+    // Harmless: the backend upserts, so a duplicate send is a no-op.
+    Serial.println("[DEPLOY] Outbox ack commit failed — events will be resent");
+  }
+}
+
 static BackendIngestResult ingestBackendResponse(const String& responseBody) {
+  ingestDeploymentEventAcks(responseBody);
   const uint32_t rtcBefore = getRTCTime();
   const bool rtcTrusted = rtcBefore >= 1704067200UL;
   Serial.printf("[CONTROL] HTTP response body bytes=%u\n",
@@ -268,9 +359,16 @@ void processSnapshot(const DecodedSnapshot& decoded, const uint8_t* mac) {
                 (unsigned)decoded.sensorPresent, (unsigned)decoded.protocolVersion,
                 batV ? *batV : 0.0f, airT ? *airT : 0.0f, airH ? *airH : 0.0f);
 
+  // Stamp the deployment the sample was actually taken under, BEFORE it reaches
+  // the CSV buffer — so a reading recorded before a redeploy but uploaded after
+  // it keeps the old deployment. `decoded` is a const reference, so stamp a copy
+  // rather than casting away const.
+  DecodedSnapshot stamped = decoded;
+  stamped.deploymentEpoch = resolveEpochForSample(stamped.nodeId, stamped.nodeTimestamp);
+
   bool persisted = false;
   if (flashIsReady()) {
-    persisted = logDecodedSnapshot(decoded);
+    persisted = logDecodedSnapshot(stamped);
     if (!persisted) {
       Serial.println("[SNAP] Flash logging failed");
     }
@@ -946,6 +1044,10 @@ void performModemUpload(const TransmissionSettings& txSettings, uint32_t session
 
     bool anyJsonSuccess = false;
     bool firstChunk = true;
+    // Set when the backend rejects the status/deploymentEvents object but
+    // accepts the readings. Keeps a status-side fault from ever costing a
+    // reading or moving the CSV cursor.
+    bool statusRejected = false;
     bool controlReportDirty = false;
     uint32_t nowUnix = getRTCTime();
 
@@ -1016,7 +1118,12 @@ void performModemUpload(const TransmissionSettings& txSettings, uint32_t session
       diagJson,
       fPaused,
       firmwareStatusJson,
-      controlStatusJson
+      controlStatusJson,
+      // Only claim epoch support once the on-disk CSV schema is current — i.e.
+      // no unstamped legacy rows are still queued.
+      (uint8_t)(flashCsvSchemaIsCurrent() ? 1 : 0),
+      deploymentOutboxToJson(),
+      deploymentEpochClampCount()
     };
 
     while (uploadQueue.getPendingRows() > 0 && !sessionExpired()) {
@@ -1107,6 +1214,7 @@ void performModemUpload(const TransmissionSettings& txSettings, uint32_t session
                                   json.rowCount);
         uploadQueue.purgeUploaded();
         uploadQueue.resetRetryCount();
+        uploadQueue.clearNonRetryableFailures();
         anyJsonSuccess = true;
         firstChunk = false;
         // Commit readings first: control parsing never invalidates a successful
@@ -1118,9 +1226,111 @@ void performModemUpload(const TransmissionSettings& txSettings, uint32_t session
       } else if (isNonRetryableHttpStatus(result.httpStatus)) {
         // Not transient: bad payload or bad credentials.  Do NOT advance the
         // cursor and do NOT increment the retry counter — retrying won't help.
-        Serial.printf("[UPLOAD] JSON non-retryable HTTP %d (%s) — not advancing cursor, not retrying\n",
-                      result.httpStatus,
-                      nonRetryableHttpReason(result.httpStatus));
+        //
+        // But "never advance" is only right when the whole payload is bad
+        // (revoked key, wrong URL). When ONE row is unparseable — most often a
+        // node with a flat coin cell reporting a year-2000 datetime — refusing
+        // to advance wedges the queue permanently: every later session rebuilds
+        // the same chunk and takes the same rejection, nothing ever drains,
+        // deploymentTrackingVersion never turns on, and emergencyPurgeIfFull()
+        // eventually discards the oldest half of the buffer anyway. That loses
+        // MORE data than skipping, later and silently.
+        //
+        // Isolate the ACTUAL cause before discarding anything. A 4xx can come
+        // from the status object, a deployment event, the endpoint, the schema,
+        // or one bad reading — and this chunk can hold up to 100 good readings.
+        Serial.printf("[UPLOAD] JSON non-retryable HTTP %d (%s) at offset %u, %u rows\n",
+                      result.httpStatus, nonRetryableHttpReason(result.httpStatus),
+                      (unsigned)payload.startOffset, (unsigned)json.rowCount);
+
+        // 401/403 are whole-payload credential failures. No row caused them and
+        // no row can fix them: stop, discard nothing.
+        if (result.httpStatus == 401 || result.httpStatus == 403) {
+          Serial.println("[UPLOAD] Credential failure — cursor untouched, nothing discarded");
+          break;
+        }
+
+        // Step A: if this POST carried the status object, re-send the SAME rows
+        // without it. If that succeeds the fault was in status/deploymentEvents,
+        // which must never cost a reading.
+        if (firstChunk) {
+          JsonPayload rowsOnly = buildJsonUpload(payload.csvData, kMaxReadingsPerPost,
+                                                 FW_SEMVER, nullptr, getRTCTime());
+          if (rowsOnly.ok && rowsOnly.rowCount > 0) {
+            HttpsPostResult retry = modem.httpsPost(url, rowsOnly.body,
+                                                    "application/json", authHeader);
+            if (retry.httpStatus == 200) {
+              Serial.println("[UPLOAD] Rows accepted without status — status/deploymentEvents "
+                             "rejected; suppressing status for this session");
+              statusRejected = true;
+              firstChunk = false;   // never re-attach the offending status object
+              nowUnix = getRTCTime();
+              uploadQueue.advanceCursor(payload.startOffset + rowsOnly.csvBytesConsumed,
+                                        nowUnix, rowsOnly.rowCount);
+              uploadQueue.purgeUploaded();
+              uploadQueue.resetRetryCount();
+              uploadQueue.clearNonRetryableFailures();
+              anyJsonSuccess = true;
+              ingestBackendResponse(retry.responseBody);
+              continue;   // the reading cursor moved only for rows that SUCCEEDED
+            }
+          }
+        }
+
+        // Step B: isolate a single row. If one row alone is accepted, the poison
+        // is further along and we make progress without discarding anything; if
+        // one row alone is rejected, that row — and only that row — is the
+        // problem.
+        JsonPayload single = buildJsonUpload(payload.csvData, 1, FW_SEMVER,
+                                             nullptr, getRTCTime());
+        if (!single.ok || single.rowCount != 1 || single.csvBytesConsumed == 0) {
+          Serial.println("[UPLOAD] Could not isolate a single row — cursor untouched");
+          break;
+        }
+        HttpsPostResult one = modem.httpsPost(url, single.body,
+                                              "application/json", authHeader);
+        if (one.httpStatus == 200) {
+          Serial.println("[UPLOAD] Single row accepted — advancing past it, poison is later");
+          nowUnix = getRTCTime();
+          uploadQueue.advanceCursor(payload.startOffset + single.csvBytesConsumed,
+                                    nowUnix, 1);
+          uploadQueue.purgeUploaded();
+          uploadQueue.resetRetryCount();
+          uploadQueue.clearNonRetryableFailures();
+          anyJsonSuccess = true;
+          firstChunk = false;
+          ingestBackendResponse(one.responseBody);
+          continue;
+        }
+        if (!isNonRetryableHttpStatus(one.httpStatus)) {
+          // The isolation attempt hit a transient error; treat the whole thing
+          // as retryable rather than blaming the row.
+          Serial.printf("[UPLOAD] Isolation attempt returned transient HTTP %d — retrying later\n",
+                        one.httpStatus);
+          uploadQueue.incrementRetryCount(retryNowUnix, retryCooldownSec);
+          break;
+        }
+
+        // This one row is genuinely unacceptable to the backend.
+        //
+        // We do NOT discard it. An earlier revision dropped the row after three
+        // sessions to keep the queue moving, on the assumption that a reading
+        // dated before 2020 could never be accepted. The backend now QUARANTINES
+        // those instead of rejecting them (flagging IMPLAUSIBLE_TIME), so the
+        // realistic cause of a permanently-rejected row is gone — and dropping
+        // readings locally to work around a server-side rule we no longer have
+        // would be destroying data to hide a bug.
+        //
+        // A row that still fails alone therefore means a genuine contract defect,
+        // which must stay visible rather than be quietly deleted. The count is
+        // kept so the condition is diagnosable.
+        const uint8_t stuckCount =
+            uploadQueue.noteNonRetryableFailure(payload.startOffset);
+        Serial.printf("[UPLOAD] Row at offset %u rejected on its own (HTTP %d), attempt %u — "
+                      "NOT discarded; queue is blocked until this is fixed\n",
+                      (unsigned)payload.startOffset, one.httpStatus,
+                      (unsigned)stuckCount);
+        Serial.printf("[UPLOAD] Blocked row: %.200s\n", single.body.c_str());
         break;
       } else {
         // 429, 5xx, or transport error (-1): retry with backoff next window.
@@ -1212,6 +1422,20 @@ void performModemUpload(const TransmissionSettings& txSettings, uint32_t session
 
     if (anyJsonSuccess) {
       uploadQueue.resetRetryCount();
+    }
+
+    // Suppressing the status object to save the readings also suppressed
+    // status.deploymentEvents[], so nothing in the durable outbox was offered
+    // this session and no ack or conflict came back for it. The events are
+    // still on flash and go out next session — but that is a silent wait, and
+    // an operator who has just ended a deployment sees neither a confirmation
+    // nor a conflict reason. Say so explicitly rather than leaving the
+    // condition undiagnosable.
+    if (statusRejected) {
+      Serial.printf("[DEPLOY] Status object was rejected this session — %u deployment "
+                    "event(s) NOT offered to the backend; they stay queued and retry "
+                    "next session\n",
+                    (unsigned)deploymentOutboxCount());
     }
 
     // Cloud OTA: if a DEPLOY_RELEASE was staged (this wake or a prior one that
@@ -1392,6 +1616,9 @@ void handleSyncWake() {
   // are available for the JSON upload payload.
   loadPairedNodes();
   configInitRecordingIntervalControl();
+  // Deployment epochs must be live BEFORE the sync window opens, or snapshots
+  // received this cycle would be stamped 0.
+  deploymentBootstrap();
 
   // Init ESP-NOW in sync-only mode
   if (!initEspNowSyncOnly(ESPNOW_CHANNEL)) {
@@ -1722,6 +1949,7 @@ void handleConfigWake() {
   Serial.flush();
   loadPairedNodes();
   configInitRecordingIntervalControl();
+  deploymentBootstrap();
   Serial.println("[CFG-DBG] Step 3 done: loadPairedNodes OK");
   Serial.flush();
 

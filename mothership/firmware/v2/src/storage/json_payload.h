@@ -57,6 +57,19 @@ struct StatusContext {
   // --- Firmware & control (additive; "" = omit the object) ---
   String   firmwareJson;        // status.firmware{} — mothership identity + OTA state
   String   controlJson;         // status.control{}  — dispatcher revision + results
+  // --- Deployment epochs ---
+  // status.deploymentTrackingVersion: 1 once readings are reliably epoch-stamped
+  // (i.e. /datalog.csv carries the current header). 0 = omit the key entirely,
+  // which is how the backend tells "firmware predates epochs" from "firmware
+  // supports epochs but omitted one".
+  uint8_t  deploymentTrackingVersion;
+  // status.deploymentEvents[] — durable outbox, pre-built "[...]" array. Each
+  // entry is a complete deployment upsert, resent until the backend acks it by
+  // eventId. status.nodes[] is current state and cannot carry this history.
+  String   deploymentEventsJson;
+  // status.epochClampCount — readings whose timestamp fell outside every
+  // retained deployment boundary and were attributed approximately.
+  uint32_t epochClampCount;
 };
 
 // ---------------------------------------------------------------------------

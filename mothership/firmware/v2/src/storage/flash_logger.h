@@ -33,6 +33,11 @@ struct DecodedSnapshot {
     // For V2 snapshots this is synthesised from the readings so existing
     // CSV columns (sensorPresent) stay populated.
     uint16_t sensorPresent;
+    // Which deployment this sample was taken under. Stamped by the FieldHub at
+    // receive time from the deployment store (resolveEpochForSample), NOT sent
+    // by the node. 0 = unknown / never deployed; the backend then falls back to
+    // the node's active deployment, reproducing pre-epoch behaviour.
+    uint16_t deploymentEpoch;
     DecodedReading readings[MAX_READINGS_PER_SNAPSHOT];
     size_t   readingCount;
 
@@ -67,12 +72,19 @@ bool initFlash();
 bool logSnapshotRow(const node_snapshot_t* snap);
 bool logSnapshotBatch(const node_snapshot_t* snapshots, int count);
 bool logDecodedSnapshot(const DecodedSnapshot& decoded);
-// Format the canonical 30-column row without touching LittleFS. Used by the
+// Format the canonical 31-column row without touching LittleFS. Used by the
 // logger and the focused V2 spectral-pipeline regression test.
 bool formatDecodedSnapshotCSVRow(const DecodedSnapshot& decoded, String& outRow);
 bool flashLogCSVRow(const String& row);
 String flashGetCSVStats();
 bool flashCreateCSVHeader();
+
+// True once /datalog.csv carries the current (epoch-bearing) header — i.e.
+// every remaining queued row is stamped. Gates deploymentTrackingVersion so the
+// hub never claims epoch support while unstamped legacy rows are still in
+// flight. Reads the on-disk header, so call it once per upload session rather
+// than per row.
+bool flashCsvSchemaIsCurrent();
 bool flashIsReady();
 bool flashMountFailed();
 bool flashFormatExplicit();

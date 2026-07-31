@@ -19,7 +19,8 @@
 //   25 spectral_clear 26 spectral_nir 27 spectral_gain
 //   28 spectral_integration_ms 29 spectral_saturated
 
-static constexpr int kNumCsvColumns = 30;
+//   30 deploymentEpoch
+static constexpr int kNumCsvColumns = 31;
 static constexpr uint16_t kMaxReadingsPerPost = 100;  // backend hard limit
 
 enum CellType {
@@ -68,6 +69,10 @@ static const ColumnMapping kColumnMappings[kNumCsvColumns] = {
   {27, "spectral_gain",           CELL_NUM_NULLABLE},
   {28, "spectral_integration_ms", CELL_NUM_NULLABLE},
   {29, "spectral_saturated",      CELL_NUM_NULLABLE},
+  // Appended by the 30 -> 31 schema bump. A legacy 30-field row simply stops
+  // before this mapping (see the `m.index >= n` break in appendReadingObject),
+  // so the key is absent and the backend falls back — no migration needed.
+  {30, "deploymentEpoch",         CELL_INT},
 };
 
 // ---------------------------------------------------------------------------
@@ -431,6 +436,23 @@ JsonPayload buildJsonUpload(const String& csvChunk,
     // This is what populates the backend "nodes" table.
     body += ",\"nodes\":";
     body += status->nodesJson.length() ? status->nodesJson : String("[]");
+
+    // --- Deployment epochs -------------------------------------------------
+    // Omitted entirely while unstamped legacy rows remain, so the backend can
+    // distinguish "firmware predates epochs" from "supports epochs but omitted
+    // one". Never emit 0.
+    if (status->deploymentTrackingVersion > 0) {
+      body += ",\"deploymentTrackingVersion\":";
+      body += String((unsigned)status->deploymentTrackingVersion);
+    }
+    body += ",\"epochClampCount\":"; body += String(status->epochClampCount);
+    // Durable outbox — resent every session until acked by eventId. Separate
+    // from status.nodes[] because that array is current state and cannot record
+    // a deployment that has already been replaced.
+    if (status->deploymentEventsJson.length()) {
+      body += ",\"deploymentEvents\":";
+      body += status->deploymentEventsJson;
+    }
 
     body += ",\"fleet\":{\"total\":"; body += String((unsigned)status->fleetTotal);
     body += ",\"deployed\":"; body += String((unsigned)status->fleetDeployed);

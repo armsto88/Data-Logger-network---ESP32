@@ -6,9 +6,43 @@ static const char* kDataFile    = "/datalog.csv";
 static const char* kTempFile    = "/datalog_tmp.csv";
 static const char* kBackupFile  = "/datalog_bak.csv";
 
+// Any header older than the current one. Both must be recognised: a hub can be
+// carrying a 25- or a 30-column file depending on which firmware it upgraded
+// from, and either way the queued rows must be preserved and drained, not
+// deleted or misparsed.
 static bool isLegacyCSVHeader(String header) {
   header.trim();
-  return header == String(kLegacyCSVHeader25);
+  return header == String(kLegacyCSVHeader25) ||
+         header == String(kLegacyCSVHeader30);
+}
+
+bool uploadQueueHasLegacyRows(uint32_t* pendingRowsOut) {
+  if (pendingRowsOut) *pendingRowsOut = 0;
+  if (!LittleFS.exists(kDataFile)) return false;
+
+  File f = LittleFS.open(kDataFile, "r");
+  if (!f) return false;
+
+  String header = f.readStringUntil('\n');
+  header.trim();
+  if (!isLegacyCSVHeader(header)) {
+    f.close();
+    return false;   // current schema: every queued row is stamped
+  }
+
+  // Legacy header. Only report a block if rows actually remain — an empty
+  // legacy file is upgraded in place by initFlash()/purgeUploaded() and must
+  // not lock the operator out.
+  uint32_t rows = 0;
+  while (f.available()) {
+    String line = f.readStringUntil('\n');
+    line.trim();
+    if (line.length() > 0) rows++;
+  }
+  f.close();
+
+  if (pendingRowsOut) *pendingRowsOut = rows;
+  return rows > 0;
 }
 
 static bool commitTempDataFile(const char* context) {
@@ -36,7 +70,7 @@ static bool commitTempDataFile(const char* context) {
 // Construction / init
 // ---------------------------------------------------------------------------
 UploadQueue::UploadQueue()
-    : m_initialised(false) {
+    : m_initialised(false), m_poisonOffset(0), m_poisonCount(0) {
   m_cursor.byteOffset    = 0;
   m_cursor.rowsUploaded   = 0;
   m_cursor.lastUploadUnix = 0;
@@ -80,8 +114,55 @@ void UploadQueue::loadCursor() {
   m_cursor.wakeCounter    = prefs.getUInt("wake_counter", 0);
   // NVS keys are limited to 15 characters; keep this key deliberately short.
   m_cursor.nextAttemptUnix = prefs.getUInt("next_attempt", 0);
+  // Poison-row tracking. The hub cold-boots between wakes, so an in-RAM counter
+  // could never reach the threshold — it has to be durable.
+  m_poisonOffset = prefs.getUInt("poison_off", 0);
+  m_poisonCount  = prefs.getUChar("poison_n", 0);
   // Clean up stale key from older firmware (NVS keys max 15 chars).
   prefs.remove("last_upload_unix");
+  prefs.end();
+}
+
+// ---------------------------------------------------------------------------
+// Poison-row handling
+// ---------------------------------------------------------------------------
+// A single unparseable row (most often a node with a flat coin cell reporting
+// a year-2000 datetime, which the backend rejects) permanently wedges the
+// queue: the non-retryable branch deliberately does not advance the cursor, so
+// every later session rebuilds the same chunk and takes the same rejection.
+// Nothing drains, deploymentTrackingVersion never turns on, and
+// emergencyPurgeIfFull() eventually discards the oldest half of the buffer —
+// so the "safe" non-advancing path loses MORE data than skipping, just later
+// and silently.
+//
+// Counting consecutive rejections at the same offset converts that permanent
+// wedge into a bounded, visible loss.
+uint8_t UploadQueue::noteNonRetryableFailure(uint32_t offset) {
+  if (offset != m_poisonOffset) {
+    m_poisonOffset = offset;
+    m_poisonCount  = 0;
+  }
+  if (m_poisonCount < 255) m_poisonCount++;
+  savePoisonState();
+  return m_poisonCount;
+}
+
+void UploadQueue::clearNonRetryableFailures() {
+  if (m_poisonOffset == 0 && m_poisonCount == 0) return;
+  m_poisonOffset = 0;
+  m_poisonCount  = 0;
+  savePoisonState();
+}
+
+uint8_t UploadQueue::nonRetryableFailureCount(uint32_t offset) const {
+  return (offset == m_poisonOffset) ? m_poisonCount : 0;
+}
+
+void UploadQueue::savePoisonState() {
+  Preferences prefs;
+  if (!prefs.begin(kTxNamespace, false)) return;
+  prefs.putUInt("poison_off", m_poisonOffset);
+  prefs.putUChar("poison_n", m_poisonCount);
   prefs.end();
 }
 
@@ -443,7 +524,8 @@ bool UploadQueue::purgeUploaded() {
     header.trim();
     if (queueDrained && isLegacyCSVHeader(header)) {
       wf.println(kUploadCSVHeader);
-      Serial.println("[UQ] purgeUploaded: queue drained; upgraded CSV header 25 -> 30 columns");
+      Serial.printf("[UQ] purgeUploaded: queue drained; upgraded CSV header to %u columns\n",
+                    (unsigned)kCurrentCSVColumnCount);
     } else if (header.length() > 0) {
       wf.println(header);
     } else {
