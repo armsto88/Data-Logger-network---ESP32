@@ -4878,7 +4878,11 @@ static void performManualUpload(String& resultMsg, bool& ok) {
           else if (n.state == PAIRED) mPaired++;
           else mUnpaired++;
           if (n.stateChangePending || n.deployPending) mPending++;
-          if (n.state == DEPLOYED && n.recordingPaused) mPaused++;
+          // An ENDED deployment is not paused. End leaves the node DEPLOYED and
+          // converges it to STANDBY, so recordingPaused is true - counting that
+          // as "paused" reports an archived site as a live node awaiting resume.
+          if (n.state == DEPLOYED && n.recordingPaused &&
+              n.deploymentEndedUnix == 0) mPaused++;
         }
         extern uint32_t g_projectStartedUnix;  // defined in main.cpp
         extern String   g_resetReasonStr;      // defined in main.cpp

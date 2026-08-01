@@ -985,7 +985,11 @@ void performModemUpload(const TransmissionSettings& txSettings, uint32_t session
       else if (n.state == PAIRED) fPaired++;
       else fUnpaired++;
       if (n.stateChangePending || n.deployPending) fPending++;
-      if (n.state == DEPLOYED && n.recordingPaused) fPaused++;
+      // An ENDED deployment is not paused. End leaves the node DEPLOYED and
+          // converges it to STANDBY, so recordingPaused is true - counting that
+          // as "paused" reports an archived site as a live node awaiting resume.
+          if (n.state == DEPLOYED && n.recordingPaused &&
+              n.deploymentEndedUnix == 0) fPaused++;
     }
     const char* statusLastResult =
         (statusCursor.lastUploadUnix > 0 && statusCursor.retryCount == 0) ? "success"
@@ -1306,7 +1310,9 @@ void performModemUpload(const TransmissionSettings& txSettings, uint32_t session
       fPaused = 0;
       for (const auto& node : getRegisteredNodes()) {
         if (node.stateChangePending || node.deployPending) fPending++;
-        if (node.state == DEPLOYED && node.recordingPaused) fPaused++;
+        // Same exclusion as the initial count above: ended is not paused.
+        if (node.state == DEPLOYED && node.recordingPaused &&
+            node.deploymentEndedUnix == 0) fPaused++;
       }
       statusCtx.rtcUnix = getRTCTime();
       statusCtx.fleetPending = fPending;
