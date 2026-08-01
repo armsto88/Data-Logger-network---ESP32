@@ -56,6 +56,21 @@ struct NodeInfo {
   NodePendingState lastAppliedTargetState;
   uint32_t  deployedSinceUnix;    // unix timestamp when state became DEPLOYED (0 = not deployed)
   bool      recordingPaused;      // standby: deployed but recording paused (UI status)
+  // Deployment-epoch mirror. The authority is the deployment store
+  // (config/deployment_store.h, /deploy.bin); these are refreshed by
+  // deploymentSyncRegistryMirror() so the UI and status.nodes[] can read them
+  // without touching the store. NOT persisted by savePairedNodes() — the store
+  // owns persistence, which is why they cannot inherit the wakeIntervalMin bug.
+  //
+  // NOTE deploymentStartedUnix is NOT deployedSinceUnix. They agree for epoch 1,
+  // then diverge: deploySelectedNodes() only stamps deployedSinceUnix when the
+  // node is not already DEPLOYED, and a redeployed node stays DEPLOYED
+  // throughout, so deployedSinceUnix keeps the original first-deployment time.
+  // deploymentStartedUnix is the authoritative deployment-window start.
+  uint16_t  deploymentEpoch;       // 0 = never deployed
+  uint32_t  deploymentStartedUnix; // start of the CURRENT deployment
+  uint32_t  deploymentEndedUnix;   // 0 = active
+  uint8_t   deploymentPendingOp;   // DeployPendingOp — in-flight Start/End
   // Configured "expected" sensors + fault tracking (SNAP_PRESENT_* capability bits).
   uint16_t  expectedSensorMask;   // sensors the operator marked installed (no VALID bit)
   uint16_t  lastSensorPresent;    // sensorPresent from the most recent snapshot
@@ -142,6 +157,12 @@ bool setDesiredConfig(const char* nodeId, const NodeDesiredConfig& cfg);
 // -----------------------------------------------------------------------------
 // Node meta helpers (numeric ID + Name + Notes in NVS)
 // -----------------------------------------------------------------------------
+
+// Canonical form of an operator-assigned node number: digits only, truncated to
+// 3, left zero-padded ("1" -> "001"). Factored out of setNodeUserId so the
+// deployment number guard compares the same canonical form and "1" collides
+// with "001". Returns "" for input with no digits.
+String normalizeUserId(String userId);
 
 String getNodeUserId(const String& nodeId);
 void   setNodeUserId(const String& nodeId, String userId);

@@ -84,6 +84,22 @@ void runSuite() {
   gPass = gFail = 0;
   Serial.println("\n--- node config convergence assertion suite ---");
 
+  resetFixture(7, 3, true, 7, false);
+  registeredNodes[0].deploymentEndedUnix = 1753000000UL;
+  Command endedResume{};
+  strlcpy(endedResume.cmdId, "TEST-ENDED-RESUME-1", CMD_ID_LEN);
+  endedResume.type = CMD_SET_NODE_CONFIG;
+  endedResume.source = SRC_DASHBOARD;
+  endedResume.configFields = CFG_FIELD_TARGET_STATE;
+  strlcpy(endedResume.payload.nodeId, "ENV_D13F98", CMD_NODEID_LEN);
+  endedResume.payload.targetState = 2;
+  Command resolvedEnded{};
+  CmdOutcome endedRejection = OUT_ACCEPTED;
+  check("backend resume is rejected after deployment End",
+        !controlResolveBackendNodeConfig(endedResume, resolvedEnded,
+                                         endedRejection) &&
+        endedRejection == OUT_INVALID);
+
   resetFixture(7, 2, true, 0, true);
   bindDispatcherRevision(7, 2);
   check("first CONFIG_ACK/HELLO converges",

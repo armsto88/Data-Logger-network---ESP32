@@ -17,7 +17,15 @@
 // ---------------------------------------------------------------------------
 // CSV header (must match flash_logger.cpp)
 // ---------------------------------------------------------------------------
-static constexpr const char* kUploadCSVHeader = kCurrentCSVHeader30;
+static constexpr const char* kUploadCSVHeader = kCurrentCSVHeader31;
+
+// True while /datalog.csv still carries a pre-epoch header, i.e. queued rows
+// exist that have no deploymentEpoch column. Those rows would follow the
+// backend's fallback into whatever deployment is active at ingest, so any
+// operation that changes which deployment that is must be blocked until they
+// drain. pendingRowsOut (optional) receives an estimated row count for the
+// operator-facing message.
+bool uploadQueueHasLegacyRows(uint32_t* pendingRowsOut);
 
 // ---------------------------------------------------------------------------
 // Cursor — persisted in NVS
@@ -92,14 +100,29 @@ class UploadQueue {
   bool maxRetriesExceeded(uint8_t maxRetries) const;
   bool maxRetriesExceeded(uint8_t maxRetries, uint32_t nowUnix) const;
 
+  // --- Poison-row tracking --------------------------------------------------
+  // A non-retryable rejection does not advance the cursor, so one unparseable
+  // row wedges the queue forever and the emergency purge eventually eats the
+  // buffer from the oldest end. Counting consecutive rejections at the SAME
+  // offset lets the caller skip past the offending chunk after a bounded number
+  // of attempts, turning a silent permanent stall into a visible bounded loss.
+  // Durable, because the hub cold-boots between wakes.
+  uint8_t noteNonRetryableFailure(uint32_t offset);
+  void    clearNonRetryableFailures();
+  uint8_t nonRetryableFailureCount(uint32_t offset) const;
+
  private:
   // Persist m_cursor to NVS namespace "tx".
   void saveCursor();
   // Load m_cursor from NVS.
   void loadCursor();
+  // Persist the poison-row counters to NVS namespace "tx".
+  void savePoisonState();
   // Byte offset of the first data row (end of header line).
   uint32_t headerEndOffset() const;
 
   UploadCursor m_cursor;
   bool m_initialised;
+  uint32_t m_poisonOffset;   // cursor offset the failures are counted against
+  uint8_t  m_poisonCount;    // consecutive non-retryable rejections there
 };

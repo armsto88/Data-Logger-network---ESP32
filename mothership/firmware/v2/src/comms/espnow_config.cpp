@@ -1,5 +1,6 @@
 #include "comms/espnow_config.h"
 #include "config/node_registry.h"
+#include "config/deployment_epoch.h"
 #include "time/rtc_alarm.h"
 #include "storage/flash_logger.h"
 #include "system/pins.h"
@@ -135,9 +136,15 @@ static void processDecodedSnapshot(const DecodedSnapshot& decoded, const uint8_t
     }
   }
 
+  // Config-mode receive path — must stamp exactly like the sync-window path in
+  // main.cpp, or snapshots collected while the AP portal is open would upload
+  // unattributed. `decoded` is const; stamp a copy.
+  DecodedSnapshot stamped = decoded;
+  stamped.deploymentEpoch = resolveEpochForSample(stamped.nodeId, stamped.nodeTimestamp);
+
   bool persisted = false;
   if (flashIsReady()) {
-    persisted = logDecodedSnapshot(decoded);
+    persisted = logDecodedSnapshot(stamped);
     if (!persisted) {
       Serial.println("[SNAP] Flash logging failed");
     }

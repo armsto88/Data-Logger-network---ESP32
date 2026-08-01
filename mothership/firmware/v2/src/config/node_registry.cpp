@@ -99,7 +99,7 @@ String getNodeUserId(const String& nodeId) {
   return loadNodeMeta(nodeId, "id_");
 }
 
-void setNodeUserId(const String& nodeId, String userId) {
+String normalizeUserId(String userId) {
   String cleaned;
   userId.trim();
   for (size_t i = 0; i < userId.length(); ++i) {
@@ -112,7 +112,11 @@ void setNodeUserId(const String& nodeId, String userId) {
   if (cleaned.length() > 0 && cleaned.length() < 3) {
     while (cleaned.length() < 3) cleaned = "0" + cleaned;
   }
-  storeNodeMeta(nodeId, "id_", cleaned);
+  return cleaned;
+}
+
+void setNodeUserId(const String& nodeId, String userId) {
+  storeNodeMeta(nodeId, "id_", normalizeUserId(userId));
 }
 
 String getNodeName(const String& nodeId) {
@@ -393,6 +397,13 @@ void registerNode(const uint8_t* mac,
   n.lastStateAppliedMs   = 0;
   n.lastAppliedTargetState = PENDING_NONE;
   n.deployedSinceUnix    = (state == DEPLOYED) ? getRTCTime() : 0;
+  // Mirror fields only — the deployment store is the authority and
+  // deploymentSyncRegistryMirror() refills these. A newly discovered node has no
+  // deployment until Start commits one.
+  n.deploymentEpoch       = 0;
+  n.deploymentStartedUnix = 0;
+  n.deploymentEndedUnix   = 0;
+  n.deploymentPendingOp   = 0;
   n.syncStale = false;
   n.staleMissCount = 0;
   n.lastStaleAssistMs = 0;
@@ -854,7 +865,19 @@ String buildNodesStatusJson(uint32_t nowUnix) {
       NodeDesiredConfig dc = getDesiredConfig(n.nodeId.c_str());
       out += ",\"desiredConfigVersion\":";   out += String((unsigned)dc.configVersion);
       out += ",\"desiredTargetState\":";     out += String((unsigned)dc.targetState);
-      out += ",\"desiredWakeIntervalMin\":"; out += String((unsigned)dc.wakeIntervalMin);
+      // The backend validates this as 1-240 and 400s the WHOLE upload outside
+      // that range — which would also cost a session of deployment events via
+      // the status-suppression path. getDesiredConfig() defaults wakeIntervalMin
+      // to 0 for a node that has never had one written (common on a fresh
+      // fleet), so emit the EFFECTIVE interval and clamp it into range rather
+      // than reporting an unset 0.
+      {
+        unsigned effWake = dc.wakeIntervalMin;
+        if (effWake == 0) effWake = n.wakeIntervalMin;
+        if (effWake == 0) effWake = 1;
+        if (effWake > 240) effWake = 240;
+        out += ",\"desiredWakeIntervalMin\":"; out += String(effWake);
+      }
       out += ",\"desiredSensorMask\":";      out += String((unsigned)dc.sensorMask);
     }
     // Node firmware/OTA identity via FW_CAPS. null/false until the node reports.
@@ -898,6 +921,12 @@ String buildNodesStatusJson(uint32_t nowUnix) {
     if (isnan(n.longitude)) { out += "null"; }
     else { dtostrf(n.longitude, 1, 5, nb); out += nb; }
     out += ",\"deployedSinceUnix\":"; out += String(n.deployedSinceUnix);
+    // Deployment identity. deploymentEndedUnix ALONE distinguishes an ended
+    // deployment from a paused one — do not key on (state, recordingPaused),
+    // which reports recordingPaused:false between End and the node's ACK.
+    out += ",\"deploymentEpoch\":";        out += String((unsigned)n.deploymentEpoch);
+    out += ",\"deploymentStartedUnix\":";  out += String(n.deploymentStartedUnix);
+    out += ",\"deploymentEndedUnix\":";    out += String(n.deploymentEndedUnix);
     out += ",\"recordingPaused\":";   out += n.recordingPaused ? "true" : "false";
     // Configured-sensor state: which sensors the operator marked installed, what
     // reported this cycle, and which configured sensors are faulted (missing).

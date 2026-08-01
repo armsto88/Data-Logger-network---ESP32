@@ -11,6 +11,8 @@
 #include "comms/espnow_config.h"
 #include "time/rtc_alarm.h"
 #include "storage/flash_logger.h"
+#include "config/deployment_store.h"
+#include "config/deployment_epoch.h"
 #include "system/power.h"
 #include "system/pins.h"
 #include "system/hardware_identity.h"
@@ -230,6 +232,17 @@ volatile bool gShutdownRequested = false;
 // the next sync window. Reset to false at config-mode entry (handleConfigWake).
 static bool gDeployedThisSession = false;
 
+// Any operator change worth pushing before power-down, not just a deploy.
+//
+// handleShutdown() used to sync only when gDeployedThisSession was set, so End,
+// Remove, Pause and Resume all powered the hub down with their result sitting
+// unsent. That is worst for End: it queues a durable deployment event, and the
+// operator watches the archive succeed on the hub while the dashboard keeps
+// showing the site as live until the next scheduled sync — up to a full sync
+// interval later (six hours on the default schedule, and longer still when a
+// pending schedule handover pins the wake to the OLD slot).
+static bool gFieldChangeThisSession = false;
+
 // Upload queue instance for config-mode UI (separate from the sync-wake
 // global in main.cpp, which is only active during a sync wake).
 UploadQueue gUploadQueue;
@@ -333,6 +346,11 @@ static BackendCommandApplyResult executeBackendRecordingIntervalFromUi(
 }
 
 static void ingestBackendResponseFromUi(const String& responseBody) {
+  // Clear acknowledged deployment events, exactly as the scheduled-sync path
+  // does. Without this a UI-triggered upload delivers the events, the backend
+  // applies them, and the hub still believes they are outstanding — so it
+  // resends them every session and the outbox never drains.
+  deploymentIngestAckResponse(responseBody);
   const uint32_t rtcBefore = getRTCTimeUnix();
   Serial.printf("[CONTROL] manual HTTP response body bytes=%u\n",
                 static_cast<unsigned>(responseBody.length()));
@@ -396,6 +414,46 @@ static NodeConfigApplyResult applyLocalDesiredConfig(
                 static_cast<unsigned>(result.wireConfigVersion),
                 result.durable ? 1 : 0, result.registryApplied ? 1 : 0);
   return result;
+}
+
+// ---------------------------------------------------------------------------
+// Deployment-epoch wiring
+// ---------------------------------------------------------------------------
+
+// Bridge for deployment_epoch: queue a node's desired lifecycle state durably.
+// Reports success only when the change is durable AND applied to the registry
+// AND accepted (or a replay of an already-accepted command) — all three, so a
+// Start never commits an epoch behind a config change that did not stick.
+static bool deploymentApplyDesiredState(const String& nodeId, uint8_t targetState) {
+  NodeDesiredConfig dc = getDesiredConfig(nodeId.c_str());
+  if (dc.targetState == targetState && dc.configVersion != 0) {
+    // Already the desired state — nothing to queue, and re-submitting would
+    // bump configVersion for no reason.
+    return true;
+  }
+  dc.targetState = targetState;
+  const NodeConfigApplyResult applied = applyLocalDesiredConfig(nodeId, dc);
+  return applied.durable && applied.registryApplied &&
+         (applied.command.outcome == OUT_ACCEPTED ||
+          applied.command.outcome == OUT_REPLAY);
+}
+
+static uint32_t deploymentNowBridge() { return getRTCTimeUnix(); }
+
+void deploymentBootstrap() {
+  deploymentSetConfigApplyFn(deploymentApplyDesiredState);
+  deploymentSetLegacyBacklogFn(uploadQueueHasLegacyRows);
+  deploymentSetNowFn(deploymentNowBridge);
+
+  if (!deploymentStoreBegin()) {
+    Serial.println("[DEPLOY] Store unavailable — epochs will not be stamped this session");
+    return;
+  }
+  // Seed epoch 1 for anything deployed under pre-epoch firmware, then replay an
+  // interrupted Start/End, then publish to the registry mirror the UI reads.
+  deploymentSeedFromRegistry();
+  deploymentRecoverPending();
+  deploymentSyncRegistryMirror();
 }
 
 static bool setRTCTime(int year, int month, int day, int hour, int minute, int second) {
@@ -1059,6 +1117,12 @@ static String jsonEscapeLocal(const String& in) {
     else if (c == '\n') { out += "\\n"; }
     else if (c == '\r') { out += "\\r"; }
     else if (c == '\t') { out += "\\t"; }
+    // Any other control character is illegal bare inside a JSON string.
+    else if ((uint8_t)c < 0x20) {
+      char b[7];
+      snprintf(b, sizeof(b), "\\u%04X", (unsigned)(uint8_t)c);
+      out += b;
+    }
     else { out += c; }
   }
   return out;
@@ -1218,9 +1282,16 @@ a{color:var(--primary);text-decoration:none}
 .node-status-cell{display:flex;flex-direction:column;align-items:flex-start;gap:3px;min-width:86px}
 .item--node .chip{font-weight:600}
 .item--node .chip{white-space:nowrap}
-.node-select-wrap{display:grid;grid-template-columns:44px minmax(0,1fr);gap:8px;align-items:stretch}
-.node-select-control{display:flex;align-items:center;justify-content:center;border:2px solid #c9d0c3;
+/* Per-node checkboxes are opt-in, exactly like the action bar they feed. The
+   list is read one node at a time far more often than it is acted on in bulk,
+   and a permanent checkbox column costs 44px of width on a phone plus a
+   selection affordance on every row for a mode the operator is usually not in.
+   body.batch-mode is set by showBatchBar(). */
+.node-select-wrap{display:grid;grid-template-columns:minmax(0,1fr);gap:8px;align-items:stretch}
+.node-select-control{display:none;align-items:center;justify-content:center;border:2px solid #c9d0c3;
   border-radius:8px;background:#f7f8f4;cursor:pointer;min-height:86px}
+body.batch-mode .node-select-wrap{grid-template-columns:44px minmax(0,1fr)}
+body.batch-mode .node-select-control{display:flex}
 .node-select-control input{width:22px;height:22px;margin:0;accent-color:var(--primary)}
 .node-select-wrap.is-selected .node-select-control{border-color:var(--primary);background:rgba(122,155,112,.20)}
 .node-select-wrap.is-selected .item--node{border-color:var(--primary)}
@@ -1279,6 +1350,11 @@ a{color:var(--primary);text-decoration:none}
 .action-choice--start input:checked + span{background:rgba(122,155,112,.25)}
 .action-choice--stop input:checked + span{background:rgba(196,122,90,.25)}
 .action-choice--unpair input:checked + span{background:rgba(196,90,74,.20)}
+/* Two-line variant: action name plus ONE line of consequence. A modifier rather
+   than a change to .action-choice span, because the recording-interval picker
+   reuses the base class and must stay a single centred line. */
+.action-choice--why span{flex-direction:column;align-items:flex-start;justify-content:center;gap:3px;text-align:left}
+.action-choice--why em{font-style:normal;font-weight:400;font-size:12px;line-height:1.3;opacity:.8}
 .icon{width:1.2em;height:1.2em;display:inline-block;vertical-align:-0.12em;fill:currentColor}
 .quick-row{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px;margin:0 0 12px}
 .quick-row .btn{margin-top:0;min-height:52px}
@@ -1330,7 +1406,8 @@ a{color:var(--primary);text-decoration:none}
   .node-row{grid-template-columns:1fr;gap:8px}
   .node-timing,.node-status{grid-template-columns:1fr 1fr;gap:6px}
   .node-timing-cell,.node-status-cell{min-width:0}
-  .node-select-wrap{grid-template-columns:42px minmax(0,1fr);gap:6px}
+  .node-select-wrap{grid-template-columns:minmax(0,1fr);gap:6px}
+  body.batch-mode .node-select-wrap{grid-template-columns:42px minmax(0,1fr)}
   .batch-actions{top:66px}
   .batch-actions__buttons{grid-template-columns:1fr}
 
@@ -1538,10 +1615,19 @@ function flashBtn(btn, ok){
 }
 
 // --- Node cards: incremental, XSS-safe (textContent for device strings) ---
-function chipState(state, paused, pending, desiredTarget){
+function chipState(state, paused, pending, desiredTarget, ended, reportedPaused){
   if (pending && Number(desiredTarget)===0) return ['chip chip--state-unpaired','Remove queued'];
+  // Ended outranks paused, matching the server-rendered chips. End queues
+  // STANDBY and keeps the node DEPLOYED, so every test below would otherwise
+  // call an archived deployment "Paused".
+  if (ended) return ['chip chip--bat-low','Ended'];
   if (state==='DEPLOYED' && pending && Number(desiredTarget)===3) return ['chip chip--state-paused','Pause queued'];
-  if (state==='DEPLOYED' && pending && Number(desiredTarget)===2) return ['chip chip--state-deployed','Resume queued'];
+  // Only a node that is actually paused is resuming. A settings change leaves a
+  // pending desired config at targetState 2 as well, and calling that "Resume
+  // queued" reports a recovery from a pause that never happened.
+  if (state==='DEPLOYED' && pending && Number(desiredTarget)===2)
+    return reportedPaused ? ['chip chip--state-deployed','Resume queued']
+                          : ['chip chip--state-deployed','Update queued'];
   if (state==='DEPLOYED') return paused ? ['chip chip--state-paused','Paused']
                                         : ['chip chip--state-deployed','Active'];
   if (state==='PAIRED')   return ['chip chip--state-paired','Connected'];
@@ -1564,7 +1650,7 @@ function nodeCell(parentClass, labelText, fieldName){
 }
 function applyNodeFields(card, n){
   if (card && card.dataset){ card.dataset.state=n.state||''; card.dataset.paused=n.paused?'1':'0'; }
-  var st=chipState(n.state, n.paused, n.pending, n.desiredTarget), s=card.querySelector('[data-f="status"]');
+  var st=chipState(n.state, n.paused, n.pending, n.desiredTarget, n.deploymentEnded, n.reportedPaused), s=card.querySelector('[data-f="status"]');
   if (s){ s.className=st[0]; s.textContent=st[1]; }
   var bt=chipBatt(n.batV), b=card.querySelector('[data-f="batt"]');
   if (b){ b.className=bt[0]; b.textContent=bt[1]; }
@@ -1856,14 +1942,48 @@ static bool isAjaxRequest() {
 }
 
 static void sendAjaxResult(bool ok, const String& message) {
+  const String escaped = jsonEscapeLocal(message);
   String body;
-  body.reserve(message.length() + 40);
+  body.reserve(escaped.length() + 40);
   body += "{\"ok\":";
   body += ok ? "true" : "false";
   body += ",\"message\":\"";
-  body += message;
+  body += escaped;
   body += "\"}";
   server.send(ok ? 200 : 400, "application/json", body);
+}
+
+// Page frame helpers are defined further down; declared here so the deployment
+// error responder can render an HTML fallback for non-AJAX form posts.
+static String headCommon(const String& title, const String& actionsHtml, int navActive);
+static inline String footCommon();
+
+// Deployment-action failure. AJAX callers (the setup wizard) get a JSON body
+// with the machine-readable holder so step 1 can highlight the clashing number;
+// browser form posts get a plain page back to the node.
+static void sendDeploymentError(int httpCode, const String& message,
+                                const String& holder, const String& nodeId) {
+  if (isAjaxRequest()) {
+    String body = "{\"ok\":false,\"error\":\"";
+    body += jsonEscapeLocal(message);
+    body += "\"";
+    if (holder.length()) {
+      body += ",\"holder\":\"";
+      body += jsonEscapeLocal(holder);
+      body += "\"";
+    }
+    body += "}";
+    server.send(httpCode, "application/json", body);
+    return;
+  }
+  String actions = String("<a href='/station?id=") + nodeId +
+                   "' class='btn btn--sm'>Back</a>";
+  String html = headCommon("Node", actions, -1);
+  html += F("<div class='section center'><h3>Cannot complete this action</h3><p>");
+  html += htmlEscape(message);
+  html += F("</p><a href='/stations' class='btn btn--primary'>Back to Nodes</a></div>");
+  html += footCommon();
+  server.send(httpCode, "text/html", html);
 }
 
 static void sendCaptivePortalLanding() {
@@ -2199,6 +2319,15 @@ static String buildLiveJson() {
     j += ",\"paused\":";  j += mirroredPaused ? "true" : "false";
     j += ",\"pending\":"; j += (n.stateChangePending || n.deployPending) ? "true" : "false";
     j += ",\"desiredTarget\":"; j += String((unsigned)desiredTarget);
+    // Needed by chipState(): an ended deployment is state DEPLOYED with STANDBY
+    // queued, so without this the live refresh repaints an archived node as
+    // "Paused" the moment the poll lands, undoing the server-rendered chip.
+    j += ",\"deploymentEnded\":"; j += (n.deploymentEndedUnix != 0) ? "true" : "false";
+    // The node's OWN reported state, as distinct from "paused" above, which
+    // mirrors the DESIRED config. Only the reported flag can tell a genuine
+    // resume from an ordinary settings change that happens to leave
+    // targetState at 2.
+    j += ",\"reportedPaused\":"; j += n.recordingPaused ? "true" : "false";
     // Configured-sensor state for the deployment UI: which sensors are marked
     // installed, what reported last cycle, and which configured ones are faulted.
     j += ",\"expectedSensorMask\":"; j += String((unsigned)n.expectedSensorMask);
@@ -2929,29 +3058,30 @@ static void handleSetSyncTime() {
 
 static void handleRevertNode() {
   String nodeId = server.arg("node_id");
-  bool found   = false;
-  bool sentCmd = false;
+  bool found = false;
+  DeploymentOpResult endResult{};
 
   for (auto& node : registeredNodes) {
     if (node.nodeId == nodeId && node.state == DEPLOYED) {
-      node.state = PAIRED;
-      savePairedNodes();
       found = true;
-      sentCmd = pairNode(nodeId);
-      Serial.printf("[REVERT] %s -> PAIRED (cmd=%s)\n", nodeId.c_str(), sentCmd ? "OK" : "FAIL");
+      endResult = endDeployment(nodeId, node.deploymentEpoch);
+      Serial.printf("[REVERT] %s legacy stop -> End deployment (status=%u)\n",
+                    nodeId.c_str(), (unsigned)endResult.status);
       break;
     }
   }
 
   String html = headCommon("fieldMesh");
   html += F("<div class='section center'>");
-  if (found) {
-    html += F("<h3>Node stopped</h3><p>Node <strong>");
+  if (found && (endResult.status == DEPLOY_OK ||
+                endResult.status == DEPLOY_REPLAYED)) {
+    html += F("<h3>Deployment ended</h3><p>Node <strong>");
     html += nodeId;
-    html += F("</strong> is now connected but not active.</p>");
-    if (!sentCmd) {
-      html += F("<p class='muted'>Warning: could not send stop command to the node.</p>");
-    }
+    html += F("</strong> is archived and will stop recording at its next sync.</p>");
+  } else if (found) {
+    html += F("<h3>Nothing changed</h3><p>");
+    html += htmlEscape(endResult.message);
+    html += F("</p>");
   } else {
     html += F("<h3>Node not found or not active</h3><p>No action taken.</p>");
   }
@@ -3022,14 +3152,27 @@ static void handleStationsPage() {
     const bool nodePaused = (node.state == DEPLOYED) &&
         (desiredPending ? nodeDesired.targetState == 3 : node.recordingPaused);
     const bool removePending = desiredPending && nodeDesired.targetState == 0;
+    // Ended outranks paused. End queues STANDBY (targetState 3) and deliberately
+    // leaves the node DEPLOYED, so every paused test above matches an ended
+    // deployment too — which used to label an archived site "Paused" in the one
+    // view an operator scans before choosing a batch action. Pause and End have
+    // different consequences and must not share a word.
+    const bool nodeEnded = (node.deploymentEndedUnix != 0);
     const char* stCls = removePending ? "chip chip--state-unpaired"
+                       : nodeEnded ? "chip chip--bat-low"
                        : nodePaused ? "chip chip--state-paused"
                        : (node.state == DEPLOYED) ? "chip chip--state-deployed"
                        : (node.state == PAIRED)   ? "chip chip--state-paired"
                        : "chip chip--state-unpaired";
+    // "Resume queued" only when the node is actually paused; a settings change
+    // (e.g. a fleet-wide recording-interval update) also leaves a pending
+    // desired config with targetState 2 and must not read as a resume.
     const char* stTxt = removePending ? "Remove queued"
+                       : nodeEnded ? "Ended"
                        : (desiredPending && nodeDesired.targetState == 3) ? "Pause queued"
-                       : (desiredPending && nodeDesired.targetState == 2) ? "Resume queued"
+                       : (desiredPending && nodeDesired.targetState == 2 && node.recordingPaused)
+                           ? "Resume queued"
+                       : (desiredPending && nodeDesired.targetState == 2) ? "Update queued"
                        : nodePaused ? "Paused"
                        : (node.state == DEPLOYED) ? "Active"
                        : (node.state == PAIRED)   ? "Connected" : "New";
@@ -3104,6 +3247,10 @@ static void handleStationsPage() {
     var tog=document.getElementById('batch-toggle');
     if(bar)bar.hidden=!show;
     if(tog)tog.style.display=show?'none':'';
+    // Drives the per-node checkbox column too — they appear together and vanish
+    // together, so the list is never showing a selection affordance for a mode
+    // that is not active.
+    document.body.classList.toggle('batch-mode', !!show);
     if(!show){ boxes().forEach(function(b){b.checked=false;}); updateBatchSelection(); }
   };
   window.updateBatchSelection=function(changed){
@@ -3117,7 +3264,8 @@ static void handleStationsPage() {
     if(selected.length>0){
       var bar=document.getElementById('batch-node-actions');
       var tog=document.getElementById('batch-toggle');
-      if(bar&&bar.hidden){bar.hidden=false;if(tog)tog.style.display='none';}
+      if(bar&&bar.hidden){bar.hidden=false;if(tog)tog.style.display='none';
+        document.body.classList.add('batch-mode');}
     }
     all.forEach(function(b){var w=b.closest('.node-select-wrap');if(w)w.classList.toggle('is-selected',b.checked);});
     var count=document.getElementById('batch-count');
@@ -3184,6 +3332,18 @@ static bool selectedNodeAlreadyAdded(const std::vector<String>& selected,
   return false;
 }
 
+// Archive a node's deployment ahead of removal, reporting FAILURE so the caller
+// can abandon the removal. An unpair that proceeds after a failed archive would
+// clear the node's identity and drop it from the registry with no record of the
+// deployment ever written.
+static bool endDeploymentForUnpairFailed(const String& nodeId) {
+  const DeploymentOpResult r = endDeploymentForUnpair(nodeId);
+  if (r.status == DEPLOY_OK || r.status == DEPLOY_REPLAYED) return false;
+  Serial.printf("[DEPLOY] %s removal blocked: %s\n",
+                nodeId.c_str(), r.message.c_str());
+  return true;
+}
+
 static void handleBatchNodeAction() {
   static constexpr size_t kMaxBatchNodes = 8;
   const String action = server.arg("action");
@@ -3232,7 +3392,11 @@ static void handleBatchNodeAction() {
       tone = "chip chip--state-unpaired";
       outcome = F("Not registered - unchanged");
     } else if (action == "pause" || action == "resume") {
-      if (node->state != DEPLOYED) {
+      if (node->deploymentEndedUnix != 0) {
+        ++skipped;
+        tone = "chip chip--bat-low";
+        outcome = F("Deployment ended - start a new deployment first");
+      } else if (node->state != DEPLOYED) {
         ++skipped;
         tone = "chip chip--state-paired";
         outcome = F("Not deployed - unchanged");
@@ -3270,29 +3434,46 @@ static void handleBatchNodeAction() {
         }
       }
     } else if (node->state == DEPLOYED) {
-      NodeDesiredConfig desired = getDesiredConfig(nodeId.c_str());
-      if (desired.targetState == 0 && node->stateChangePending &&
-          node->pendingTargetState == PENDING_TO_UNPAIRED) {
-        ++unchanged;
-        tone = "chip chip--state-unpaired";
-        outcome = F("Removal already queued");
+      // Batch removal is an unpair: capture the ended deployment (with its
+      // identity) before anything clears node_meta, same as the single-node
+      // unpair path — and skip this node entirely if that capture fails, rather
+      // than removing a node whose deployment was never archived.
+      const DeploymentOpResult endRes = endDeploymentForUnpair(nodeId);
+      if (endRes.status != DEPLOY_OK && endRes.status != DEPLOY_REPLAYED) {
+        ++failed;
+        tone = "chip chip--bat-low";
+        outcome = F("Not removed - deployment could not be archived");
       } else {
-        desired.targetState = 0;
-        const NodeConfigApplyResult applied =
-            applyLocalDesiredConfig(nodeId, desired, false, true);
-        const bool ok = applied.durable && applied.registryApplied &&
-            (applied.command.outcome == OUT_ACCEPTED ||
-             applied.command.outcome == OUT_REPLAY);
-        if (ok) {
-          ++changed;
+        NodeDesiredConfig desired = getDesiredConfig(nodeId.c_str());
+        if (desired.targetState == 0 && node->stateChangePending &&
+            node->pendingTargetState == PENDING_TO_UNPAIRED) {
+          ++unchanged;
           tone = "chip chip--state-unpaired";
-          outcome = F("Removal queued - awaiting next-sync confirmation");
+          outcome = F("Removal already queued");
         } else {
-          ++failed;
-          tone = "chip chip--state-unpaired";
-          outcome = F("Could not queue removal");
+          desired.targetState = 0;
+          const NodeConfigApplyResult applied =
+              applyLocalDesiredConfig(nodeId, desired, false, true);
+          const bool ok = applied.durable && applied.registryApplied &&
+              (applied.command.outcome == OUT_ACCEPTED ||
+               applied.command.outcome == OUT_REPLAY);
+          if (ok) {
+            ++changed;
+            tone = "chip chip--state-unpaired";
+            outcome = F("Removal queued - awaiting next-sync confirmation");
+          } else {
+            ++failed;
+            tone = "chip chip--state-unpaired";
+            outcome = F("Could not queue removal");
+          }
         }
       }
+    } else if (endDeploymentForUnpairFailed(nodeId)) {
+      // Same guard for the awake-node path: never remove a node whose
+      // deployment record could not be archived.
+      ++failed;
+      tone = "chip chip--bat-low";
+      outcome = F("Not removed - deployment could not be archived");
     } else {
       // New/connected nodes are awake in config mode, so preserve the existing
       // immediate unpair path. A deployed node never uses this branch.
@@ -3333,6 +3514,9 @@ static void handleBatchNodeAction() {
 
   const char* actionLabel = action == "pause" ? "Pause"
       : action == "resume" ? "Resume" : "Remove";
+  // Batch pause/resume/remove are lifecycle changes too, so they must reach
+  // the dashboard before power-down like the single-node paths do.
+  if (changed > 0) gFieldChangeThisSession = true;
   Serial.printf("[BATCH] %s complete selected=%u changed=%u unchanged=%u skipped=%u failed=%u\n",
                 actionLabel, static_cast<unsigned>(selected.size()), changed,
                 unchanged, skipped, failed);
@@ -3414,15 +3598,30 @@ static void handleStationDetail() {
 
   // --- Status header ---
   html += F("<div class='muted' style='margin:0 0 10px 0'>");
-  if (target->state == DEPLOYED) {
-    if (displayedPaused) {
-      html += desiredPending
-          ? F("<span class='chip chip--state-paused'>Pause queued</span>")
-          : F("<span class='chip chip--state-paused'>Paused</span>");
+  if (target->state == DEPLOYED && target->deploymentEndedUnix != 0) {
+    // Ended before paused: End leaves the node DEPLOYED and queues STANDBY, so
+    // displayedPaused is true for an archived deployment and this header would
+    // otherwise contradict the "ended" chip directly beneath it.
+    html += F("<span class='chip chip--bat-low'>Ended</span>");
+  }
+  else if (target->state == DEPLOYED) {
+    // A queued LIFECYCLE change and a queued SETTINGS change both leave
+    // configVersion ahead of configVersionApplied, but only one of them is a
+    // resume. Calling a recording-interval change "Resume queued" tells the
+    // operator a node is coming back from a pause it was never in — which is
+    // exactly what a fleet-wide interval change used to produce on every node.
+    if (desiredPending && displayedDesired.targetState == 3) {
+      html += F("<span class='chip chip--state-paused'>Pause queued</span>");
+    } else if (desiredPending && displayedDesired.targetState == 0) {
+      html += F("<span class='chip chip--state-unpaired'>Removal queued</span>");
+    } else if (desiredPending && target->recordingPaused) {
+      html += F("<span class='chip chip--state-deployed'>Resume queued</span>");
+    } else if (desiredPending) {
+      html += F("<span class='chip chip--state-deployed'>Settings update queued</span>");
+    } else if (target->recordingPaused) {
+      html += F("<span class='chip chip--state-paused'>Paused</span>");
     } else {
-      html += desiredPending
-          ? F("<span class='chip chip--state-deployed'>Resume/change queued</span>")
-          : F("<span class='chip chip--state-deployed'>Active</span>");
+      html += F("<span class='chip chip--state-deployed'>Active</span>");
     }
   }
   else if (target->state == PAIRED) html += F("<span class='chip chip--state-paired'>Connected</span>");
@@ -3456,6 +3655,59 @@ static void handleStationDetail() {
   html += F("</div>");
 
   // Sensor configuration — opens the toggle-button picker, returns here on save.
+  // --- Deployment chip -----------------------------------------------------
+  // Data, not prose: one line stating which deployment this is. An ended node
+  // gets the explicit route to the wizard for the next one, because End leaves
+  // it DEPLOYED and the detail page therefore still renders.
+  const bool deploymentEnded = (target->deploymentEndedUnix != 0);
+  {
+    const uint32_t stamp = deploymentEnded ? target->deploymentEndedUnix
+                                           : target->deploymentStartedUnix;
+    String when;
+    if (stamp > 0) {
+      time_t t = (time_t)stamp;
+      struct tm* tmv = gmtime(&t);
+      static const char* kMon[] = {"Jan","Feb","Mar","Apr","May","Jun",
+                                   "Jul","Aug","Sep","Oct","Nov","Dec"};
+      char b[16];
+      snprintf(b, sizeof(b), "%d %s", tmv->tm_mday, kMon[tmv->tm_mon]);
+      when = b;
+    }
+    if (target->deploymentEpoch > 0) {
+      html += F("<div style='margin-bottom:10px'><span class='chip ");
+      html += deploymentEnded ? F("chip--bat-low") : F("chip--cfg-ok");
+      html += F("'>Deployment ");
+      html += String((unsigned)target->deploymentEpoch);
+      const String num = getNodeUserId(target->nodeId);
+      if (num.length()) { html += F(" &middot; "); html += htmlEscape(num); }
+      if (when.length()) {
+        html += deploymentEnded ? F(" &middot; ended ") : F(" &middot; since ");
+        html += when;
+      }
+      html += F("</span>");
+      if (target->deploymentPendingOp == 2 /* DEPLOY_OP_END_STANDBY */) {
+        html += F(" <span class='chip chip--bat-low'>still stopping recording</span>");
+      }
+      html += F("</div>");
+      // The dashboard rejected a queued deployment record. It stays queued and
+      // retries, and the usual cause (a number another node still holds) clears
+      // itself once that node's End reaches the backend — but the hub cannot see
+      // that, so the reason has to be shown here.
+      const String conflict = deploymentOutboxConflictSummary();
+      if (conflict.length()) {
+        html += F("<div style='margin-bottom:10px'><span class='chip chip--bat-low'>");
+        html += htmlEscape(conflict);
+        html += F("</span></div>");
+      }
+    }
+    if (deploymentEnded) {
+      html += F("<div style='margin-bottom:12px'><a href='/station-setup?id=");
+      html += target->nodeId;
+      html += F("' class='btn btn--primary' style='display:block;text-align:center;padding:12px'>"
+                "Start new deployment</a></div>");
+    }
+  }
+
   html += F("<div style='margin-bottom:12px'>"
             "<a href='/node-sensors?id=");
   html += target->nodeId;
@@ -3468,16 +3720,13 @@ static void handleStationDetail() {
   html += F("'>");
 
   // --- Location section (manual entry with phone GPS guidance) ---
+  //
+  // Fields first, help on demand. This was a paragraph plus a boxed four-step
+  // walkthrough permanently above two number inputs — read once, then in the
+  // way on every later visit. The steps are unchanged in substance, just folded
+  // into a <details> and compressed to one sentence.
   html += F("<div class='section'>"
             "<h3>Location</h3>"
-            "<p class='muted'>Find this node's coordinates using your phone's Maps app, then enter them below.</p>"
-            "<div style='margin:8px 0;padding:10px;border:1px solid var(--border);border-radius:8px;background:var(--panel)'>"
-            "<strong>How to get coordinates:</strong><br>"
-            "<span class='muted'>1. Open Google Maps or Apple Maps on your phone<br>"
-            "2. Tap the location dot to centre on your position<br>"
-            "3. Long-press the blue dot → coordinates appear at the top<br>"
-            "4. Copy the latitude and longitude values</span>"
-            "</div>"
             "<label class='label'>Latitude</label>"
             "<input class='input' type='text' id='lat' name='lat' placeholder='-27.469771' value='");
   if (!isnan(target->latitude)) {
@@ -3494,6 +3743,11 @@ static void handleStationDetail() {
     html += lonBuf;
   }
   html += F("'>"
+            "<details style='margin-top:8px'>"
+            "<summary class='muted' style='cursor:pointer;font-size:13px'>How do I find these?</summary>"
+            "<p class='muted' style='margin:6px 0 0'>In Google or Apple Maps, long-press your "
+            "location on the map. The latitude and longitude appear at the top &mdash; copy them here.</p>"
+            "</details>"
             "</div>");
 
   html += F("<div style='margin-bottom:10px;padding:10px;border:1px solid var(--border);border-radius:8px;background:#fafafa'>"
@@ -3545,29 +3799,68 @@ static void handleStationDetail() {
   }
   html += F("</div>");
 
-  html += F("<label class='label'>Node action (optional)</label>"
-            "<div class='muted' style='font-size:12px'>Leave these unselected when only saving the node details above.</div>"
+  // The page branches on ended vs active and never shows both states' controls,
+  // so the list grows by one when active and SHRINKS by one when ended rather
+  // than becoming a long menu.
+  html += F("<input type='hidden' name='expected_epoch' value='");
+  html += String((unsigned)target->deploymentEpoch);
+  html += F("'>");
+  // Every action carries ONE line naming its consequence, because the three are
+  // easy to confuse and the difference that matters is reversibility:
+  //   Pause  — reversible, same deployment
+  //   End    — terminal for this deployment, data kept and archived
+  //   Remove — terminal AND the hardware leaves the registry
+  // Without that line the operator is choosing between three similar-looking
+  // buttons whose outcomes differ permanently.
+  html += F("<label class='label'>Node action</label>"
             "<div class='action-choices'>");
-  if (!isDeployed) {
+  if (deploymentEnded) {
+    // Ended: pause/resume are meaningless, and Resume would restart sampling
+    // under a deployment that is already archived. Only removal remains; the
+    // route forward is the Start new deployment button above.
+  } else if (!isDeployed) {
     // New / Connected node — the in-hand deploy path.
-    html += F("<label class='action-choice action-choice--start'><input type='radio' name='action' value='start'><span>Deploy (start recording)</span></label>");
+    html += F("<label class='action-choice action-choice--start action-choice--why'>"
+              "<input type='radio' name='action' value='start'>"
+              "<span>Deploy<em>Starts recording and begins this node&rsquo;s first deployment.</em></span></label>");
   } else if (displayedPaused) {
     // Paused deployed node — resume remotely at the next sync.
-    html += F("<label class='action-choice action-choice--start'><input type='radio' name='action' value='resume'><span>Resume recording</span></label>");
+    html += F("<label class='action-choice action-choice--start action-choice--why'>"
+              "<input type='radio' name='action' value='resume'>"
+              "<span>Resume recording<em>Continues the same deployment and its data history.</em></span></label>");
   } else {
     // Active deployed node — pause (standby) remotely at the next sync.
-    html += F("<label class='action-choice action-choice--stop'><input type='radio' name='action' value='pause'><span>Pause recording</span></label>");
+    html += F("<label class='action-choice action-choice--stop action-choice--why'>"
+              "<input type='radio' name='action' value='pause'>"
+              "<span>Pause recording<em>Keeps this deployment. You can resume any time.</em></span></label>");
   }
-  html += F("<label class='action-choice action-choice--unpair'><input type='radio' name='action' value='unpair'><span>Remove node</span></label>"
+  if (isDeployed && !deploymentEnded && target->deploymentEpoch > 0) {
+    html += F("<label class='action-choice action-choice--stop action-choice--why'>"
+              "<input type='radio' name='action' value='end_deployment'>"
+              "<span>End deployment<em>Archives this site&rsquo;s data");
+    const String heldNum = getNodeUserId(target->nodeId);
+    if (heldNum.length()) {
+      html += F(" and frees number ");
+      html += htmlEscape(heldNum);
+    }
+    html += F(". Cannot be resumed.</em></span></label>");
+  }
+  html += F("<label class='action-choice action-choice--unpair action-choice--why'>"
+            "<input type='radio' name='action' value='unpair'>"
+            "<span>Remove node<em>Ends the deployment, then unpairs the hardware.</em></span></label>"
             "</div>");
   if (isDeployed) {
-    html += F("<div class='muted' style='font-size:12px;margin-top:6px'>Pause/Resume/Remove are delivered at the node&rsquo;s next sync check-in.</div>");
+    html += F("<div class='muted' style='font-size:12px;margin-top:6px'>Applied at the node&rsquo;s next check-in.</div>");
   }
   html += F("<button type='submit' class='btn btn--success' style='margin-top:12px'>"
             "Save Changes</button>"
             "</form>");
 
-  html += F("<script>function confirmRemove(){var r=document.querySelector('input[name=action]:checked');if(r&&r.value==='unpair'){return confirm('Remove this node? You will need to re-add it with the pair button.');}return true;}</script>");
+  html += F("<script>function confirmRemove(){var r=document.querySelector('input[name=action]:checked');"
+            "if(!r)return true;"
+            "if(r.value==='unpair'){return confirm('Remove this node? You will need to re-add it with the pair button.');}"
+            "if(r.value==='end_deployment'){return confirm('End this deployment? The node stops recording and its number is freed for another node.');}"
+            "return true;}</script>");
   html += F("</div>");
   html += footCommon();
   server.send(200, "text/html", html);
@@ -3588,14 +3881,51 @@ static void handleNodeConfigSave() {
   }
 
   const bool isCurrentlyDeployed = (target && target->state == DEPLOYED);
-  const bool allowIdentityEdit = (!isCurrentlyDeployed) || editIdentityConfirmed;
+
+  // A node that has never been deployed, or whose deployment has ended, has no
+  // identity to edit — only identity being PROPOSED. Stage it so an abandoned
+  // wizard cannot overwrite the archived identity of an ended deployment before
+  // its outbox event has been uploaded. beginNewDeployment() commits it.
+  const bool stageIdentity = target && deploymentIdentityIsStaged(nodeId);
+
+  // An ENDED node stays state==DEPLOYED (End queues STANDBY, never PAIRED), so
+  // the plain isCurrentlyDeployed test would refuse its identity edits and the
+  // wizard's step 1 would answer "Saved" having written nothing. Staged edits
+  // touch no archived record by construction, so they are always allowed.
+  const bool allowIdentityEdit =
+      (!isCurrentlyDeployed) || editIdentityConfirmed || stageIdentity;
+
+  // Identity is validated BEFORE anything is written. Previously setNodeUserId
+  // ran ahead of every lifecycle check, so a rejected number collision or an
+  // abandoned wizard still mutated node_meta.
+  if (allowIdentityEdit && server.hasArg("user_id") && target) {
+    const DeploymentGuardResult guard = checkNumberAvailable(userId, nodeId);
+    if (!guard.free) {
+      const String msg = "Number " + normalizeUserId(userId) + " is in use by " +
+                         guard.holderLabel + " - end that deployment first";
+      Serial.printf("[DEPLOY] %s number collision: %s\n", nodeId.c_str(), msg.c_str());
+      sendDeploymentError(409, msg, guard.holderLabel, nodeId);
+      return;
+    }
+  }
+
   if (allowIdentityEdit) {
-    if (server.hasArg("user_id")) setNodeUserId(nodeId, userId);
-    if (server.hasArg("name")) setNodeName(nodeId, name);
+    if (stageIdentity) {
+      const String* pNum  = server.hasArg("user_id") ? &userId : nullptr;
+      const String* pName = server.hasArg("name") ? &name : nullptr;
+      if (pNum || pName) deploymentStageIdentity(nodeId, pNum, pName, nullptr, nullptr);
+    } else {
+      if (server.hasArg("user_id")) setNodeUserId(nodeId, userId);
+      if (server.hasArg("name")) setNodeName(nodeId, name);
+    }
   }
   if (server.hasArg("notes")) setNodeNotes(nodeId, notes);
 
   // --- GPS coordinates (optional) ---
+  // Staged exactly like number and name for a node with no active deployment.
+  // Writing them straight to NodeInfo would let an abandoned or rejected wizard
+  // move the ARCHIVED deployment's recorded location, which is part of the
+  // record the backend keeps.
   if (target) {
     String latStr = server.arg("lat");
     String lonStr = server.arg("lon");
@@ -3603,8 +3933,12 @@ static void handleNodeConfigSave() {
       float lat = latStr.toFloat();
       float lon = lonStr.toFloat();
       if (lat != 0.0f || lon != 0.0f) {
-        target->latitude  = lat;
-        target->longitude = lon;
+        if (stageIdentity) {
+          deploymentStageIdentity(nodeId, nullptr, nullptr, &lat, &lon);
+        } else {
+          target->latitude  = lat;
+          target->longitude = lon;
+        }
       }
     }
   }
@@ -3682,9 +4016,82 @@ static void handleNodeConfigSave() {
   bool pauseOk  = false;
   bool resumeOk = false;
 
-  if (action == "none" || action.length() == 0) {
-    // No lifecycle change requested — only name/notes/schedule saved.
+  // expected_epoch makes Start/End idempotent: a double-submitted form or a
+  // retry after a lost response carries the stale epoch and is reported as a
+  // replay instead of incrementing again.
+  const uint16_t expectedEpoch =
+      (uint16_t)(server.hasArg("expected_epoch")
+                     ? server.arg("expected_epoch").toInt()
+                     : (target ? target->deploymentEpoch : 0));
+
+  if (action == "start_deployment") {
+    if (!target) {
+      sendDeploymentError(404, "Node is not registered", "", nodeId);
+      return;
+    }
+    float lat = NAN, lon = NAN;
+    if (server.hasArg("lat") && server.hasArg("lon")) {
+      lat = server.arg("lat").toFloat();
+      lon = server.arg("lon").toFloat();
+    }
+    const DeploymentOpResult r =
+        beginNewDeployment(nodeId, userId, name, lat, lon, expectedEpoch);
+    if (r.status != DEPLOY_OK && r.status != DEPLOY_REPLAYED) {
+      const int code = (r.status == DEPLOY_ERR_NUMBER_TAKEN) ? 409 : 400;
+      sendDeploymentError(code, r.message, r.holderLabel, nodeId);
+      return;
+    }
+    if (r.status == DEPLOY_OK) {
+      // The durable ACTIVE config is already queued by beginNewDeployment; this
+      // immediate DEPLOY_NODE is best-effort and only lands if the node is awake
+      // in config mode. Convergence rides the NODE_CONFIG reconcile.
+      std::vector<String> ids;
+      ids.push_back(nodeId);
+      deployOk = deploySelectedNodes(ids);
+      gDeployedThisSession = true;
+    }
+    if (isAjaxRequest()) {
+      String j = String("{\"ok\":true,\"epoch\":") + String((unsigned)r.epoch) +
+                 ",\"replayed\":" + (r.status == DEPLOY_REPLAYED ? "true" : "false") +
+                 ",\"deploy\":" + (deployOk ? "true" : "false") + "}";
+      server.send(200, "application/json", j);
+      return;
+    }
+  } else if (action == "end_deployment") {
+    if (!target) {
+      sendDeploymentError(404, "Node is not registered", "", nodeId);
+      return;
+    }
+    const DeploymentOpResult r = endDeployment(nodeId, expectedEpoch);
+    if (r.status != DEPLOY_OK && r.status != DEPLOY_REPLAYED) {
+      sendDeploymentError(400, r.message, "", nodeId);
+      return;
+    }
+    gFieldChangeThisSession = true;
+    if (isAjaxRequest()) {
+      sendAjaxResult(true, r.message);
+      return;
+    }
+  } else if (action == "none" || action.length() == 0) {
+    // No lifecycle change requested — only name/notes/schedule saved. If this
+    // node has an ACTIVE deployment, refresh its outbox event so an in-place
+    // identity or location edit reaches the backend as an upsert.
+    if (target && !stageIdentity &&
+        (server.hasArg("user_id") || server.hasArg("name") ||
+         server.hasArg("lat") || server.hasArg("lon"))) {
+      deploymentTouchActiveEvent(nodeId);
+    }
   } else if (action == "start") {
+    // Plain start never increments. It initialises epoch 1 for a node that has
+    // never been deployed, and is REJECTED once a deployment has ended so a
+    // redeploy cannot silently re-stitch two sites onto one series.
+    if (target) {
+      const DeploymentOpResult r = ensureFirstDeployment(nodeId);
+      if (r.status != DEPLOY_OK) {
+        sendDeploymentError(400, r.message, "", nodeId);
+        return;
+      }
+    }
     if (target && target->state == UNPAIRED) {
       pairOk = pairNode(nodeId);
       if (pairOk) {
@@ -3698,18 +4105,23 @@ static void handleNodeConfigSave() {
     Serial.printf("[CONFIG] %s start -> deploy: %s\n", nodeId.c_str(), deployOk ? "OK" : "FAIL");
     if (deployOk) gDeployedThisSession = true;  // triggers dashboard sync at Finish
   } else if (action == "stop") {
+    // Legacy alias. Stopping monitoring is now a deployment lifecycle action;
+    // never put a deployed node back into PAIRED behind the epoch ledger.
     if (target) {
-      target->state = PAIRED;
-      target->deployPending = false;
-      savePairedNodes();
-      revertOk = pairNode(nodeId);
-      Serial.printf("[CONFIG] %s stop -> PAIRED: %s\n", nodeId.c_str(), revertOk ? "OK" : "FAIL");
+      const DeploymentOpResult r = endDeployment(nodeId, expectedEpoch);
+      if (r.status != DEPLOY_OK && r.status != DEPLOY_REPLAYED) {
+        sendDeploymentError(400, r.message, "", nodeId);
+        return;
+      }
+      revertOk = true;
+      gFieldChangeThisSession = true;
+      Serial.printf("[CONFIG] %s legacy stop -> deployment ended\n", nodeId.c_str());
     }
   } else if (action == "pause") {
     // Standby: stop recording but keep the node deployed + syncing (remotely
     // resumable). Deferred via the sync-window NODE_CONFIG reconcile, same as
     // unpair — a deployed node is asleep now.
-    if (target && target->state == DEPLOYED) {
+    if (target && target->state == DEPLOYED && target->deploymentEndedUnix == 0) {
       NodeDesiredConfig du = getDesiredConfig(nodeId.c_str());
       du.targetState = 3;  // STANDBY
       const NodeConfigApplyResult applied = applyLocalDesiredConfig(nodeId, du);
@@ -3717,11 +4129,12 @@ static void handleNodeConfigSave() {
                 (applied.command.outcome == OUT_ACCEPTED ||
                  applied.command.outcome == OUT_REPLAY);
       du = getDesiredConfig(nodeId.c_str());
+      gFieldChangeThisSession = true;
       Serial.printf("[CONFIG] %s pause SCHEDULED: desired v%u STANDBY at next sync\n",
                     nodeId.c_str(), (unsigned)du.configVersion);
     }
   } else if (action == "resume") {
-    if (target && target->state == DEPLOYED) {
+    if (target && target->state == DEPLOYED && target->deploymentEndedUnix == 0) {
       NodeDesiredConfig du = getDesiredConfig(nodeId.c_str());
       du.targetState = 2;  // DEPLOYED / ACTIVE
       const NodeConfigApplyResult applied = applyLocalDesiredConfig(nodeId, du);
@@ -3729,11 +4142,35 @@ static void handleNodeConfigSave() {
                  (applied.command.outcome == OUT_ACCEPTED ||
                   applied.command.outcome == OUT_REPLAY);
       du = getDesiredConfig(nodeId.c_str());
+      gFieldChangeThisSession = true;
       Serial.printf("[CONFIG] %s resume SCHEDULED: desired v%u ACTIVE at next sync\n",
                     nodeId.c_str(), (unsigned)du.configVersion);
     }
   } else if (action == "unpair") {
     if (target) {
+      // Unpair implies End. Capture the ended deployment WITH its current
+      // number and name into the durable outbox before anything clears
+      // node_meta — status.nodes[] is current state and cannot carry a
+      // deployment that is about to leave the registry.
+      //
+      // If that capture FAILS (hub clock unset, outbox full, storage error) the
+      // removal must not proceed: continuing would clear the identity and drop
+      // the node while its deployment record was never written, destroying the
+      // history this feature exists to keep.
+      const DeploymentOpResult endRes = endDeploymentForUnpair(nodeId);
+      if (endRes.status != DEPLOY_OK && endRes.status != DEPLOY_REPLAYED) {
+        Serial.printf("[DEPLOY] %s unpair blocked: %s\n",
+                      nodeId.c_str(), endRes.message.c_str());
+        sendDeploymentError(409,
+                            "Could not archive this node's deployment, so it was not "
+                            "removed: " + endRes.message,
+                            "", nodeId);
+        return;
+      }
+      // The archived deployment is now queued and the node is about to leave the
+      // registry — the case where an unsent event matters most, because nothing
+      // on the hub will reference it again.
+      gFieldChangeThisSession = true;
       if (target->state == DEPLOYED) {
         // Deferred unpair: a deployed node is asleep now and only reachable in
         // its sync window. Record the desired UNPAIRED state (durable, version
@@ -3862,7 +4299,13 @@ static void handleStationSetupWizard() {
     return;
   }
   // Already deployed → nothing to onboard; send to the management view.
-  if (target->state == DEPLOYED) {
+  //
+  // An ENDED deployment is the exception: End leaves the node DEPLOYED (it goes
+  // to STANDBY, not PAIRED — PAIR_NODE would erase the node's unflushed queue),
+  // so it must be let through to start the next deployment. Note handleStationDetail
+  // 302s non-DEPLOYED nodes HERE, so these two guards are a mutual redirect pair:
+  // widening the other one instead of this one produces an infinite redirect loop.
+  if (target->state == DEPLOYED && target->deploymentEndedUnix == 0) {
     server.sendHeader("Location", String("/station?id=") + nodeId, true);
     server.send(302, "text/plain", "");
     return;
@@ -3874,15 +4317,39 @@ static void handleStationSetupWizard() {
   const uint16_t sensorMask = (dc.sensorMask & NODE_SENSOR_MASK_VALID)
       ? (uint16_t)(dc.sensorMask & ~NODE_SENSOR_MASK_VALID) : 0;
   const bool hasIdentity = userId.length() > 0 || name.length() > 0;
-  const int startStep = hasIdentity ? 2 : 1;  // resume past identity if already named
+  // Starting a NEW deployment must always begin at naming.
+  //
+  // node_meta still holds the PREVIOUS deployment's number and name, so
+  // hasIdentity is true for every ended node — and jumping to step 2 skipped the
+  // one screen that matters most, letting a new site silently inherit the old
+  // site's identity. The resume-past-identity shortcut exists for a first-time
+  // setup that was interrupted part-way, which is a different situation.
+  const bool startingNewDeployment = (target->deploymentEndedUnix != 0);
+  const int startStep = (hasIdentity && !startingNewDeployment) ? 2 : 1;
 
   html += F("<div class='section'>"
             "<p class='muted' style='margin:0 0 10px'>Node setup &middot; step <span id='wz-cur'>1</span> of 4</p>");
 
   // Step 1 — Identify
   html += F("<div class='wz-step' data-step='1'>"
-            "<h3>1. Name this node</h3>"
-            "<p class='muted'>Give the node a short ID and a name so you can recognise it.</p>"
+            "<h3>1. Name this node</h3>");
+  // A chip, not a paragraph: state the deployment being replaced, nothing more.
+  if (target->deploymentEndedUnix != 0 && target->deploymentEpoch > 0) {
+    time_t t = (time_t)target->deploymentEndedUnix;
+    struct tm* tmv = gmtime(&t);
+    static const char* kMon[] = {"Jan","Feb","Mar","Apr","May","Jun",
+                                 "Jul","Aug","Sep","Oct","Nov","Dec"};
+    char b[16];
+    snprintf(b, sizeof(b), "%d %s", tmv->tm_mday, kMon[tmv->tm_mon]);
+    html += F("<div style='margin-bottom:10px'><span class='chip chip--bat-low'>Previous: ");
+    const String prevNum = getNodeUserId(target->nodeId);
+    const String prevName = getNodeName(target->nodeId);
+    html += htmlEscape(prevNum.length() ? prevNum : String("-"));
+    if (prevName.length()) { html += F(" \""); html += htmlEscape(prevName); html += F("\""); }
+    html += F(" &middot; ended "); html += b;
+    html += F("</span></div>");
+  }
+  html += F("<p class='muted'>Give the node a short ID and a name so you can recognise it.</p>"
             "<label class='label'>Node ID (numeric, e.g. 001)</label>"
             "<input class='input' id='wz-uid' type='text' maxlength='3' inputmode='numeric' placeholder='001' value='");
   html += htmlEscape(userId);
@@ -3940,14 +4407,17 @@ static void handleStationSetupWizard() {
             "<button type='button' class='btn btn--primary' id='wz-loc-next'>Save &amp; continue</button></div>"
             "</div>");
 
-  // Step 4 — Deploy
+  // Step 4 — Deploy. The button names the outcome ("Start deployment 2"), so the
+  // explanatory line is unnecessary.
+  const unsigned nextEpoch = (unsigned)target->deploymentEpoch + 1u;
   html += F("<div class='wz-step' data-step='4' style='display:none'>"
             "<h3>4. Deploy</h3>"
-            "<p class='muted'>Start recording on this node. It joins the fleet on the current recording schedule.</p>"
+            "<p class='muted'>The node joins the fleet on the current recording schedule.</p>"
             "<div id='wz-deploy-result' class='help' style='margin-top:8px'></div>"
             "<div style='margin-top:14px'><button type='button' class='btn btn--sm' data-wz='back'>Back</button> "
-            "<button type='button' class='btn btn--success' id='wz-deploy-go' style='min-width:160px'>Deploy node</button></div>"
-            "</div>");
+            "<button type='button' class='btn btn--success' id='wz-deploy-go' style='min-width:160px'>Start deployment ");
+  html += String(nextEpoch);
+  html += F("</button></div></div>");
 
   html += F("</div>");  // .section
 
@@ -3962,6 +4432,10 @@ static void handleStationSetupWizard() {
   // Controller — mirrors the hub /setup wizard.
   html += F("<script>(function(){");
   html += F("var NODE=\""); html += htmlEscape(nodeId); html += F("\";");
+  // Prior epoch, so the Start post is a compare-and-set: a double submit or a
+  // retry after a lost response carries the stale value and is reported as a
+  // replay instead of incrementing again.
+  html += F("var EPOCH="); html += String((unsigned)target->deploymentEpoch); html += F(";");
   html += F("var startStep="); html += String(startStep); html += F(";");
   html += F(
     "var TOTAL=4,cur=startStep||1;"
@@ -3976,11 +4450,19 @@ static void handleStationSetupWizard() {
     "document.addEventListener('click',function(e){var t=e.target;while(t&&t!==document&&!t.getAttribute('data-wz'))t=t.parentNode;"
     "if(!t||t===document)return;var a=t.getAttribute('data-wz');"
     "if(a==='next'||a==='skip')show(cur+1);else if(a==='back')show(cur-1);});"
-    // Step 1 identify
+    // Step 1 identify. The number is checked on blur so a clash surfaces here
+    // rather than three steps later at Deploy; the server re-checks on commit.
+    "var uidEl=document.getElementById('wz-uid');"
+    "uidEl.addEventListener('blur',function(){"
+    "var v=uidEl.value.trim();if(!v)return;"
+    "fetch('/api/number-check?id='+encodeURIComponent(NODE)+'&number='+encodeURIComponent(v),{cache:'no-store'})"
+    ".then(function(r){return r.json();}).then(function(j){"
+    "document.getElementById('wz-id-result').innerHTML=j.free?'':chip(false,j.number+' \\u2014 in use by '+(j.holder||'another node'));"
+    "}).catch(function(){});});"
     "document.getElementById('wz-id-next').addEventListener('click',function(){"
-    "var uid=document.getElementById('wz-uid').value,nm=document.getElementById('wz-name').value;"
+    "var uid=uidEl.value,nm=document.getElementById('wz-name').value;"
     "post('/station',{node_id:NODE,user_id:uid,name:nm,action:'none'}).then(function(j){"
-    "document.getElementById('wz-id-result').innerHTML=chip(j.ok,j.ok?'Saved':'Save failed');"
+    "document.getElementById('wz-id-result').innerHTML=chip(j.ok,j.ok?'Saved':(j.error||'Save failed'));"
     "if(j.ok)show(2);});});"
     // Step 2 sensors
     "var sbtns=[].slice.call(document.querySelectorAll('#wz-sensor-grid .sbtn'));"
@@ -3999,16 +4481,24 @@ static void handleStationSetupWizard() {
     "post('/station',{node_id:NODE,lat:lat,lon:lon,action:'none'}).then(function(j){"
     "document.getElementById('wz-loc-result').innerHTML=chip(j.ok,j.ok?'Location saved':'Save failed');"
     "if(j.ok)show(4);});});"
-    // Step 4 deploy
+    // Step 4 deploy. Posts start_deployment (not start): this is the one action
+    // that increments the epoch, and it carries the identity + expected prior
+    // epoch so the whole deployment commits as one operation and a retry cannot
+    // increment twice. A number clash returns 409 and bounces back to step 1.
     "document.getElementById('wz-deploy-go').addEventListener('click',function(){"
-    "var btn=this;btn.disabled=true;btn.textContent='Deploying...';"
-    "post('/station',{node_id:NODE,action:'start'}).then(function(j){"
-    "if(j.ok){document.getElementById('wz-deploy-result').innerHTML=chip(true,'Deployed');"
+    "var btn=this,label=btn.textContent;btn.disabled=true;btn.textContent='Starting...';"
+    "post('/station',{node_id:NODE,action:'start_deployment',"
+    "user_id:uidEl.value,name:document.getElementById('wz-name').value,"
+    "lat:document.getElementById('wz-lat').value,lon:document.getElementById('wz-lon').value,"
+    "expected_epoch:EPOCH}).then(function(j){"
+    "if(j.ok){document.getElementById('wz-deploy-result').innerHTML=chip(true,'Deployment '+j.epoch+' started');"
     "setTimeout(function(){location.href='/station?id='+encodeURIComponent(NODE);},600);}"
-    "else{btn.disabled=false;btn.textContent='Deploy node';"
-    "document.getElementById('wz-deploy-result').innerHTML=chip(false,'Deploy failed — try again');}"
-    "}).catch(function(){btn.disabled=false;btn.textContent='Deploy node';"
-    "document.getElementById('wz-deploy-result').innerHTML=chip(false,'Network error — try again');});});"
+    "else{btn.disabled=false;btn.textContent=label;"
+    "document.getElementById('wz-id-result').innerHTML=chip(false,j.error||'Could not start');"
+    "document.getElementById('wz-deploy-result').innerHTML=chip(false,j.error||'Could not start');"
+    "if(j.holder)show(1);}"
+    "}).catch(function(){btn.disabled=false;btn.textContent=label;"
+    "document.getElementById('wz-deploy-result').innerHTML=chip(false,'Network error \\u2014 try again');});});"
     "show(cur);"
     "})();</script>");
   html += footCommon();
@@ -4349,7 +4839,13 @@ static void performManualUpload(String& resultMsg, bool& ok) {
     resultMsg = "Storage not ready — cannot read data";
   } else {
     gUploadQueue.init();
-    if (gUploadQueue.getPendingBytes() == 0) {
+    // A deployment event rides in the STATUS object, not in readings, so an
+    // empty reading queue must not count as "nothing to send". Observed on the
+    // bench: an End was archived on the hub, the pre-shutdown sync correctly
+    // fired with queuedEvents=1, and then bailed here because the CSV buffer
+    // was empty — so the archive still never reached the dashboard.
+    const uint8_t manQueuedEvents = deploymentOutboxCount();
+    if (gUploadQueue.getPendingBytes() == 0 && manQueuedEvents == 0) {
       resultMsg = "No new data to upload";
       ok = true;
     } else {
@@ -4390,7 +4886,11 @@ static void performManualUpload(String& resultMsg, bool& ok) {
           else if (n.state == PAIRED) mPaired++;
           else mUnpaired++;
           if (n.stateChangePending || n.deployPending) mPending++;
-          if (n.state == DEPLOYED && n.recordingPaused) mPaused++;
+          // An ENDED deployment is not paused. End leaves the node DEPLOYED and
+          // converges it to STANDBY, so recordingPaused is true - counting that
+          // as "paused" reports an archived site as a live node awaiting resume.
+          if (n.state == DEPLOYED && n.recordingPaused &&
+              n.deploymentEndedUnix == 0) mPaused++;
         }
         extern uint32_t g_projectStartedUnix;  // defined in main.cpp
         extern String   g_resetReasonStr;      // defined in main.cpp
@@ -4440,7 +4940,10 @@ static void performManualUpload(String& resultMsg, bool& ok) {
           manDiagJson,
           mPaused,
           mothershipFirmwareStatusJson(),
-          backendControlStatusJson()
+          backendControlStatusJson(),
+          (uint8_t)(flashCsvSchemaIsCurrent() ? 1 : 0),
+          deploymentOutboxToJson(),
+          deploymentEpochClampCount()
         };
 
         while (posts < kMaxManualPosts && gUploadQueue.getPendingRows() > 0 && !stop) {
@@ -4485,6 +4988,33 @@ static void performManualUpload(String& resultMsg, bool& ok) {
             stop = true;
           }
         }
+        // Status-only POST when no reading chunk carried the status object.
+        // The loop attaches status to its FIRST post, so this covers exactly
+        // the case where the loop never posted — an empty reading queue with
+        // deployment events waiting.
+        bool statusOnlySent = false;
+        if (posts == 0 && !stop && lastErr.length() == 0 && manQueuedEvents > 0) {
+          JsonPayload statusOnly = buildJsonUpload(String(), 1, FW_SEMVER,
+                                                   &manStatusCtx, getRTCTimeUnix());
+          if (statusOnly.ok) {
+            HttpsPostResult sres = modem.httpsPost(url, statusOnly.body,
+                                                   "application/json", authHeader);
+            posts++;
+            if (sres.httpStatus == 200) {
+              statusOnlySent = true;
+              // Drains deploymentEventAcks so the outbox clears, exactly as the
+              // readings path does.
+              ingestBackendResponseFromUi(sres.responseBody);
+            } else {
+              char buf[64];
+              snprintf(buf, sizeof(buf), "status POST HTTP %d", sres.httpStatus);
+              lastErr = String(buf);
+            }
+          } else {
+            lastErr = "status JSON build failed";
+          }
+        }
+
         modem.gracefulShutdown();
 
         if (sent > 0 && lastErr.length() == 0) {
@@ -4494,6 +5024,13 @@ static void performManualUpload(String& resultMsg, bool& ok) {
         } else if (sent > 0) {
           char buf[96];
           snprintf(buf, sizeof(buf), "Sent %d then stopped: %s", sent, lastErr.c_str());
+          resultMsg = String(buf); ok = true;
+        } else if (statusOnlySent) {
+          const uint8_t remaining = deploymentOutboxCount();
+          char buf[96];
+          snprintf(buf, sizeof(buf),
+                   "Deployment changes sent (%u queued, %u remaining)",
+                   (unsigned)manQueuedEvents, (unsigned)remaining);
           resultMsg = String(buf); ok = true;
         } else {
           resultMsg = String("Upload failed: ") + (lastErr.length() ? lastErr : String("no readings sent"));
@@ -4982,17 +5519,26 @@ static void handleShutdown() {
   // when nothing was deployed or if manual upload is disabled in settings.
   String syncMsg;
   bool syncOk = false;
-  const bool deployedThisSession = gDeployedThisSession;
+  // Sync when ANY lifecycle change happened, or whenever a deployment event is
+  // still queued — the outbox check also covers an event left over from an
+  // earlier session whose upload never landed.
+  const uint8_t queuedEvents = deploymentOutboxCount();
+  const bool deployedThisSession =
+      gDeployedThisSession || gFieldChangeThisSession || queuedEvents > 0;
   if (deployedThisSession) {
-    Serial.println("[UI] Deploy detected this session — syncing to dashboard before shutdown");
+    Serial.printf("[UI] Field change this session (deploy=%d change=%d queuedEvents=%u)"
+                  " — syncing to dashboard before shutdown\n",
+                  gDeployedThisSession ? 1 : 0, gFieldChangeThisSession ? 1 : 0,
+                  (unsigned)queuedEvents);
     performManualUpload(syncMsg, syncOk);
     if (syncOk) {
-      Serial.printf("[UI] Post-deploy sync: %s\n", syncMsg.c_str());
+      Serial.printf("[UI] Pre-shutdown sync: %s\n", syncMsg.c_str());
     } else {
-      Serial.printf("[UI] Post-deploy sync skipped/failed: %s\n", syncMsg.c_str());
+      Serial.printf("[UI] Pre-shutdown sync skipped/failed: %s\n", syncMsg.c_str());
     }
   }
   gDeployedThisSession = false;  // reset for the next config session
+  gFieldChangeThisSession = false;
 
   gShutdownRequested = true;
   if (isAjaxRequest()) {
@@ -5325,6 +5871,19 @@ void startConfigServer() {
   server.on("/api/live", HTTP_GET, []() {
     server.sendHeader("Cache-Control", "no-store, no-cache, must-revalidate");
     server.send(200, "application/json", buildLiveJson());
+  });
+  // Advisory number check so a clash surfaces while the operator is typing,
+  // rather than four wizard steps later at Deploy. The authoritative guard runs
+  // again inside beginNewDeployment().
+  server.on("/api/number-check", HTTP_GET, []() {
+    const String nodeId = server.arg("id");
+    const String number = server.arg("number");
+    const DeploymentGuardResult guard = checkNumberAvailable(number, nodeId);
+    String body = String("{\"free\":") + (guard.free ? "true" : "false") +
+                  ",\"number\":\"" + jsonEscapeLocal(normalizeUserId(number)) + "\"" +
+                  ",\"holder\":\"" + jsonEscapeLocal(guard.holderLabel) + "\"}";
+    server.sendHeader("Cache-Control", "no-store");
+    server.send(200, "application/json", body);
   });
 
   server.on("/stations", HTTP_GET, handleStationsPage);

@@ -39,6 +39,14 @@ bool configMarkRecordingIntervalNodeConverged(const char* nodeId,
 
 int computeAutoSyncMin(int wakeMin);
 
+// Bring the deployment store up and wire its collaborators (desired-config
+// apply, legacy-backlog gate, hub clock). Lives here rather than in
+// deployment_epoch.cpp because applyLocalDesiredConfig() and its dispatcher
+// retry are config_server-private. Call once per boot, AFTER initFlash() (the
+// store lives in LittleFS) and AFTER loadPairedNodes() (seeding and pending
+// recovery both walk the registry). Safe to call on either boot path.
+void deploymentBootstrap();
+
 extern volatile bool gShutdownRequested;
 
 // Device identification (defined in config_server.cpp, used by json_payload

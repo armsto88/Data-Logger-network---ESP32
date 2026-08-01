@@ -58,6 +58,11 @@ bool controlResolveBackendNodeConfig(const Command& requested,
       (fields & CFG_FIELD_TARGET_STATE) == 0 ||
       requested.payload.targetState < 2 || requested.payload.targetState > 3)
     return false;
+  // End is terminal until the Field UI starts a new deployment. Backend
+  // PAUSE/RESUME commands have no lifecycle authority and must not restart an
+  // archived epoch merely because End deliberately leaves registry state as
+  // DEPLOYED while the node is held in STANDBY.
+  if (node->deploymentEndedUnix != 0) return false;
 
   const NodeDesiredConfig existing =
       getDesiredConfig(requested.payload.nodeId);
