@@ -62,10 +62,21 @@ static uint32_t gFakeNow = 1753000000UL;   // 2025-07-20, comfortably plausible
 static uint32_t fakeNow() { return gFakeNow; }
 
 static bool gConfigApplyOk = true;
+// The COMPENSATION path is controlled separately. beginNewDeployment() reacts to
+// a failed ACTIVE queue by trying to queue STANDBY, and it behaves differently
+// depending on whether that succeeds:
+//   compensation OK   -> unwind cleanly, nothing pending
+//   compensation FAILS-> deliberately leave START pending, because the desired
+//                        config may be durable-but-unacked and the node could
+//                        still converge to ACTIVE; recovery must finish forward.
+// A single flag forced both calls to fail, so the clean-unwind branch was never
+// reachable and its assertions failed against the pending-retained branch.
+static bool gStandbyApplyOk = true;
 static int  gLastTargetState = -1;
 static bool fakeConfigApply(const String& nodeId, uint8_t targetState) {
   (void)nodeId;
   gLastTargetState = targetState;
+  if (targetState == 3) return gStandbyApplyOk;
   return gConfigApplyOk;
 }
 
@@ -103,6 +114,7 @@ static void resetAll() {
   registeredNodes.clear();
   gMeta.clear();
   gConfigApplyOk = true;
+  gStandbyApplyOk = true;
   gLegacyBacklog = false;
   gLegacyRows = 0;
   gLastTargetState = -1;
@@ -354,6 +366,49 @@ static void testStartRollsBackWhenConfigFails() {
 // Review F2: rollback must restore the COMPLETE slot, not just epoch/started/
 // ended. Boundary history and staged identity are part of the record; restoring
 // a subset leaves it internally inconsistent.
+// The other half of the failed-Start contract, previously unreachable because a
+// single flag failed both config calls.
+//
+// When ACTIVE cannot be queued AND the compensating STANDBY also fails, the hub
+// does NOT unwind. A failed apply can still mean "durably persisted but not
+// acknowledged", so the node may yet converge to ACTIVE; unwinding would leave
+// it recording against an epoch the hub had thrown away. The intent therefore
+// stays on flash and deploymentRecoverPending() completes it forward on the next
+// boot — which is exactly what the operator-facing message promises.
+static void testStartLeavesIntentPendingWhenCompensationFails() {
+  resetAll();
+  addNode("ENV_A1", 0x01, DEPLOYED);
+
+  gConfigApplyOk = false;
+  gStandbyApplyOk = false;
+  DeploymentOpResult r = beginNewDeployment("ENV_A1", "001", "A", NAN, NAN, 0);
+
+  check("pending-on-failure: Start reports the queue failure",
+        r.status == DEPLOY_ERR_CONFIG_QUEUE || r.status == DEPLOY_ERR_PERSIST);
+  check("pending-on-failure: epoch is NOT published yet", epochOf("ENV_A1") == 0);
+
+  const DeploymentSlot* s = deploymentFindByNodeId("ENV_A1");
+  check("pending-on-failure: START intent is retained for recovery",
+        s && s->pendingOp == DEPLOY_OP_START && s->pendingEpoch == 1);
+  check("pending-on-failure: staged identity is retained with it",
+        s && s->hasStagedIdentity && String(s->stagedUserId) == "001");
+  check("pending-on-failure: identity is not published early",
+        getNodeUserId("ENV_A1") == "");
+
+  // Now let the node become reachable and replay recovery, as a reboot would.
+  gConfigApplyOk = true;
+  gStandbyApplyOk = true;
+  deploymentRecoverPending();
+
+  check("pending-on-failure: recovery completes the Start forward",
+        epochOf("ENV_A1") == 1);
+  check("pending-on-failure: recovery publishes the staged number",
+        getNodeUserId("ENV_A1") == "001");
+  const DeploymentSlot* after = deploymentFindByNodeId("ENV_A1");
+  check("pending-on-failure: pending cleared after recovery",
+        after && after->pendingOp == DEPLOY_OP_NONE);
+}
+
 static void testStartRollbackRestoresWholeSlot() {
   resetAll();
   addNode("ENV_A1", 0x01, DEPLOYED);
@@ -476,13 +531,22 @@ static void testInterruptedStartWaitsForActiveQueue() {
 static void testOutboxFullRefusedBeforeIntent() {
   resetAll();
   // Fill the outbox with unrelated events.
+  //
+  // deploymentStartedUnix MUST be non-zero. deploymentOutboxUpsert() refuses a
+  // zero start (the backend records it as a conflict and never acks, so it would
+  // wedge the outbox forever), which means a zero-initialised filler is silently
+  // rejected and the outbox never actually fills — the assertions below then
+  // measure an ordinary successful Start.
   for (int i = 0; i < (int)kMaxOutboxEvents; ++i) {
     DeploymentEvent e{};
     snprintf(e.eventId, sizeof(e.eventId), "FILLER-%d", i);
     strncpy(e.nodeId, "ENV_FILL", sizeof(e.nodeId) - 1);
     e.deploymentEpoch = 1;
+    e.deploymentStartedUnix = 1750000000UL;
     e.inUse = true;
-    deploymentOutboxUpsert(e);
+    if (!deploymentOutboxUpsert(e)) {
+      check("outbox full: filler was accepted (fixture sanity)", false);
+    }
   }
   addNode("ENV_A1", 0x01, DEPLOYED);
 
@@ -513,13 +577,27 @@ static void testFailedEndBlocksUnpair() {
         getNodeUserId("ENV_A1") == "001");
 
   // Outbox full is the other way End can fail.
+  //
+  // The node's OWN epoch-1 event must be cleared first, simulating the backend
+  // having acked it. While it is still queued, End's event has the same
+  // deterministic id and upserts IN PLACE — correctly needing no free slot — so
+  // End cannot be made to fail this way and the assertions below measure a
+  // perfectly ordinary success.
   gFakeNow = 1753000000UL;
   resetAll();
   addNode("ENV_A1", 0x01, DEPLOYED);
   beginNewDeployment("ENV_A1", "001", "North Hedge", NAN, NAN, 0);
+  {
+    char ownId[kDeployEventIdLen];
+    deploymentMakeEventId("ENV_A1", 1, ownId, sizeof(ownId));
+    deploymentOutboxRemove(ownId);
+  }
   for (int i = 0; i < (int)kMaxOutboxEvents; ++i) {
     DeploymentEvent e{};
     snprintf(e.eventId, sizeof(e.eventId), "FILLER-%d", i);
+    // Non-zero start required, or the upsert refuses it and the outbox stays
+    // empty — see testOutboxFullRefusedBeforeIntent.
+    e.deploymentStartedUnix = 1750000000UL;
     e.inUse = true;
     deploymentOutboxUpsert(e);
   }
@@ -633,8 +711,24 @@ static void testEndThenStartKeepsBothEvents() {
         json.indexOf("\"userId\":\"001\"") >= 0);
   check("outbox: epoch-1 event keeps its OWN name",
         json.indexOf("North Hedge") >= 0);
+  // Scoped to the epoch-1 OBJECT, not the whole array. The epoch-2 event is the
+  // live deployment and MUST report deploymentEndedUnix:0, so scanning the whole
+  // JSON for ":0," fails on correct output.
+  const int at1 = json.indexOf(id1);
+  const int obj1End = at1 >= 0 ? json.indexOf('}', at1) : -1;
+  const String event1 = (at1 >= 0 && obj1End > at1)
+      ? json.substring(at1, obj1End) : String();
   check("outbox: epoch-1 event carries its end timestamp",
-        json.indexOf("\"deploymentEndedUnix\":0,") < 0);
+        event1.length() > 0 &&
+        event1.indexOf("\"deploymentEndedUnix\":0") < 0);
+
+  const int at2 = json.indexOf(id2);
+  const int obj2End = at2 >= 0 ? json.indexOf('}', at2) : -1;
+  const String event2 = (at2 >= 0 && obj2End > at2)
+      ? json.substring(at2, obj2End) : String();
+  check("outbox: the ACTIVE epoch-2 event reports no end timestamp",
+        event2.length() > 0 &&
+        event2.indexOf("\"deploymentEndedUnix\":0") >= 0);
 }
 
 static void testUnpairPreservesEndEvent() {
@@ -1007,6 +1101,7 @@ void setup() {
   testRtcUnsetRejects();
   testRetryIdempotency();
   testStartRollsBackWhenConfigFails();
+  testStartLeavesIntentPendingWhenCompensationFails();
   testStartRollbackRestoresWholeSlot();
   testInterruptedStartCompletesForward();
   testInterruptedStartWaitsForActiveQueue();

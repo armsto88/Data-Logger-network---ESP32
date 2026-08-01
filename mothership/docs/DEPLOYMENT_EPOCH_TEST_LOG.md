@@ -19,9 +19,9 @@ Branch: `feat/node-deployment-epochs` (both repos).
 |---|---|---|
 | 0 | Backend pre-flight against production data | **PASS** — see dashboard log |
 | 1 | Backend migration rehearsal on a clone | **PASS** — see dashboard log |
-| 2 | **Firmware on-device bench tests** | **NOT RUN** — blocking |
+| 2 | **Firmware on-device bench tests** | **PASS (2a)** — 2026-08-01, real hardware. 2b/2c outstanding |
 | 3 | End-to-end hardware → hub → backend → dashboard | **NOT RUN** — blocking |
-| 4 | Staged rollout | **NOT STARTED** |
+| 4 | Staged rollout | DB migrated; **Edge Function NOT deployed** — blocks firmware |
 | 5 | Post-deploy monitoring | **NOT STARTED** |
 
 ---
@@ -90,14 +90,69 @@ pio run -t upload -e mothership-v2-test-spectral-pipeline
 pio run -t upload -e mothership-v2-test-node-config-control
 ```
 
-Capture the serial `RESULT|SUMMARY|n/n|OVERALL:` line for each and paste below.
+**RUN 2026-08-01 on the bench FieldHub (COM4, CH340).** Board reset via DTR/RTS
+before each capture, because these sketches print once from `setup()` and a
+monitor attached after boot misses everything.
 
-| Environment | Assertions | Result | Date |
+| Environment | Assertions | Result | Notes |
 |---|---|---|---|
-| `test-deployment-epoch` | | | |
-| `test-upload-queue` | | | |
-| `test-spectral-pipeline` | | | |
-| `test-node-config-control` | | | |
+| `test-deployment-epoch` | **150/150** | **OVERALL:PASS** | real LittleFS, real store |
+| `test-upload-queue` | **27/27** | **OVERALL:PASS** | 30→31 schema migration |
+| `test-spectral-pipeline` | — | **RESULT: PASS** | emitted `"deploymentEpoch":7` as column 31 |
+| `test-node-config-control` | — | **CRASHES** | pre-existing, unrelated — see below |
+
+### The 10 initial failures were all test defects, not firmware defects
+
+First-ever hardware run returned `131/141 OVERALL:FAIL`. Every failure was in the
+test, and the firmware behaviour each one contradicted turned out to be correct
+and deliberate. Recorded because "the test was wrong" is a conclusion that must
+be justified, not assumed.
+
+| Cluster | Failures | Diagnosis |
+|---|---|---|
+| Outbox-full | 6 | Filler events were built with `DeploymentEvent e{}`, leaving `deploymentStartedUnix = 0`. `deploymentOutboxUpsert()` **correctly refuses** a zero start (the backend records it as a conflict and never acks it, so it would wedge the outbox forever). 34 fillers were rejected, the outbox never filled, and the assertions were measuring an ordinary successful Start. |
+| Failed-End | 2 | Same zero-start fixture bug, plus a deeper one: the node's own epoch-1 event was still queued from the preceding `beginNewDeployment`, so End's event has the same deterministic id and **upserts in place**, needing no free slot. That is correct — ending a deployment whose Start event is still queued should just stamp the end onto it. The fixture now clears the event first, simulating a backend ack. |
+| Rollback | 3 | A single `gConfigApplyOk` flag failed both the ACTIVE queue *and* the compensating STANDBY queue, forcing the code down its documented "leave START pending for recovery" branch while the test asserted clean-unwind semantics. The firmware is right: a failed apply can mean *durably persisted but unacknowledged*, so the node may still converge to ACTIVE, and unwinding would leave it recording against a discarded epoch. |
+| End timestamp | 1 | `json.indexOf("\"deploymentEndedUnix\":0,") < 0` scanned the whole outbox. The **active** epoch-2 event must report `ended:0`, so the assertion failed on correct output. Now scoped to the epoch-1 object. |
+
+Fixes added coverage rather than just silencing: `gStandbyApplyOk` was split out
+so both failure branches are reachable, and
+`testStartLeavesIntentPendingWhenCompensationFails` now asserts the
+pending-retained path end to end, including that recovery completes the Start
+forward and publishes the staged number on the next boot. 141 → 150 assertions.
+
+### `test-node-config-control` crashes — pre-existing, NOT from this work
+
+```
+### FieldMesh node config control test ###
+Guru Meditation Error: Core 1 panic'ed (Double exception).
+EXCCAUSE: 0x00000002  EXCVADDR: 0xffffffe0   [repeating backtrace]
+```
+
+Faults immediately after the banner, before any assertion runs — i.e. inside
+`dispatcherInit()`, which this work does not touch.
+
+**Verified by A/B on hardware:** restoring `node_config_control.cpp` to its
+pre-change version (`git show ea98b05^:...`) and reflashing produced the
+identical crash. The deployment-epoch change is not the cause.
+
+Strongest lead for whoever triages it: `dispatcherInit()` value-initialises two
+`DispatcherStateRecord` locals **on the stack**, and the repeating backtrace plus
+double-exception is the classic signature of blowing the 8 KB Arduino loop-task
+stack — the same failure mode `deployment_store.cpp` documents avoiding by
+hashing in place instead of copying a ~9.3 KB record. Note the production
+firmware calls `dispatcherInit()` at every boot and has run in the field for
+days without incident, so this is most likely specific to the cut-down test
+environment rather than a production defect. **Confirm that by watching a normal
+boot of `mothership-v1-main` on this board before drawing conclusions.**
+
+**Coverage gap this leaves:** the one-line guard added to
+`controlResolveBackendNodeConfig` (refuse a backend PAUSE/RESUME once
+`deploymentEndedUnix != 0`) is currently unverified on device. It is defended at
+three other layers — the FieldHub detail form, the batch action, and the
+dashboard's `canBatchControlNode` — and the backend independently sets
+`nodes.state = 'ENDED'`, so the lifecycle is not open. But this specific guard
+rests on code review alone.
 
 Pay particular attention to these named cases, which cover the riskiest logic:
 
