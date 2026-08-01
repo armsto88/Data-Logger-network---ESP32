@@ -1611,6 +1611,43 @@ void handleSyncWake() {
     NodeDesiredConfig dc = getDesiredConfig(n.nodeId.c_str());
     // Broadcast to deployed nodes and to any node pending unpair.
     if (n.state != DEPLOYED && dc.targetState != 0 /*UNPAIRED*/) continue;
+
+    // Repair a STRANDED desired state.
+    //
+    // Nodes apply a NODE_CONFIG only when its version is STRICTLY greater than
+    // the one they hold. So if we want a state the node has not applied, but our
+    // version is not newer than the version it already applied, that intent can
+    // never land — we would rebroadcast it every window forever while the node
+    // ACKs "already current" and stays as it is. Observed 2026-08-01: the hub
+    // sent v12 target=2 to a node holding v12 from a target=3 (STANDBY), leaving
+    // it paused permanently with both sides reporting success.
+    //
+    // recordingPaused is written at convergence from the targetState the node
+    // actually applied, so it is the one signal that distinguishes real
+    // divergence from the normal post-convergence case where desired == applied.
+    // Gating on it is what stops this from bumping the version every window.
+    const bool desiredPaused = (dc.targetState == 3);
+    if (dc.configVersion != 0 &&
+        dc.configVersion <= n.configVersionApplied &&
+        desiredPaused != n.recordingPaused &&
+        n.configVersionApplied < UINT16_MAX) {
+      const uint16_t repaired = (uint16_t)(n.configVersionApplied + 1U);
+      Serial.printf("[SYNC] %s desired target=%u stranded at v%u (node applied v%u)"
+                    " — re-asserting as v%u\n",
+                    n.nodeId.c_str(), (unsigned)dc.targetState,
+                    (unsigned)dc.configVersion,
+                    (unsigned)n.configVersionApplied, (unsigned)repaired);
+      dc.configVersion = repaired;
+      if (!setDesiredConfig(n.nodeId.c_str(), dc)) {
+        // Not durable — broadcast the stale version rather than a version we
+        // failed to record, so the hub and the node cannot disagree about what
+        // was assigned.
+        Serial.printf("[SYNC] %s stranded-version repair did not persist —"
+                      " leaving v%u\n",
+                      n.nodeId.c_str(), (unsigned)n.configVersionApplied);
+        dc = getDesiredConfig(n.nodeId.c_str());
+      }
+    }
     node_config_message_t cfg{};
     strncpy(cfg.command, "NODE_CONFIG", sizeof(cfg.command) - 1);
     strncpy(cfg.nodeId, n.nodeId.c_str(), sizeof(cfg.nodeId) - 1);

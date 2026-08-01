@@ -504,6 +504,13 @@ void savePairedNodes() {
     snprintf(key, sizeof(key), "cfgv%d", idx);
     writeOk = prefs.putUShort(key, n.configVersionApplied) == sizeof(uint16_t) && writeOk;
 
+    // Absolute time of last genuine contact. Must survive the power-off between
+    // wakes: without it the millis()-based lastSeen restarts every boot and the
+    // hub reports every paired node as seen seconds ago, so a node that has been
+    // silent for hours is indistinguishable from a healthy one.
+    snprintf(key, sizeof(key), "seen%d", idx);
+    writeOk = prefs.putUInt(key, n.lastSeenUnix) == sizeof(uint32_t) && writeOk;
+
     idx++;
   }
 
@@ -714,12 +721,24 @@ void loadPairedNodes() {
     uint16_t savedConfigVersion = 0;
     if (prefs.getType(key) == PT_U16) savedConfigVersion = prefs.getUShort(key, 0);
 
+    // --- Absolute last-contact time (optional; added after initial rollout) ---
+    snprintf(key, sizeof(key), "seen%d", i);
+    uint32_t savedLastSeenUnix = 0;
+    if (prefs.getType(key) == PT_U32) savedLastSeenUnix = prefs.getUInt(key, 0);
+
     // All fields validated — build the NodeInfo record.
     NodeInfo newNode{};
     memcpy(newNode.mac, mac, 6);
     newNode.nodeId   = nid;
     newNode.nodeType = ntype;
-    newNode.lastSeen = millis();
+    // NOT millis(): restoring a node from NVS is not evidence anyone has heard
+    // from it. Stamping it as seen-now here is what let a node stay silent for
+    // hours while the dashboard showed it as freshly checked in — and because
+    // every wake reboots the hub, the lie refreshed itself indefinitely.
+    // 0 means "not heard from this session"; the absolute time below carries
+    // whatever the last real contact was.
+    newNode.lastSeen     = 0;
+    newNode.lastSeenUnix = savedLastSeenUnix;
     newNode.isActive = true;
     newNode.state    = state;
     newNode.channel  = ESPNOW_CHANNEL;
@@ -834,15 +853,21 @@ String buildNodesStatusJson(uint32_t nowUnix) {
   String out = "[";
   char nb[16];
   bool first = true;
-  for (const auto& n : registeredNodes) {
+  for (auto& n : registeredNodes) {
     if (!first) out += ",";
     first = false;
 
-    // Convert the node's millis-based lastSeen into an absolute unix time.
-    uint32_t lastSeenUnix = 0;
+    // Contact THIS session is authoritative and refreshes the persisted value.
+    // Otherwise fall back to the last genuine contact carried across boots —
+    // never to "now". A node we have not heard from reports its real age, and a
+    // node never heard from reports 0, so the dashboard can say so honestly.
+    uint32_t lastSeenUnix = n.lastSeenUnix;
     if (n.lastSeen > 0 && nowUnix > 0) {
       uint32_t ageSec = (millis() - n.lastSeen) / 1000UL;
-      lastSeenUnix = (ageSec < nowUnix) ? (nowUnix - ageSec) : 0;
+      if (ageSec < nowUnix) {
+        lastSeenUnix = nowUnix - ageSec;
+        n.lastSeenUnix = lastSeenUnix;   // persisted by the next savePairedNodes
+      }
     }
 
     out += "{\"nodeId\":\"";  out += jsonEscapeStr(n.nodeId);            out += "\"";

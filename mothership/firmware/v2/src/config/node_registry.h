@@ -30,7 +30,13 @@ struct NodeInfo {
   uint8_t   mac[6];
   String    nodeId;
   String    nodeType;
-  uint32_t  lastSeen;
+  uint32_t  lastSeen;       // millis() of last contact THIS session; 0 = not yet
+                            // heard from since boot. Only meaningful within a
+                            // session — the FieldHub powers off between wakes.
+  uint32_t  lastSeenUnix;   // absolute unix time of last genuine contact, and
+                            // the only value safe to report outward. Persisted,
+                            // because millis() restarts at every wake and a
+                            // reboot must not make a silent node look present.
   bool      isActive;
   NodeState state;
   uint8_t   channel;
