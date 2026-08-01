@@ -1395,7 +1395,21 @@ static void onDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
   g_lastSendStatus = status;
   g_lastSendDone = true;
 }
+// --- Receive-path diagnostics -----------------------------------------------
+// Separates "packets are arriving and being discarded" from "nothing is
+// reaching the radio at all". Every drop path here is silent, so the two look
+// identical from the outside: on 2026-08-01 ENV_6C0A80 sat awake and listening
+// through the hub's rendezvous, on the same slot where two other nodes joined
+// normally, and reported only "Sync marker not seen".
+//
+// Written from the ESP-NOW RX callback, so these only record — nothing is
+// printed here. They are reported once the listen window closes.
+static volatile uint32_t g_rxTotalPackets     = 0;  // reached the callback at all
+static volatile uint32_t g_rxForeignMacDrops  = 0;  // sender != stored mothership
+static volatile uint8_t  g_rxLastForeignMac[6] = {0};
+
 static void onDataReceived(const uint8_t *mac, const uint8_t *incomingData, int len) {
+  ++g_rxTotalPackets;
   if (!mac || !incomingData || len <= 0) {
     noteInvalidNodePacket();
     return;
@@ -1425,6 +1439,11 @@ static void onDataReceived(const uint8_t *mac, const uint8_t *incomingData, int 
       type == IncomingMessageType::SNAPSHOT_ACK;
 
   if (operational && hasMothershipMAC() && memcmp(mac, mothershipMAC, 6) != 0) {
+    // Record who it actually came from. If the hub's broadcasts are arriving but
+    // being rejected here, this is the only place that can prove it — and the
+    // captured MAC says whether we are bound to the wrong mothership.
+    ++g_rxForeignMacDrops;
+    memcpy((void*)g_rxLastForeignMac, mac, 6);
     noteInvalidNodePacket();
     return;
   }
@@ -2476,6 +2495,22 @@ static void handleRtcWakeEvents(bool dataWake, bool syncWake) {
         Serial.println("⚠️ Sync marker not seen in listen window; flush skipped this cycle");
       }
     }
+    // Report the receive path regardless of outcome. rx=0 means nothing reached
+    // the radio (RF/antenna/channel); rx>0 with foreignMac>0 means the hub was
+    // heard and discarded as an unknown sender, and lastForeign names who we
+    // actually heard versus the mothership we are bound to.
+    const NodeEventCounters rxc = getNodeEventCounters();
+    Serial.printf("[RX-DIAG] rx=%lu invalid=%lu foreignMac=%lu\n",
+                  (unsigned long)g_rxTotalPackets,
+                  (unsigned long)rxc.callbackInvalidPackets,
+                  (unsigned long)g_rxForeignMacDrops);
+    Serial.printf("[RX-DIAG] boundMothership=%02X:%02X:%02X:%02X:%02X:%02X"
+                  "  lastForeign=%02X:%02X:%02X:%02X:%02X:%02X\n",
+                  mothershipMAC[0], mothershipMAC[1], mothershipMAC[2],
+                  mothershipMAC[3], mothershipMAC[4], mothershipMAC[5],
+                  g_rxLastForeignMac[0], g_rxLastForeignMac[1],
+                  g_rxLastForeignMac[2], g_rxLastForeignMac[3],
+                  g_rxLastForeignMac[4], g_rxLastForeignMac[5]);
   }
 
   finalizeWakeAndSleep("wake cycle complete + next alarms armed");
