@@ -2757,6 +2757,35 @@ void loop() {
       (int)resp.second
     );
 
+    // Refuse a STALE time source.
+    //
+    // The FieldHub sends TIME_SYNC at the START of its rendezvous and
+    // SYNC_RELEASE at the END. Both carry mothership time, and both set the
+    // RTC. Because events are queued here and applied in loop context, a
+    // TIME_SYNC captured ~23s earlier could be applied AFTER the newer release
+    // and drag the clock BACKWARDS by the length of the sync window.
+    //
+    // That is self-locking, and it is what stranded ENV_6C0A80 on 2026-08-01:
+    // the node then computes its next slot from its own slow clock, wakes that
+    // much late in real terms, arrives after the hub's rendezvous has closed at
+    // slot+15s, and so never receives the sync that would correct the clock. Its
+    // DS3231 is accurate to ~2ppm, so it holds the bad offset perfectly and
+    // misses EVERY window rather than drifting back into range.
+    //
+    // Compare against the last accepted sync SOURCE, not against our own RTC, so
+    // a genuine correction still applies in either direction — only a message
+    // older than one we have already honoured is dropped.
+    const uint32_t incomingUnix = dt.unixtime();
+    if (lastTimeSyncUnix > 0 && incomingUnix < lastTimeSyncUnix) {
+      Serial.printf("⏰ [LOOP] TIME_SYNC IGNORED as stale: payload %lu is %lus "
+                    "behind last accepted sync %lu\n",
+                    (unsigned long)incomingUnix,
+                    (unsigned long)(lastTimeSyncUnix - incomingUnix),
+                    (unsigned long)lastTimeSyncUnix);
+      debugState("after stale TIME_SYNC (loop)");
+      return;
+    }
+
     uint32_t prevSync = lastTimeSyncUnix;
     rtc.adjust(dt);
     rtcSynced        = true;
