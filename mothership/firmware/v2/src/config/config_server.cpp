@@ -4947,7 +4947,8 @@ static void performManualUpload(String& resultMsg, bool& ok) {
         };
 
         while (posts < kMaxManualPosts && gUploadQueue.getPendingRows() > 0 && !stop) {
-          UploadPayload payload = gUploadQueue.getNewData(16384);
+          // Same 8 KB bound as the scheduled path - see kJsonChunkBytes.
+          UploadPayload payload = gUploadQueue.getNewData(8192);
           if (payload.byteLength == 0) break;
 
           // Status object only on the first POST of this click (it doesn't

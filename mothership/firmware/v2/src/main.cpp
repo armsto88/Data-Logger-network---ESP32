@@ -948,7 +948,12 @@ void performModemUpload(const TransmissionSettings& txSettings, uint32_t session
   // -----------------------------------------------------------------------
   if (txSettings.useJsonUpload) {
     constexpr uint16_t kMaxReadingsPerPost = 100;
-    constexpr uint32_t kJsonChunkBytes     = 16384;  // ~100-130 rows of CSV
+    // 8 KB of CSV -> ~32 KB of JSON -> ~65 KB peak (readings + body copy).
+    // 16 KB produced a ~65 KB document and a ~130 KB peak, which is where the
+    // 2026-08-01 truncation happened. The upload LOOPS over chunks, so a smaller
+    // chunk costs an extra POST rather than leaving anything behind - and it is
+    // what keeps the peak flat as the fleet grows.
+    constexpr uint32_t kJsonChunkBytes     = 8192;   // ~37 rows of CSV
 
     // Supabase: header-only Bearer auth, JSON array body, no query params.
     // The legacy Google Apps Script path (apiKey empty) still appends action.

@@ -328,16 +328,29 @@ JsonPayload buildJsonUpload(const String& csvChunk,
   // 51 readings produced a 39,632 B body. 850 leaves headroom for long node
   // names and the widest spectral values.
   const uint32_t kEstBytesPerReading = 850U;
-  const uint32_t estBytes = (uint32_t)maxReadings * kEstBytesPerReading;
+  // Size from the ACTUAL chunk, not the maxReadings ceiling.
+  //
+  // The caller bounds a chunk by CSV bytes, so maxReadings (100) is an upper
+  // limit that is rarely reached — budgeting for it would demand ~178 KB of
+  // free heap and refuse builds this hardware can comfortably do, wedging the
+  // queue instead of draining it. JSON runs ~4x the CSV it came from, measured
+  // on real uploads: 6,419 -> 25,446 and 11,099 -> 39,632.
+  const uint32_t estByChunk = (uint32_t)csvChunk.length() * 4U + 1024U;
+  const uint32_t estByRows  = (uint32_t)maxReadings * kEstBytesPerReading + 1024U;
+  const uint32_t estBytes   = estByChunk < estByRows ? estByChunk : estByRows;
+  // Doubled because the readings array and the body it is copied into exist at
+  // the same time.
   if (ESP.getFreeHeap() < (estBytes * 2U) + 8192U) {
-    Serial.printf("[JSON] Insufficient heap for build (need=%u free=%u)\n",
-                  (unsigned)(estBytes * 2U + 8192U), (unsigned)ESP.getFreeHeap());
+    Serial.printf("[JSON] Insufficient heap for build (need=%u free=%u csv=%u)\n",
+                  (unsigned)(estBytes * 2U + 8192U), (unsigned)ESP.getFreeHeap(),
+                  (unsigned)csvChunk.length());
     return result;
   }
 
   String readings;
-  if (!readings.reserve(estBytes + 32U)) {
-    Serial.println("[JSON] readings reserve failed");
+  if (!readings.reserve(estBytes)) {
+    Serial.printf("[JSON] readings reserve failed (want=%u free=%u)\n",
+                  (unsigned)estBytes, (unsigned)ESP.getFreeHeap());
     return result;
   }
 
