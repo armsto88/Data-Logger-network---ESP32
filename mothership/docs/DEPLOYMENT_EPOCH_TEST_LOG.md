@@ -184,7 +184,72 @@ Target a few hundred cycles. Record cycles run, interruptions, and failures.
 |---|---|---|---|
 | | | | |
 
+### 2e. Production firmware on the bench hub — 2026-08-01 (PASS)
+
+Flashed `mothership-v1-main` over USB after the suites. NVS and LittleFS both
+survived, as predicted: no re-pairing, no lost cursor, no lost sync anchor.
+
+```
+[fwid] role=mothership ver=0.1.0 build=253f6c7 hw=mothership-v1 proto=2 idv=1
+[FW] V2 snapshot decode; CSV schema=31; spectral metadata IDs=1109-1113
+[REG] Loading 3 paired/deployed nodes from NVS
+[REG] Load complete: 3 restored, 0 skipped
+[DEPLOY] Store ready (gen=1, outbox=0, fresh=1)
+[DEPLOY] Seeded ENV_D13F98 as epoch 1 (since 1785180891)
+[DEPLOY] Seeded ENV_6C0AA0 as epoch 1 (since 1785180801)
+[DEPLOY] Seeded ENV_6C0A80 as epoch 1 (since 1785180951)
+[SYNC] Loaded anchor sync_anchor_a generation=6 phase=1785527760 interval=360 mode=1
+[RTC] Alarm 1 armed for 2026-08-01 07:55:50 (phase-aligned, in 2424 sec)
+```
+
+**Hub-side seeding matches the backend backfill exactly.** `1785180801` is
+2026-07-27 19:33:21Z, which is precisely the `started_at` the migration wrote to
+`node_deployments` for Node 1 (same for 002 and 003). The hub's first deployment
+events will therefore upsert onto the existing `BACKFILL` rows rather than
+creating duplicates or tripping the active-number guard.
+
+Also settles the open question from `test-node-config-control`: production
+firmware calls `dispatcherInit()` on this same board and boots cleanly, so that
+crash is specific to the cut-down test environment and is not a production
+defect.
+
+Sync anchor survived the reflash (`generation=6` loaded, saved as `7`), so the
+hub stayed on its existing 6-hourly phase — next slot 09:56 Berlin, alarm armed
+10 s early as the usual pre-roll.
+
+### 2d. Deployment-store residue — FOUND AND FIXED
+
+Running the epoch suite on a hub is not free. The suite writes a real
+`/deploy.bin`, and production firmware then loaded it verbatim:
+
+```
+[DEPLOY] Store ready (gen=4, outbox=1, fresh=0)
+```
+
+`fresh=0` = loaded, not created. `outbox=1` = a queued fixture event. The last
+test leaves an `ENV_A2` event claiming number **002**, which the live
+`ENV_D13F98` deployment holds. On sync the backend would reject it against
+`node_deployments_active_number_idx`, return CONFLICT, never acknowledge it, and
+the hub would retry forever — a permanent conflict chip and a wedged outbox slot.
+
+Caught before the hub synced. `mothership-v2-wipe-deploy-store` removed the
+three store files and asserted `/datalog.csv` was byte-identical before and
+after (367 bytes, header only). Production firmware then rebuilt the store
+`fresh=1, outbox=0` as shown above.
+
+**Always run the wipe env between the epoch suite and production firmware.**
+
 ### 2c. CSV schema drain (30 → 31 columns)
+
+> **Not exercised on this hub, and no longer can be.** `test_upload_queue`
+> rewrote `/datalog.csv`, so by the time production firmware ran the file was a
+> bare 31-column header (367 bytes) with an empty queue — the legacy-drain path
+> never triggered. The `rows=3432` in the cursor log is the lifetime uploaded
+> counter, not pending rows.
+>
+> This case therefore still needs a hub that upgrades from real pre-epoch
+> firmware carrying a genuine 30-column buffer. It is the one Phase 2 item with
+> no hardware evidence behind it.
 
 Flash the new firmware onto a hub carrying a **real** 30-column
 `/datalog.csv` with queued rows. This is the upgrade path every existing hub
