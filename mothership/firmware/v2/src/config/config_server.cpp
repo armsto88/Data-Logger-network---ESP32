@@ -1277,9 +1277,16 @@ a{color:var(--primary);text-decoration:none}
 .node-status-cell{display:flex;flex-direction:column;align-items:flex-start;gap:3px;min-width:86px}
 .item--node .chip{font-weight:600}
 .item--node .chip{white-space:nowrap}
-.node-select-wrap{display:grid;grid-template-columns:44px minmax(0,1fr);gap:8px;align-items:stretch}
-.node-select-control{display:flex;align-items:center;justify-content:center;border:2px solid #c9d0c3;
+/* Per-node checkboxes are opt-in, exactly like the action bar they feed. The
+   list is read one node at a time far more often than it is acted on in bulk,
+   and a permanent checkbox column costs 44px of width on a phone plus a
+   selection affordance on every row for a mode the operator is usually not in.
+   body.batch-mode is set by showBatchBar(). */
+.node-select-wrap{display:grid;grid-template-columns:minmax(0,1fr);gap:8px;align-items:stretch}
+.node-select-control{display:none;align-items:center;justify-content:center;border:2px solid #c9d0c3;
   border-radius:8px;background:#f7f8f4;cursor:pointer;min-height:86px}
+body.batch-mode .node-select-wrap{grid-template-columns:44px minmax(0,1fr)}
+body.batch-mode .node-select-control{display:flex}
 .node-select-control input{width:22px;height:22px;margin:0;accent-color:var(--primary)}
 .node-select-wrap.is-selected .node-select-control{border-color:var(--primary);background:rgba(122,155,112,.20)}
 .node-select-wrap.is-selected .item--node{border-color:var(--primary)}
@@ -1394,7 +1401,8 @@ a{color:var(--primary);text-decoration:none}
   .node-row{grid-template-columns:1fr;gap:8px}
   .node-timing,.node-status{grid-template-columns:1fr 1fr;gap:6px}
   .node-timing-cell,.node-status-cell{min-width:0}
-  .node-select-wrap{grid-template-columns:42px minmax(0,1fr);gap:6px}
+  .node-select-wrap{grid-template-columns:minmax(0,1fr);gap:6px}
+  body.batch-mode .node-select-wrap{grid-template-columns:42px minmax(0,1fr)}
   .batch-actions{top:66px}
   .batch-actions__buttons{grid-template-columns:1fr}
 
@@ -1602,14 +1610,19 @@ function flashBtn(btn, ok){
 }
 
 // --- Node cards: incremental, XSS-safe (textContent for device strings) ---
-function chipState(state, paused, pending, desiredTarget, ended){
+function chipState(state, paused, pending, desiredTarget, ended, reportedPaused){
   if (pending && Number(desiredTarget)===0) return ['chip chip--state-unpaired','Remove queued'];
   // Ended outranks paused, matching the server-rendered chips. End queues
   // STANDBY and keeps the node DEPLOYED, so every test below would otherwise
   // call an archived deployment "Paused".
   if (ended) return ['chip chip--bat-low','Ended'];
   if (state==='DEPLOYED' && pending && Number(desiredTarget)===3) return ['chip chip--state-paused','Pause queued'];
-  if (state==='DEPLOYED' && pending && Number(desiredTarget)===2) return ['chip chip--state-deployed','Resume queued'];
+  // Only a node that is actually paused is resuming. A settings change leaves a
+  // pending desired config at targetState 2 as well, and calling that "Resume
+  // queued" reports a recovery from a pause that never happened.
+  if (state==='DEPLOYED' && pending && Number(desiredTarget)===2)
+    return reportedPaused ? ['chip chip--state-deployed','Resume queued']
+                          : ['chip chip--state-deployed','Update queued'];
   if (state==='DEPLOYED') return paused ? ['chip chip--state-paused','Paused']
                                         : ['chip chip--state-deployed','Active'];
   if (state==='PAIRED')   return ['chip chip--state-paired','Connected'];
@@ -1632,7 +1645,7 @@ function nodeCell(parentClass, labelText, fieldName){
 }
 function applyNodeFields(card, n){
   if (card && card.dataset){ card.dataset.state=n.state||''; card.dataset.paused=n.paused?'1':'0'; }
-  var st=chipState(n.state, n.paused, n.pending, n.desiredTarget, n.deploymentEnded), s=card.querySelector('[data-f="status"]');
+  var st=chipState(n.state, n.paused, n.pending, n.desiredTarget, n.deploymentEnded, n.reportedPaused), s=card.querySelector('[data-f="status"]');
   if (s){ s.className=st[0]; s.textContent=st[1]; }
   var bt=chipBatt(n.batV), b=card.querySelector('[data-f="batt"]');
   if (b){ b.className=bt[0]; b.textContent=bt[1]; }
@@ -2305,6 +2318,11 @@ static String buildLiveJson() {
     // queued, so without this the live refresh repaints an archived node as
     // "Paused" the moment the poll lands, undoing the server-rendered chip.
     j += ",\"deploymentEnded\":"; j += (n.deploymentEndedUnix != 0) ? "true" : "false";
+    // The node's OWN reported state, as distinct from "paused" above, which
+    // mirrors the DESIRED config. Only the reported flag can tell a genuine
+    // resume from an ordinary settings change that happens to leave
+    // targetState at 2.
+    j += ",\"reportedPaused\":"; j += n.recordingPaused ? "true" : "false";
     // Configured-sensor state for the deployment UI: which sensors are marked
     // installed, what reported last cycle, and which configured ones are faulted.
     j += ",\"expectedSensorMask\":"; j += String((unsigned)n.expectedSensorMask);
@@ -3141,10 +3159,15 @@ static void handleStationsPage() {
                        : (node.state == DEPLOYED) ? "chip chip--state-deployed"
                        : (node.state == PAIRED)   ? "chip chip--state-paired"
                        : "chip chip--state-unpaired";
+    // "Resume queued" only when the node is actually paused; a settings change
+    // (e.g. a fleet-wide recording-interval update) also leaves a pending
+    // desired config with targetState 2 and must not read as a resume.
     const char* stTxt = removePending ? "Remove queued"
                        : nodeEnded ? "Ended"
                        : (desiredPending && nodeDesired.targetState == 3) ? "Pause queued"
-                       : (desiredPending && nodeDesired.targetState == 2) ? "Resume queued"
+                       : (desiredPending && nodeDesired.targetState == 2 && node.recordingPaused)
+                           ? "Resume queued"
+                       : (desiredPending && nodeDesired.targetState == 2) ? "Update queued"
                        : nodePaused ? "Paused"
                        : (node.state == DEPLOYED) ? "Active"
                        : (node.state == PAIRED)   ? "Connected" : "New";
@@ -3219,6 +3242,10 @@ static void handleStationsPage() {
     var tog=document.getElementById('batch-toggle');
     if(bar)bar.hidden=!show;
     if(tog)tog.style.display=show?'none':'';
+    // Drives the per-node checkbox column too — they appear together and vanish
+    // together, so the list is never showing a selection affordance for a mode
+    // that is not active.
+    document.body.classList.toggle('batch-mode', !!show);
     if(!show){ boxes().forEach(function(b){b.checked=false;}); updateBatchSelection(); }
   };
   window.updateBatchSelection=function(changed){
@@ -3232,7 +3259,8 @@ static void handleStationsPage() {
     if(selected.length>0){
       var bar=document.getElementById('batch-node-actions');
       var tog=document.getElementById('batch-toggle');
-      if(bar&&bar.hidden){bar.hidden=false;if(tog)tog.style.display='none';}
+      if(bar&&bar.hidden){bar.hidden=false;if(tog)tog.style.display='none';
+        document.body.classList.add('batch-mode');}
     }
     all.forEach(function(b){var w=b.closest('.node-select-wrap');if(w)w.classList.toggle('is-selected',b.checked);});
     var count=document.getElementById('batch-count');
@@ -3572,14 +3600,23 @@ static void handleStationDetail() {
     html += F("<span class='chip chip--bat-low'>Ended</span>");
   }
   else if (target->state == DEPLOYED) {
-    if (displayedPaused) {
-      html += desiredPending
-          ? F("<span class='chip chip--state-paused'>Pause queued</span>")
-          : F("<span class='chip chip--state-paused'>Paused</span>");
+    // A queued LIFECYCLE change and a queued SETTINGS change both leave
+    // configVersion ahead of configVersionApplied, but only one of them is a
+    // resume. Calling a recording-interval change "Resume queued" tells the
+    // operator a node is coming back from a pause it was never in — which is
+    // exactly what a fleet-wide interval change used to produce on every node.
+    if (desiredPending && displayedDesired.targetState == 3) {
+      html += F("<span class='chip chip--state-paused'>Pause queued</span>");
+    } else if (desiredPending && displayedDesired.targetState == 0) {
+      html += F("<span class='chip chip--state-unpaired'>Removal queued</span>");
+    } else if (desiredPending && target->recordingPaused) {
+      html += F("<span class='chip chip--state-deployed'>Resume queued</span>");
+    } else if (desiredPending) {
+      html += F("<span class='chip chip--state-deployed'>Settings update queued</span>");
+    } else if (target->recordingPaused) {
+      html += F("<span class='chip chip--state-paused'>Paused</span>");
     } else {
-      html += desiredPending
-          ? F("<span class='chip chip--state-deployed'>Resume/change queued</span>")
-          : F("<span class='chip chip--state-deployed'>Active</span>");
+      html += F("<span class='chip chip--state-deployed'>Active</span>");
     }
   }
   else if (target->state == PAIRED) html += F("<span class='chip chip--state-paired'>Connected</span>");
@@ -3678,16 +3715,13 @@ static void handleStationDetail() {
   html += F("'>");
 
   // --- Location section (manual entry with phone GPS guidance) ---
+  //
+  // Fields first, help on demand. This was a paragraph plus a boxed four-step
+  // walkthrough permanently above two number inputs — read once, then in the
+  // way on every later visit. The steps are unchanged in substance, just folded
+  // into a <details> and compressed to one sentence.
   html += F("<div class='section'>"
             "<h3>Location</h3>"
-            "<p class='muted'>Find this node's coordinates using your phone's Maps app, then enter them below.</p>"
-            "<div style='margin:8px 0;padding:10px;border:1px solid var(--border);border-radius:8px;background:var(--panel)'>"
-            "<strong>How to get coordinates:</strong><br>"
-            "<span class='muted'>1. Open Google Maps or Apple Maps on your phone<br>"
-            "2. Tap the location dot to centre on your position<br>"
-            "3. Long-press the blue dot → coordinates appear at the top<br>"
-            "4. Copy the latitude and longitude values</span>"
-            "</div>"
             "<label class='label'>Latitude</label>"
             "<input class='input' type='text' id='lat' name='lat' placeholder='-27.469771' value='");
   if (!isnan(target->latitude)) {
@@ -3704,6 +3738,11 @@ static void handleStationDetail() {
     html += lonBuf;
   }
   html += F("'>"
+            "<details style='margin-top:8px'>"
+            "<summary class='muted' style='cursor:pointer;font-size:13px'>How do I find these?</summary>"
+            "<p class='muted' style='margin:6px 0 0'>In Google or Apple Maps, long-press your "
+            "location on the map. The latitude and longitude appear at the top &mdash; copy them here.</p>"
+            "</details>"
             "</div>");
 
   html += F("<div style='margin-bottom:10px;padding:10px;border:1px solid var(--border);border-radius:8px;background:#fafafa'>"
