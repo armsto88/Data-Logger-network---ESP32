@@ -20,7 +20,7 @@ Branch: `feat/node-deployment-epochs` (both repos).
 | 0 | Backend pre-flight against production data | **PASS** — see dashboard log |
 | 1 | Backend migration rehearsal on a clone | **PASS** — see dashboard log |
 | 2 | **Firmware on-device bench tests** | **PASS (2a)** — 2026-08-01, real hardware. 2b/2c outstanding |
-| 3 | End-to-end hardware → hub → backend → dashboard | **PASS for steady state** — first sync 2026-08-01 09:56 Berlin. Lifecycle journeys still untested |
+| 3 | End-to-end hardware → hub → backend → dashboard | **J1, J2, J4 PASS** 2026-08-01 on hardware. J3, J5–J7 outstanding |
 | 4 | Staged rollout | DB migrated; **Edge Function NOT deployed** — blocks firmware |
 | 5 | Post-deploy monitoring | **NOT STARTED** |
 
@@ -306,7 +306,46 @@ against the sync boundary without allowing for the node's 20-minute recording
 cadence. Fixed in the dashboard repo (`91ca298`); it was latent in production
 beforehand and is not attributable to this work. Detail in the dashboard log.
 
-## Phase 3 (continued) — lifecycle journeys on the bench (NOT STARTED)
+## Phase 3 (continued) — lifecycle journeys — J1, J2, J4 PASS (2026-08-01)
+
+Run on the bench hub against the live backend. Full evidence in the dashboard
+log; the firmware-side summary:
+
+| Journey | Result |
+|---|---|
+| **J1** End deployment | `ENV_6C0A80` epoch 1 archived, `ended_at 12:05:55Z`, identity frozen, receipt `APPLIED` |
+| **J2** Post-End quarantine | 5 readings `POST_DEPLOYMENT` (12:17:03 → 13:37:15), `latest_readings` held at 11:57:00, node converged to STANDBY and stopped |
+| **J4** Reuse number 003 | epoch 1 kept `'Node 3'`, epoch 2 took `'Node 3 ( moved )'`, `source_epoch` diverged, both receipts `APPLIED` |
+
+**Ten firmware/dashboard bugs found, none reachable by any test suite.** Each
+needed an operator performing a real action on real hardware — which is the
+whole case for these journeys, and the reason the compile-only Phase 2 result
+was never sufficient on its own.
+
+Firmware-side defects (dashboard-side listed in the other log):
+
+| Defect | Fix |
+|---|---|
+| `handleShutdown()` synced only on `gDeployedThisSession`, a flag set solely by deploy actions, so End/Remove/Pause/Resume powered the hub down with their result unsent | `d187d82` |
+| `performManualUpload()` gates on pending READINGS; a deployment event rides in the status object, so an empty CSV buffer meant the modem never powered on — worst exactly when an operator ends a deployment shortly after a sync | `892bdf5` |
+| The ack handler was a file-static in `main.cpp`, so UI uploads delivered events and discarded the acknowledgements. Cumulative: after 16 UI lifecycle actions the outbox fills and Start/End begin refusing | `7a4e85f` |
+| The setup wizard skipped the naming step when starting a NEW deployment. `node_meta` still holds the previous deployment's identity, so `hasIdentity` is true for every ended node and the new site silently inherited the old name | `0b60e5f` |
+| "Resume queued" shown for a fleet recording-interval change on nodes that were never paused | `79f30b9` |
+| `fleet.paused` counted an ENDED deployment as paused | `7357d01` |
+| Permanent per-node checkbox column; six-line coordinates walkthrough above two inputs | `79f30b9` |
+
+### Still to run
+
+**J3** (Resume refused on an ended deployment) — needs Node 3 ended again, so it
+pairs with J6/J7. Still the only available evidence for the backend
+`controlResolveBackendNodeConfig` guard while `test-node-config-control` crashes.
+
+**J5** (number collision) — claim 001 on Node 3 while Node 1 holds it; expect
+refusal at wizard step 1.
+
+**J6** (Remove archives before removing) and **J7** (interrupted Start).
+
+## Phase 3 (original plan) — lifecycle journeys on the bench
 
 One FieldHub, two nodes, pointed at a **clone** (not production). Walk all seven
 lifecycle journeys and verify each **against the database, not the FieldHub
