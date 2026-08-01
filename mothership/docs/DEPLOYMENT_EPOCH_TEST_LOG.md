@@ -20,7 +20,7 @@ Branch: `feat/node-deployment-epochs` (both repos).
 | 0 | Backend pre-flight against production data | **PASS** — see dashboard log |
 | 1 | Backend migration rehearsal on a clone | **PASS** — see dashboard log |
 | 2 | **Firmware on-device bench tests** | **PASS (2a)** — 2026-08-01, real hardware. 2b/2c outstanding |
-| 3 | End-to-end hardware → hub → backend → dashboard | **NOT RUN** — blocking |
+| 3 | End-to-end hardware → hub → backend → dashboard | **PASS for steady state** — first sync 2026-08-01 09:56 Berlin. Lifecycle journeys still untested |
 | 4 | Staged rollout | DB migrated; **Edge Function NOT deployed** — blocks firmware |
 | 5 | Post-deploy monitoring | **NOT STARTED** |
 
@@ -284,7 +284,29 @@ Confirm:
 
 ---
 
-## Phase 3 — End-to-end on the bench (BLOCKING, not started)
+## Phase 3 — first live sync, 2026-08-01 (PASS, steady state only)
+
+The hub woke on its phase-aligned alarm at 07:55:50Z, opened its node window,
+uploaded, and slept. Confirmed from a production dump afterwards:
+
+- `motherships.last_seen` 07:56:53Z — 63 s after the alarm
+- `firmware_build = 253f6c7`
+- all three nodes checked in, `last_seen_unix` 07:56:23–24Z
+- **3,328 readings, 100% `RESOLVED`**; deployments still exactly 3; no conflicts
+
+`deployment_event_receipts` is empty, and that is correct:
+`deploymentSeedFromRegistry()` seeds epoch 1 into the store but deliberately does
+not enqueue an outbox event, because the backend already holds those rows from
+the migration backfill. Events are raised only by operator actions. The first
+receipts will appear when the lifecycle journeys below are run.
+
+A dashboard defect surfaced from watching this sync — all three nodes rendered
+"Delayed" despite having just checked in, because reading freshness was judged
+against the sync boundary without allowing for the node's 20-minute recording
+cadence. Fixed in the dashboard repo (`91ca298`); it was latent in production
+beforehand and is not attributable to this work. Detail in the dashboard log.
+
+## Phase 3 (continued) — lifecycle journeys on the bench (NOT STARTED)
 
 One FieldHub, two nodes, pointed at a **clone** (not production). Walk all seven
 lifecycle journeys and verify each **against the database, not the FieldHub
