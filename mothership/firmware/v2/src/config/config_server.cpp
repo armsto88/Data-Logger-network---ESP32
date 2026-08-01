@@ -4317,7 +4317,15 @@ static void handleStationSetupWizard() {
   const uint16_t sensorMask = (dc.sensorMask & NODE_SENSOR_MASK_VALID)
       ? (uint16_t)(dc.sensorMask & ~NODE_SENSOR_MASK_VALID) : 0;
   const bool hasIdentity = userId.length() > 0 || name.length() > 0;
-  const int startStep = hasIdentity ? 2 : 1;  // resume past identity if already named
+  // Starting a NEW deployment must always begin at naming.
+  //
+  // node_meta still holds the PREVIOUS deployment's number and name, so
+  // hasIdentity is true for every ended node — and jumping to step 2 skipped the
+  // one screen that matters most, letting a new site silently inherit the old
+  // site's identity. The resume-past-identity shortcut exists for a first-time
+  // setup that was interrupted part-way, which is a different situation.
+  const bool startingNewDeployment = (target->deploymentEndedUnix != 0);
+  const int startStep = (hasIdentity && !startingNewDeployment) ? 2 : 1;
 
   html += F("<div class='section'>"
             "<p class='muted' style='margin:0 0 10px'>Node setup &middot; step <span id='wz-cur'>1</span> of 4</p>");
