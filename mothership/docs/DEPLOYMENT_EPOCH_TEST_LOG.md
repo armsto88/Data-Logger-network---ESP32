@@ -21,7 +21,7 @@ Branch: `feat/node-deployment-epochs` (both repos).
 | 1 | Backend migration rehearsal on a clone | **PASS** — see dashboard log |
 | 2 | **Firmware on-device bench tests** | **PASS (2a)** — 2026-08-01, real hardware. 2b/2c outstanding |
 | 3 | End-to-end hardware → hub → backend → dashboard | **J1, J2, J4 PASS** 2026-08-01 on hardware. J3, J5–J7 outstanding |
-| 4 | Staged rollout | DB migrated; **Edge Function NOT deployed** — blocks firmware |
+| 4 | Staged rollout | DB migrated ✅ · Edge Function deployed ✅ · hub flashed ✅ · frontend deployed ✅ |
 | 5 | Post-deploy monitoring | **NOT STARTED** |
 
 ---
