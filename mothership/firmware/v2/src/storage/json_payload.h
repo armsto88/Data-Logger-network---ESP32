@@ -104,3 +104,22 @@ JsonPayload buildJsonUpload(const String& csvChunk,
                             const String& fwVersion,
                             const StatusContext* status = nullptr,
                             uint32_t rtcFallbackUnix = 0);
+
+// ---------------------------------------------------------------------------
+// Upload-response inspection
+// ---------------------------------------------------------------------------
+
+// How many readings the backend actually STORED, from the response's
+// "appended" field. Returns -1 when the field is absent (legacy backend).
+//
+// HTTP 200 alone does not mean the readings landed: a payload the backend can
+// parse but which carries no usable readings answers 200 with "appended": 0.
+// A caller that advances its upload cursor on status code alone then deletes
+// rows the database never received.
+int jsonResponseAppendedCount(const String& responseBody);
+
+// True when the backend recognised this payload_hash as one it already
+// processed. Then "appended": 0 is CORRECT and the rows are safely stored, so
+// the cursor MUST still advance — otherwise a lost response wedges the queue
+// on data the backend already holds.
+bool jsonResponseIsDuplicate(const String& responseBody);

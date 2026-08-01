@@ -317,17 +317,26 @@ JsonPayload buildJsonUpload(const String& csvChunk,
     fallbackIso = tb;
   }
 
-  // Each reading object carries every field (null for missing sensors), so
-  // budget ~600 bytes/reading plus a small wrapper.
-  const uint32_t estBytes = (uint32_t)maxReadings * 600U + 256U;
-  if (ESP.getFreeHeap() < estBytes + 8192U) {
-    Serial.printf("[JSON] Insufficient heap for build (est=%u free=%u)\n",
-                  (unsigned)estBytes, (unsigned)ESP.getFreeHeap());
+  // Budget for BOTH buffers, because they exist at the same time: the readings
+  // array is built first and then COPIED into body, so peak usage is roughly
+  // double. The old estimate covered a single copy at 600 B/reading, which let
+  // a batch past this guard that then failed to allocate its body — and an
+  // Arduino String reports no error when a grow fails, so the result was a
+  // silently truncated payload the backend accepted with "appended": 0.
+  //
+  // 31-column rows measure ~780 B of JSON each, verified against a real upload:
+  // 51 readings produced a 39,632 B body. 850 leaves headroom for long node
+  // names and the widest spectral values.
+  const uint32_t kEstBytesPerReading = 850U;
+  const uint32_t estBytes = (uint32_t)maxReadings * kEstBytesPerReading;
+  if (ESP.getFreeHeap() < (estBytes * 2U) + 8192U) {
+    Serial.printf("[JSON] Insufficient heap for build (need=%u free=%u)\n",
+                  (unsigned)(estBytes * 2U + 8192U), (unsigned)ESP.getFreeHeap());
     return result;
   }
 
   String readings;
-  if (!readings.reserve((uint32_t)maxReadings * 560U + 32U)) {
+  if (!readings.reserve(estBytes + 32U)) {
     Serial.println("[JSON] readings reserve failed");
     return result;
   }
@@ -393,7 +402,19 @@ JsonPayload buildJsonUpload(const String& csvChunk,
         + status->modemJson.length() + status->diagnosticsJson.length()
         + status->firmwareJson.length() + status->controlJson.length()
       : 0U;
-  body.reserve(readings.length() + fwVersion.length() + 160U + statusEst);
+  // CHECKED. This reserve was unchecked, and that is exactly how 74 readings
+  // were destroyed on 2026-08-01: the allocation failed, String silently
+  // refused to grow, a 5,892-byte body claiming 76 readings went out, the
+  // backend replied 200 with "appended": 0, and the hub purged the rows.
+  if (!body.reserve(readings.length() + fwVersion.length() + 160U + statusEst)) {
+    Serial.printf("[JSON] body reserve failed (need=%u free=%u) — refusing to send\n",
+                  (unsigned)(readings.length() + statusEst + 160U),
+                  (unsigned)ESP.getFreeHeap());
+    result.rowCount = 0;
+    result.csvBytesConsumed = 0;
+    return result;   // ok stays false — caller retries rather than advancing
+  }
+  const uint32_t expectedReadingsLen = readings.length();
   body += "{\"readings\":[";
   body += readings;
   body += "],\"meta\":{\"firmwareVersion\":\"";
@@ -521,7 +542,65 @@ JsonPayload buildJsonUpload(const String& csvChunk,
   }
   body += "}";
 
+  // Integrity gate. Every append above can fail silently on a fragmented heap,
+  // so verify the finished document actually contains what we counted before
+  // handing the caller something it will treat as delivered.
+  //
+  // A short body is not a cosmetic problem: the caller advances the upload
+  // cursor and purges the CSV on HTTP 200, so a truncated payload the backend
+  // shrugs at costs real readings.
+  if (emitted > 0 && body.length() < expectedReadingsLen) {
+    Serial.printf("[JSON] TRUNCATED build: body=%u < readings=%u for %u rows "
+                  "(free=%u) — refusing to send\n",
+                  (unsigned)body.length(), (unsigned)expectedReadingsLen,
+                  (unsigned)emitted, (unsigned)ESP.getFreeHeap());
+    body = String();
+    result.rowCount = 0;
+    result.csvBytesConsumed = 0;
+    return result;   // ok stays false
+  }
+  if (body.length() == 0 || body[body.length() - 1] != '}') {
+    Serial.println("[JSON] malformed build (unterminated) — refusing to send");
+    body = String();
+    result.rowCount = 0;
+    result.csvBytesConsumed = 0;
+    return result;
+  }
+
   result.byteLength = body.length();
   result.ok = true;
   return result;
+}
+
+// ---------------------------------------------------------------------------
+// Upload-response inspection
+// ---------------------------------------------------------------------------
+// Hand-rolled rather than parsed: this runs on the modem path where heap is
+// tight, matching how the rest of the response handling reads these bodies.
+
+int jsonResponseAppendedCount(const String& responseBody) {
+  const int at = responseBody.indexOf("\"appended\"");
+  if (at < 0) return -1;                       // legacy backend — cannot judge
+  int i = responseBody.indexOf(':', at);
+  if (i < 0) return -1;
+  ++i;
+  while (i < (int)responseBody.length() && responseBody[i] == ' ') ++i;
+  int value = 0;
+  bool sawDigit = false;
+  while (i < (int)responseBody.length() &&
+         responseBody[i] >= '0' && responseBody[i] <= '9') {
+    value = value * 10 + (responseBody[i] - '0');
+    sawDigit = true;
+    ++i;
+  }
+  return sawDigit ? value : -1;
+}
+
+bool jsonResponseIsDuplicate(const String& responseBody) {
+  const int at = responseBody.indexOf("\"duplicate\"");
+  if (at < 0) return false;
+  const int colon = responseBody.indexOf(':', at);
+  if (colon < 0) return false;
+  return responseBody.indexOf("true", colon) == colon + 1 ||
+         responseBody.indexOf("true", colon) == colon + 2;
 }

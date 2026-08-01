@@ -4968,6 +4968,21 @@ static void performManualUpload(String& resultMsg, bool& ok) {
           HttpsPostResult result = modem.httpsPost(url, json.body, "application/json", authHeader);
           posts++;
           if (result.httpStatus == 200) {
+            // Same guard as the scheduled path: HTTP 200 does not mean the rows
+            // were stored, and advancing the cursor deletes them. See the note
+            // in main.cpp performModemUpload.
+            const int appended = jsonResponseAppendedCount(result.responseBody);
+            if (appended == 0 && json.rowCount > 0 &&
+                !jsonResponseIsDuplicate(result.responseBody)) {
+              Serial.printf("[UI] REFUSING to advance: sent %u readings, backend "
+                            "stored 0 — rows stay on flash\n",
+                            (unsigned)json.rowCount);
+              lastErr = "backend stored 0 of " + String((unsigned)json.rowCount) +
+                        " readings";
+              ingestBackendResponseFromUi(result.responseBody);
+              stop = true;
+              break;
+            }
             gUploadQueue.advanceCursor(payload.startOffset + json.csvBytesConsumed, getRTCTimeUnix(),
                                        json.rowCount);
             gUploadQueue.purgeUploaded();

@@ -1129,6 +1129,37 @@ void performModemUpload(const TransmissionSettings& txSettings, uint32_t session
                                                "application/json", authHeader);
 
       if (result.httpStatus == 200) {
+        // HTTP 200 is NOT proof the readings were stored. Check the backend's
+        // own count before deleting anything.
+        //
+        // On 2026-08-01 a truncated payload went out claiming 76 readings, the
+        // backend answered 200 with "appended": 0, and the cursor advanced and
+        // purged them anyway — 74 readings destroyed. The build fault itself is
+        // fixed in json_payload.cpp; this guard is what makes any future
+        // occurrence cost a retry instead of the data.
+        //
+        // A recognised DUPLICATE payload is the one case where 0 is correct:
+        // the backend already holds those rows, so the cursor must still
+        // advance or a lost response wedges the queue on data already stored.
+        const int appended = jsonResponseAppendedCount(result.responseBody);
+        const bool wasDuplicate = jsonResponseIsDuplicate(result.responseBody);
+        if (appended == 0 && json.rowCount > 0 && !wasDuplicate) {
+          Serial.printf("[UPLOAD] REFUSING to advance: sent %u readings, backend "
+                        "stored 0 and it is not a duplicate — rows stay on flash\n",
+                        (unsigned)json.rowCount);
+          Serial.printf("[UPLOAD] body was %u bytes for %u rows (suspect a "
+                        "truncated build)\n",
+                        (unsigned)json.byteLength, (unsigned)json.rowCount);
+          uploadQueue.incrementRetryCount(retryNowUnix, retryCooldownSec);
+          ingestBackendResponse(result.responseBody);
+          break;
+        }
+        if (appended > 0 && (uint32_t)appended < (uint32_t)json.rowCount) {
+          // Partial. The shortfall is row-level duplicates the backend skipped,
+          // which are already stored, so advancing is correct — but say so.
+          Serial.printf("[UPLOAD] partial store: sent %u, appended %d (rest already present)\n",
+                        (unsigned)json.rowCount, appended);
+        }
         Serial.printf("[UPLOAD] JSON SUCCESS: HTTP 200, %u readings\n",
                       (unsigned)json.rowCount);
         nowUnix = getRTCTime();
