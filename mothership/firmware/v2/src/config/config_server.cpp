@@ -4826,7 +4826,13 @@ static void performManualUpload(String& resultMsg, bool& ok) {
     resultMsg = "Storage not ready — cannot read data";
   } else {
     gUploadQueue.init();
-    if (gUploadQueue.getPendingBytes() == 0) {
+    // A deployment event rides in the STATUS object, not in readings, so an
+    // empty reading queue must not count as "nothing to send". Observed on the
+    // bench: an End was archived on the hub, the pre-shutdown sync correctly
+    // fired with queuedEvents=1, and then bailed here because the CSV buffer
+    // was empty — so the archive still never reached the dashboard.
+    const uint8_t manQueuedEvents = deploymentOutboxCount();
+    if (gUploadQueue.getPendingBytes() == 0 && manQueuedEvents == 0) {
       resultMsg = "No new data to upload";
       ok = true;
     } else {
@@ -4965,6 +4971,33 @@ static void performManualUpload(String& resultMsg, bool& ok) {
             stop = true;
           }
         }
+        // Status-only POST when no reading chunk carried the status object.
+        // The loop attaches status to its FIRST post, so this covers exactly
+        // the case where the loop never posted — an empty reading queue with
+        // deployment events waiting.
+        bool statusOnlySent = false;
+        if (posts == 0 && !stop && lastErr.length() == 0 && manQueuedEvents > 0) {
+          JsonPayload statusOnly = buildJsonUpload(String(), 1, FW_SEMVER,
+                                                   &manStatusCtx, getRTCTimeUnix());
+          if (statusOnly.ok) {
+            HttpsPostResult sres = modem.httpsPost(url, statusOnly.body,
+                                                   "application/json", authHeader);
+            posts++;
+            if (sres.httpStatus == 200) {
+              statusOnlySent = true;
+              // Drains deploymentEventAcks so the outbox clears, exactly as the
+              // readings path does.
+              ingestBackendResponseFromUi(sres.responseBody);
+            } else {
+              char buf[64];
+              snprintf(buf, sizeof(buf), "status POST HTTP %d", sres.httpStatus);
+              lastErr = String(buf);
+            }
+          } else {
+            lastErr = "status JSON build failed";
+          }
+        }
+
         modem.gracefulShutdown();
 
         if (sent > 0 && lastErr.length() == 0) {
@@ -4974,6 +5007,13 @@ static void performManualUpload(String& resultMsg, bool& ok) {
         } else if (sent > 0) {
           char buf[96];
           snprintf(buf, sizeof(buf), "Sent %d then stopped: %s", sent, lastErr.c_str());
+          resultMsg = String(buf); ok = true;
+        } else if (statusOnlySent) {
+          const uint8_t remaining = deploymentOutboxCount();
+          char buf[96];
+          snprintf(buf, sizeof(buf),
+                   "Deployment changes sent (%u queued, %u remaining)",
+                   (unsigned)manQueuedEvents, (unsigned)remaining);
           resultMsg = String(buf); ok = true;
         } else {
           resultMsg = String("Upload failed: ") + (lastErr.length() ? lastErr : String("no readings sent"));
