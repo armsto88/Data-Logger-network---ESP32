@@ -2137,7 +2137,11 @@ void setup() {
   Serial.println();
   Serial.println("=== Mothership V1 Firmware ===");
   fwIdentityPrint(fwIdentity(NODE_PROTOCOL_VERSION));
-  Serial.println("[FW] V2 snapshot decode; CSV schema=30; spectral metadata IDs=1109-1113");
+  // Derived, not hardcoded. This banner said "schema=30" for the whole of the
+  // 30 -> 31 rollout, which is the one moment an operator reads the boot log
+  // specifically to find out whether the epoch-bearing schema is live.
+  Serial.printf("[FW] V2 snapshot decode; CSV schema=%u; spectral metadata IDs=1109-1113\n",
+                (unsigned)kCurrentCSVColumnCount);
 
   // Available in every wake mode. A command received after this wake's node
   // window is delivered through the existing NODE_CONFIG path at the next
