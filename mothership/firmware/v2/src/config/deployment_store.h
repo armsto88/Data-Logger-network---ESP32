@@ -219,6 +219,20 @@ String deploymentOutboxConflictSummary();
 // Serialise the outbox as status.deploymentEvents[]. Empty array when none.
 String deploymentOutboxToJson();
 
+// Apply an upload response's deploymentEventAcks[] / deploymentEventConflicts[]
+// to the outbox and commit.
+//
+// Acked events are removed; conflicted ones are KEPT with their reason recorded,
+// because a conflict did not commit and the usual cause (a number another node's
+// active deployment still holds) clears itself once that node's End lands.
+//
+// Lives here rather than in main.cpp because BOTH upload paths need it. It was
+// a file-static in main.cpp, so a manual upload from the config server sent its
+// events and then discarded the acknowledgements: the backend applied them, the
+// hub never cleared its outbox, and the same events were resent every session
+// until the outbox filled and started refusing Start/End.
+void deploymentIngestAckResponse(const String& body);
+
 // ---------------------------------------------------------------------------
 // Diagnostics
 // ---------------------------------------------------------------------------

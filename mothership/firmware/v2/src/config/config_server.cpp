@@ -346,6 +346,11 @@ static BackendCommandApplyResult executeBackendRecordingIntervalFromUi(
 }
 
 static void ingestBackendResponseFromUi(const String& responseBody) {
+  // Clear acknowledged deployment events, exactly as the scheduled-sync path
+  // does. Without this a UI-triggered upload delivers the events, the backend
+  // applies them, and the hub still believes they are outstanding — so it
+  // resends them every session and the outbox never drains.
+  deploymentIngestAckResponse(responseBody);
   const uint32_t rtcBefore = getRTCTimeUnix();
   Serial.printf("[CONTROL] manual HTTP response body bytes=%u\n",
                 static_cast<unsigned>(responseBody.length()));

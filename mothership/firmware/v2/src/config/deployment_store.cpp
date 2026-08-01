@@ -505,3 +505,91 @@ void deploymentStoreResetForTest() {
   gReady = true;
   gCreatedFresh = true;
 }
+
+// Drain deploymentEventAcks[] / deploymentEventConflicts[] from an upload
+// response.
+//
+// The two lists are handled DIFFERENTLY:
+//   acked     -> the backend committed it; remove from the outbox.
+//   conflicted-> it did NOT commit; keep it queued and record the reason for the
+//                operator. The common case is a number still held by another
+//                node's active deployment, which clears itself once that node's
+//                End event lands — dropping the event would permanently lose the
+//                deployment record for a condition that resolves on its own.
+//   neither   -> never reached us; stays queued and is resent. Safe because the
+//                eventId is deterministic and the backend upserts on
+//                (project, node, epoch).
+//
+// Deliberately a hand-rolled scan rather than a JSON parse: the response can be
+// several KB and this runs on the modem path where heap is tight, matching how
+// the rest of this file reads responses.
+void deploymentIngestAckResponse(const String& body) {
+  if (body.length() == 0 || deploymentOutboxCount() == 0) return;
+
+  bool dirty = false;
+
+  // --- Acks: bare quoted ids ---------------------------------------------
+  const int ackAt = body.indexOf("\"deploymentEventAcks\"");
+  if (ackAt >= 0) {
+    const int arrStart = body.indexOf('[', ackAt);
+    const int arrEnd   = arrStart >= 0 ? body.indexOf(']', arrStart) : -1;
+    int scan = arrStart;
+    while (arrStart >= 0 && arrEnd > arrStart && scan < arrEnd) {
+      const int q1 = body.indexOf('"', scan);
+      if (q1 < 0 || q1 > arrEnd) break;
+      const int q2 = body.indexOf('"', q1 + 1);
+      if (q2 < 0 || q2 > arrEnd) break;
+      const String token = body.substring(q1 + 1, q2);
+      scan = q2 + 1;
+      if (token.length() && deploymentOutboxRemove(token.c_str())) {
+        Serial.printf("[DEPLOY] Event %s acked — cleared from outbox\n", token.c_str());
+        dirty = true;
+      }
+    }
+  }
+
+  // --- Conflicts: {"eventId":"...","reason":"..."} objects ----------------
+  const int confAt = body.indexOf("\"deploymentEventConflicts\"");
+  if (confAt >= 0) {
+    const int arrStart = body.indexOf('[', confAt);
+    const int arrEnd   = arrStart >= 0 ? body.indexOf(']', arrStart) : -1;
+    int scan = arrStart;
+    while (arrStart >= 0 && arrEnd > arrStart && scan < arrEnd) {
+      const int idKey = body.indexOf("\"eventId\"", scan);
+      if (idKey < 0 || idKey > arrEnd) break;
+      const int idq1 = body.indexOf('"', body.indexOf(':', idKey) + 1);
+      if (idq1 < 0 || idq1 > arrEnd) break;
+      const int idq2 = body.indexOf('"', idq1 + 1);
+      if (idq2 < 0 || idq2 > arrEnd) break;
+      const String eventId = body.substring(idq1 + 1, idq2);
+
+      String reason;
+      const int rKey = body.indexOf("\"reason\"", idq2);
+      if (rKey > 0 && rKey < arrEnd) {
+        const int rq1 = body.indexOf('"', body.indexOf(':', rKey) + 1);
+        int rq2 = rq1 + 1;
+        while (rq2 > 0 && rq2 < arrEnd) {          // honour \" inside the reason
+          rq2 = body.indexOf('"', rq2);
+          if (rq2 < 0) break;
+          if (body[rq2 - 1] != '\\') break;
+          rq2++;
+        }
+        if (rq1 > 0 && rq2 > rq1) reason = body.substring(rq1 + 1, rq2);
+      }
+      scan = idq2 + 1;
+
+      if (eventId.length() &&
+          deploymentOutboxNoteConflict(eventId.c_str(), reason.c_str())) {
+        Serial.printf("[DEPLOY] Event %s CONFLICT (still queued): %s\n",
+                      eventId.c_str(), reason.c_str());
+        dirty = true;
+      }
+    }
+  }
+
+  if (dirty && !deploymentStoreCommit()) {
+    // The commit failed, so the events are still on flash and will be resent.
+    // Harmless: the backend upserts, so a duplicate send is a no-op.
+    Serial.println("[DEPLOY] Outbox ack commit failed — events will be resent");
+  }
+}
