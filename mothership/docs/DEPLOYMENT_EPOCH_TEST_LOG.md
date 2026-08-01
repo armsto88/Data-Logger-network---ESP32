@@ -241,15 +241,25 @@ after (367 bytes, header only). Production firmware then rebuilt the store
 
 ### 2c. CSV schema drain (30 → 31 columns)
 
-> **Not exercised on this hub, and no longer can be.** `test_upload_queue`
-> rewrote `/datalog.csv`, so by the time production firmware ran the file was a
-> bare 31-column header (367 bytes) with an empty queue — the legacy-drain path
-> never triggered. The `rows=3432` in the cursor log is the lifetime uploaded
-> counter, not pending rows.
+> **Not exercised against a real field buffer, and there is no remaining
+> opportunity to do so.** `test_upload_queue` rewrote `/datalog.csv`, so by the
+> time production firmware ran, the file was a bare 31-column header (367 bytes)
+> with an empty queue and the legacy-drain path never triggered. The `rows=3432`
+> in the cursor log is the lifetime uploaded counter, not pending rows.
 >
-> This case therefore still needs a hub that upgrades from real pre-epoch
-> firmware carrying a genuine 30-column buffer. It is the one Phase 2 item with
-> no hardware evidence behind it.
+> The fleet is **one hub** (`Backyard_Hub`), and it has now been upgraded, so no
+> device remains that could upgrade from pre-epoch firmware carrying a genuine
+> 30-column buffer. Any hub added later starts on the current firmware and never
+> has a legacy buffer either.
+>
+> **Residual risk: low, and lower than this heading suggests.** The drain logic
+> itself *is* covered on hardware — `test_upload_queue` passed 27/27 on this
+> board and includes legacy 25- and 30-column headers, both empty and carrying
+> rows, asserting that queued rows are preserved rather than deleted and that
+> the header upgrades only once the queue drains. What was never observed is
+> that logic meeting a genuine field buffer. And in the event it mattered here,
+> it could not have: the hub's queue was already empty at upgrade, so there were
+> no legacy rows to lose.
 
 Flash the new firmware onto a hub carrying a **real** 30-column
 `/datalog.csv` with queued rows. This is the upgrade path every existing hub
