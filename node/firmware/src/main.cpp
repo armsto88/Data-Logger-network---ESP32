@@ -105,8 +105,17 @@ RTC_DS3231 rtc;
 #endif
 
 // Sync wake behavior (minute-resolution DS3231 Alarm2 windowing)
+//
+// Wake a full minute BEFORE the sync slot. At 0 the node powered on exactly at
+// the slot and then spent ~2.5s booting and enumerating 14 sensors before it
+// could hear anything, leaving no margin at all: the FieldHub wakes ~10s early
+// and holds its rendezvous only to slot+15s, so the entire overlap was the tail
+// of the hub's window. Alarm2 is minute-resolution, so 60 is the smallest lead
+// that can actually be expressed — anything less floors back to the slot.
+//
+// Costs ~1 extra minute awake per sync (~0.3% duty at a 6-hour sync interval).
 #ifndef SYNC_PRE_WAKE_SEC
-#define SYNC_PRE_WAKE_SEC 0
+#define SYNC_PRE_WAKE_SEC 60
 #endif
 
 #ifndef SYNC_LISTEN_WINDOW_MS
@@ -1174,7 +1183,15 @@ static uint32_t nextSyncSlotUnix(uint32_t nowUnix) {
   if (phase > nowUnix) return phase;
 
   // For an A2-driven sync wake we want the current slot boundary, not the next one.
-  const uint32_t slot = (nowUnix - phase) / periodSec;
+  uint32_t slot = (nowUnix - phase) / periodSec;
+  // ...except when we deliberately woke EARLY. With SYNC_PRE_WAKE_SEC the alarm
+  // fires before its slot, so flooring would resolve to the slot that already
+  // passed and produce a listen window that closed long ago. Round up only
+  // inside the pre-wake margin (plus boot slack), so a normal at-slot or late
+  // wake still resolves to the slot it woke for.
+  const uint32_t rem = (nowUnix - phase) % periodSec;
+  const uint32_t toNextSlot = periodSec - rem;
+  if (rem != 0 && toNextSlot <= (uint32_t)SYNC_PRE_WAKE_SEC + 90UL) ++slot;
   return phase + slot * periodSec;
 }
 
