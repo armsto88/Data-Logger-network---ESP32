@@ -232,6 +232,17 @@ volatile bool gShutdownRequested = false;
 // the next sync window. Reset to false at config-mode entry (handleConfigWake).
 static bool gDeployedThisSession = false;
 
+// Any operator change worth pushing before power-down, not just a deploy.
+//
+// handleShutdown() used to sync only when gDeployedThisSession was set, so End,
+// Remove, Pause and Resume all powered the hub down with their result sitting
+// unsent. That is worst for End: it queues a durable deployment event, and the
+// operator watches the archive succeed on the hub while the dashboard keeps
+// showing the site as live until the next scheduled sync — up to a full sync
+// interval later (six hours on the default schedule, and longer still when a
+// pending schedule handover pins the wake to the OLD slot).
+static bool gFieldChangeThisSession = false;
+
 // Upload queue instance for config-mode UI (separate from the sync-wake
 // global in main.cpp, which is only active during a sync wake).
 UploadQueue gUploadQueue;
@@ -1327,6 +1338,11 @@ a{color:var(--primary);text-decoration:none}
 .action-choice--start input:checked + span{background:rgba(122,155,112,.25)}
 .action-choice--stop input:checked + span{background:rgba(196,122,90,.25)}
 .action-choice--unpair input:checked + span{background:rgba(196,90,74,.20)}
+/* Two-line variant: action name plus ONE line of consequence. A modifier rather
+   than a change to .action-choice span, because the recording-interval picker
+   reuses the base class and must stay a single centred line. */
+.action-choice--why span{flex-direction:column;align-items:flex-start;justify-content:center;gap:3px;text-align:left}
+.action-choice--why em{font-style:normal;font-weight:400;font-size:12px;line-height:1.3;opacity:.8}
 .icon{width:1.2em;height:1.2em;display:inline-block;vertical-align:-0.12em;fill:currentColor}
 .quick-row{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px;margin:0 0 12px}
 .quick-row .btn{margin-top:0;min-height:52px}
@@ -3465,6 +3481,9 @@ static void handleBatchNodeAction() {
 
   const char* actionLabel = action == "pause" ? "Pause"
       : action == "resume" ? "Resume" : "Remove";
+  // Batch pause/resume/remove are lifecycle changes too, so they must reach
+  // the dashboard before power-down like the single-node paths do.
+  if (changed > 0) gFieldChangeThisSession = true;
   Serial.printf("[BATCH] %s complete selected=%u changed=%u unchanged=%u skipped=%u failed=%u\n",
                 actionLabel, static_cast<unsigned>(selected.size()), changed,
                 unchanged, skipped, failed);
@@ -3742,8 +3761,14 @@ static void handleStationDetail() {
   html += F("<input type='hidden' name='expected_epoch' value='");
   html += String((unsigned)target->deploymentEpoch);
   html += F("'>");
-  html += F("<label class='label'>Node action (optional)</label>"
-            "<div class='muted' style='font-size:12px'>Leave these unselected when only saving the node details above.</div>"
+  // Every action carries ONE line naming its consequence, because the three are
+  // easy to confuse and the difference that matters is reversibility:
+  //   Pause  — reversible, same deployment
+  //   End    — terminal for this deployment, data kept and archived
+  //   Remove — terminal AND the hardware leaves the registry
+  // Without that line the operator is choosing between three similar-looking
+  // buttons whose outcomes differ permanently.
+  html += F("<label class='label'>Node action</label>"
             "<div class='action-choices'>");
   if (deploymentEnded) {
     // Ended: pause/resume are meaningless, and Resume would restart sampling
@@ -3751,27 +3776,37 @@ static void handleStationDetail() {
     // route forward is the Start new deployment button above.
   } else if (!isDeployed) {
     // New / Connected node — the in-hand deploy path.
-    html += F("<label class='action-choice action-choice--start'><input type='radio' name='action' value='start'><span>Deploy (start recording)</span></label>");
+    html += F("<label class='action-choice action-choice--start action-choice--why'>"
+              "<input type='radio' name='action' value='start'>"
+              "<span>Deploy<em>Starts recording and begins this node&rsquo;s first deployment.</em></span></label>");
   } else if (displayedPaused) {
     // Paused deployed node — resume remotely at the next sync.
-    html += F("<label class='action-choice action-choice--start'><input type='radio' name='action' value='resume'><span>Resume recording</span></label>");
+    html += F("<label class='action-choice action-choice--start action-choice--why'>"
+              "<input type='radio' name='action' value='resume'>"
+              "<span>Resume recording<em>Continues the same deployment and its data history.</em></span></label>");
   } else {
     // Active deployed node — pause (standby) remotely at the next sync.
-    html += F("<label class='action-choice action-choice--stop'><input type='radio' name='action' value='pause'><span>Pause recording</span></label>");
+    html += F("<label class='action-choice action-choice--stop action-choice--why'>"
+              "<input type='radio' name='action' value='pause'>"
+              "<span>Pause recording<em>Keeps this deployment. You can resume any time.</em></span></label>");
   }
   if (isDeployed && !deploymentEnded && target->deploymentEpoch > 0) {
-    html += F("<label class='action-choice action-choice--stop'><input type='radio' name='action' value='end_deployment'><span>End deployment");
+    html += F("<label class='action-choice action-choice--stop action-choice--why'>"
+              "<input type='radio' name='action' value='end_deployment'>"
+              "<span>End deployment<em>Archives this site&rsquo;s data");
     const String heldNum = getNodeUserId(target->nodeId);
     if (heldNum.length()) {
-      html += F(" &mdash; frees ");
+      html += F(" and frees number ");
       html += htmlEscape(heldNum);
     }
-    html += F("</span></label>");
+    html += F(". Cannot be resumed.</em></span></label>");
   }
-  html += F("<label class='action-choice action-choice--unpair'><input type='radio' name='action' value='unpair'><span>Remove node</span></label>"
+  html += F("<label class='action-choice action-choice--unpair action-choice--why'>"
+            "<input type='radio' name='action' value='unpair'>"
+            "<span>Remove node<em>Ends the deployment, then unpairs the hardware.</em></span></label>"
             "</div>");
   if (isDeployed) {
-    html += F("<div class='muted' style='font-size:12px;margin-top:6px'>Pause/Resume/Remove are delivered at the node&rsquo;s next sync check-in.</div>");
+    html += F("<div class='muted' style='font-size:12px;margin-top:6px'>Applied at the node&rsquo;s next check-in.</div>");
   }
   html += F("<button type='submit' class='btn btn--success' style='margin-top:12px'>"
             "Save Changes</button>"
@@ -3988,6 +4023,7 @@ static void handleNodeConfigSave() {
       sendDeploymentError(400, r.message, "", nodeId);
       return;
     }
+    gFieldChangeThisSession = true;
     if (isAjaxRequest()) {
       sendAjaxResult(true, r.message);
       return;
@@ -4034,6 +4070,7 @@ static void handleNodeConfigSave() {
         return;
       }
       revertOk = true;
+      gFieldChangeThisSession = true;
       Serial.printf("[CONFIG] %s legacy stop -> deployment ended\n", nodeId.c_str());
     }
   } else if (action == "pause") {
@@ -4048,6 +4085,7 @@ static void handleNodeConfigSave() {
                 (applied.command.outcome == OUT_ACCEPTED ||
                  applied.command.outcome == OUT_REPLAY);
       du = getDesiredConfig(nodeId.c_str());
+      gFieldChangeThisSession = true;
       Serial.printf("[CONFIG] %s pause SCHEDULED: desired v%u STANDBY at next sync\n",
                     nodeId.c_str(), (unsigned)du.configVersion);
     }
@@ -4060,6 +4098,7 @@ static void handleNodeConfigSave() {
                  (applied.command.outcome == OUT_ACCEPTED ||
                   applied.command.outcome == OUT_REPLAY);
       du = getDesiredConfig(nodeId.c_str());
+      gFieldChangeThisSession = true;
       Serial.printf("[CONFIG] %s resume SCHEDULED: desired v%u ACTIVE at next sync\n",
                     nodeId.c_str(), (unsigned)du.configVersion);
     }
@@ -4084,6 +4123,10 @@ static void handleNodeConfigSave() {
                             "", nodeId);
         return;
       }
+      // The archived deployment is now queued and the node is about to leave the
+      // registry — the case where an unsent event matters most, because nothing
+      // on the hub will reference it again.
+      gFieldChangeThisSession = true;
       if (target->state == DEPLOYED) {
         // Deferred unpair: a deployed node is asleep now and only reachable in
         // its sync window. Record the desired UNPAIRED state (durable, version
@@ -5380,17 +5423,26 @@ static void handleShutdown() {
   // when nothing was deployed or if manual upload is disabled in settings.
   String syncMsg;
   bool syncOk = false;
-  const bool deployedThisSession = gDeployedThisSession;
+  // Sync when ANY lifecycle change happened, or whenever a deployment event is
+  // still queued — the outbox check also covers an event left over from an
+  // earlier session whose upload never landed.
+  const uint8_t queuedEvents = deploymentOutboxCount();
+  const bool deployedThisSession =
+      gDeployedThisSession || gFieldChangeThisSession || queuedEvents > 0;
   if (deployedThisSession) {
-    Serial.println("[UI] Deploy detected this session — syncing to dashboard before shutdown");
+    Serial.printf("[UI] Field change this session (deploy=%d change=%d queuedEvents=%u)"
+                  " — syncing to dashboard before shutdown\n",
+                  gDeployedThisSession ? 1 : 0, gFieldChangeThisSession ? 1 : 0,
+                  (unsigned)queuedEvents);
     performManualUpload(syncMsg, syncOk);
     if (syncOk) {
-      Serial.printf("[UI] Post-deploy sync: %s\n", syncMsg.c_str());
+      Serial.printf("[UI] Pre-shutdown sync: %s\n", syncMsg.c_str());
     } else {
-      Serial.printf("[UI] Post-deploy sync skipped/failed: %s\n", syncMsg.c_str());
+      Serial.printf("[UI] Pre-shutdown sync skipped/failed: %s\n", syncMsg.c_str());
     }
   }
   gDeployedThisSession = false;  // reset for the next config session
+  gFieldChangeThisSession = false;
 
   gShutdownRequested = true;
   if (isAjaxRequest()) {
