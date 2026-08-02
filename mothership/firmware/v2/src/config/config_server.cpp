@@ -2278,7 +2278,9 @@ static String buildLiveJson() {
           (uint32_t)(n.nodeId.length() * 131U) + (uint32_t)(n.name.length() * 17U) +
           ((uint32_t)n.expectedSensorMask << 9) + ((uint32_t)n.sensorFaultMask << 20) +
           (mirrored ? ((uint32_t)mirrored->wakeIntervalMin << 24) : 0U) +
-          ((uint32_t)desiredTarget * 2654435761UL);
+          ((uint32_t)desiredTarget * 2654435761UL) +
+          ((uint32_t)n.deploymentEpoch * 2246822519UL) +
+          n.deploymentEndedUnix + ((uint32_t)n.deploymentPendingOp << 28);
     fp *= 16777619UL;  // FNV-style fold — cheap change detector, not a hash guarantee
   }
   fp ^= (gDiscovery.generation * 2654435761UL) + (gDiscovery.active ? 1UL : 0UL) +
@@ -3910,12 +3912,12 @@ static void handleStationDetail() {
       static const char* kHistMon[] = {"Jan","Feb","Mar","Apr","May","Jun",
                                        "Jul","Aug","Sep","Oct","Nov","Dec"};
       String rows;
-      // Newest first: the deployment before this one is the one an operator
-      // standing at the station is most likely asking about.
+      // Newest first. Include the just-ended current epoch: the chip above
+      // describes the node's lifecycle state, while this section is the
+      // operator's proof that the completed deployment was actually archived.
       for (int i = (int)histSlot->archiveCount - 1; i >= 0; --i) {
         const DeploymentArchive& archived = histSlot->archive[i];
         if (archived.epoch == 0) continue;
-        if (archived.epoch == target->deploymentEpoch) continue;  // chip above
         rows += F("<div style='margin:8px 0'><strong>Deployment ");
         rows += String((unsigned)archived.epoch);
         if ((archived.known & DEPLOY_ARCHIVE_IDENTITY_KNOWN) && archived.name[0]) {
@@ -3926,7 +3928,7 @@ static void handleStationDetail() {
           rows += F(" &middot; ");
           rows += htmlEscape(archived.userId);
         }
-        rows += F("</strong><div class='muted'>");
+        rows += F("</strong><div class='muted'>Stored locally &middot; ");
         if ((archived.known & DEPLOY_ARCHIVE_START_KNOWN) && archived.startedUnix > 0) {
           time_t bt = (time_t)archived.startedUnix;
           struct tm* btm = gmtime(&bt);
@@ -3961,7 +3963,7 @@ static void handleStationDetail() {
         rows += F("</div></div>");
       }
       if (rows.length()) {
-        html += F("<div class='section'><h3>Previous deployments</h3>");
+        html += F("<div class='section'><h3>Completed deployments</h3>");
         html += rows;
         // The ring evicts the oldest once full, so a surviving epoch 1 is proof
         // nothing has been dropped. Without this an operator could read a short
