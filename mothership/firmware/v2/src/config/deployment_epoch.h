@@ -69,6 +69,32 @@ void deploymentSetLegacyBacklogFn(DeploymentLegacyBacklogFn fn);
 typedef uint32_t (*DeploymentNowFn)();
 void deploymentSetNowFn(DeploymentNowFn fn);
 
+// Optional durable archive sink (the production SD card). The LittleFS store
+// remains authoritative, so a sink failure is reported but never rolls back a
+// committed lifecycle transition.
+typedef bool (*DeploymentArchiveSinkFn)(const char* nodeId,
+                                        const DeploymentEvent& event);
+void deploymentSetArchiveSinkFn(DeploymentArchiveSinkFn fn);
+
+// Whether FieldMesh lifecycle events should occupy the upload outbox. The
+// default when no hook is installed is true (preserves tests and connected
+// behavior). Standalone/custom operation keeps the local archive but must never
+// fill a cloud-only outbox and block fleet management.
+typedef bool (*DeploymentCloudEventsEnabledFn)();
+void deploymentSetCloudEventsEnabledFn(DeploymentCloudEventsEnabledFn fn);
+
+struct DeploymentBackfillResult {
+  uint16_t queued;    // newly added to the durable outbox this call
+  uint16_t deferred;  // known records waiting for a later free outbox slot
+  bool     committed;
+};
+
+// Fill available outbox slots with complete local deployment records that
+// FieldMesh has not acknowledged yet. Repeated calls are idempotent and allow a
+// standalone history larger than the 16-event transport window to drain over
+// successive connected syncs.
+DeploymentBackfillResult deploymentQueueFieldMeshBackfill();
+
 // ---------------------------------------------------------------------------
 // Lifecycle operations
 // ---------------------------------------------------------------------------

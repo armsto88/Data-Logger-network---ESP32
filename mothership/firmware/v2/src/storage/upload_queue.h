@@ -7,12 +7,15 @@
 // Upload cursor / queue manager for the Mothership V1 modem upload subsystem.
 //
 // Tracks how much of /datalog.csv has been successfully uploaded to the
-// Google Cloud Function endpoint.  The cursor (byte offset) is persisted in
-// NVS namespace "tx" so it survives deep-sleep / power cycles.
+// remote endpoint. The cursor (byte offset) is persisted in NVS namespace
+// "tx" so it survives deep-sleep / power cycles.
 //
-// Purge strategy: single-file streaming rewrite (no temp index files).
-// Emergency purge: when LittleFS usage exceeds a threshold, discard the
-// oldest 50% of data rows.
+// Upload acknowledgement advances a cursor but does not delete local history.
+// LittleFS is a bounded rolling store: at a safe high-water mark, the oldest
+// rows are removed with a crash-safe streaming rewrite.
+
+static constexpr uint8_t kLittleFsRetentionHighWaterPct = 65;
+static constexpr uint8_t kLittleFsRetentionKeepPct = 40;
 
 // ---------------------------------------------------------------------------
 // CSV header (must match flash_logger.cpp)
@@ -37,6 +40,7 @@ struct UploadCursor {
   uint8_t  retryCount;      // current retry count within this window
   uint32_t wakeCounter;     // sync-wake counter for upload policy scheduling
   uint32_t nextAttemptUnix; // earliest retry time after reaching retry limit
+  uint32_t rowsRemovedLocally; // cumulative rows evicted from bounded history
 };
 
 // ---------------------------------------------------------------------------
@@ -78,9 +82,14 @@ class UploadQueue {
   // swaps files and resets the cursor to the header end.
   bool purgeUploaded();
 
-  // If LittleFS usage exceeds thresholdPct, purge the oldest 50% of data
-  // rows via streaming rewrite.  Adjusts the cursor if it was in the
-  // purged region.
+  // One-time compatibility compaction only. A legacy 25/30-column file must be
+  // rewritten after its pending rows drain so new epoch-bearing rows can use
+  // the current header. Current-schema files are deliberately left intact.
+  bool purgeUploadedIfLegacyDrained();
+
+  // If LittleFS usage exceeds thresholdPct, retain a bounded portion of the
+  // newest rows via streaming rewrite. Adjusts the cursor if it was in the
+  // removed region.
   bool emergencyPurgeIfFull(uint8_t thresholdPct);
 
   bool recoverDataFile();

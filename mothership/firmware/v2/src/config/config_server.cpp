@@ -1,6 +1,6 @@
 // Config-mode WiFi AP + web server for Mothership V1.
-// Ported from production main.cpp — adapted to use V1's rtc_alarm.h and
-// flash_logger.h instead of production's rtc_manager.h / sd_manager.h.
+// Ported from production main.cpp and adapted to this target's RTC and storage
+// modules.
 
 #include "config/config_server.h"
 #include "config/node_registry.h"
@@ -11,6 +11,7 @@
 #include "comms/espnow_config.h"
 #include "time/rtc_alarm.h"
 #include "storage/flash_logger.h"
+#include "storage/sd_logger.h"
 #include "config/deployment_store.h"
 #include "config/deployment_epoch.h"
 #include "system/power.h"
@@ -439,11 +440,21 @@ static bool deploymentApplyDesiredState(const String& nodeId, uint8_t targetStat
 }
 
 static uint32_t deploymentNowBridge() { return getRTCTimeUnix(); }
+static bool deploymentArchiveToSd(const char* nodeId, const DeploymentEvent& event) {
+  return !sdIsReady() || sdAppendDeploymentEvent(nodeId, event);
+}
+static bool deploymentCloudEventsEnabled() {
+  TransmissionSettings tx;
+  loadTransmissionSettings(tx);
+  return tx.destinationMode == TX_DEST_FIELDMESH && tx.enabled;
+}
 
 void deploymentBootstrap() {
   deploymentSetConfigApplyFn(deploymentApplyDesiredState);
   deploymentSetLegacyBacklogFn(uploadQueueHasLegacyRows);
   deploymentSetNowFn(deploymentNowBridge);
+  deploymentSetArchiveSinkFn(deploymentArchiveToSd);
+  deploymentSetCloudEventsEnabledFn(deploymentCloudEventsEnabled);
 
   if (!deploymentStoreBegin()) {
     Serial.println("[DEPLOY] Store unavailable — epochs will not be stamped this session");
@@ -2029,9 +2040,8 @@ static void sendProbeMsConnect() {
 }
 
 // Persistent primary navigation. navActive selects the current destination:
-// 0=Overview, 1=Stations, 2=Export, 3=Settings; <0 emits nothing (child/result
-// pages keep their header Back button). Export is a download route, so its tab is
-// a plain link with no aria-current state. Icons reuse the inline SVGs already in
+// 0=Overview, 1=Stations, 2=Data, 3=Settings; <0 emits nothing (child/result
+// pages keep their header Back button). Icons reuse the inline SVGs already in
 // the page bodies — no external assets.
 static String navBarHtml(int navActive) {
   if (navActive < 0) return String();
@@ -2053,7 +2063,7 @@ static String navBarHtml(int navActive) {
   h += tab("/stations", "Nodes",
            "M12 2a4 4 0 110 8 4 4 0 010-8zm-7 12a3 3 0 110 6 3 3 0 010-6zm14 0a3 3 0 110 6 3 3 0 010-6zM9.3 9.8l-3 3.9 1.6 1.2 3-3.9-1.6-1.2zm5.4 0l-1.6 1.2 3 3.9 1.6-1.2-3-3.9z",
            navActive == 1);
-  h += tab("/export", "Export",
+  h += tab("/export", "Data",
            "M12 3a1 1 0 011 1v8.59l2.3-2.3 1.4 1.42-4.7 4.7-4.7-4.7 1.4-1.42 2.3 2.3V4a1 1 0 011-1zm-7 14h14v2H5v-2z",
            navActive == 2);
   h += tab("/settings", "Settings",
@@ -2191,7 +2201,7 @@ static String buildStatusJson() {
   // Upload subsystem status
   TransmissionSettings txSettings;
   loadTransmissionSettings(txSettings);
-  UploadCursor cursor = {0, 0, 0, 0, 0};
+  UploadCursor cursor{};
   uint32_t pendingBytes = 0;
   uint32_t pendingRows = 0;
   if (flashIsReady()) {
@@ -2206,6 +2216,9 @@ static String buildStatusJson() {
     ? (uint32_t)((fsUsed * 100ULL) / fsTotal) : 0;
 
   json += ",\"upload\":{";
+  json += "\"destinationMode\":\"";
+  json += txDestinationModeName(txSettings.destinationMode);
+  json += "\",";
   json += "\"enabled\":";
   json += txSettings.enabled ? "true" : "false";
   json += ",\"cursorOffset\":";
@@ -2343,16 +2356,20 @@ static String buildLiveJson() {
 // Data status section (adapted to use flash_logger instead of SD)
 // ---------------------------------------------------------------------------
 static String buildDataStatusSectionHtml() {
-  bool hasFile = flashIsReady() && LittleFS.exists("/datalog.csv");
+  const bool usingSD = sdIsReady() && SD.exists(sdReadingsPath());
+  bool hasFile = usingSD || (flashIsReady() && LittleFS.exists("/datalog.csv"));
   uint32_t records = 0;
   uint64_t fileBytes = 0;
+  String firstConfirmedSync = "n/a";
   String lastConfirmedSync = "n/a";
 
   if (hasFile) {
-    File file = LittleFS.open("/datalog.csv", "r");
+    File file = usingSD ? SD.open(sdReadingsPath(), FILE_READ)
+                        : LittleFS.open("/datalog.csv", "r");
     if (file) {
       fileBytes = (uint64_t)file.size();
       uint32_t lineNo = 0;
+      String firstDataLine;
       String lastDataLine;
       while (file.available()) {
         String line = file.readStringUntil('\n');
@@ -2361,9 +2378,14 @@ static String buildDataStatusSectionHtml() {
         lineNo++;
         if (lineNo == 1) continue;
         records++;
+        if (firstDataLine.length() == 0) firstDataLine = line;
         lastDataLine = line;
       }
       file.close();
+      if (firstDataLine.length() > 0) {
+        const int comma = firstDataLine.indexOf(',');
+        if (comma > 0) firstConfirmedSync = firstDataLine.substring(0, comma);
+      }
       if (lastDataLine.length() > 0) {
         const int comma = lastDataLine.indexOf(',');
         if (comma > 0) {
@@ -2375,19 +2397,21 @@ static String buildDataStatusSectionHtml() {
     }
   }
 
-  const uint64_t totalBytes = (uint64_t)LittleFS.totalBytes();
-  const uint64_t usedBytes  = (uint64_t)LittleFS.usedBytes();
+  const uint64_t totalBytes = usingSD ? sdTotalBytes() : (uint64_t)LittleFS.totalBytes();
+  const uint64_t usedBytes  = usingSD ? sdUsedBytes() : (uint64_t)LittleFS.usedBytes();
   const uint64_t freeBytes  = (totalBytes > usedBytes) ? (totalBytes - usedBytes) : 0;
 
   String out;
   out.reserve(900);
-  out += F("<div class='section'><h3>Data status</h3>");
+  out += F("<div class='section'><h3>Local data</h3><p><span class='chip chip--cfg-ok'>");
+  out += usingSD ? F("SD card archive") : F("Internal storage");
+  out += F("</span></p>");
 
   out += F("<div class='stats' style='margin:0 0 10px 0'>"
-           "<div class='stat'><strong>Records</strong><span class='num'>");
+           "<div class='stat'><strong>Stored readings</strong><span class='num'>");
   out += String(records);
   out += F("</span></div>"
-           "<div class='stat'><strong>CSV size</strong><span class='num' style='font-size:16px'>");
+           "<div class='stat'><strong>Readings file</strong><span class='num' style='font-size:16px'>");
   out += hasFile ? formatBytesUi(fileBytes) : String("n/a");
   out += F("</span></div>"
            "<div class='stat'><strong>Storage free</strong><span class='num' style='font-size:16px'>");
@@ -2412,6 +2436,13 @@ static String buildDataStatusSectionHtml() {
   out += F("<p class='muted'><strong>Last collection:</strong> ");
   out += lastConfirmedSync;
   out += F("</p>");
+  if (records > 0) {
+    out += F("<p class='muted'><strong>Stored range:</strong> ");
+    out += firstConfirmedSync;
+    out += F(" to ");
+    out += lastConfirmedSync;
+    out += F("</p>");
+  }
 
   // Upload status summary
   TransmissionSettings txSettings;
@@ -2423,20 +2454,42 @@ static String buildDataStatusSectionHtml() {
     cursor = gUploadQueue.getCursor();
     pendingRows = gUploadQueue.getPendingRows();
   }
-  out += F("<p class='muted'><strong>Cloud upload:</strong> ");
-  out += txSettings.enabled ? String("enabled") : String("disabled");
-  out += F(" &nbsp;|&nbsp; <strong>Readings waiting:</strong> ");
-  out += String(pendingRows);
-  out += F(" &nbsp;|&nbsp; <strong>Readings sent:</strong> ");
-  out += String(cursor.rowsUploaded);
-  if (cursor.lastUploadUnix > 0) {
-    DateTime lastUp(cursor.lastUploadUnix);
-    out += F(" &nbsp;|&nbsp; <strong>Last upload:</strong> ");
-    out += formatDateTimeDisplay(lastUp);
+  if (txSettings.enabled) {
+    out += F("<p class='muted'><strong>Remote upload:</strong> enabled"
+             " &nbsp;|&nbsp; <strong>Waiting:</strong> ");
+    out += String(pendingRows);
+    out += F(" &nbsp;|&nbsp; <strong>Sent:</strong> ");
+    out += String(cursor.rowsUploaded);
+    if (cursor.lastUploadUnix > 0) {
+      DateTime lastUp(cursor.lastUploadUnix);
+      out += F(" &nbsp;|&nbsp; <strong>Last upload:</strong> ");
+      out += formatDateTimeDisplay(lastUp);
+    }
+    out += F("</p>");
+  } else {
+    out += F("<p class='muted'><strong>Remote upload:</strong> not connected. "
+             "All stored readings remain available for local download.</p>");
   }
-  out += F("</p>");
-
-  out += F("<p class='muted'>Use the Export Data page to download a CSV, or <a href='/settings'>Settings</a> to configure cloud upload.</p></div>");
+  if (!usingSD && cursor.rowsRemovedLocally > 0) {
+    out += F("<p><span class='chip chip--bat-low'>");
+    out += String(cursor.rowsRemovedLocally);
+    out += F(" older readings removed as internal storage filled</span></p>");
+  }
+  if (usingSD) {
+    out += F("<p class='muted'>The SD card keeps the complete archive until the card "
+             "is full or files are removed. Uploading and downloading do not delete it. "
+             "Internal storage continues as the upload cache and fallback.</p>");
+    if (sdHadWriteError()) {
+      out += F("<p><span class='chip chip--bat-low'>An SD write failed this session; "
+               "check the card. Recent readings still use internal fallback storage.</span></p>");
+    }
+  } else {
+    out += F("<p class='muted'>Internal storage keeps a rolling recent history. "
+             "Older readings are removed automatically at the storage limit; "
+             "downloading or uploading does not delete them. Add an SD card for "
+             "capacity-limited complete history.</p>");
+  }
+  out += F("</div>");
   return out;
 }
 
@@ -2444,14 +2497,25 @@ static String buildDataStatusSectionHtml() {
 // Route handlers
 // ---------------------------------------------------------------------------
 static void handleRoot() {
-  // Unprovisioned (no connection key saved) → send the user straight into the
-  // first-run setup wizard instead of the normal home page. Once provisioned,
-  // "/" behaves exactly as before. The wizard itself stays reachable manually
-  // (Settings → "Run setup wizard") regardless of this gate.
+  // First-run setup is keyed to completion of the local wizard, never to a
+  // cloud credential. Existing hubs predate the marker, so a saved FieldMesh
+  // key or any registered node is sufficient migration evidence that they are
+  // already commissioned and must not be trapped in onboarding after upgrade.
   {
-    TransmissionSettings txProbe;
-    loadTransmissionSettings(txProbe);
-    if (txProbe.apiKey.length() == 0) {
+    Preferences setupPrefs;
+    bool setupDone = false;
+    bool hasExplicitMarker = false;
+    if (setupPrefs.begin("ui_setup", true)) {
+      hasExplicitMarker = setupPrefs.isKey("done");
+      setupDone = setupPrefs.getBool("done", false);
+      setupPrefs.end();
+    }
+    if (!hasExplicitMarker) {
+      TransmissionSettings priorTx;
+      loadTransmissionSettings(priorTx);
+      setupDone = priorTx.apiKey.length() > 0 || !getRegisteredNodes().empty();
+    }
+    if (!setupDone) {
       server.sendHeader("Location", "/setup", true);
       server.send(302, "text/plain", "");
       return;
@@ -2601,17 +2665,17 @@ static void handleRoot() {
       html += F("Off");
     }
     html += F("</span></div>"
-              "<div class='stat'><strong>Auto upload</strong><span class='num' style='font-size:16px'>");
+              "<div class='stat'><strong>FieldHub sync</strong><span class='num' style='font-size:16px'>");
     html += String(gSyncIntervalMin);
     html += F(" min</span></div>"
-              "<div class='stat'><strong>Next upload</strong><span class='num' style='font-size:16px'><span id='kpi-next-sync'>");
+              "<div class='stat'><strong>Next sync</strong><span class='num' style='font-size:16px'><span id='kpi-next-sync'>");
     html += computeNextCollectionIsoLocal();
     html += F("</span></span></div>"
               "</div>"
               "</div>");
   }
 
-  // --- Cloud upload status (flat; status shown as a chip, not a bare dot) ---
+  // --- Optional data destination (flat; status is text, not just colour) ---
   {
     TransmissionSettings txSettings;
     loadTransmissionSettings(txSettings);
@@ -2622,7 +2686,7 @@ static void handleRoot() {
     }
 
     const char* chipCls = "chip";
-    const char* statusLabel = "Upload off";
+    const char* statusLabel = "Stored locally";
     if (txSettings.enabled) {
       if (cursor.retryCount > 0) {
         chipCls = "chip chip--bat-med";
@@ -2634,7 +2698,7 @@ static void handleRoot() {
     }
 
     html += F("<div class='section section--flat'>"
-              "<h3>Cloud upload</h3>"
+              "<h3>Data destination</h3>"
               "<p style='margin:4px 0'><span class='");
     html += chipCls;
     html += F("' style='font-weight:600'>");
@@ -2647,10 +2711,13 @@ static void handleRoot() {
       html += F(" &middot; ");
       html += String(cursor.rowsUploaded);
       html += F(" readings sent</p>");
-    } else {
+    } else if (txSettings.enabled) {
       html += F("<p class='muted'>No uploads yet &middot; ");
       html += String(cursor.rowsUploaded);
       html += F(" readings sent</p>");
+    } else {
+      html += F("<p class='muted'>Readings remain on this FieldHub for local download. "
+                "Cloud upload can be connected later in Settings.</p>");
     }
     html += F("</div>");
   }
@@ -2742,6 +2809,17 @@ static void handleSetTime() {
 static void handleSetRemoteManagement() {
   const bool want = server.hasArg("remote_management") &&
                     server.arg("remote_management") == "1";
+  TransmissionSettings tx;
+  loadTransmissionSettings(tx);
+  if (want && (tx.destinationMode != TX_DEST_FIELDMESH || !tx.enabled ||
+               tx.apiKey.length() == 0)) {
+    if (isAjaxRequest()) {
+      sendAjaxResult(false, "Connect to FieldMesh before enabling dashboard control");
+    } else {
+      server.send(400, "text/plain", "FieldMesh connection required");
+    }
+    return;
+  }
   const bool ok = backendControlSetRemoteManagementEnabled(want);
   if (isAjaxRequest()) {
     if (ok) sendAjaxResult(true, want ? "Dashboard changes allowed" : "Dashboard changes off");
@@ -2752,22 +2830,134 @@ static void handleSetRemoteManagement() {
   server.send(302, "text/plain", "");
 }
 
+static void handleCompleteSetup() {
+  Preferences prefs;
+  if (!prefs.begin("ui_setup", false)) {
+    sendAjaxResult(false, "Could not save setup state");
+    return;
+  }
+  const bool ok = prefs.putBool("done", true) == sizeof(bool);
+  prefs.end();
+  sendAjaxResult(ok, ok ? "FieldHub setup complete" : "Could not save setup state");
+}
+
 static void handleDownloadCSV() {
-  if (!flashIsReady() || !LittleFS.exists("/datalog.csv")) {
+  const bool useSD = sdIsReady() && SD.exists(sdReadingsPath());
+  const bool useFlash = flashIsReady() && LittleFS.exists("/datalog.csv");
+  if (!useSD && !useFlash) {
     server.send(404, "text/plain", "CSV file not found");
     return;
   }
-  File file = LittleFS.open("/datalog.csv", "r");
+  File file = useSD ? SD.open(sdReadingsPath(), FILE_READ)
+                    : LittleFS.open("/datalog.csv", "r");
   if (!file) {
     server.send(404, "text/plain", "CSV file not found");
     return;
   }
   server.sendHeader("Content-Type", "text/csv");
-  server.sendHeader("Content-Disposition", "inline; filename=datalog.csv");
+  server.sendHeader("Content-Disposition", "attachment; filename=fieldmesh-readings.csv");
   server.sendHeader("Connection", "close");
   server.streamFile(file, "text/csv");
   file.close();
   Serial.println("[CSV] file downloaded by client");
+}
+
+static String csvCellLocal(const char* value) {
+  String out = "\"";
+  if (value) {
+    for (const char* p = value; *p; ++p) {
+      if (*p == '"') out += '"';
+      out += *p;
+    }
+  }
+  out += '"';
+  return out;
+}
+
+static void handleDownloadDeployments() {
+  if (sdIsReady() && SD.exists(sdDeploymentsPath())) {
+    File file = SD.open(sdDeploymentsPath(), FILE_READ);
+    if (!file) {
+      server.send(500, "text/plain", "Could not open SD deployment archive");
+      return;
+    }
+    server.sendHeader("Content-Disposition", "attachment; filename=fieldmesh-deployments.csv");
+    server.sendHeader("Connection", "close");
+    server.streamFile(file, "text/csv");
+    file.close();
+    return;
+  }
+  if (!deploymentStoreReady()) {
+    server.send(503, "text/plain", "Deployment storage unavailable");
+    return;
+  }
+
+  server.sendHeader("Content-Disposition", "attachment; filename=deployments.csv");
+  server.sendHeader("Cache-Control", "no-store");
+  server.setContentLength(CONTENT_LENGTH_UNKNOWN);
+  server.send(200, "text/csv", "");
+  server.sendContent(
+      "nodeId,deploymentEpoch,startedUnix,endedUnix,userId,name,latitude,longitude,recordStatus\r\n");
+
+  for (size_t n = 0; n < kMaxDeployNodes; ++n) {
+    const DeploymentSlot* slot = deploymentSlotAt(n);
+    if (!slot) continue;
+    for (uint8_t i = 0; i < slot->archiveCount; ++i) {
+      const DeploymentArchive& archived = slot->archive[i];
+      if (archived.epoch == 0) continue;
+      String row;
+      row.reserve(180);
+      row += csvCellLocal(slot->nodeId);
+      row += ',';
+      row += String((unsigned)archived.epoch);
+      row += ',';
+      if (archived.known & DEPLOY_ARCHIVE_START_KNOWN) row += String(archived.startedUnix);
+      row += ',';
+      if (archived.known & DEPLOY_ARCHIVE_END_KNOWN) row += String(archived.endedUnix);
+      row += ',';
+      if (archived.known & DEPLOY_ARCHIVE_IDENTITY_KNOWN) row += csvCellLocal(archived.userId);
+      row += ',';
+      if (archived.known & DEPLOY_ARCHIVE_IDENTITY_KNOWN) row += csvCellLocal(archived.name);
+      row += ',';
+      if (archived.known & DEPLOY_ARCHIVE_LOCATION_KNOWN) row += String(archived.latitude, 6);
+      row += ',';
+      if (archived.known & DEPLOY_ARCHIVE_LOCATION_KNOWN) row += String(archived.longitude, 6);
+      row += ',';
+      const uint8_t completeMask = DEPLOY_ARCHIVE_START_KNOWN |
+          DEPLOY_ARCHIVE_END_KNOWN | DEPLOY_ARCHIVE_IDENTITY_KNOWN;
+      row += ((archived.known & completeMask) == completeMask)
+          ? "complete" : "partial-from-earlier-software";
+      row += "\r\n";
+      server.sendContent(row);
+    }
+  }
+  server.sendContent("");
+  Serial.println("[DEPLOY] Local deployment archive downloaded");
+}
+
+static void handleDataPage() {
+  String actions = String("<a href='/export' class='btn btn--sm'>Refresh</a>");
+  String html = headCommon("Data", actions, 2);
+  html += buildDataStatusSectionHtml();
+  html += F("<div class='section'><h3>Downloads</h3>"
+            "<p class='muted'>Raw CSV files for backup or use in your own tools. "
+            "The FieldHub does not alter or chart the readings here.</p>");
+  if ((sdIsReady() && SD.exists(sdReadingsPath())) ||
+      (flashIsReady() && LittleFS.exists("/datalog.csv"))) {
+    html += F("<a href='/download-csv' class='btn btn--primary' "
+              "style='display:block;text-align:center'>Download readings CSV</a>");
+  } else {
+    html += F("<button class='btn' style='width:100%' disabled>No readings available</button>");
+  }
+  html += F("<a href='/download-deployments' class='btn' "
+            "style='display:block;text-align:center;margin-top:8px'>"
+            "Download deployment archive CSV</a>"
+            "<p class='muted' style='margin-top:10px'>With an SD card, completed deployment "
+            "records are appended for the life of the card. Internal fallback keeps the latest "
+            "four per node. Records migrated from earlier software identify unavailable fields "
+            "explicitly.</p></div>");
+  html += footCommon();
+  server.send(200, "text/html", html);
 }
 
 static void handleDiscoverNodes() {
@@ -3712,42 +3902,63 @@ static void handleStationDetail() {
     }
     // --- Previous deployments ------------------------------------------
     //
-    // history[] is a bounded ring of (epoch, startedUnix) boundaries kept so a
-    // backlog delivered several deployments late can be attributed to the epoch
-    // it was actually taken under. It is also the ONLY deployment history the
-    // hub holds: the number, name and location a deployment ran under go out in
-    // its outbox event and are not retained once that event is acked. The labels
-    // therefore live in the dashboard, and saying so is better than rendering an
-    // empty name — a blank would read as "that deployment had no name", which is
-    // a different and wrong claim.
-    //
-    // End times are deliberately omitted for past epochs. There is no endedUnix
-    // per boundary, and inferring one from the next epoch's start is wrong
-    // whenever a node sat ended before being redeployed — ENV_6C0A80 on
-    // 2026-08-01 ended at 12:05 and was not restarted until 14:31.
+    // archive[] is separate from the sample-attribution boundary ring. New
+    // records carry the exact identity and exact End time captured at End;
+    // migrated records expose missing fields explicitly rather than guessing.
     const DeploymentSlot* histSlot = deploymentFindByNodeId(target->nodeId.c_str());
-    if (histSlot != nullptr && histSlot->historyCount > 0) {
+    if (histSlot != nullptr && histSlot->archiveCount > 0) {
       static const char* kHistMon[] = {"Jan","Feb","Mar","Apr","May","Jun",
                                        "Jul","Aug","Sep","Oct","Nov","Dec"};
       String rows;
       // Newest first: the deployment before this one is the one an operator
       // standing at the station is most likely asking about.
-      for (int i = (int)histSlot->historyCount - 1; i >= 0; --i) {
-        const DeploymentBoundary& b = histSlot->history[i];
-        if (b.epoch == 0) continue;
-        if (b.epoch == target->deploymentEpoch) continue;  // shown in the chip above
-        rows += F("<div class='muted' style='margin:3px 0'>Deployment ");
-        rows += String((unsigned)b.epoch);
-        if (b.startedUnix > 0) {
-          time_t bt = (time_t)b.startedUnix;
+      for (int i = (int)histSlot->archiveCount - 1; i >= 0; --i) {
+        const DeploymentArchive& archived = histSlot->archive[i];
+        if (archived.epoch == 0) continue;
+        if (archived.epoch == target->deploymentEpoch) continue;  // chip above
+        rows += F("<div style='margin:8px 0'><strong>Deployment ");
+        rows += String((unsigned)archived.epoch);
+        if ((archived.known & DEPLOY_ARCHIVE_IDENTITY_KNOWN) && archived.name[0]) {
+          rows += F(" &middot; ");
+          rows += htmlEscape(archived.name);
+        }
+        if ((archived.known & DEPLOY_ARCHIVE_IDENTITY_KNOWN) && archived.userId[0]) {
+          rows += F(" &middot; ");
+          rows += htmlEscape(archived.userId);
+        }
+        rows += F("</strong><div class='muted'>");
+        if ((archived.known & DEPLOY_ARCHIVE_START_KNOWN) && archived.startedUnix > 0) {
+          time_t bt = (time_t)archived.startedUnix;
           struct tm* btm = gmtime(&bt);
           char bb[24];
           snprintf(bb, sizeof(bb), "%d %s %02d:%02d",
                    btm->tm_mday, kHistMon[btm->tm_mon], btm->tm_hour, btm->tm_min);
-          rows += F(" &middot; started ");
+          rows += F("Started ");
           rows += bb;
+        } else {
+          rows += F("Start time unavailable");
         }
-        rows += F("</div>");
+        if ((archived.known & DEPLOY_ARCHIVE_END_KNOWN) && archived.endedUnix > 0) {
+          time_t et = (time_t)archived.endedUnix;
+          struct tm* etm = gmtime(&et);
+          char eb[24];
+          snprintf(eb, sizeof(eb), "%d %s %02d:%02d",
+                   etm->tm_mday, kHistMon[etm->tm_mon], etm->tm_hour, etm->tm_min);
+          rows += F(" &middot; Ended ");
+          rows += eb;
+        } else {
+          rows += F(" &middot; End time unavailable");
+        }
+        if (!(archived.known & DEPLOY_ARCHIVE_IDENTITY_KNOWN)) {
+          rows += F("<br>Label unavailable from earlier FieldHub software");
+        }
+        if (archived.known & DEPLOY_ARCHIVE_LOCATION_KNOWN) {
+          rows += F("<br>Location ");
+          rows += String(archived.latitude, 5);
+          rows += F(", ");
+          rows += String(archived.longitude, 5);
+        }
+        rows += F("</div></div>");
       }
       if (rows.length()) {
         html += F("<div class='section'><h3>Previous deployments</h3>");
@@ -3755,13 +3966,11 @@ static void handleStationDetail() {
         // The ring evicts the oldest once full, so a surviving epoch 1 is proof
         // nothing has been dropped. Without this an operator could read a short
         // list as the complete history.
-        if (histSlot->historyCount >= (uint8_t)kBoundaryHistory &&
-            histSlot->history[0].epoch > 1) {
+        if (histSlot->archiveCount >= (uint8_t)kLocalDeploymentArchive &&
+            histSlot->archive[0].epoch > 1) {
           html += F("<div class='muted' style='margin-top:8px'>"
-                    "Earlier deployments are not kept on the FieldHub.</div>");
+                    "Earlier deployment details are not kept in internal storage.</div>");
         }
-        html += F("<div class='muted' style='margin-top:8px'>"
-                  "Numbers and names for past deployments are in the dashboard.</div>");
         html += F("</div>");
       }
     }
@@ -4582,11 +4791,85 @@ static String formatUploadTime(uint32_t unixSec) {
   return formatDateTimeDisplay(dt);
 }
 
+// POST /set-data-destination — local recording is a complete operating mode,
+// not an unprovisioned error state. FieldMesh may only be selected after its
+// device credential exists. Custom HTTPS is configured through its own form so
+// its acknowledgement contract stays explicit.
+static void handleSetDataDestination() {
+  const String mode = server.arg("mode");
+  TransmissionSettings tx;
+  loadTransmissionSettings(tx);
+
+  if (mode == "local_only") {
+    if (!backendControlSetRemoteManagementEnabled(false)) {
+      sendAjaxResult(false, "Could not disable dashboard control");
+      return;
+    }
+    tx.destinationMode = TX_DEST_LOCAL_ONLY;
+    tx.enabled = false;
+    saveTransmissionSettings(tx);
+    sendAjaxResult(true, "Using local storage only");
+    return;
+  }
+
+  if (mode == "fieldmesh") {
+    if (tx.apiKey.length() == 0) {
+      sendAjaxResult(false, "Connect to FieldMesh before enabling uploads");
+      return;
+    }
+    tx.destinationMode = TX_DEST_FIELDMESH;
+    tx.enabled = true;
+    saveTransmissionSettings(tx);
+    sendAjaxResult(true, "FieldMesh upload enabled");
+    return;
+  }
+
+  sendAjaxResult(false, "Unsupported data destination");
+}
+
+static void handleSetCustomDestination() {
+  TransmissionSettings tx;
+  loadTransmissionSettings(tx);
+  String url = server.arg("custom_url");
+  url.trim();
+  bool unsafeUrlChar = false;
+  for (size_t i = 0; i < url.length(); ++i) {
+    const char c = url[i];
+    if ((uint8_t)c <= 0x20 || c == '"') { unsafeUrlChar = true; break; }
+  }
+  if (!url.startsWith("https://") || url.length() < 12 || url.length() > 240 ||
+      unsafeUrlChar) {
+    sendAjaxResult(false, "Enter a valid HTTPS endpoint URL");
+    return;
+  }
+
+  String token = server.arg("custom_token");
+  token.trim();
+  if (token.length() > 192 || token.indexOf('\r') >= 0 || token.indexOf('\n') >= 0) {
+    sendAjaxResult(false, "Bearer token is too long or invalid");
+    return;
+  }
+  if (server.hasArg("clear_token") && server.arg("clear_token") == "1") {
+    tx.customBearerToken = "";
+  } else if (token.length() > 0) {
+    tx.customBearerToken = token;
+  }
+  tx.customEndpointUrl = url;
+  tx.destinationMode = TX_DEST_CUSTOM_HTTPS;
+  tx.enabled = true;
+  if (!backendControlSetRemoteManagementEnabled(false)) {
+    sendAjaxResult(false, "Could not disable dashboard control");
+    return;
+  }
+  saveTransmissionSettings(tx);
+  sendAjaxResult(true, "Custom HTTPS upload saved; it will be tested at the next sync");
+}
+
 static void handleSettings() {
   TransmissionSettings tx;
   loadTransmissionSettings(tx);
 
-  UploadCursor cursor = {0, 0, 0, 0, 0};
+  UploadCursor cursor{};
   uint32_t pendingBytes = 0;
   uint32_t pendingRows = 0;
   if (flashIsReady()) {
@@ -4645,9 +4928,57 @@ static void handleSettings() {
   html += F("</p>");
   html += F("</div>");
 
-  // --- Cloud connection ---
+  // --- Data destination --------------------------------------------------
+  // Local operation is complete in its own right. FieldMesh connection is an
+  // optional service choice, never the condition for entering the portal.
+  html += F("<div class='section'><h3>Data destination</h3>");
+  if (tx.destinationMode == TX_DEST_FIELDMESH && tx.apiKey.length() > 0) {
+    html += F("<p><span class='chip chip--cfg-ok' style='font-weight:600'>Connected to FieldMesh</span></p>"
+              "<p class='muted'>Readings can upload during FieldHub syncs. Local fleet management remains available without the service.</p>"
+              "<form class='async-form' action='/set-data-destination' method='POST'>"
+              "<input type='hidden' name='mode' value='local_only'>"
+              "<button type='submit' class='btn btn--sm'>Use local storage only</button></form>");
+  } else if (tx.destinationMode == TX_DEST_CUSTOM_HTTPS &&
+             tx.customEndpointUrl.startsWith("https://")) {
+    html += F("<p><span class='chip chip--cfg-ok' style='font-weight:600'>Custom HTTPS endpoint</span></p>"
+              "<p class='muted' style='word-break:break-all'>");
+    html += htmlEscape(tx.customEndpointUrl);
+    html += F("</p><p class='muted'>Your server owns storage and validation. Local fleet management "
+              "and downloads remain available independently.</p>"
+              "<form class='async-form' action='/set-data-destination' method='POST'>"
+              "<input type='hidden' name='mode' value='local_only'>"
+              "<button type='submit' class='btn btn--sm'>Use local storage only</button></form>"
+              "<a href='/provision' class='btn btn--sm' style='margin-top:8px'>Connect to FieldMesh instead</a>");
+  } else {
+    html += F("<p><span class='chip chip--cfg-ok' style='font-weight:600'>Local storage only</span></p>"
+              "<p class='muted'>No account is required. Configure nodes, record data and download it directly from this FieldHub.</p>"
+              "<a href='/provision' class='btn btn--sm'>Connect to FieldMesh (optional)</a>");
+  }
+  html += F("<details style='margin-top:12px'><summary style='font-weight:600;cursor:pointer'>"
+            "Send to your own server</summary>"
+            "<form class='async-form' action='/set-custom-destination' method='POST' style='margin-top:10px'>"
+            "<label class='label' for='custom_url'>HTTPS ingest endpoint</label>"
+            "<input class='input' id='custom_url' name='custom_url' type='url' required "
+            "placeholder='https://example.org/fieldmesh' value='");
+  html += htmlEscape(tx.customEndpointUrl);
+  html += F("'><label class='label' for='custom_token' style='margin-top:10px'>"
+            "Bearer token (optional)</label>"
+            "<input class='input' id='custom_token' name='custom_token' type='password' maxlength='192' "
+            "placeholder='Leave blank to keep the saved token'>");
+  if (tx.customBearerToken.length() > 0) {
+    html += F("<label class='label'><input type='checkbox' name='clear_token' value='1'> "
+              "Remove saved token</label>");
+  }
+  html += F("<div class='help'>The FieldHub POSTs its JSON batch format and treats any 2xx "
+            "response as a durable acknowledgement. Only return 2xx after your server has saved "
+            "the readings. The endpoint cannot provide FieldMesh charts, alerts or remote control.</div>"
+            "<button type='submit' class='btn btn--primary' style='margin-top:10px'>"
+            "Use custom HTTPS</button></form></details>");
+  html += F("</div>");
+
+  if (tx.destinationMode == TX_DEST_FIELDMESH && tx.apiKey.length() > 0) {
   html += F("<div class='section'>");
-  html += F("<h3>Cloud connection</h3>");
+  html += F("<h3>FieldMesh service</h3>");
 
   html += F("<form class='async-form' action='/save-settings' method='POST'>");
 
@@ -4743,6 +5074,7 @@ static void handleSettings() {
   html += F("<button type='submit' class='btn btn--primary' style='margin-top:12px'>Save</button>");
   html += F("</form>");
   html += F("</div>");
+  }
 
   // --- Storage + manual upload status ---
   html += F("<div class='section'><h3>Storage</h3>");
@@ -4757,13 +5089,15 @@ static void handleSettings() {
   html += String(storagePct);
   html += F("%</span></div></div>");
 
-  if (tx.allowManualUpload) {
+  if (tx.enabled && tx.allowManualUpload) {
     html += F("<form action='/manual-upload' method='POST'>");
     html += F("<input type='hidden' name='ajax' value='1'>");
     html += F("<button type='submit' class='btn btn--warn'>Upload now (30-60s)</button>");
     html += F("</form>");
-  } else {
+  } else if (tx.enabled) {
     html += F("<p class='muted'>Manual upload is disabled in advanced settings.</p>");
+  } else {
+    html += F("<p class='muted'>Readings are stored locally. Connect a data service to enable uploads.</p>");
   }
 
   html += F("</div>");
@@ -4814,6 +5148,7 @@ static void handleSetTransmission() {
   // (which forces them), along with the phase anchor this form doesn't edit.
   TransmissionSettings prev;
   loadTransmissionSettings(prev);
+  tx.destinationMode    = prev.destinationMode;
   tx.uploadPhaseUnix     = prev.uploadPhaseUnix;
   tx.uploadIntervalMin   = prev.uploadIntervalMin;
   tx.minBatteryMv        = prev.minBatteryMv;
@@ -4822,6 +5157,8 @@ static void handleSetTransmission() {
   tx.useJsonUpload = prev.useJsonUpload;
   tx.mothershipId = prev.mothershipId;  // not editable via this form yet
   tx.projectId = prev.projectId;        // not editable via this form yet
+  tx.customEndpointUrl = prev.customEndpointUrl;
+  tx.customBearerToken = prev.customBearerToken;
   tx.authToken    = prev.authToken;     // legacy fields hidden — preserve stored values
   tx.siteId       = prev.siteId;
   tx.deploymentId = prev.deploymentId;
@@ -4838,7 +5175,9 @@ static void handleSetTransmission() {
     tx.endpointUrl = prev.endpointUrl;
   }
 
-  if (!backendControlSetRemoteManagementEnabled(remoteRequested)) {
+  const bool remoteEffective = remoteRequested &&
+      tx.destinationMode == TX_DEST_FIELDMESH && tx.enabled && tx.apiKey.length() > 0;
+  if (!backendControlSetRemoteManagementEnabled(remoteEffective)) {
     if (isAjaxRequest()) sendAjaxResult(false, "Could not persist remote management setting");
     else server.send(500, "text/plain", "Could not persist remote management setting");
     return;
@@ -4893,6 +5232,11 @@ static void performManualUpload(String& resultMsg, bool& ok) {
   resultMsg = "";
   ok = false;
 
+  if (!tx.enabled || tx.destinationMode == TX_DEST_LOCAL_ONLY) {
+    resultMsg = "Remote upload is not enabled";
+    return;
+  }
+
   if (!tx.allowManualUpload) {
     resultMsg = "Manual upload is disabled in settings";
     return;
@@ -4910,7 +5254,10 @@ static void performManualUpload(String& resultMsg, bool& ok) {
     // bench: an End was archived on the hub, the pre-shutdown sync correctly
     // fired with queuedEvents=1, and then bailed here because the CSV buffer
     // was empty — so the archive still never reached the dashboard.
-    const uint8_t manQueuedEvents = deploymentOutboxCount();
+    const bool manFieldMesh = tx.destinationMode == TX_DEST_FIELDMESH;
+    const bool manCustomHttps = tx.destinationMode == TX_DEST_CUSTOM_HTTPS;
+    if (manFieldMesh) deploymentQueueFieldMeshBackfill();
+    const uint8_t manQueuedEvents = manFieldMesh ? deploymentOutboxCount() : 0;
     if (gUploadQueue.getPendingBytes() == 0 && manQueuedEvents == 0) {
       resultMsg = "No new data to upload";
       ok = true;
@@ -4930,7 +5277,7 @@ static void performManualUpload(String& resultMsg, bool& ok) {
         // Batch upload: up to 100 readings per POST. Loop a bounded number of
         // POSTs per click so a manual upload drains a useful amount without
         // tying up config mode indefinitely.
-        const String authHeader = tx.apiKey.length() > 0 ? tx.apiKey : tx.authToken;
+        const String authHeader = buildUploadAuth(tx);
         const String url = buildUploadUrl(tx);
         const int kMaxManualPosts = 6;   // up to ~600 readings per click
         int posts = 0;
@@ -5008,7 +5355,7 @@ static void performManualUpload(String& resultMsg, bool& ok) {
           mothershipFirmwareStatusJson(),
           backendControlStatusJson(),
           (uint8_t)(flashCsvSchemaIsCurrent() ? 1 : 0),
-          deploymentOutboxToJson(),
+          manFieldMesh ? deploymentOutboxToJson() : String("[]"),
           deploymentEpochClampCount()
         };
 
@@ -5027,19 +5374,24 @@ static void performManualUpload(String& resultMsg, bool& ok) {
             // Malformed row(s) skipped by the builder — advance past them and
             // keep going, don't POST or error out.
             gUploadQueue.advanceCursor(payload.startOffset + json.csvBytesConsumed, getRTCTimeUnix());
-            gUploadQueue.purgeUploaded();
+            gUploadQueue.purgeUploadedIfLegacyDrained();
             continue;
           }
           if (!json.ok || json.rowCount == 0) { lastErr = "JSON build failed (heap?)"; break; }
 
           HttpsPostResult result = modem.httpsPost(url, json.body, "application/json", authHeader);
           posts++;
-          if (result.httpStatus == 200) {
+          const bool accepted = manCustomHttps
+              ? (result.httpStatus >= 200 && result.httpStatus < 300)
+              : (result.httpStatus == 200);
+          if (accepted) {
             // Same guard as the scheduled path: HTTP 200 does not mean the rows
-            // were stored, and advancing the cursor deletes them. See the note
+            // were stored, and advancing the remote-delivery cursor loses the
+            // chance to retry them. See the note
             // in main.cpp performModemUpload.
-            const int appended = jsonResponseAppendedCount(result.responseBody);
-            if (appended == 0 && json.rowCount > 0 &&
+            const int appended = manFieldMesh
+                ? jsonResponseAppendedCount(result.responseBody) : (int)json.rowCount;
+            if (manFieldMesh && appended == 0 && json.rowCount > 0 &&
                 !jsonResponseIsDuplicate(result.responseBody)) {
               Serial.printf("[UI] REFUSING to advance: sent %u readings, backend "
                             "stored 0 — rows stay on flash\n",
@@ -5052,14 +5404,15 @@ static void performManualUpload(String& resultMsg, bool& ok) {
             }
             gUploadQueue.advanceCursor(payload.startOffset + json.csvBytesConsumed, getRTCTimeUnix(),
                                        json.rowCount);
-            gUploadQueue.purgeUploaded();
+            gUploadQueue.purgeUploadedIfLegacyDrained();
             gUploadQueue.resetRetryCount();
             sent += json.rowCount;
-            ingestBackendResponseFromUi(result.responseBody);
-          } else if (result.httpStatus == 401 || result.httpStatus == 400) {
+            if (manFieldMesh) ingestBackendResponseFromUi(result.responseBody);
+          } else if (result.httpStatus >= 400 && result.httpStatus < 500 &&
+                     result.httpStatus != 408 && result.httpStatus != 429) {
             char buf[80];
-            snprintf(buf, sizeof(buf), "HTTP %d (%s)",
-                     result.httpStatus, result.httpStatus == 401 ? "unauthorized" : "bad request");
+            snprintf(buf, sizeof(buf), "HTTP %d (request rejected)",
+                     result.httpStatus);
             lastErr = String(buf);
             stop = true;  // not transient — don't increment retry counter
           } else {
@@ -5374,6 +5727,7 @@ static void handleProvisionApply() {
   loadTransmissionSettings(tx);
   tx.endpointUrl = prov.endpoint;
   tx.apiKey      = prov.connectionKey;
+  tx.destinationMode = TX_DEST_FIELDMESH;
   // Auto-enable cloud upload on a successful provision. Applying a connection
   // key is an explicit "connect this hub" action, so there is no reason to make
   // the user then separately hunt for and tick an "Enable cloud upload" box —
@@ -5390,10 +5744,10 @@ static void handleProvisionApply() {
 // GET /setup — first-run onboarding wizard. One server-rendered page whose
 // steps are shown/hidden client-side (same pattern as the provision widget),
 // each step reusing the existing per-setting endpoints so there is no duplicate
-// server logic. The wizard is intentionally hub-focused — get the FieldHub
-// online and under dashboard control — and does NOT deal with node deployment
-// (pairing/discovery is the node manager's job):
-//   1 Register (manual MAC entry / QR)  2 Connect (shared provision widget)
+// server logic. Local recording is the default path; FieldMesh connection is an
+// optional branch. The wizard does NOT deal with node deployment (pairing and
+// discovery are the node manager's job):
+//   1 Choose local or FieldMesh  2 Connect (shared provision widget)
 //   3 Cloud confirmed  4 Dashboard control (/set-remote-management)
 //   5 Time (/set-time)  6 Recording interval (/set-wake-interval — the upload/
 //   sync cadence is auto-derived from this, never set by the user)  7 Review
@@ -5403,6 +5757,8 @@ static void handleSetupWizard() {
   TransmissionSettings tx;
   loadTransmissionSettings(tx);
   const bool hasKey  = tx.apiKey.length() > 0;
+  const bool connectedToFieldMesh =
+      tx.destinationMode == TX_DEST_FIELDMESH && tx.enabled && hasKey;
   const bool hasTime = getRTCTimeUnix() >= kMinValidPhaseUnix;
   const bool remoteEnabled = backendControlRemoteManagementEnabled();
   const String mac = hwMacString();
@@ -5419,16 +5775,20 @@ static void handleSetupWizard() {
   // browser). Once connected, land on the first post-connect config step so the
   // rest of setup (Dashboard control → Time → Recording) still gets walked;
   // registration + connect are already done at that point.
-  int startStep = hasKey ? 4 : 1;
+  int startStep = connectedToFieldMesh ? 4 : 1;
 
   String html = headCommon("Set up FieldHub", F("<a href='/' class='btn btn--sm'>Exit</a>"));
   html += F("<div class='section'>"
-            "<p class='muted' style='margin:0 0 10px'>Setup &middot; step <span id='wz-cur'>1</span> of 8</p>");
+            "<p class='muted' style='margin:0 0 10px'>FieldHub setup</p>");
 
-  // Step 1 — Register
+  // Step 1 — choose the standalone or connected path
   html += F("<div class='wz-step' data-step='1'>"
-            "<h3>1. Register this FieldHub</h3>"
-            "<p class='muted'>In the FieldMesh dashboard, add a new FieldHub using this address:</p>"
+            "<h3>Set up this FieldHub</h3>"
+            "<p class='muted'>Set up local recording first. No account or connection key is required.</p>"
+            "<button type='button' class='btn btn--primary' style='width:100%' id='wz-local'>Set up local recording</button>"
+            "<div id='wz-local-result' class='help' style='margin-top:8px'></div>"
+            "<button type='button' class='btn' style='width:100%;margin-top:8px' data-wz='goto' data-goto='2'>Connect to FieldMesh (optional)</button>"
+            "<p class='muted' style='margin-top:14px'>FieldHub hardware identity:</p>"
             "<div class='help'><strong>Hardware MAC</strong><br>"
             "<span id='wz-mac' style='font-family:monospace;font-size:20px;font-weight:700'>");
   html += htmlEscape(mac);
@@ -5438,13 +5798,14 @@ static void handleSetupWizard() {
             "<div style='margin-top:8px;text-align:center'>");
   html += renderQrSvg(hwRegisterUri(mac));
   html += F("</div></details>"
-            "<div style='margin-top:16px'><button type='button' class='btn btn--primary' data-wz='next'>I've registered — continue</button></div>"
+            "<div style='margin-top:16px'><button type='button' class='btn btn--sm' data-wz='next'>Continue to FieldMesh</button></div>"
             "</div>");
 
   // Step 2 — Connect (shared provision widget; success records cloud state +
   // endpoint host for the Review step, then advances to step 3).
   html += F("<div class='wz-step' data-step='2' style='display:none'>"
-            "<h3>2. Connect to FieldMesh</h3>");
+            "<h3>Connect to FieldMesh</h3>"
+            "<p class='muted'>Optional: connect the paid service for remote history and management. Local operation remains available without it.</p>");
   html += provisionWidgetHtml(F(
     "if(window.wzConnected)window.wzConnected(document.getElementById('pv-host').textContent);"));
   html += F("<div style='margin-top:12px'><button type='button' class='btn btn--sm' data-wz='back'>Back</button></div>"
@@ -5452,7 +5813,7 @@ static void handleSetupWizard() {
 
   // Step 3 — Cloud confirmed
   html += F("<div class='wz-step' data-step='3' style='display:none'>"
-            "<h3>3. Cloud upload</h3>"
+            "<h3>Cloud upload</h3>"
             "<p><span class='chip chip--cfg-ok' style='font-weight:600'>Cloud upload: Enabled</span></p>"
             "<p class='muted'>Connecting this FieldHub turned on cloud upload automatically. Data will upload to your project during collection rounds.</p>"
             "<div style='margin-top:12px'><button type='button' class='btn btn--sm' data-wz='back'>Back</button> "
@@ -5461,7 +5822,7 @@ static void handleSetupWizard() {
 
   // Step 4 — Dashboard control
   html += F("<div class='wz-step' data-step='4' style='display:none'>"
-            "<h3>4. Dashboard control</h3>"
+            "<h3>Dashboard control</h3>"
             "<p class='muted'>Let this FieldHub be configured from the dashboard. Changes you make in the dashboard reach nodes during the next sync. You can change this later in Settings.</p>"
             "<label class='label'><input type='checkbox' id='wz-remote'");
   if (remoteEnabled) html += F(" checked");
@@ -5473,7 +5834,7 @@ static void handleSetupWizard() {
 
   // Step 5 — Time
   html += F("<div class='wz-step' data-step='5' style='display:none'>"
-            "<h3>5. Set the clock</h3>"
+            "<h3>Set the clock</h3>"
             "<p class='muted'>Sets the FieldHub clock from this device (stored as UTC). This is the time reference for the whole fleet.</p>"
             "<p>This device (UTC): <strong id='wz-time-now'>--</strong></p>"
             "<button type='button' class='btn btn--primary' id='wz-time-set'>Use this time</button>"
@@ -5488,8 +5849,8 @@ static void handleSetupWizard() {
   // auto-derived from this by handleSetWakeInterval (computeAutoSyncMin) — the
   // user never sets a sync schedule directly, so there is no sync UI here.
   html += F("<div class='wz-step' data-step='6' style='display:none'>"
-            "<h3>6. Recording interval</h3>"
-            "<p class='muted'>How often should nodes record a reading? Uploads are scheduled automatically from this.</p>"
+            "<h3>Recording interval</h3>"
+            "<p class='muted'>How often should nodes record a reading? Fleet collection rounds are scheduled automatically from this.</p>"
             "<div id='wz-int-row' style='display:flex;flex-wrap:wrap;gap:6px'>");
   for (size_t i = 0; i < kAllowedCount; ++i) {
     html += F("<button type='button' class='btn btn--sm wz-int");
@@ -5511,7 +5872,8 @@ static void handleSetupWizard() {
             "<h3>Review</h3>"
             "<div id='wz-review'></div>"
             "<div style='margin-top:14px'><button type='button' class='btn btn--sm' data-wz='back'>Back</button> "
-            "<button type='button' class='btn btn--primary' data-wz='goto' data-goto='8'>Looks good</button></div>"
+            "<button type='button' class='btn btn--primary' id='wz-complete'>Looks good</button></div>"
+            "<div id='wz-complete-result' class='help' style='margin-top:8px'></div>"
             "</div>");
 
   // Step 8 — Done. The wizard only sets the hub up; it deliberately does NOT
@@ -5521,7 +5883,7 @@ static void handleSetupWizard() {
   // so the hub wizard makes no mention of it.
   html += F("<div class='wz-step' data-step='8' style='display:none'>"
             "<h3><span class='chip chip--cfg-ok' style='font-weight:700'>FieldHub ready</span></h3>"
-            "<p class='muted'>Your FieldHub is connected and configured. When everything's in place, "
+            "<p class='muted'>Your FieldHub is configured for recording. When everything's in place, "
             "press <strong>Finish &amp; Start Recording</strong> on the home screen.</p>"
             "<a href='/' class='btn btn--primary' style='width:100%;text-align:center'>Go to overview</a>"
             "<div style='margin-top:10px'><button type='button' class='btn btn--sm' data-wz='back'>Back</button></div>"
@@ -5532,8 +5894,8 @@ static void handleSetupWizard() {
   // --- Wizard controller ---
   html += F("<script>(function(){var INIT=");
   html += F("{\"startStep\":");        html += String(startStep);
-  html += F(",\"cloudEnabled\":");     html += (tx.enabled && hasKey) ? F("true") : F("false");
-  html += F(",\"endpointHost\":\"");   html += host; html += F("\"");
+  html += F(",\"cloudEnabled\":");     html += connectedToFieldMesh ? F("true") : F("false");
+  html += F(",\"endpointHost\":\"");   html += jsonEscapeLocal(host); html += F("\"");
   html += F(",\"interval\":");         html += String(gWakeIntervalMin);
   html += F(",\"remote\":");           html += remoteEnabled ? F("true") : F("false");
   html += F("};");
@@ -5553,16 +5915,27 @@ static void handleSetupWizard() {
     "row('Recording interval',iv);}"
     "function show(n){cur=Math.max(1,Math.min(TOTAL,n));"
     "steps.forEach(function(s){s.style.display=(parseInt(s.dataset.step,10)===cur)?'block':'none';});"
-    "document.getElementById('wz-cur').textContent=cur;"
     "if(cur===7)renderReview();"
     "window.scrollTo(0,0);}"
     "window.wzGo=show;"
     "window.wzConnected=function(host){S.cloud=true;if(host)S.host=host;show(3);};"
+    "document.getElementById('wz-local').addEventListener('click',function(){"
+    "var b=this,label=b.textContent;b.disabled=true;b.textContent='Saving...';"
+    "post('/set-data-destination',{mode:'local_only'}).then(function(j){"
+    "if(!j.ok)throw new Error(j.message||'Could not save local mode');"
+    "S.cloud=false;S.host='';S.remote=false;document.getElementById('wz-remote').checked=false;show(5);"
+    "}).catch(function(e){b.disabled=false;b.textContent=label;"
+    "document.getElementById('wz-local-result').innerHTML=chip(false,e.message||'Could not save local mode');});});"
+    "document.getElementById('wz-complete').addEventListener('click',function(){"
+    "var b=this;b.disabled=true;post('/complete-setup',{}).then(function(j){"
+    "if(!j.ok)throw new Error(j.message||'Could not finish setup');show(8);"
+    "}).catch(function(e){b.disabled=false;document.getElementById('wz-complete-result').innerHTML="
+    "chip(false,e.message||'Could not finish setup');});});"
     "document.addEventListener('click',function(e){var t=e.target;while(t&&t!==document&&!t.getAttribute('data-wz'))t=t.parentNode;"
     "if(!t||t===document)return;var a=t.getAttribute('data-wz');"
-    "if(a==='next'||a==='skip')show(cur+1);else if(a==='back')show(cur-1);"
+    "if(a==='next'||a==='skip')show(cur+1);else if(a==='back')show((cur===5&&!S.cloud)?1:cur-1);"
     "else if(a==='goto')show(parseInt(t.getAttribute('data-goto'),10));});"
-    // Step 1 copy
+    // Hardware identity copy
     "document.getElementById('wz-copy').addEventListener('click',function(){"
     "var t=document.getElementById('wz-mac').textContent;if(navigator.clipboard)navigator.clipboard.writeText(t);"
     "this.textContent='Copied';var b=this;setTimeout(function(){b.textContent='Copy MAC';},1500);});"
@@ -5585,7 +5958,7 @@ static void handleSetupWizard() {
     "var v=parseInt(b.getAttribute('data-int'),10);post('/set-wake-interval',{interval:v}).then(function(j){"
     "S.interval=v;[].forEach.call(document.querySelectorAll('.wz-int'),function(x){x.classList.remove('btn--primary');});"
     "b.classList.add('btn--primary');"
-    "document.getElementById('wz-int-result').innerHTML=chip(true,'Recording every '+v+' min &middot; uploads scheduled automatically');});});});"
+    "document.getElementById('wz-int-result').innerHTML=chip(true,'Recording every '+v+' min &middot; collection scheduled automatically');});});});"
     "show(cur);"
     "})();</script>");
   html += footCommon();
@@ -5940,6 +6313,7 @@ void startConfigServer() {
   server.on("/shutdown", HTTP_POST, handleShutdown);
   server.on("/set-time", HTTP_POST, handleSetTime);
   server.on("/download-csv", HTTP_GET, handleDownloadCSV);
+  server.on("/download-deployments", HTTP_GET, handleDownloadDeployments);
   server.on("/discover-nodes", HTTP_POST, handleDiscoverNodes);
   server.on("/set-wake-interval", HTTP_POST, handleSetWakeInterval);
   server.on("/set-sync-mode", HTTP_POST, handleSetSyncMode);
@@ -5978,6 +6352,8 @@ void startConfigServer() {
   server.on("/revert-node", HTTP_POST, handleRevertNode);
 
   server.on("/settings", HTTP_GET, handleSettings);
+  server.on("/set-data-destination", HTTP_POST, handleSetDataDestination);
+  server.on("/set-custom-destination", HTTP_POST, handleSetCustomDestination);
   server.on("/set-transmission", HTTP_POST, handleSetTransmission);
   server.on("/manual-upload", HTTP_POST, handleManualUpload);
   server.on("/upload-status", HTTP_GET, handleUploadStatus);
@@ -5989,6 +6365,7 @@ void startConfigServer() {
 
   // First-run onboarding wizard + the lightweight per-setting endpoint it needs.
   server.on("/setup", HTTP_GET, handleSetupWizard);
+  server.on("/complete-setup", HTTP_POST, handleCompleteSetup);
   server.on("/set-remote-management", HTTP_POST, handleSetRemoteManagement);
 
   // --- Legacy route aliases (backwards compatibility) ---
@@ -6013,10 +6390,7 @@ void startConfigServer() {
   server.on("/find-stations", HTTP_POST, handleDiscoverNodes);
   server.on("/set-recording-interval", HTTP_POST, handleSetWakeInterval);
   server.on("/save-settings", HTTP_POST, handleSetTransmission);
-  server.on("/export", HTTP_GET, []() {
-    server.sendHeader("Location", "/download-csv", true);
-    server.send(302, "text/plain", "");
-  });
+  server.on("/export", HTTP_GET, handleDataPage);
 
   // Shared control revision + local self-update (§4.2, §7.1)
   server.on("/api/control", HTTP_GET, handleControlStatus);

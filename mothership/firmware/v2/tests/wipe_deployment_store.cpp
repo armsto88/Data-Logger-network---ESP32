@@ -16,7 +16,7 @@
 // in the Field UI and an outbox slot that never frees.
 //
 // Run this after the epoch test suite and BEFORE flashing production firmware
-// for field use. Only the three deployment-store files are touched; the reading
+// for field use. Only deployment-store files are touched; the reading
 // buffer (/datalog.csv) and all NVS state (paired nodes, upload cursor, sync
 // anchor) are deliberately left alone.
 //
@@ -66,10 +66,14 @@ void setup() {
   removeIfPresent("/deploy.bin");
   removeIfPresent("/deploy.bak");
   removeIfPresent("/deploy.tmp");
+  removeIfPresent("/deploy.v1");
+  removeIfPresent("/deploy.v1.tmp");
 
   check("deploy.bin is gone", !LittleFS.exists("/deploy.bin"));
   check("deploy.bak is gone", !LittleFS.exists("/deploy.bak"));
   check("deploy.tmp is gone", !LittleFS.exists("/deploy.tmp"));
+  check("deploy.v1 is gone", !LittleFS.exists("/deploy.v1"));
+  check("deploy.v1.tmp is gone", !LittleFS.exists("/deploy.v1.tmp"));
 
   size_t csvAfter = 0;
   const bool haveCsv = LittleFS.exists("/datalog.csv");

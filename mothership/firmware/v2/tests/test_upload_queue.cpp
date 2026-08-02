@@ -181,6 +181,22 @@ static void testStampedRowRoundTrip() {
         json0.body.indexOf("\"deploymentEpoch\":0") >= 0);
 }
 
+static void testUploadAckCompatibilityHookKeepsCurrentHistory() {
+  writeDataFile(kCurrentCSVHeader31, (String(kRow31) + "\n").c_str());
+  File beforeFile = LittleFS.open(kDataFile, "r");
+  const size_t before = beforeFile ? beforeFile.size() : 0;
+  if (beforeFile) beforeFile.close();
+
+  UploadQueue queue;
+  check("retention: compatibility hook accepts a current-schema file",
+        queue.purgeUploadedIfLegacyDrained());
+  File afterFile = LittleFS.open(kDataFile, "r");
+  const size_t after = afterFile ? afterFile.size() : 0;
+  if (afterFile) afterFile.close();
+  check("retention: upload acknowledgement does not delete current local history",
+        before > 0 && after == before);
+}
+
 // ---------------------------------------------------------------------------
 void setup() {
   Serial.begin(115200);
@@ -205,6 +221,7 @@ void setup() {
   testSchemaCurrentGate();
   testMixedWidthRowsParse();
   testStampedRowRoundTrip();
+  testUploadAckCompatibilityHookKeepsCurrentHistory();
 
   LittleFS.remove(kDataFile);
   if (hadData) LittleFS.rename(kBackupFile, kDataFile);

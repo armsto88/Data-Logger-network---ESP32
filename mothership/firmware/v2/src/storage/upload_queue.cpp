@@ -77,6 +77,7 @@ UploadQueue::UploadQueue()
   m_cursor.retryCount     = 0;
   m_cursor.wakeCounter    = 0;
   m_cursor.nextAttemptUnix = 0;
+  m_cursor.rowsRemovedLocally = 0;
 }
 
 bool UploadQueue::init() {
@@ -114,6 +115,7 @@ void UploadQueue::loadCursor() {
   m_cursor.wakeCounter    = prefs.getUInt("wake_counter", 0);
   // NVS keys are limited to 15 characters; keep this key deliberately short.
   m_cursor.nextAttemptUnix = prefs.getUInt("next_attempt", 0);
+  m_cursor.rowsRemovedLocally = prefs.getUInt("local_removed", 0);
   // Poison-row tracking. The hub cold-boots between wakes, so an in-RAM counter
   // could never reach the threshold — it has to be durable.
   m_poisonOffset = prefs.getUInt("poison_off", 0);
@@ -131,7 +133,7 @@ void UploadQueue::loadCursor() {
 // queue: the non-retryable branch deliberately does not advance the cursor, so
 // every later session rebuilds the same chunk and takes the same rejection.
 // Nothing drains, deploymentTrackingVersion never turns on, and
-// emergencyPurgeIfFull() eventually discards the oldest half of the buffer —
+// emergencyPurgeIfFull() eventually discards the oldest part of the buffer —
 // so the "safe" non-advancing path loses MORE data than skipping, just later
 // and silently.
 //
@@ -178,6 +180,7 @@ void UploadQueue::saveCursor() {
   prefs.putUChar("retry_count", m_cursor.retryCount);
   prefs.putUInt("wake_counter", m_cursor.wakeCounter);
   prefs.putUInt("next_attempt", m_cursor.nextAttemptUnix);
+  prefs.putUInt("local_removed", m_cursor.rowsRemovedLocally);
   prefs.end();
 }
 
@@ -568,6 +571,18 @@ bool UploadQueue::purgeUploaded() {
   return true;
 }
 
+bool UploadQueue::purgeUploadedIfLegacyDrained() {
+  File file = LittleFS.open(kDataFile, "r");
+  if (!file) return false;
+  String header = file.readStringUntil('\n');
+  file.close();
+  header.trim();
+  if (!isLegacyCSVHeader(header)) return true;
+  if (getPendingRows() > 0) return true;
+  Serial.println("[UQ] Legacy upload queue drained; upgrading CSV without retaining legacy rows");
+  return purgeUploaded();
+}
+
 // ---------------------------------------------------------------------------
 // emergencyPurgeIfFull
 // ---------------------------------------------------------------------------
@@ -610,8 +625,10 @@ bool UploadQueue::emergencyPurgeIfFull(uint8_t thresholdPct) {
     return true;
   }
 
-  uint32_t rowsToKeep = totalDataRows / 2;        // keep newest 50%
-  uint32_t rowsToSkip = totalDataRows - rowsToKeep; // discard oldest 50%
+  uint32_t rowsToKeep =
+      (totalDataRows * (uint32_t)kLittleFsRetentionKeepPct) / 100U;
+  if (rowsToKeep == 0 && totalDataRows > 0) rowsToKeep = 1;
+  uint32_t rowsToSkip = totalDataRows - rowsToKeep;
 
   Serial.printf("[UQ] emergencyPurge: totalRows=%u skip=%u keep=%u\n",
                 (unsigned)totalDataRows, (unsigned)rowsToSkip, (unsigned)rowsToKeep);
@@ -700,6 +717,7 @@ bool UploadQueue::emergencyPurgeIfFull(uint8_t thresholdPct) {
       m_cursor.byteOffset = headerEndOffset();
     }
   }
+  m_cursor.rowsRemovedLocally += rowsToSkip;
   saveCursor();
 
   Serial.printf("[UQ] emergencyPurge: done, copied %u bytes, cursor=%u\n",

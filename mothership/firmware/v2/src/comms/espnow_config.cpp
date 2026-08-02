@@ -3,6 +3,7 @@
 #include "config/deployment_epoch.h"
 #include "time/rtc_alarm.h"
 #include "storage/flash_logger.h"
+#include "storage/sd_logger.h"
 #include "system/pins.h"
 #include <esp_now.h>
 #include <WiFi.h>
@@ -144,12 +145,20 @@ static void processDecodedSnapshot(const DecodedSnapshot& decoded, const uint8_t
 
   bool persisted = false;
   if (flashIsReady()) {
-    persisted = logDecodedSnapshot(stamped);
-    if (!persisted) {
+    const bool flashSaved = logDecodedSnapshot(stamped);
+    persisted = persisted || flashSaved;
+    if (!flashSaved) {
       Serial.println("[SNAP] Flash logging failed");
     }
-  } else {
-    Serial.println("[SNAP] Flash unavailable; snapshot not durably logged");
+  }
+  if (sdIsReady()) {
+    String archiveRow;
+    const bool sdSaved = formatDecodedSnapshotCSVRow(stamped, archiveRow) &&
+                         sdLogCSVRow(archiveRow);
+    persisted = persisted || sdSaved;
+  }
+  if (!persisted) {
+    Serial.println("[SNAP] No storage accepted the snapshot");
   }
   sendDecodedSnapshotAck(mac, decoded, persisted);
   Serial.printf("[SNAP] %.15s seq=%lu present=0x%04X proto=%u readings=%u\n",

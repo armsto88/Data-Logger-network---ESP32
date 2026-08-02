@@ -4,23 +4,19 @@
 #include <SD.h>
 #include <SPI.h>
 
-// SD card logging module for Mothership V1.
-// Manages SPI SD card init and CSV logging of node snapshots.
+// Durable field archive. LittleFS remains the upload cursor/cache and fallback;
+// when a card is mounted, the same canonical reading row is also appended here
+// and is never removed after upload.
 
-// Snapshot structure for logging (matches protocol.h sensor_data_message_t)
-struct NodeSnapshot {
-  char     nodeId[16];
-  char     sensorType[16];
-  char     sensorLabel[24];
-  uint16_t sensorId;
-  float    value;
-  unsigned long nodeTimestamp;
-  uint16_t qualityFlags;
-};
+struct DeploymentEvent;
 
 bool initSD();
-bool logSnapshot(const NodeSnapshot* snap);
-bool logCSVRow(const String& row);
-String getCSVStats();
-bool createCSVHeader();
 bool sdIsReady();
+bool sdHadWriteError();
+bool sdLogCSVRow(const String& row);
+bool sdAppendDeploymentEvent(const char* nodeId, const DeploymentEvent& event);
+const char* sdReadingsPath();
+const char* sdDeploymentsPath();
+uint64_t sdReadingsFileSize();
+uint64_t sdTotalBytes();
+uint64_t sdUsedBytes();

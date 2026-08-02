@@ -5,7 +5,7 @@
 // Transmission settings for the Mothership V1 modem upload subsystem.
 // Stored in NVS namespace "tx".  Loaded at boot and after web UI saves.
 //
-// Endpoint: Google Cloud Function (raw CSV POST, token in URL query param).
+// Upload settings for local-only, FieldMesh, or an operator-owned HTTPS sink.
 
 // ---------------------------------------------------------------------------
 // Defaults
@@ -55,14 +55,28 @@ static constexpr const char* DEFAULT_PROJECT_ID = FM_DEFAULT_PROJECT_ID;
 // the local provisioning flow applies a dashboard-issued key.
 static constexpr const char* DEFAULT_API_KEY = FM_DEFAULT_API_KEY;
 
+// Data destination is explicit. A blank connection key means "not connected to
+// FieldMesh"; it must not mean "the FieldHub itself is not set up" because all
+// local commissioning and recording functions work without a backend.
+enum TxDestinationMode : uint8_t {
+  TX_DEST_LOCAL_ONLY   = 0,
+  TX_DEST_FIELDMESH    = 1,
+  TX_DEST_CUSTOM_HTTPS = 2,
+};
+
+static constexpr TxDestinationMode DEFAULT_DESTINATION_MODE = TX_DEST_LOCAL_ONLY;
+
 // ---------------------------------------------------------------------------
 // Settings struct
 // ---------------------------------------------------------------------------
 struct TransmissionSettings {
+  TxDestinationMode destinationMode;
   bool     enabled;
   String   endpointUrl;        // upload endpoint (Supabase ingest function)
   String   authToken;          // legacy token appended as ?token=xxx
   String   apiKey;             // device API key (sent as Bearer)
+  String   customEndpointUrl;  // operator-owned HTTPS JSON ingest endpoint
+  String   customBearerToken;  // optional Bearer value for custom endpoint
   String   mothershipId;       // UUID sent as "mothership_id" in each reading
   String   projectId;          // UUID sent as "project_id" in each reading
   String   siteId;
@@ -94,5 +108,14 @@ String transmissionSettingsToJson(const TransmissionSettings& s);
 // (mothershipId/projectId) — only the 9 fields the ingest schema stores.
 String buildTransmissionStatusJson(const TransmissionSettings& s);
 
-// Build the full upload URL: endpointUrl + ?token=xxx&siteId=yyy&deploymentId=zzz
+// Build the active destination URL. Legacy FieldMesh-compatible settings may
+// still append token/site query parameters; custom HTTPS secrets never do.
 String buildUploadUrl(const TransmissionSettings& s);
+
+// Bearer value for the active destination (blank means no Authorization
+// header). Kept separate from buildUploadUrl so custom secrets never enter a
+// query string.
+String buildUploadAuth(const TransmissionSettings& s);
+
+// Stable operator/API label for the persisted destination mode.
+const char* txDestinationModeName(TxDestinationMode mode);

@@ -42,6 +42,7 @@
 // ---------------------------------------------------------------------------
 static constexpr size_t kMaxDeployNodes  = 64;  // matches kMaxPairedNodes
 static constexpr size_t kBoundaryHistory = 4;   // epochs we can attribute exactly
+static constexpr size_t kLocalDeploymentArchive = 4;  // completed deployments per node
 static constexpr size_t kMaxOutboxEvents = 16;  // backend per-request cap is 64
 
 static constexpr uint16_t kDeployUserIdLen = 4;   // "001" + NUL
@@ -69,6 +70,29 @@ struct DeploymentBoundary {
   uint32_t startedUnix;
 };
 
+// Complete local snapshot of an ended deployment. This is intentionally
+// separate from history[]: history is an attribution index that includes the
+// current deployment, while archive[] is operator-facing history and contains
+// completed deployments only.
+enum DeploymentArchiveKnown : uint8_t {
+  DEPLOY_ARCHIVE_START_KNOWN    = 1 << 0,
+  DEPLOY_ARCHIVE_END_KNOWN      = 1 << 1,
+  DEPLOY_ARCHIVE_IDENTITY_KNOWN = 1 << 2,
+  DEPLOY_ARCHIVE_LOCATION_KNOWN = 1 << 3,
+};
+
+struct DeploymentArchive {
+  uint32_t startedUnix;
+  uint32_t endedUnix;
+  float    latitude;
+  float    longitude;
+  uint16_t epoch;
+  uint8_t  known;
+  bool     fieldMeshAcked;  // exact archived record accepted by FieldMesh
+  char     userId[kDeployUserIdLen];
+  char     name[kDeployNameLen];
+};
+
 // In-flight lifecycle transition. Start and End commit in opposite orders (see
 // deployment_epoch.h), so recovery differs per op.
 enum DeployPendingOp : uint8_t {
@@ -90,6 +114,10 @@ struct DeploymentSlot {
 
   DeploymentBoundary history[kBoundaryHistory];  // oldest -> newest
   uint8_t  historyCount;
+
+  DeploymentArchive archive[kLocalDeploymentArchive];  // oldest -> newest
+  uint8_t  archiveCount;
+  bool     activeFieldMeshAcked;  // current active epoch accepted by FieldMesh
 
   uint8_t  pendingOp;          // DeployPendingOp
   uint16_t pendingEpoch;
@@ -162,6 +190,15 @@ bool deploymentStoreWasCreatedFresh();
 // Push a boundary onto a slot's history ring, dropping the oldest when full.
 void deploymentPushBoundary(DeploymentSlot& slot, uint16_t epoch, uint32_t startedUnix);
 
+// Add or replace a completed deployment snapshot in the slot's local archive.
+// Does not commit; End folds it into the same atomic write as endedUnix and the
+// upload outbox event.
+void deploymentArchiveUpsert(DeploymentSlot& slot, const DeploymentEvent& event);
+
+// Fixed-table access for bounded local export. Returns nullptr for an unused
+// slot or an out-of-range table index.
+const DeploymentSlot* deploymentSlotAt(size_t tableIndex);
+
 // ---------------------------------------------------------------------------
 // Slot access
 // ---------------------------------------------------------------------------
@@ -198,6 +235,8 @@ bool deploymentOutboxUpsert(const DeploymentEvent& event);
 // already told a node to change state cannot be unwound just because the record
 // of it has nowhere to go.
 bool deploymentOutboxHasRoomFor(const char* eventId);
+bool deploymentOutboxHasEvent(const char* eventId);
+bool deploymentOutboxGet(const char* eventId, DeploymentEvent& out);
 
 uint8_t deploymentOutboxCount();
 const DeploymentEvent* deploymentOutboxAt(uint8_t index);

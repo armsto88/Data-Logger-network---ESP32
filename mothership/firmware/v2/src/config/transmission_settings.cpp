@@ -4,17 +4,29 @@
 // NVS namespace for all transmission / upload settings.
 static const char* kTxNamespace = "tx";
 
+const char* txDestinationModeName(TxDestinationMode mode) {
+  switch (mode) {
+    case TX_DEST_FIELDMESH:    return "fieldmesh";
+    case TX_DEST_CUSTOM_HTTPS: return "custom_https";
+    case TX_DEST_LOCAL_ONLY:
+    default:                   return "local_only";
+  }
+}
+
 // ---------------------------------------------------------------------------
 // loadTransmissionSettings
 // ---------------------------------------------------------------------------
 void loadTransmissionSettings(TransmissionSettings& s) {
   Preferences prefs;
   if (!prefs.begin(kTxNamespace, true)) {   // read-only
+    s.destinationMode    = DEFAULT_DESTINATION_MODE;
     Serial.println("[TX] NVS begin(\"tx\") failed — using defaults");
     s.enabled            = DEFAULT_TX_ENABLED;
     s.endpointUrl        = String(DEFAULT_ENDPOINT_URL);
     s.authToken          = String("");
     s.apiKey             = String(DEFAULT_API_KEY);
+    s.customEndpointUrl  = String("");
+    s.customBearerToken  = String("");
     s.mothershipId       = String(DEFAULT_MOTHERSHIP_ID);
     s.projectId          = String(DEFAULT_PROJECT_ID);
     s.siteId             = String("");
@@ -59,6 +71,14 @@ void loadTransmissionSettings(TransmissionSettings& s) {
     s.apiKey = String(DEFAULT_API_KEY);
   }
   memset(stringBuf, 0, sizeof(stringBuf));
+  prefs.getString("custom_url", stringBuf, sizeof(stringBuf));
+  stringBuf[sizeof(stringBuf) - 1] = '\0';
+  s.customEndpointUrl = String(stringBuf);
+  memset(stringBuf, 0, sizeof(stringBuf));
+  prefs.getString("custom_token", stringBuf, sizeof(stringBuf));
+  stringBuf[sizeof(stringBuf) - 1] = '\0';
+  s.customBearerToken = String(stringBuf);
+  memset(stringBuf, 0, sizeof(stringBuf));
   prefs.getString("mothership_id", stringBuf, sizeof(stringBuf));
   stringBuf[sizeof(stringBuf) - 1] = '\0';
   s.mothershipId = String(stringBuf);
@@ -97,7 +117,27 @@ void loadTransmissionSettings(TransmissionSettings& s) {
   // operation.  The corrected value will be persisted on the next save.
   s.useJsonUpload      = true;
 
+  // Upgrade older settings without changing their working behaviour. Before
+  // destination mode existed, an enabled uploader or saved device key meant a
+  // FieldMesh-provisioned unit; otherwise it was effectively local-only.
+  const uint8_t storedMode = prefs.getUChar("dest_mode", 0xFF);
+  if (storedMode <= static_cast<uint8_t>(TX_DEST_CUSTOM_HTTPS)) {
+    s.destinationMode = static_cast<TxDestinationMode>(storedMode);
+  } else {
+    s.destinationMode = (s.enabled || s.apiKey.length() > 0)
+        ? TX_DEST_FIELDMESH : TX_DEST_LOCAL_ONLY;
+  }
+
   prefs.end();
+
+  // Local-only is authoritative. A stale pre-upgrade `enabled=true` value must
+  // not power the modem after the operator explicitly chooses local storage.
+  if (s.destinationMode == TX_DEST_LOCAL_ONLY) {
+    s.enabled = false;
+  } else if (s.destinationMode == TX_DEST_CUSTOM_HTTPS &&
+             !s.customEndpointUrl.startsWith("https://")) {
+    s.enabled = false;
+  }
 
   // Sanity clamp: stale NVS values from the config UI (e.g. old 256 KB
   // default) are larger than the ESP32 free heap can support in a single
@@ -132,9 +172,12 @@ void saveTransmissionSettings(const TransmissionSettings& s) {
   }
 
   prefs.putBool("enabled", s.enabled);
+  prefs.putUChar("dest_mode", static_cast<uint8_t>(s.destinationMode));
   prefs.putString("url", s.endpointUrl);
   prefs.putString("token", s.authToken);
   prefs.putString("api_key", s.apiKey);
+  prefs.putString("custom_url", s.customEndpointUrl);
+  prefs.putString("custom_token", s.customBearerToken);
   prefs.putString("mothership_id", s.mothershipId);
   prefs.putString("project_id", s.projectId);
   prefs.putString("site_id", s.siteId);
@@ -170,10 +213,14 @@ String transmissionSettingsToJson(const TransmissionSettings& s) {
   String j;
   j.reserve(512);
   j += "{";
+  j += "\"destinationMode\":\"";
+  j += txDestinationModeName(s.destinationMode);
+  j += "\",";
   j += "\"enabled\":" + String(s.enabled ? "true" : "false") + ",";
   j += "\"endpointUrl\":\"" + esc(s.endpointUrl) + "\",";
   j += "\"authToken\":\"" + esc(s.authToken) + "\",";
   j += "\"apiKey\":\"" + esc(s.apiKey) + "\",";
+  j += "\"customEndpointUrl\":\"" + esc(s.customEndpointUrl) + "\",";
   j += "\"mothershipId\":\"" + esc(s.mothershipId) + "\",";
   j += "\"projectId\":\"" + esc(s.projectId) + "\",";
   j += "\"siteId\":\"" + esc(s.siteId) + "\",";
@@ -207,7 +254,9 @@ String buildTransmissionStatusJson(const TransmissionSettings& s) {
   String j;
   j.reserve(384);
   j += "{";
-  j += "\"endpointUrl\":\"" + esc(s.endpointUrl) + "\",";
+  const String activeEndpoint = (s.destinationMode == TX_DEST_CUSTOM_HTTPS)
+      ? s.customEndpointUrl : s.endpointUrl;
+  j += "\"endpointUrl\":\"" + esc(activeEndpoint) + "\",";
   j += "\"siteId\":\"" + esc(s.siteId) + "\",";
   j += "\"deploymentId\":\"" + esc(s.deploymentId) + "\",";
   j += "\"uploadIntervalMin\":" + String(s.uploadIntervalMin) + ",";
@@ -245,14 +294,15 @@ static String urlEncodeParam(const String& s) {
 }
 
 String buildUploadUrl(const TransmissionSettings& s) {
-  String url = s.endpointUrl;
+  String url = (s.destinationMode == TX_DEST_CUSTOM_HTTPS)
+      ? s.customEndpointUrl : s.endpointUrl;
   if (url.length() == 0) return url;
 
   // Supabase path: authentication is header-only (Authorization: Bearer
   // <apiKey>) and the endpoint takes no query params.  When an API key is set
   // we return the endpoint untouched.  Query params are only appended on the
   // legacy Google Apps Script path (apiKey empty, authToken set).
-  if (s.apiKey.length() > 0) return url;
+  if (s.destinationMode == TX_DEST_CUSTOM_HTTPS || s.apiKey.length() > 0) return url;
 
   // Append query params.  Use ? for the first param, & for the rest.
   char sep = '?';
@@ -278,4 +328,10 @@ String buildUploadUrl(const TransmissionSettings& s) {
     sep = '&';
   }
   return url;
+}
+
+String buildUploadAuth(const TransmissionSettings& s) {
+  if (s.destinationMode == TX_DEST_FIELDMESH) return s.apiKey;
+  if (s.destinationMode == TX_DEST_CUSTOM_HTTPS) return s.customBearerToken;
+  return String();
 }
