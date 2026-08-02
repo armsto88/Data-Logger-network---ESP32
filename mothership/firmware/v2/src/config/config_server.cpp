@@ -1361,6 +1361,10 @@ body.batch-mode .node-select-control{display:flex}
 .action-choice--start input:checked + span{background:rgba(122,155,112,.25)}
 .action-choice--stop input:checked + span{background:rgba(196,122,90,.25)}
 .action-choice--unpair input:checked + span{background:rgba(196,90,74,.20)}
+button.action-choice{display:block;width:100%;padding:0;border:0;background:transparent;
+  color:inherit;font:inherit;text-align:inherit}
+button.action-choice:focus-visible{outline:none}
+button.action-choice:focus-visible span{outline:2px solid var(--primary);outline-offset:2px}
 /* Two-line variant: action name plus ONE line of consequence. A modifier rather
    than a change to .action-choice span, because the recording-interval picker
    reuses the base class and must stay a single centred line. */
@@ -2402,6 +2406,13 @@ static String buildDataStatusSectionHtml() {
   const uint64_t totalBytes = usingSD ? sdTotalBytes() : (uint64_t)LittleFS.totalBytes();
   const uint64_t usedBytes  = usingSD ? sdUsedBytes() : (uint64_t)LittleFS.usedBytes();
   const uint64_t freeBytes  = (totalBytes > usedBytes) ? (totalBytes - usedBytes) : 0;
+  uint16_t completedDeployments = 0;
+  if (deploymentStoreReady()) {
+    for (size_t i = 0; i < kMaxDeployNodes; ++i) {
+      const DeploymentSlot* slot = deploymentSlotAt(i);
+      if (slot) completedDeployments += slot->archiveCount;
+    }
+  }
 
   String out;
   out.reserve(900);
@@ -2418,6 +2429,9 @@ static String buildDataStatusSectionHtml() {
   out += F("</span></div>"
            "<div class='stat'><strong>Storage free</strong><span class='num' style='font-size:16px'>");
   out += (totalBytes > 0) ? formatBytesUi(freeBytes) : String("n/a");
+  out += F("</span></div>"
+           "<div class='stat'><strong>Completed deployments</strong><span class='num'>");
+  out += String(completedDeployments);
   out += F("</span></div></div>");
 
   if (!hasFile) {
@@ -3991,7 +4005,7 @@ static void handleStationDetail() {
   html += F("' class='btn btn--sm' style='display:block;text-align:center;padding:12px'>"
             "&#9881; Configure Sensors</a></div>");
 
-  html += F("<form action='/station' method='POST' onsubmit='return confirmRemove()'>"
+  html += F("<form action='/station' method='POST'>"
             "<input type='hidden' name='node_id' value='");
   html += target->nodeId;
   html += F("'>");
@@ -4097,47 +4111,43 @@ static void handleStationDetail() {
     // route forward is the Start new deployment button above.
   } else if (!isDeployed) {
     // New / Connected node — the in-hand deploy path.
-    html += F("<label class='action-choice action-choice--start action-choice--why'>"
-              "<input type='radio' name='action' value='start'>"
-              "<span>Deploy<em>Starts recording and begins this node&rsquo;s first deployment.</em></span></label>");
+    html += F("<button type='submit' name='action' value='start' "
+              "class='action-choice action-choice--start action-choice--why'>"
+              "<span>Deploy<em>Starts recording and begins this node&rsquo;s first deployment.</em></span></button>");
   } else if (displayedPaused) {
     // Paused deployed node — resume remotely at the next sync.
-    html += F("<label class='action-choice action-choice--start action-choice--why'>"
-              "<input type='radio' name='action' value='resume'>"
-              "<span>Resume recording<em>Continues the same deployment and its data history.</em></span></label>");
+    html += F("<button type='submit' name='action' value='resume' "
+              "class='action-choice action-choice--start action-choice--why'>"
+              "<span>Resume recording<em>Continues the same deployment and its data history.</em></span></button>");
   } else {
     // Active deployed node — pause (standby) remotely at the next sync.
-    html += F("<label class='action-choice action-choice--stop action-choice--why'>"
-              "<input type='radio' name='action' value='pause'>"
-              "<span>Pause recording<em>Keeps this deployment. You can resume any time.</em></span></label>");
+    html += F("<button type='submit' name='action' value='pause' "
+              "class='action-choice action-choice--stop action-choice--why'>"
+              "<span>Pause recording<em>Keeps this deployment. You can resume any time.</em></span></button>");
   }
   if (isDeployed && !deploymentEnded && target->deploymentEpoch > 0) {
-    html += F("<label class='action-choice action-choice--stop action-choice--why'>"
-              "<input type='radio' name='action' value='end_deployment'>"
+    html += F("<button type='submit' name='action' value='end_deployment' "
+              "class='action-choice action-choice--stop action-choice--why' "
+              "onclick=\"return confirm('End this deployment? The node stops recording and its number is freed for another node.')\">"
               "<span>End deployment<em>Archives this site&rsquo;s data");
     const String heldNum = getNodeUserId(target->nodeId);
     if (heldNum.length()) {
       html += F(" and frees number ");
       html += htmlEscape(heldNum);
     }
-    html += F(". Cannot be resumed.</em></span></label>");
+    html += F(". Cannot be resumed.</em></span></button>");
   }
-  html += F("<label class='action-choice action-choice--unpair action-choice--why'>"
-            "<input type='radio' name='action' value='unpair'>"
-            "<span>Remove node<em>Ends the deployment, then unpairs the hardware.</em></span></label>"
+  html += F("<button type='submit' name='action' value='unpair' "
+            "class='action-choice action-choice--unpair action-choice--why' "
+            "onclick=\"return confirm('Remove this node? You will need to re-add it with the pair button.')\">"
+            "<span>Remove node<em>Ends the deployment, then unpairs the hardware.</em></span></button>"
             "</div>");
   if (isDeployed) {
     html += F("<div class='muted' style='font-size:12px;margin-top:6px'>Applied at the node&rsquo;s next check-in.</div>");
   }
-  html += F("<button type='submit' class='btn btn--success' style='margin-top:12px'>"
-            "Save Changes</button>"
+  html += F("<button type='submit' name='action' value='none' class='btn btn--success' style='margin-top:12px'>"
+            "Save settings only</button>"
             "</form>");
-
-  html += F("<script>function confirmRemove(){var r=document.querySelector('input[name=action]:checked');"
-            "if(!r)return true;"
-            "if(r.value==='unpair'){return confirm('Remove this node? You will need to re-add it with the pair button.');}"
-            "if(r.value==='end_deployment'){return confirm('End this deployment? The node stops recording and its number is freed for another node.');}"
-            "return true;}</script>");
   html += F("</div>");
   html += footCommon();
   server.send(200, "text/html", html);
@@ -4292,6 +4302,7 @@ static void handleNodeConfigSave() {
   bool unpairOk = false;
   bool pauseOk  = false;
   bool resumeOk = false;
+  bool endOk    = false;
 
   // expected_epoch makes Start/End idempotent: a double-submitted form or a
   // retry after a lost response carries the stale epoch and is reported as a
@@ -4344,9 +4355,32 @@ static void handleNodeConfigSave() {
       sendDeploymentError(400, r.message, "", nodeId);
       return;
     }
+    const DeploymentSlot* endedSlot = deploymentFindByNodeId(nodeId.c_str());
+    if (endedSlot && endedSlot->endedUnix != 0) {
+      for (uint8_t i = 0; i < endedSlot->archiveCount; ++i) {
+        if (endedSlot->archive[i].epoch == endedSlot->epoch &&
+            endedSlot->archive[i].endedUnix == endedSlot->endedUnix) {
+          endOk = true;
+          break;
+        }
+      }
+    }
+    Serial.printf("[DEPLOY] %s End request status=%u epoch=%u ended=%lu archive=%u verified=%d\n",
+                  nodeId.c_str(), (unsigned)r.status,
+                  endedSlot ? (unsigned)endedSlot->epoch : 0U,
+                  endedSlot ? (unsigned long)endedSlot->endedUnix : 0UL,
+                  endedSlot ? (unsigned)endedSlot->archiveCount : 0U,
+                  endOk ? 1 : 0);
+    if (!endOk) {
+      sendDeploymentError(
+          500,
+          "The deployment was not found in local archive storage; no success was reported",
+          "", nodeId);
+      return;
+    }
     gFieldChangeThisSession = true;
     if (isAjaxRequest()) {
-      sendAjaxResult(true, r.message);
+      sendAjaxResult(true, "Deployment archived locally");
       return;
     }
   } else if (action == "none" || action.length() == 0) {
@@ -4513,8 +4547,13 @@ static void handleNodeConfigSave() {
     + nodeId
     + String("' class='btn btn--sm'>Refresh</a>");
   String html = headCommon("Node", actionsHtml);
-  html += F("<div class='section center'>"
-            "<h3>Node settings applied</h3>");
+  html += F("<div class='section center'>");
+  if (endOk) {
+    html += F("<h3>Deployment archived</h3>"
+              "<p><strong>Stored locally.</strong> The node will stop recording at its next check-in.</p>");
+  } else {
+    html += F("<h3>Node settings applied</h3>");
+  }
 
   if (!target) {
     html += F("<p class='muted'>Warning: this node ID is not currently in the registered list.</p>");
@@ -4539,8 +4578,9 @@ static void handleNodeConfigSave() {
   if (revertOk) html += F("<br>Stop monitoring: OK");
   if (pauseOk)  html += F("<br>Pause: SCHEDULED &mdash; the node stops recording at its next sync check-in (stays deployed &amp; resumable)");
   if (resumeOk) html += F("<br>Resume: SCHEDULED &mdash; the node resumes recording at its next sync check-in");
+  if (endOk)    html += F("<br>End deployment: ARCHIVED LOCALLY");
   if (unpairOk) html += F("<br>Remove node: SCHEDULED &mdash; completes when the node confirms at its next sync");
-  if (!pairOk && !deployOk && !revertOk && !pauseOk && !resumeOk && !unpairOk) {
+  if (!pairOk && !deployOk && !revertOk && !pauseOk && !resumeOk && !endOk && !unpairOk) {
     html += F("<br>No lifecycle change requested.");
   }
   html += F("</p>"

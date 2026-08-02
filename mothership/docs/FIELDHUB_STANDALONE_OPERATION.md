@@ -77,6 +77,9 @@ cloud OTA. The full field reference remains in
    pending lifecycle state, and known history survive two boots.
 2. Run the deployment-epoch and upload-queue test images on hardware, then use
    the documented wipe image before returning the hub to production firmware.
+   **Bench only:** the wipe removes the hub's complete local deployment store,
+   including genuine archived deployments. It is not part of a normal field
+   upgrade and must only be used where that history is disposable or backed up.
 3. Exercise local setup with no key/SIM/backend, commission a node, end and
    redeploy it, reboot, and download both CSVs.
 4. Fill LittleFS beyond its retention threshold and power-cycle during a rewrite;
@@ -108,6 +111,8 @@ Executed from commit `91f5411` on the physical ESP32 FieldHub
   upload acknowledgement does not delete current local history.
 - `mothership-v2-wipe-deploy-store`: **6/6, OVERALL:PASS**. All deployment test
   files were absent afterward and `/datalog.csv` remained present at 367 bytes.
+  Because the same files hold genuine local deployment history, any archive
+  that existed on this test hub before the suite was intentionally removed.
 - `mothership-v1-main` was restored successfully. Build `91f5411` booted without
   a panic and entered the expected USB-service path. A subsequent physical
   configuration wake served web UI requests, initialized the LittleFS upload
