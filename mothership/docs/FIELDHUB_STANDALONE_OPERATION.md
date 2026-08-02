@@ -1,8 +1,9 @@
 # FieldHub standalone operation
 
 This note records the local-first contract implemented on
-`feat/fieldhub-standalone-ui`. It is an operating and field-acceptance guide,
-not evidence that the hardware checks below have already run.
+`feat/fieldhub-standalone-ui`. It is an operating and field-acceptance guide;
+executed checks are recorded separately below so build results are not confused
+with hardware evidence.
 
 ## Operating modes
 
@@ -91,3 +92,31 @@ cloud OTA. The full field reference remains in
    convergence and OTA remain unchanged.
 
 Build success alone does not satisfy these hardware and backend acceptance gates.
+
+## Acceptance evidence
+
+### 2026-08-02 — bench FieldHub on COM4
+
+Executed from commit `91f5411` on the physical ESP32 FieldHub
+(`48:9d:31:f8:16:a8`):
+
+- `mothership-v2-test-deployment-epoch`: **193/193, OVERALL:PASS**. This
+  included local archive retention, more than 16 standalone lifecycle records,
+  bounded backfill fixtures, and v1 deployment-store migration.
+- `mothership-v2-test-upload-queue`: **29/29, OVERALL:PASS**. The new retention
+  checks confirmed that a current-schema readings file is accepted and an
+  upload acknowledgement does not delete current local history.
+- `mothership-v2-wipe-deploy-store`: **6/6, OVERALL:PASS**. All deployment test
+  files were absent afterward and `/datalog.csv` remained present at 367 bytes.
+- `mothership-v1-main` was restored successfully. Build `91f5411` booted without
+  a panic and entered the expected USB-service path. A subsequent physical
+  configuration wake served web UI requests, initialized the LittleFS upload
+  queue, and completed the UI-requested Sync & Power Down path with the next RTC
+  alarm armed.
+
+No SD card was present on this device. SD archive, removal, capacity, canonical
+filename, and interrupted-write acceptance checks were therefore **NOT RUN**,
+not failed. The initial portal-start and SD-detection lines occurred before the
+serial capture reconnected, so they are not claimed as evidence. Full
+captive-portal workflow checks and the remaining manual/backend journeys are
+still outstanding.
