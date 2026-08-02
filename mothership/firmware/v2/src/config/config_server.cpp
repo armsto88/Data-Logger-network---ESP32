@@ -3221,7 +3221,17 @@ static void handleStationsPage() {
     html += F("</div><div class='node-status'>"
               "<div class='node-status-cell'><span class='node-timing-label'>Status</span>"
               "<span class='");
-    html += stCls; html += F("' data-f='status'>"); html += stTxt; html += F("</span></div>"
+    html += stCls; html += F("' data-f='status'>"); html += stTxt; html += F("</span>");
+    // Which deployment this station is on. Shown only past the first, because
+    // "D1" on every node is noise — the signal is that a station has been
+    // redeployed, and therefore that its earlier data belongs to a different
+    // deployment than the one running now.
+    if (node.deploymentEpoch > 1) {
+      html += F("<span class='chip' style='margin-left:4px' title='Deployment number'>D");
+      html += String((unsigned)node.deploymentEpoch);
+      html += F("</span>");
+    }
+    html += F("</div>"
               "<div class='node-status-cell'><span class='node-timing-label'>Battery</span>"
               "<span class='");
     html += battCls; html += F("' data-f='batt'>"); html += battTxt; html += F("</span></div>"
@@ -3700,6 +3710,62 @@ static void handleStationDetail() {
         html += F("</span></div>");
       }
     }
+    // --- Previous deployments ------------------------------------------
+    //
+    // history[] is a bounded ring of (epoch, startedUnix) boundaries kept so a
+    // backlog delivered several deployments late can be attributed to the epoch
+    // it was actually taken under. It is also the ONLY deployment history the
+    // hub holds: the number, name and location a deployment ran under go out in
+    // its outbox event and are not retained once that event is acked. The labels
+    // therefore live in the dashboard, and saying so is better than rendering an
+    // empty name — a blank would read as "that deployment had no name", which is
+    // a different and wrong claim.
+    //
+    // End times are deliberately omitted for past epochs. There is no endedUnix
+    // per boundary, and inferring one from the next epoch's start is wrong
+    // whenever a node sat ended before being redeployed — ENV_6C0A80 on
+    // 2026-08-01 ended at 12:05 and was not restarted until 14:31.
+    const DeploymentSlot* histSlot = deploymentFindByNodeId(target->nodeId.c_str());
+    if (histSlot != nullptr && histSlot->historyCount > 0) {
+      static const char* kHistMon[] = {"Jan","Feb","Mar","Apr","May","Jun",
+                                       "Jul","Aug","Sep","Oct","Nov","Dec"};
+      String rows;
+      // Newest first: the deployment before this one is the one an operator
+      // standing at the station is most likely asking about.
+      for (int i = (int)histSlot->historyCount - 1; i >= 0; --i) {
+        const DeploymentBoundary& b = histSlot->history[i];
+        if (b.epoch == 0) continue;
+        if (b.epoch == target->deploymentEpoch) continue;  // shown in the chip above
+        rows += F("<div class='muted' style='margin:3px 0'>Deployment ");
+        rows += String((unsigned)b.epoch);
+        if (b.startedUnix > 0) {
+          time_t bt = (time_t)b.startedUnix;
+          struct tm* btm = gmtime(&bt);
+          char bb[24];
+          snprintf(bb, sizeof(bb), "%d %s %02d:%02d",
+                   btm->tm_mday, kHistMon[btm->tm_mon], btm->tm_hour, btm->tm_min);
+          rows += F(" &middot; started ");
+          rows += bb;
+        }
+        rows += F("</div>");
+      }
+      if (rows.length()) {
+        html += F("<div class='section'><h3>Previous deployments</h3>");
+        html += rows;
+        // The ring evicts the oldest once full, so a surviving epoch 1 is proof
+        // nothing has been dropped. Without this an operator could read a short
+        // list as the complete history.
+        if (histSlot->historyCount >= (uint8_t)kBoundaryHistory &&
+            histSlot->history[0].epoch > 1) {
+          html += F("<div class='muted' style='margin-top:8px'>"
+                    "Earlier deployments are not kept on the FieldHub.</div>");
+        }
+        html += F("<div class='muted' style='margin-top:8px'>"
+                  "Numbers and names for past deployments are in the dashboard.</div>");
+        html += F("</div>");
+      }
+    }
+
     if (deploymentEnded) {
       html += F("<div style='margin-bottom:12px'><a href='/station-setup?id=");
       html += target->nodeId;
