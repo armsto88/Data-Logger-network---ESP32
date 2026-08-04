@@ -6,14 +6,16 @@ static const char* kDataFile    = "/datalog.csv";
 static const char* kTempFile    = "/datalog_tmp.csv";
 static const char* kBackupFile  = "/datalog_bak.csv";
 
-// Any header older than the current one. Both must be recognised: a hub can be
-// carrying a 25- or a 30-column file depending on which firmware it upgraded
-// from, and either way the queued rows must be preserved and drained, not
-// deleted or misparsed.
+// Any header older than the current one. All must be recognised: a hub can be
+// carrying a 25-, 30-, 31-, or 33-column file depending on which firmware it
+// upgraded from, and either way the queued rows must be preserved and
+// drained, not deleted or misparsed.
 static bool isLegacyCSVHeader(String header) {
   header.trim();
   return header == String(kLegacyCSVHeader25) ||
-         header == String(kLegacyCSVHeader30);
+         header == String(kLegacyCSVHeader30) ||
+         header == String(kLegacyCSVHeader31) ||
+         header == String(kLegacyCSVHeader33);
 }
 
 bool uploadQueueHasLegacyRows(uint32_t* pendingRowsOut) {

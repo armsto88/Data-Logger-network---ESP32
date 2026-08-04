@@ -8,6 +8,7 @@ namespace {
 static constexpr const char* kNamespace = "node_cfg";
 static constexpr const char* kSlotA = "node_cfg_a";
 static constexpr const char* kSlotB = "node_cfg_b";
+static constexpr const char* kDeploymentEpochKey = "depEpoch";
 static constexpr uint32_t kMagic = 0x4E434647UL;  // "NCFG"
 static constexpr uint16_t kSchema = 1;
 
@@ -274,6 +275,22 @@ bool nodeSensorMaskSave(uint16_t mask) {
   const size_t written = prefs.putUShort("sensMask", mask);
   prefs.end();
   return written == sizeof(mask);
+}
+
+uint16_t nodeDeploymentEpochLoad() {
+  Preferences prefs;
+  if (!prefs.begin(kNamespace, true)) return 0;
+  const uint16_t epoch = prefs.getUShort(kDeploymentEpochKey, 0);
+  prefs.end();
+  return epoch;
+}
+
+bool nodeDeploymentEpochSave(uint16_t epoch) {
+  Preferences prefs;
+  if (!prefs.begin(kNamespace, false)) return false;
+  const size_t written = prefs.putUShort(kDeploymentEpochKey, epoch);
+  prefs.end();
+  return written == sizeof(epoch);
 }
 
 #ifdef NODE_CONFIG_STORE_TESTING

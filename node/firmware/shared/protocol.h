@@ -62,6 +62,10 @@ typedef struct deployment_command {
                                // Applied immediately so the first capture after
                                // deploy respects the operator's selection, not
                                // just auto-detect.
+    // Deployment identity from the FieldHub. This uses the packet's former ABI
+    // tail padding, so deployment_command_t remains 92 bytes. 0 means a legacy
+    // FieldHub that does not provide an epoch.
+    uint16_t deploymentEpoch;
 } deployment_command_t;
 
 // Node -> mothership deployment confirmation (sent immediately after apply)

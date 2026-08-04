@@ -462,6 +462,7 @@ static bool buildRecoveryDeploy(const NodeInfo& node, uint16_t activeSyncMin,
   deploy.syncIntervalMin = activeSyncMin;
   deploy.syncPhaseUnix = activeSyncPhase;
   deploy.sensorMask = desired.sensorMask;  // 0 = auto; else SNAP_PRESENT_* + VALID
+  deploy.deploymentEpoch = node.deploymentEpoch;
   return true;
 }
 

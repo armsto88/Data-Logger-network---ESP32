@@ -180,6 +180,12 @@ void   setNodeNotes(const String& nodeId, String notes);
 String getCsvNodeId(const String& nodeId);
 String getCsvNodeName(const String& nodeId);
 
+// Current registry location for a node (RAM only, mirrors NodeInfo::latitude/
+// longitude). NAN if the node isn't currently registered or has no location
+// set. Used to stamp CSV/upload rows at log time — see csv_schema.h.
+float getNodeLatitude(const String& nodeId);
+float getNodeLongitude(const String& nodeId);
+
 // -----------------------------------------------------------------------------
 // Registry mutation (used by espnow_config.cpp)
 // -----------------------------------------------------------------------------

@@ -69,7 +69,7 @@ bool initSD() {
     return false;
   }
 
-  if (!ensureFileHeader(kSDReadingsFile, kCurrentCSVHeader31) ||
+  if (!ensureFileHeader(kSDReadingsFile, kCurrentCSVHeader35) ||
       !ensureFileHeader(kSDDeploymentsFile, kSDDeploymentsHeader)) {
     Serial.println("[SD] Could not prepare FieldMesh archive files");
     gSDWriteError = true;

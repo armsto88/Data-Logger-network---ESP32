@@ -676,14 +676,24 @@ bool deploySelectedNodes(const std::vector<String>& nodeIds) {
                         (unsigned long)gLastSyncBroadcastUnix);
         }
         deployCmd.sensorMask = desired.sensorMask;  // 0 = auto; else SNAP_PRESENT_* + VALID
+        deployCmd.deploymentEpoch = node.deploymentEpoch;
 
-        Serial.printf("[DEPLOY] %s: cfgV=%u wakeMin=%u syncMin=%u phase=%lu\n",
+        Serial.printf("[DEPLOY] %s: epoch=%u cfgV=%u wakeMin=%u syncMin=%u phase=%lu\n",
                       nodeId.c_str(),
+                      (unsigned)deployCmd.deploymentEpoch,
                       (unsigned)deployCmd.configVersion,
                       (unsigned)deployCmd.wakeIntervalMin,
                       (unsigned)deployCmd.syncIntervalMin,
                       (unsigned long)deployCmd.syncPhaseUnix);
 
+        // Config mode starts with only the broadcast peer. A node that was
+        // already deployed (for example, End -> Start New Deployment) is not
+        // paired again, so register its unicast peer here before sending.
+        // ESP_ERR_ESPNOW_NOT_FOUND otherwise makes the direct DEPLOY_NODE
+        // miss; a successful broadcast queue is not proof that the node got it.
+        ensurePeerOnChannel(node.mac, ESPNOW_CHANNEL);
+        esp_wifi_set_channel(ESPNOW_CHANNEL, WIFI_SECOND_CHAN_NONE);
+        delay(10);
         esp_err_t result = esp_now_send(node.mac, (uint8_t*)&deployCmd, sizeof(deployCmd));
         esp_err_t resultBcast = esp_now_send(kBroadcastAddr, (uint8_t*)&deployCmd, sizeof(deployCmd));
 

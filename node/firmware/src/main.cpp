@@ -712,6 +712,9 @@ uint16_t  g_syncIntervalMin = 15;
 uint32_t  g_syncPhaseUnix = 0;
 uint32_t  g_lastSyncSlot = 0xFFFFFFFFUL;
 uint16_t  g_appliedConfigVersion = 0;
+// Last FieldHub deployment epoch applied by this physical node. Stored
+// separately from the A/B config record so firmware upgrades preserve it.
+uint16_t  g_deploymentEpoch = 0;
 // Standby: node stays DEPLOYED and keeps its sync (A2) check-ins, but does not
 // arm the recording alarm (A1) or take samples. Persisted so it survives the
 // power-cycle that happens at every wake. Cleared on resume/unpair.
@@ -964,6 +967,7 @@ static void loadNodeConfig() {
     g_syncPhaseUnix = 0;
     g_lastSyncSlot = 0xFFFFFFFFUL;
     g_appliedConfigVersion = 0;
+    g_deploymentEpoch = 0;
     g_recordingPaused = false;
     memset(mothershipMAC, 0, sizeof(mothershipMAC));
     return;
@@ -979,6 +983,7 @@ static void loadNodeConfig() {
     g_syncPhaseUnix = 0;
     g_lastSyncSlot = 0xFFFFFFFFUL;
     g_appliedConfigVersion = 0;
+    g_deploymentEpoch = 0;
     g_recordingPaused = false;
     memset(mothershipMAC, 0, sizeof(mothershipMAC));
     return;
@@ -998,13 +1003,14 @@ static void loadNodeConfig() {
   lastTimeSyncUnix = record.lastTimeSyncUnix;
   g_lastSyncSlot = record.lastSyncSlot;
   g_appliedConfigVersion = record.appliedConfigVersion;
+  g_deploymentEpoch = nodeDeploymentEpochLoad();
   g_recordingPaused = record.recordingPaused;
-
-  Serial.printf("[CFG] loaded status=%u state=%u rtcSynced=%d deployed=%d interval=%u syncMin=%u syncPhase=%lu syncSlot=%lu cfgV=%u paused=%d\n",
+  Serial.printf("[CFG] loaded status=%u state=%u rtcSynced=%d deployed=%d interval=%u syncMin=%u syncPhase=%lu syncSlot=%lu cfgV=%u epoch=%u paused=%d\n",
                 (unsigned)loadStatus,
                 (unsigned)nodeState, rtcSynced, deployedFlag, g_intervalMin,
                 (unsigned)g_syncIntervalMin, (unsigned long)g_syncPhaseUnix,
                 (unsigned long)g_lastSyncSlot, (unsigned)g_appliedConfigVersion,
+                (unsigned)g_deploymentEpoch,
                 g_recordingPaused ? 1 : 0);
 
   if (lastTimeSyncUnix > 0) {
@@ -2830,6 +2836,8 @@ void loop() {
     rtcSynced        = false;
     deployedFlag     = false;
     lastTimeSyncUnix = 0;
+    g_deploymentEpoch = 0;
+    nodeDeploymentEpochSave(0);
     ds3231DisableAlarmInterrupt();
     ds3231DisableAlarm2Interrupt();
     clearDS3231_AlarmFlags();
@@ -2856,6 +2864,8 @@ void loop() {
       rtcSynced        = false;
       deployedFlag     = false;
       lastTimeSyncUnix = 0;
+      g_deploymentEpoch = 0;
+      nodeDeploymentEpochSave(0);
       ds3231DisableAlarmInterrupt();
       ds3231DisableAlarm2Interrupt();
       clearDS3231_AlarmFlags();
@@ -2880,6 +2890,8 @@ void loop() {
     g_recordingPaused = false;
     lastTimeSyncUnix = 0;
     g_lastSyncSlot   = 0xFFFFFFFFUL;
+    g_deploymentEpoch = 0;
+    nodeDeploymentEpochSave(0);
     ds3231DisableAlarmInterrupt();
     ds3231DisableAlarm2Interrupt();
     clearDS3231_AlarmFlags();
@@ -2898,11 +2910,23 @@ void loop() {
 
     Serial.println("🚀 [LOOP] Applying DEPLOY_NODE");
 
-    const bool wasAlreadyDeployed = (currentNodeState() == STATE_DEPLOYED) && deployedFlag && rtcSynced;
+    const bool wasAlreadyDeployed =
+        (currentNodeState() == STATE_DEPLOYED) && deployedFlag && rtcSynced;
+    const bool carriesDeploymentEpoch = dc.deploymentEpoch != 0;
+    const bool isNewDeployment = carriesDeploymentEpoch
+        ? dc.deploymentEpoch > g_deploymentEpoch
+        : !wasAlreadyDeployed;  // legacy FieldHub packet (epoch=0)
+    if (carriesDeploymentEpoch && g_deploymentEpoch != 0 &&
+        dc.deploymentEpoch < g_deploymentEpoch) {
+      Serial.printf("[DEPLOY] stale epoch %u ignored (current=%u)\n",
+                    (unsigned)dc.deploymentEpoch, (unsigned)g_deploymentEpoch);
+      g_pendingDeployAck = false;
+      return;
+    }
     DateTime deployTime(dc.year, dc.month, dc.day, dc.hour, dc.minute, dc.second);
     uint32_t deployUnix = deployTime.unixtime();
 
-    if (!wasAlreadyDeployed) {
+    if (!wasAlreadyDeployed || isNewDeployment) {
       rtc.adjust(deployTime);
     }
     if (dc.wakeIntervalMin > 0) {
@@ -2912,7 +2936,8 @@ void loop() {
       g_syncIntervalMin = dc.syncIntervalMin;
     }
     if (dc.syncPhaseUnix > 0) {
-      if (!wasAlreadyDeployed || g_syncPhaseUnix == 0 || dc.syncPhaseUnix >= g_syncPhaseUnix) {
+      if (!wasAlreadyDeployed || isNewDeployment || g_syncPhaseUnix == 0 ||
+          dc.syncPhaseUnix >= g_syncPhaseUnix) {
         g_syncPhaseUnix = dc.syncPhaseUnix;
       } else {
         Serial.printf("↩️ Duplicate DEPLOY carried stale phase=%lu (current=%lu) -> ignored\n",
@@ -2922,14 +2947,15 @@ void loop() {
     }
     uint16_t candidateConfigVersion = getNodeConfigVersion();
     if (dc.configVersion > 0) {
-      if (!wasAlreadyDeployed || dc.configVersion >= candidateConfigVersion) {
+      if (!wasAlreadyDeployed || isNewDeployment ||
+          dc.configVersion >= candidateConfigVersion) {
         candidateConfigVersion = dc.configVersion;
       }
     }
     g_postUnpairHold = false;
     rtcSynced        = true;
     deployedFlag     = true;
-    if (!wasAlreadyDeployed) {
+    if (!wasAlreadyDeployed || isNewDeployment) {
       lastTimeSyncUnix = rtc.now().unixtime();   // treat first deploy time as fresh sync
     } else if (deployUnix > lastTimeSyncUnix) {
       lastTimeSyncUnix = deployUnix;
@@ -2943,6 +2969,19 @@ void loop() {
     } else {
       Serial.println("⚠️ DEPLOY config persist failed; config version not advanced");
     }
+    // Persist the new identity only after the main deployment config is
+    // durable. If this write fails, leave the old epoch in place and defer the
+    // baseline to the next safe retry rather than risk duplicate captures.
+    bool deploymentEpochPersisted = true;
+    if (isNewDeployment && carriesDeploymentEpoch) {
+      deploymentEpochPersisted = nodeDeploymentEpochSave(dc.deploymentEpoch);
+      if (deploymentEpochPersisted) {
+        g_deploymentEpoch = dc.deploymentEpoch;
+      } else {
+        Serial.println("[DEPLOY] epoch persist failed; baseline capture deferred for safe retry");
+      }
+    }
+
     // Apply the operator-selected sensor mask immediately so the first capture
     // after deploy respects it. Mirrors the NODE_CONFIG/CONFIG_SNAPSHOT path.
     // Only an authoritative mask (NODE_SENSOR_MASK_VALID set) is stored, so an
@@ -2969,8 +3008,12 @@ void loop() {
           (unsigned long)g_syncPhaseUnix);
     Serial.println("✅ Node deployed; ready for alarm-driven sends");
     debugState("after DEPLOY (loop)");
+    Serial.printf("[DEPLOY] epoch=%u new=%d persisted=%d\n",
+                  (unsigned)(carriesDeploymentEpoch ? dc.deploymentEpoch : 0),
+                  isNewDeployment ? 1 : 0,
+                  deploymentEpochPersisted ? 1 : 0);
 
-    if (!wasAlreadyDeployed) {
+    if (isNewDeployment && deployConfigPersisted && deploymentEpochPersisted) {
       // Defer immediate bootstrap to loop context for deterministic RTC/I2C handling.
       g_deployBootstrapPending = true;
       Serial.println("🧾 DEPLOY bootstrap queued for loop context");

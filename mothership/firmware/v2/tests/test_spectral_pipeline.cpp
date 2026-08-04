@@ -69,11 +69,11 @@ void setup() {
   String row;
   decoded.deploymentEpoch = 7;   // stamped by the receive path in production
   ok &= expect(formatDecodedSnapshotCSVRow(decoded, row), "decoded snapshot formats as CSV");
-  ok &= expect(csvColumnCount(row) == kCurrentCSVColumnCount, "CSV row has 31 columns");
+  ok &= expect(csvColumnCount(row) == kCurrentCSVColumnCount, "CSV row has the current column count");
   ok &= expect(row.endsWith("12000.000,6800.000,4.000,50.040,0.000,7"),
                "CSV columns 25-30 are the metadata values plus deploymentEpoch");
 
-  String chunk = String(kCurrentCSVHeader31) + "\n" + row + "\n";
+  String chunk = String(kCurrentCSVHeader35) + "\n" + row + "\n";
   JsonPayload json = buildJsonUpload(chunk, 1, "spectral-pipeline-test", nullptr,
                                      header->nodeTimestamp);
   ok &= expect(json.ok && json.rowCount == 1, "JSON payload builds one reading");
@@ -95,14 +95,14 @@ void setup() {
   // build must begin exactly at row 2 without skipping into it.
   String secondRow = row;
   secondRow.replace(",42,", ",43,");
-  String twoRowChunk = String(kCurrentCSVHeader31) + "\n" + row + "\n" +
+  String twoRowChunk = String(kCurrentCSVHeader35) + "\n" + row + "\n" +
                        secondRow + "\n";
   JsonPayload firstChunk = buildJsonUpload(twoRowChunk, 1, "cursor-test", nullptr,
                                            header->nodeTimestamp);
-  const uint32_t firstDataOffset = strlen(kCurrentCSVHeader31) + 1;
+  const uint32_t firstDataOffset = strlen(kCurrentCSVHeader35) + 1;
   const String remainingData = twoRowChunk.substring(
       firstDataOffset + firstChunk.csvBytesConsumed);
-  const String secondChunkCsv = String(kCurrentCSVHeader31) + "\n" + remainingData;
+  const String secondChunkCsv = String(kCurrentCSVHeader35) + "\n" + remainingData;
   JsonPayload secondChunk = buildJsonUpload(secondChunkCsv, 1, "cursor-test", nullptr,
                                             header->nodeTimestamp);
   ok &= expect(firstChunk.csvBytesConsumed == row.length() + 1,
@@ -115,7 +115,7 @@ void setup() {
   // over-advancing purge. It must be consumed locally without being emitted,
   // while the following complete row remains uploadable.
   const String truncated = "3.551,23.300,58.000,1.000,2.000,3.000,4.000\n";
-  const String recoveryCsv = String(kCurrentCSVHeader31) + "\n" + truncated +
+  const String recoveryCsv = String(kCurrentCSVHeader35) + "\n" + truncated +
                              row + "\n";
   JsonPayload recovered = buildJsonUpload(recoveryCsv, 100, "recovery-test", nullptr,
                                           header->nodeTimestamp);

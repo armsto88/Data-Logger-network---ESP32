@@ -449,9 +449,26 @@ static bool deploymentCloudEventsEnabled() {
   return tx.destinationMode == TX_DEST_FIELDMESH && tx.enabled;
 }
 
+// The legacy-backlog gate exists so unstamped rows already queued cannot be
+// uploaded under the WRONG (new) deployment's epoch by the backend's fallback
+// logic — a risk that only exists if something is actually uploading them. A
+// standalone hub with upload disabled has nowhere to send those rows, and
+// nothing else ever clears a kLegacyCSVHeader* backlog (only a successful
+// upload does), so without this check a standalone hub would be permanently
+// blocked from ever redeploying a node again after its first CSV schema bump.
+static bool deploymentLegacyBacklogGate(uint32_t* pendingRowsOut) {
+  TransmissionSettings tx;
+  loadTransmissionSettings(tx);
+  if (!tx.enabled) {
+    if (pendingRowsOut) *pendingRowsOut = 0;
+    return false;
+  }
+  return uploadQueueHasLegacyRows(pendingRowsOut);
+}
+
 void deploymentBootstrap() {
   deploymentSetConfigApplyFn(deploymentApplyDesiredState);
-  deploymentSetLegacyBacklogFn(uploadQueueHasLegacyRows);
+  deploymentSetLegacyBacklogFn(deploymentLegacyBacklogGate);
   deploymentSetNowFn(deploymentNowBridge);
   deploymentSetArchiveSinkFn(deploymentArchiveToSd);
   deploymentSetCloudEventsEnabledFn(deploymentCloudEventsEnabled);
@@ -1872,7 +1889,7 @@ function setCurrentTime(){
 const MONTH_SHORT=['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
 function formatHubClock(ms){
   const dt=new Date(ms);
-  return `${String(dt.getUTCHours()).padStart(2,'0')}:${String(dt.getUTCMinutes()).padStart(2,'0')} \u00b7 ${String(dt.getUTCDate()).padStart(2,'0')} ${MONTH_SHORT[dt.getUTCMonth()]} ${dt.getUTCFullYear()}`;
+  return `${String(dt.getUTCHours()).padStart(2,'0')}:${String(dt.getUTCMinutes()).padStart(2,'0')} · ${String(dt.getUTCDate()).padStart(2,'0')} ${MONTH_SHORT[dt.getUTCMonth()]} ${dt.getUTCFullYear()}`;
 }
 function toggleSettings(){
   const panel=document.getElementById('settings-panel');
@@ -1970,7 +1987,10 @@ static void sendAjaxResult(bool ok, const String& message) {
 
 // Page frame helpers are defined further down; declared here so the deployment
 // error responder can render an HTML fallback for non-AJAX form posts.
-static String headCommon(const String& title, const String& actionsHtml, int navActive);
+static String headCommon(const String& title,
+                         const String& actionsHtml = String(),
+                         int navActive = -1,
+                         bool includeCommonJs = true);
 static inline String footCommon();
 
 // Deployment-action failure. AJAX callers (the setup wizard) get a JSON body
@@ -2077,7 +2097,10 @@ static String navBarHtml(int navActive) {
   return h;
 }
 
-static String headCommon(const String& title, const String& actionsHtml = String(), int navActive = -1) {
+static String headCommon(const String& title,
+                         const String& actionsHtml,
+                         int navActive,
+                         bool includeCommonJs) {
   // No-store on every portal page: phones/captive-portal browsers cache the AP
   // pages aggressively, which repeatedly showed stale UI after a reflash. This
   // header is queued for this request's send(); the belt-and-braces meta tags
@@ -2093,7 +2116,9 @@ static String headCommon(const String& title, const String& actionsHtml = String
   h += F("<meta http-equiv='Cache-Control' content='no-cache, no-store, must-revalidate'>"
          "<meta http-equiv='Pragma' content='no-cache'><meta http-equiv='Expires' content='0'>");
   h += F("<style>"); h += FPSTR(COMMON_CSS); h += F("</style>");
-  h += F("<script>"); h += FPSTR(COMMON_JS);  h += F("</script>");
+  if (includeCommonJs) {
+    h += F("<script>"); h += FPSTR(COMMON_JS); h += F("</script>");
+  }
   h += F("</head><body>");
   h += F("<div id='fm-load' class='fm-load-overlay'><div class='fm-load-box'>"
          "<span class='spinner'></span><span id='fm-load-msg'>Loading&hellip;</span></div></div>");
@@ -2955,23 +2980,52 @@ static void handleDataPage() {
   String actions = String("<a href='/export' class='btn btn--sm'>Refresh</a>");
   String html = headCommon("Data", actions, 2);
   html += buildDataStatusSectionHtml();
+
   html += F("<div class='section'><h3>Downloads</h3>"
             "<p class='muted'>Raw CSV files for backup or use in your own tools. "
             "The FieldHub does not alter or chart the readings here.</p>");
-  if ((sdIsReady() && SD.exists(sdReadingsPath())) ||
-      (flashIsReady() && LittleFS.exists("/datalog.csv"))) {
-    html += F("<a href='/download-csv' class='btn btn--primary' "
-              "style='display:block;text-align:center'>Download readings CSV</a>");
-  } else {
-    html += F("<button class='btn' style='width:100%' disabled>No readings available</button>");
+
+  const bool hasReadings = (sdIsReady() && SD.exists(sdReadingsPath())) ||
+      (flashIsReady() && LittleFS.exists("/datalog.csv"));
+  html += F("<div style='border:1px solid var(--border);border-radius:8px;padding:12px'>"
+            "<div style='display:flex;justify-content:space-between;align-items:center;gap:10px'>"
+            "<strong>Readings CSV</strong>");
+  html += hasReadings
+      ? F("<a href='/download-csv' class='btn btn--primary btn--sm'>Download</a>")
+      : F("<button class='btn btn--sm' disabled>No data yet</button>");
+  html += F("</div>"
+            "<details style='margin-top:8px'>"
+            "<summary class='muted' style='cursor:pointer;font-size:13px'>What's in this file?</summary>"
+            "<p class='muted' style='font-size:13px;margin-top:6px'>One row per sensor reading: "
+            "timestamp, node ID/number/name, battery, environment/soil/spectral/wind sensors, "
+            "GPS location, and the deployment it belongs to.</p>"
+            "</details></div>");
+
+  uint16_t completedDeployments = 0;
+  if (deploymentStoreReady()) {
+    for (size_t i = 0; i < kMaxDeployNodes; ++i) {
+      const DeploymentSlot* slot = deploymentSlotAt(i);
+      if (slot) completedDeployments += slot->archiveCount;
+    }
   }
-  html += F("<a href='/download-deployments' class='btn' "
-            "style='display:block;text-align:center;margin-top:8px'>"
-            "Download deployment archive CSV</a>"
-            "<p class='muted' style='margin-top:10px'>With an SD card, completed deployment "
-            "records are appended for the life of the card. Internal fallback keeps the latest "
-            "four per node. Records migrated from earlier software identify unavailable fields "
-            "explicitly.</p></div>");
+  html += F("<div style='border:1px solid var(--border);border-radius:8px;padding:12px;margin-top:10px'>"
+            "<div style='display:flex;justify-content:space-between;align-items:center;gap:10px'>"
+            "<div><strong>Deployment archive CSV</strong><br>"
+            "<span class='muted' style='font-size:13px'>");
+  html += String(completedDeployments);
+  html += F(" completed deployment");
+  html += (completedDeployments == 1) ? F("") : F("s");
+  html += F("</span></div>"
+            "<a href='/download-deployments' class='btn btn--sm'>Download</a>"
+            "</div>"
+            "<details style='margin-top:8px'>"
+            "<summary class='muted' style='cursor:pointer;font-size:13px'>What's in this file?</summary>"
+            "<p class='muted' style='font-size:13px;margin-top:6px'>One row per completed deployment "
+            "(not per reading): node number/name, GPS location, start/end time, and whether the "
+            "record is complete or partial (from earlier software). With an SD card, records are "
+            "kept for the life of the card; internal storage keeps the latest four per node.</p>"
+            "</details></div></div>");
+
   html += footCommon();
   server.send(200, "text/html", html);
 }
@@ -4167,7 +4221,15 @@ static void handleNodeConfigSave() {
     if (n.nodeId == nodeId) { target = &n; break; }
   }
 
-  const bool isCurrentlyDeployed = (target && target->state == DEPLOYED);
+  // The deployment ledger is authoritative for lifecycle state. Normally its
+  // active epoch and the registry's DEPLOYED state change together, but a
+  // pre-fix wizard could commit epoch 1 for a freshly discovered UNPAIRED node
+  // before the radio deploy path refused it. Treat that durable active epoch as
+  // deployed here so retrying the wizard cannot overwrite its identity.
+  const bool hasActiveDeployment = target && target->deploymentEpoch > 0 &&
+      target->deploymentEndedUnix == 0;
+  const bool isCurrentlyDeployed = target &&
+      (target->state == DEPLOYED || hasActiveDeployment);
 
   // A node that has never been deployed, or whose deployment has ended, has no
   // identity to edit — only identity being PROPOSED. Stage it so an abandoned
@@ -4317,30 +4379,63 @@ static void handleNodeConfigSave() {
       sendDeploymentError(404, "Node is not registered", "", nodeId);
       return;
     }
+
+    // Discovery creates an UNPAIRED entry. The old wizard skipped this pairing
+    // step, committed the deployment record, then deploySelectedNodes() quite
+    // correctly rejected the UNPAIRED node. Its success redirect therefore
+    // returned straight to the Sensors step. Pair before committing any new
+    // deployment, and restore the local state if the radio command could not
+    // be queued.
+    if (target->state == UNPAIRED) {
+      if (!pairNode(nodeId)) {
+        target->state = UNPAIRED;
+        target->deployPending = false;
+        savePairedNodes();
+        sendDeploymentError(409,
+                            "Could not contact this node to pair it. Keep it powered "
+                            "on and in configuration mode, then try again.",
+                            "", nodeId);
+        return;
+      }
+    }
+
+    // Recover a deployment committed by the old wizard bug. This is also the
+    // safe retry after a lost browser response: it must re-send the deploy
+    // command for the existing epoch, never create epoch 2 or ask the operator
+    // to end the deployment that they just started.
+    const bool resumeActiveDeployment =
+        target->deploymentEpoch > 0 && target->deploymentEndedUnix == 0;
+    uint16_t startedEpoch = target->deploymentEpoch;
+    bool replayedStart = resumeActiveDeployment;
+
     float lat = NAN, lon = NAN;
     if (server.hasArg("lat") && server.hasArg("lon")) {
       lat = server.arg("lat").toFloat();
       lon = server.arg("lon").toFloat();
     }
-    const DeploymentOpResult r =
-        beginNewDeployment(nodeId, userId, name, lat, lon, expectedEpoch);
-    if (r.status != DEPLOY_OK && r.status != DEPLOY_REPLAYED) {
-      const int code = (r.status == DEPLOY_ERR_NUMBER_TAKEN) ? 409 : 400;
-      sendDeploymentError(code, r.message, r.holderLabel, nodeId);
-      return;
+    if (!resumeActiveDeployment) {
+      const DeploymentOpResult r =
+          beginNewDeployment(nodeId, userId, name, lat, lon, expectedEpoch);
+      if (r.status != DEPLOY_OK && r.status != DEPLOY_REPLAYED) {
+        const int code = (r.status == DEPLOY_ERR_NUMBER_TAKEN) ? 409 : 400;
+        sendDeploymentError(code, r.message, r.holderLabel, nodeId);
+        return;
+      }
+      startedEpoch = r.epoch;
+      replayedStart = (r.status == DEPLOY_REPLAYED);
     }
-    if (r.status == DEPLOY_OK) {
-      // The durable ACTIVE config is already queued by beginNewDeployment; this
-      // immediate DEPLOY_NODE is best-effort and only lands if the node is awake
-      // in config mode. Convergence rides the NODE_CONFIG reconcile.
-      std::vector<String> ids;
-      ids.push_back(nodeId);
-      deployOk = deploySelectedNodes(ids);
-      gDeployedThisSession = true;
-    }
+
+    // The durable ACTIVE config is already queued by beginNewDeployment; this
+    // immediate DEPLOY_NODE is best-effort and only lands if the node is awake
+    // in config mode. Convergence rides the NODE_CONFIG reconcile.
+    std::vector<String> ids;
+    ids.push_back(nodeId);
+    deployOk = deploySelectedNodes(ids);
+    gDeployedThisSession = true;
+
     if (isAjaxRequest()) {
-      String j = String("{\"ok\":true,\"epoch\":") + String((unsigned)r.epoch) +
-                 ",\"replayed\":" + (r.status == DEPLOY_REPLAYED ? "true" : "false") +
+      String j = String("{\"ok\":true,\"epoch\":") + String((unsigned)startedEpoch) +
+                 ",\"replayed\":" + (replayedStart ? "true" : "false") +
                  ",\"deploy\":" + (deployOk ? "true" : "false") + "}";
       server.send(200, "application/json", j);
       return;
@@ -5740,6 +5835,16 @@ static void handleProvisionPage() {
   server.send(200, "text/html", html);
 }
 
+// Keep the generated QR outside the already-large setup response. Embedding its
+// SVG path alongside the shared CSS/JS and both wizard controllers can exhaust
+// the largest contiguous heap block before the setup controller is appended,
+// leaving a visible page whose buttons have no event handlers.
+static void handleHardwareQrSvg() {
+  const String svg = renderQrSvg(hwRegisterUri(hwMacString()));
+  server.sendHeader("Cache-Control", "no-store");
+  server.send(200, "image/svg+xml", svg);
+}
+
 // POST /provision-apply — body is the raw "FM1.<base64url>" payload (text/plain,
 // so the key never lands in a URL/query/log). Firmware is authoritative: it
 // re-decodes and validates server-side (never trusting the client), enforces
@@ -5819,7 +5924,12 @@ static void handleSetupWizard() {
   // registration + connect are already done at that point.
   int startStep = connectedToFieldMesh ? 4 : 1;
 
-  String html = headCommon("Set up FieldHub", F("<a href='/' class='btn btn--sm'>Exit</a>"));
+  // This wizard owns its interactions and does not use the live-dashboard
+  // poller/forms in COMMON_JS. Omitting that unrelated 21 KB block keeps the
+  // final wizard controller in the response on the ESP32's fragmented heap.
+  String html = headCommon("Set up FieldHub",
+                           F("<a href='/' class='btn btn--sm'>Exit</a>"),
+                           -1, false);
   html += F("<div class='section'>"
             "<p class='muted' style='margin:0 0 10px'>FieldHub setup</p>");
 
@@ -5838,7 +5948,8 @@ static void handleSetupWizard() {
             "<button type='button' class='btn btn--sm' style='margin-top:10px' id='wz-copy'>Copy MAC</button>"
             "<details style='margin-top:10px'><summary style='font-size:14px;color:var(--sub);cursor:pointer'>Or scan instead</summary>"
             "<div style='margin-top:8px;text-align:center'>");
-  html += renderQrSvg(hwRegisterUri(mac));
+  html += F("<img src='/hardware-qr.svg' loading='lazy' alt='FieldHub hardware QR' "
+            "style='display:block;max-width:100%;height:auto;margin:0 auto'>");
   html += F("</div></details>"
             "<div style='margin-top:16px'><button type='button' class='btn btn--sm' data-wz='next'>Continue to FieldMesh</button></div>"
             "</div>");
@@ -6402,6 +6513,7 @@ void startConfigServer() {
 
   // Hardware identity + secure connection-key provisioning.
   server.on("/api/identity", HTTP_GET, handleApiIdentity);
+  server.on("/hardware-qr.svg", HTTP_GET, handleHardwareQrSvg);
   server.on("/provision", HTTP_GET, handleProvisionPage);
   server.on("/provision-apply", HTTP_POST, handleProvisionApply);
 

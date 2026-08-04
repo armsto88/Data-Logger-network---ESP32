@@ -19,6 +19,7 @@
 #include "storage/flash_logger.h"
 #include "storage/upload_queue.h"
 #include "storage/json_payload.h"
+#include "config/node_registry.h"
 
 static int gPass = 0, gFail = 0;
 
@@ -31,7 +32,9 @@ static bool check(const char* name, bool cond) {
 static const char* kDataFile   = "/datalog.csv";
 static const char* kBackupFile = "/datalog_testbak.csv";
 
-// A canonical 30-column row (pre-epoch) and its 31-column successor.
+// A canonical 30-column row (pre-epoch), its 31-column successor (epoch
+// stamped), and the 33-column identity-stamped row that precedes latitude/
+// longitude.
 static const char* kRow30 =
     "2026-07-30T10:00:00,ENV_A1,42,0x0007,0,3,"
     "3.900,21.500,55.000,"
@@ -44,6 +47,22 @@ static const char* kRow31 =
     "1.000,2.000,3.000,4.000,5.000,6.000,7.000,8.000,"
     "0.000,0.000,nan,nan,nan,nan,nan,nan,"
     "12000.000,6800.000,4.000,50.040,0.000,2";
+// The header ACTUALLY shipped in the field (commit ea98b05, before any of the
+// userId/name/location work): deploymentEpoch appended, nothing else. A real
+// hub upgrading straight from that firmware carries this exact 31-column file
+// on disk — this is not a synthetic case, see testRealFieldHeaderIsRecognised.
+static const char* kRow31Field =
+    "2026-07-30T09:00:00,ENV_A1,41,0x0007,0,3,"
+    "3.900,21.500,55.000,"
+    "1.000,2.000,3.000,4.000,5.000,6.000,7.000,8.000,"
+    "0.000,0.000,nan,nan,nan,nan,nan,nan,"
+    "12000.000,6800.000,4.000,50.040,0.000,1";
+static const char* kRow33 =
+    "2026-07-30T12:00:00,ENV_A1,44,0x0007,0,3,"
+    "3.900,21.500,55.000,"
+    "1.000,2.000,3.000,4.000,5.000,6.000,7.000,8.000,"
+    "0.000,0.000,nan,nan,nan,nan,nan,nan,"
+    "12000.000,6800.000,4.000,50.040,0.000,2,001,North Hedge";
 
 static void writeDataFile(const char* header, const char* rows) {
   File f = LittleFS.open(kDataFile, "w", true);
@@ -64,19 +83,56 @@ static size_t columnCount(const String& row) {
 // ---------------------------------------------------------------------------
 
 static void testSchemaConstants() {
-  check("schema: current column count is 31", kCurrentCSVColumnCount == 31);
+  check("schema: current column count is 35", kCurrentCSVColumnCount == 35);
+  check("schema: legacy 33 retained", kLegacyCSVColumnCount33 == 33);
   check("schema: legacy 30 retained", kLegacyCSVColumnCount30 == 30);
   check("schema: legacy 25 retained", kLegacyCSVColumnCount == 25);
-  check("schema: current header ends with deploymentEpoch",
-        String(kCurrentCSVHeader31).endsWith(",deploymentEpoch"));
-  check("schema: current header is the legacy-30 header plus one column",
-        String(kCurrentCSVHeader31) ==
-            String(kLegacyCSVHeader30) + ",deploymentEpoch");
+  check("schema: current header ends with latitude,longitude",
+        String(kCurrentCSVHeader35).endsWith(",latitude,longitude"));
+  check("schema: current header keeps identity columns before location",
+        String(kCurrentCSVHeader35)
+            .endsWith(",deploymentEpoch,userId,name,latitude,longitude") &&
+        String(kCurrentCSVHeader35)
+            .indexOf(",deploymentEpoch,userId,name,latitude,longitude") > 0);
+  check("schema: legacy-33 header extends the legacy-30 header",
+        String(kLegacyCSVHeader33).startsWith(String(kLegacyCSVHeader30)));
   check("schema: legacy-30 header extends the legacy-25 header",
         String(kLegacyCSVHeader30).startsWith(String(kLegacyCSVHeader25)));
   check("schema: header column counts agree",
-        columnCount(String(kCurrentCSVHeader31)) == kCurrentCSVColumnCount &&
+        columnCount(String(kCurrentCSVHeader35)) == kCurrentCSVColumnCount &&
+        columnCount(String(kLegacyCSVHeader33)) == kLegacyCSVColumnCount33 &&
         columnCount(String(kLegacyCSVHeader30)) == kLegacyCSVColumnCount30);
+}
+
+// The exact regression seen on real hardware: a hub carrying the field-shipped
+// 31-column file (ea98b05, deploymentEpoch appended, no identity/location)
+// upgrades to this firmware and calls initFlash(). Before kLegacyCSVHeader31
+// existed as a real constant, this header matched NOTHING recognised, so
+// initFlash() hit the "Unknown CSV header" branch and set gFlashReady=false —
+// every snapshot for the rest of the session then logged "No storage accepted
+// the snapshot" and nothing reached flash or SD.
+static void testRealFieldHeaderIsRecognised() {
+  const String threeRows = String(kRow31Field) + "\n" + kRow31Field + "\n";
+  writeDataFile(kLegacyCSVHeader31, threeRows.c_str());
+
+  check("field-header: initFlash() succeeds on the real shipped 31-column file",
+        initFlash());
+  check("field-header: flash logging is NOT disabled by an unrecognised header",
+        flashIsReady());
+
+  // hasDataRows=true -> preserved as-is (not upgraded, not deleted) until the
+  // upload queue drains it. Confirms the header on disk is unchanged, i.e. the
+  // "Unknown header, refusing to touch the file" branch did not fire.
+  File f = LittleFS.open(kDataFile, "r");
+  String firstLine = f ? f.readStringUntil('\n') : String();
+  if (f) f.close();
+  firstLine.trim();
+  check("field-header: the on-disk header is preserved verbatim while queued",
+        firstLine == String(kLegacyCSVHeader31));
+
+  uint32_t rows = 0;
+  check("field-header: the real 31-column backlog is detected for the UI",
+        uploadQueueHasLegacyRows(&rows) && rows == 2);
 }
 
 // F2: a queued pre-epoch backlog must be detectable, because those rows would
@@ -84,7 +140,7 @@ static void testSchemaConstants() {
 static void testLegacyBacklogDetection() {
   uint32_t rows = 0;
 
-  writeDataFile(kCurrentCSVHeader31, (String(kRow31) + "\n").c_str());
+  writeDataFile(kCurrentCSVHeader35, (String(kRow31) + "\n").c_str());
   check("legacy: a current-schema file reports no backlog",
         !uploadQueueHasLegacyRows(&rows));
 
@@ -102,6 +158,16 @@ static void testLegacyBacklogDetection() {
   writeDataFile(kLegacyCSVHeader25, (String(kRow30) + "\n").c_str());
   check("legacy: a 25-column file with rows also reports a backlog",
         uploadQueueHasLegacyRows(&rows));
+
+  writeDataFile(kLegacyCSVHeader33, "");
+  check("legacy: an EMPTY 33-column file does not block (it upgrades in place)",
+        !uploadQueueHasLegacyRows(&rows));
+
+  writeDataFile(kLegacyCSVHeader33, (String(kRow33) + "\n").c_str());
+  check("legacy: a 33-column file WITH rows reports a backlog",
+        uploadQueueHasLegacyRows(&rows));
+  check("legacy: the pending row count is reported for a 33-column backlog",
+        rows == 1);
 }
 
 // The gate for deploymentTrackingVersion: never claim epoch support while
@@ -115,8 +181,12 @@ static void testSchemaCurrentGate() {
   check("gate: schema NOT current with a 25-column header",
         !flashCsvSchemaIsCurrent());
 
-  writeDataFile(kCurrentCSVHeader31, (String(kRow31) + "\n").c_str());
-  check("gate: schema IS current with the 31-column header",
+  writeDataFile(kLegacyCSVHeader33, (String(kRow33) + "\n").c_str());
+  check("gate: schema NOT current with a 33-column header",
+        !flashCsvSchemaIsCurrent());
+
+  writeDataFile(kCurrentCSVHeader35, (String(kRow33) + ",nan,nan\n").c_str());
+  check("gate: schema IS current with the 35-column header",
         flashCsvSchemaIsCurrent());
 }
 
@@ -156,33 +226,135 @@ static void testStampedRowRoundTrip() {
   snap.readings[0].sensorId = SENSOR_ID_AIR_TEMP;
   snap.readings[0].value = 21.5f;
 
+  setNodeUserId("ENV_A1", "001");
+  setNodeName("ENV_A1", "North Hedge");
+
   String row;
   check("roundtrip: a decoded snapshot formats",
         formatDecodedSnapshotCSVRow(snap, row));
-  check("roundtrip: the row has 31 columns",
+  check("roundtrip: the row has 35 columns",
         columnCount(row) == kCurrentCSVColumnCount);
-  check("roundtrip: the row ends with the stamped epoch", row.endsWith(",5"));
+  check("roundtrip: the row carries the stamped epoch, identity, and (unset) location",
+        row.endsWith(",5,001,North Hedge,nan,nan"));
 
-  const String chunk = String(kCurrentCSVHeader31) + "\n" + row + "\n";
+  const String chunk = String(kCurrentCSVHeader35) + "\n" + row + "\n";
   JsonPayload json = buildJsonUpload(chunk, 1, "roundtrip", nullptr, 1753000000UL);
   check("roundtrip: it builds one reading", json.ok && json.rowCount == 1);
   check("roundtrip: the epoch reaches the payload",
         json.body.indexOf("\"deploymentEpoch\":5") >= 0);
+  check("roundtrip: unset location reaches the payload as null",
+        json.body.indexOf("\"latitude\":null") >= 0 &&
+        json.body.indexOf("\"longitude\":null") >= 0);
+
+  // A registered node's location must round-trip into the row and payload.
+  registeredNodes.push_back(NodeInfo{});
+  registeredNodes.back().nodeId    = "ENV_A1";
+  registeredNodes.back().latitude  = -27.469771f;
+  registeredNodes.back().longitude = 153.025124f;
+  String rowWithLoc;
+  formatDecodedSnapshotCSVRow(snap, rowWithLoc);
+  registeredNodes.clear();
+  check("roundtrip: a registered node's coordinates are stamped at 6dp",
+        rowWithLoc.endsWith(",5,001,North Hedge,-27.469771,153.025124"));
+  JsonPayload jsonLoc = buildJsonUpload(String(kCurrentCSVHeader35) + "\n" + rowWithLoc + "\n",
+                                        1, "roundtrip", nullptr, 1753000000UL);
+  check("roundtrip: the stamped location reaches the payload",
+        jsonLoc.body.indexOf("\"latitude\":-27.469771") >= 0 &&
+        jsonLoc.body.indexOf("\"longitude\":153.025124") >= 0);
+
+  // A name containing a comma must NOT re-frame the row. The Field UI accepts
+  // any character here, and an unsanitised comma pushed the row to 36 columns,
+  // failing the column gate — which dropped the reading from flash AND SD and
+  // NACKed the node into re-sending it forever.
+  setNodeName("ENV_A1", "Plot A, North");
+  String rowComma;
+  const bool commaFormatted = formatDecodedSnapshotCSVRow(snap, rowComma);
+  check("roundtrip: a name containing a comma still formats", commaFormatted);
+  check("roundtrip: a comma in the name does not add a column",
+        columnCount(rowComma) == kCurrentCSVColumnCount);
+  check("roundtrip: the comma is replaced, not dropped",
+        rowComma.indexOf("Plot A  North") >= 0);
+  JsonPayload jsonComma = buildJsonUpload(String(kCurrentCSVHeader35) + "\n" + rowComma + "\n",
+                                          1, "roundtrip", nullptr, 1753000000UL);
+  check("roundtrip: a comma-named node still uploads",
+        jsonComma.ok && jsonComma.rowCount == 1);
+  setNodeName("ENV_A1", "North Hedge");
 
   // 0 is the legacy/unresolved sentinel and must survive as an explicit 0
   // rather than being dropped, so the backend can tell it apart from absent.
   snap.deploymentEpoch = 0;
   String row0;
   formatDecodedSnapshotCSVRow(snap, row0);
-  check("roundtrip: an unresolved epoch is written as 0", row0.endsWith(",0"));
-  JsonPayload json0 = buildJsonUpload(String(kCurrentCSVHeader31) + "\n" + row0 + "\n",
+  check("roundtrip: an unresolved epoch is written as 0",
+        row0.endsWith(",0,001,North Hedge,nan,nan"));
+  JsonPayload json0 = buildJsonUpload(String(kCurrentCSVHeader35) + "\n" + row0 + "\n",
                                       1, "roundtrip", nullptr, 1753000000UL);
   check("roundtrip: an unresolved epoch reaches the payload as 0",
         json0.body.indexOf("\"deploymentEpoch\":0") >= 0);
 }
 
+// A node reporting absurd-but-finite sensor values must be REJECTED, not allowed
+// to run the row builder's offset past the end of its stack buffer. Before the
+// bounded-append fix, `snprintf(row + n, sizeof(row) - n, ...)` with n > sizeof
+// computed a destination past the array and a size_t size that wrapped to ~4 GB,
+// smashing the stack — observed as a Guru Meditation reboot every time the
+// offending node reported, and a reboot loop once it retried the unacked reading.
+//
+// NaN and infinity are already safe (they format to 3-4 characters); only large
+// FINITE values are wide enough to overrun, so that is what this drives.
+static void testOversizedRowIsRejectedNotOverflowed() {
+  const uint16_t kAllSensorIds[] = {
+    SENSOR_ID_BAT_V, SENSOR_ID_AIR_TEMP, SENSOR_ID_AIR_RH,
+    SENSOR_ID_SPECTRAL_415, SENSOR_ID_SPECTRAL_445, SENSOR_ID_SPECTRAL_480,
+    SENSOR_ID_SPECTRAL_515, SENSOR_ID_SPECTRAL_555, SENSOR_ID_SPECTRAL_590,
+    SENSOR_ID_SPECTRAL_630, SENSOR_ID_SPECTRAL_680,
+    SENSOR_ID_WIND_SPEED, SENSOR_ID_WIND_DIR,
+    SENSOR_ID_SOIL1_VWC, SENSOR_ID_SOIL1_TEMP,
+    SENSOR_ID_SOIL2_VWC, SENSOR_ID_SOIL2_TEMP,
+    SENSOR_ID_AUX1, SENSOR_ID_AUX2,
+    SENSOR_ID_SPECTRAL_CLEAR, SENSOR_ID_SPECTRAL_NIR, SENSOR_ID_SPECTRAL_GAIN,
+    SENSOR_ID_SPECTRAL_ATIME, SENSOR_ID_SPECTRAL_SAT,
+  };
+  const size_t kCount = sizeof(kAllSensorIds) / sizeof(kAllSensorIds[0]);
+
+  DecodedSnapshot huge{};
+  strncpy(huge.nodeId, "ENV_A1", sizeof(huge.nodeId) - 1);
+  huge.nodeTimestamp = 1753000000UL;
+  huge.seqNum = 99;
+  huge.deploymentEpoch = 1;
+  huge.readingCount = 0;
+  for (size_t i = 0; i < kCount && i < MAX_READINGS_PER_SNAPSHOT; ++i) {
+    huge.readings[huge.readingCount].sensorId = kAllSensorIds[i];
+    huge.readings[huge.readingCount].value    = 3.4e38f;  // float32 max, ~43 chars at %.3f
+    huge.readingCount++;
+  }
+  // A 32-character name, the widest the Field UI allows, so the identity and
+  // location columns are at their worst case too.
+  setNodeName("ENV_A1", "ABCDEFGHIJKLMNOPQRSTUVWXYZ012345");
+
+  String oversized;
+  const bool formatted = formatDecodedSnapshotCSVRow(huge, oversized);
+  // Reaching this line at all is the point: the old code corrupted the stack here.
+  check("overflow: an oversized row is rejected, not written", !formatted);
+
+  // The builder must still be usable afterwards — proves nothing was clobbered.
+  setNodeName("ENV_A1", "North Hedge");
+  DecodedSnapshot normal{};
+  strncpy(normal.nodeId, "ENV_A1", sizeof(normal.nodeId) - 1);
+  normal.nodeTimestamp = 1753000000UL;
+  normal.seqNum = 100;
+  normal.deploymentEpoch = 1;
+  normal.readingCount = 1;
+  normal.readings[0].sensorId = SENSOR_ID_AIR_TEMP;
+  normal.readings[0].value = 21.5f;
+  String after;
+  check("overflow: the builder still works after a rejected row",
+        formatDecodedSnapshotCSVRow(normal, after) &&
+        columnCount(after) == kCurrentCSVColumnCount);
+}
+
 static void testUploadAckCompatibilityHookKeepsCurrentHistory() {
-  writeDataFile(kCurrentCSVHeader31, (String(kRow31) + "\n").c_str());
+  writeDataFile(kCurrentCSVHeader35, (String(kRow31) + "\n").c_str());
   File beforeFile = LittleFS.open(kDataFile, "r");
   const size_t before = beforeFile ? beforeFile.size() : 0;
   if (beforeFile) beforeFile.close();
@@ -217,10 +389,12 @@ void setup() {
   }
 
   testSchemaConstants();
+  testRealFieldHeaderIsRecognised();
   testLegacyBacklogDetection();
   testSchemaCurrentGate();
   testMixedWidthRowsParse();
   testStampedRowRoundTrip();
+  testOversizedRowIsRejectedNotOverflowed();
   testUploadAckCompatibilityHookKeepsCurrentHistory();
 
   LittleFS.remove(kDataFile);

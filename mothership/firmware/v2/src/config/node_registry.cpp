@@ -149,6 +149,20 @@ String getCsvNodeName(const String& nodeId) {
   return getNodeName(nodeId);
 }
 
+float getNodeLatitude(const String& nodeId) {
+  for (const auto& n : registeredNodes) {
+    if (n.nodeId == nodeId) return n.latitude;
+  }
+  return NAN;
+}
+
+float getNodeLongitude(const String& nodeId) {
+  for (const auto& n : registeredNodes) {
+    if (n.nodeId == nodeId) return n.longitude;
+  }
+  return NAN;
+}
+
 // -----------------------------------------------------------------------------
 // Desired config (NVS namespace "node_dcfg")
 // -----------------------------------------------------------------------------

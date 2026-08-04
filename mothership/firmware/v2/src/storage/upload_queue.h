@@ -20,7 +20,7 @@ static constexpr uint8_t kLittleFsRetentionKeepPct = 40;
 // ---------------------------------------------------------------------------
 // CSV header (must match flash_logger.cpp)
 // ---------------------------------------------------------------------------
-static constexpr const char* kUploadCSVHeader = kCurrentCSVHeader31;
+static constexpr const char* kUploadCSVHeader = kCurrentCSVHeader35;
 
 // True while /datalog.csv still carries a pre-epoch header, i.e. queued rows
 // exist that have no deploymentEpoch column. Those rows would follow the

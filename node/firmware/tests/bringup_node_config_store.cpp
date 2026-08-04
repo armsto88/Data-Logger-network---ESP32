@@ -105,6 +105,13 @@ void setup() {
   }
 
   resetNamespace();
+  report("deployment epoch defaults to zero", nodeDeploymentEpochLoad() == 0);
+  report("deployment epoch saves", nodeDeploymentEpochSave(12));
+  report("deployment epoch reloads", nodeDeploymentEpochLoad() == 12);
+  report("deployment epoch clears", nodeDeploymentEpochSave(0) &&
+         nodeDeploymentEpochLoad() == 0);
+
+  resetNamespace();
   const NodeConfigStoreRecord rec1 = makeRecord(7, 5);
   report("save primary record", nodeConfigStoreSave(rec1));
   nodeConfigStoreResetForTest();

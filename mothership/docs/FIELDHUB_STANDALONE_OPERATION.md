@@ -125,3 +125,122 @@ not failed. The initial portal-start and SD-detection lines occurred before the
 serial capture reconnected, so they are not claimed as evidence. Full
 captive-portal workflow checks and the remaining manual/backend journeys are
 still outstanding.
+
+### 2026-08-04 — local pathway field session on COM4
+
+Executed on the same physical FieldHub (AP MAC `48:9D:31:F8:16:A9`, SSID
+`FieldHub(489D31F816A8)`), firmware reflashed repeatedly through the session
+as fixes landed (final identity: `build=5b792b4-dirty`, `CSV schema=35`).
+Local-only throughout: no cloud upload configured.
+
+**Code review before flashing turned up three latent bugs in the uncommitted
+33→35 CSV-schema work** (userId/name/latitude/longitude columns), found by
+reproducing the exact validation/formatting logic outside the firmware, not
+by running on-device tests:
+
+- A named node's readings were silently dropped from every cloud upload.
+  `json_payload.cpp`'s `validReadingRow()` ran a blanket numeric check over
+  every column past index 6; `name` is free text, so any real node name
+  failed it and the row was treated as malformed and skipped —
+  `ok=true`, `rowCount=0`, nothing surfaced as an error. Fixed by making the
+  validator schema-aware (sensor floats / epoch integer / free-text identity
+  / numeric-or-nan location, each checked on its own terms).
+- A comma (or CR/LF) in a node name reframed the CSV row: the column count no
+  longer matched, the row's own width gate rejected it, and nothing reached
+  flash *or* SD — the node would retry that reading forever. Fixed with a
+  `csvSafeCell()` sanitizer at all three row-building call sites.
+- The row-building buffer (`char row[512]`) accumulated append offsets past
+  its own end via `snprintf(buf+offset, size-offset, ...)`; once offset
+  exceeded 512 the `size_t` subtraction wrapped to ~4 GB, turning a bounds
+  argument meant to refuse the write into one that permits it — a stack
+  smash reachable by a node reporting large-but-finite sensor values.
+  Pre-existing, not introduced this session, but the four new columns ate
+  into its margin. Fixed with a bounded `appendFmt()` helper (skips writes
+  once the buffer is full, preserving the existing overflow-detection
+  behaviour) and the buffer widened to 640 bytes.
+
+All three are covered by new assertions in `test_upload_queue.cpp`.
+`mothership-v2-test-upload-queue` and every other affected test/production
+environment build clean — **compile-only; not flashed or executed this
+session.** Only `mothership-v1-main` was flashed and run live.
+
+**Two further regressions surfaced only by running production firmware
+against the hub's real, previously-field-populated storage — code review
+alone could not have found either, since both depend on state code review
+can't see:**
+
+- **Flash logging went dark on first boot.** The hub's actual `/datalog.csv`,
+  written by the real committed firmware (`ea98b05`) before any of this
+  session's schema work, carries a 31-column header (`...,deploymentEpoch`,
+  no identity/location columns) that had never been preserved as its own
+  legacy constant when the schema was extended — `initFlash()` saw a header
+  it didn't recognise and refused to touch the file:
+  `[FLASH] Unknown CSV header; preserving file and refusing incompatible
+  appends`, followed by `[SNAP] No storage accepted the snapshot` for every
+  reading that sync. Fixed by restoring `kLegacyCSVHeader31` (byte-verified
+  against the `ea98b05` commit) and wiring it into both `flash_logger.cpp`'s
+  and `upload_queue.cpp`'s legacy-header checks.
+- **A standalone hub could never redeploy a node again after any CSV schema
+  bump.** `beginNewDeployment()`'s legacy-backlog guard — meant to stop
+  unstamped rows being misattributed to a new deployment's epoch by the
+  cloud backend's fallback logic — blocks unconditionally on
+  `uploadQueueHasLegacyRows()`, and every code path that clears that backlog
+  only runs after a successful network upload. With upload disabled, this
+  hub hit it live: *"Upload existing readings before starting a new
+  deployment (45 rows pending)."* Since the risk the guard protects against
+  cannot exist without an active upload destination, fixed by gating the
+  check on `TransmissionSettings.enabled` — a standalone hub with upload off
+  is no longer blocked.
+
+**Hardware evidence, this session (all via live serial capture on COM4):**
+
+- Reflash → boot → identity banner confirms `CSV schema=35` on every boot.
+- A snapshot with the full 35-column row (`userId`, `name`,
+  `latitude`/`longitude` = `nan`, unset for this node) round-tripped through
+  a real sync: `columns=35`, `persisted=1`. Node number confirmed present
+  (`001`) via the Field UI node detail page even though it wasn't visually
+  obvious in the raw CSV — no header labels on the still-legacy on-disk
+  header, expected until the backlog drains, not a bug.
+- **Deployment lifecycle, one node (ENV_6C0A80), fully local:** End
+  deployment 1 → archived. The node's own periodic 1-minute wake cycle was
+  observed to stop (physically confirmed by the operator, not just the
+  mothership's ACK) — real STANDBY convergence, not just a config-side
+  handshake. Start deployment 2 was then blocked by the legacy-backlog gate
+  (bug above); after the fix and a reflash it succeeded —
+  `[DEPLOY] ENV_6C0A80 started deployment 2 as 001`, epoch=2, `NODE_CONFIG`
+  pushed direct+broadcast OK. The node resumed its normal 1-minute recording
+  cadence under epoch 2 at the next sync (`CONFIG_ACK converged: ENV_6C0A80
+  v4 (ACTIVE)`, fresh snapshots from seq 106).
+- **Fleet basics, two nodes:** Paired a second node (ENV_D13F98) through the
+  full wizard; fleet count reflected 2 deployed. Unpaired it while deployed —
+  exercised the deferred-unpair path (`NODE_CONFIG target=0` broadcast,
+  `CONFIG_ACK unpair confirmed: ENV_D13F98 v3 — removing node`, registry
+  dropped to 1, confirmed gone from the Field UI). Node 2 stopped waking
+  entirely afterward (stronger than STANDBY, as expected for a full
+  removal). Re-paired node 2 from scratch: prior number/name did **not**
+  resurface — unpair fully clears `node_meta`, unlike End Deployment, which
+  preserves identity for the archive.
+
+**Not run / not resolved this session:**
+
+- Sensor fault detection (fleet-basics item 12) — deferred to a future
+  session; not exercised at all.
+- Cloud upload path and induced power-loss recovery — deliberately out of
+  scope; this session stayed local-only throughout.
+- Node 1 (ENV_6C0A80) was observed to stay continuously powered rather than
+  resuming its normal wake/sleep cycle after one sync. The operator reports
+  this same symptom has occurred on this physical unit before, independent
+  of any firmware here. The only uncommitted node-firmware diff touches
+  deployment-epoch bookkeeping gated behind `DEPLOY_NODE` events, which did
+  not fire for this node on the cycle in question — reviewed and ruled out
+  as the cause, but not independently root-caused. Treated as a probable
+  hardware quirk on this specific unit pending physical inspection, not a
+  software regression.
+- One transient ESP-NOW ack-send failure (`SNAP-ACK ... send=FAIL`, node 1
+  seq 119 — the reading itself persisted fine) and a run of duplicate
+  `CONFIG_ACK converged` log lines printed after a node's removal was already
+  confirmed. Neither affected the outcome; not investigated further.
+- `/datalog.csv` remains on its original 31-column header and will stay
+  mixed-width (new 35-column rows appended under it) until an upload
+  eventually drains the backlog — expected for a hub kept local-only
+  throughout this session, not a defect.
