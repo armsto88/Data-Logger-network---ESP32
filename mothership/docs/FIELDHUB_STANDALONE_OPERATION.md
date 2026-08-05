@@ -228,14 +228,13 @@ can't see:**
 - Cloud upload path and induced power-loss recovery — deliberately out of
   scope; this session stayed local-only throughout.
 - Node 1 (ENV_6C0A80) was observed to stay continuously powered rather than
-  resuming its normal wake/sleep cycle after one sync. The operator reports
-  this same symptom has occurred on this physical unit before, independent
-  of any firmware here. The only uncommitted node-firmware diff touches
-  deployment-epoch bookkeeping gated behind `DEPLOY_NODE` events, which did
-  not fire for this node on the cycle in question — reviewed and ruled out
-  as the cause, but not independently root-caused. Treated as a probable
-  hardware quirk on this specific unit pending physical inspection, not a
-  software regression.
+  resuming its normal wake/sleep cycle after one sync. At the time this was
+  treated as a probable hardware quirk on this specific unit, since the only
+  uncommitted node-firmware diff at that point (deployment-epoch bookkeeping)
+  didn't touch power management and hadn't fired that cycle. **Correction,
+  2026-08-05: this was not hardware.** It recurred on a second, different
+  physical node (ENV_D13F98) with direct serial evidence this time, and was
+  root-caused to a real firmware bug — see the 2026-08-05 entry below.
 - One transient ESP-NOW ack-send failure (`SNAP-ACK ... send=FAIL`, node 1
   seq 119 — the reading itself persisted fine) and a run of duplicate
   `CONFIG_ACK converged` log lines printed after a node's removal was already
@@ -244,3 +243,93 @@ can't see:**
   mixed-width (new 35-column rows appended under it) until an upload
   eventually drains the backlog — expected for a hub kept local-only
   throughout this session, not a defect.
+
+### 2026-08-05 — continued local session: a real stuck-awake bug, two open items
+
+**Node firmware — stuck-awake bug found, root-caused, and fixed.** The
+"probable hardware quirk" noted above recurred, this time on node 2
+(ENV_D13F98) with the node's own serial console attached directly (not just
+the mothership's view). The evidence was unambiguous: after a sync, the node
+printed `[PWR_HOLD] release deferred: critical node work still pending`
+roughly every 100ms for well over a minute — continuing long after the
+mothership had already closed its window and powered off — until the
+operator cut power manually. Left alone this drains the battery and likely
+ends in a watchdog reset (`[WDT] hardware watchdog armed (120s)` at every
+boot) rather than a clean sleep.
+
+Root cause: `node/firmware/src/main.cpp`'s sync-wake handler has a "legacy
+fallback" path, built for a mothership old enough to only ever send a
+lightweight `SYNC_WINDOW_OPEN` marker and never the full `SYNC_SESSION_OPEN`
+handshake. If the marker arrived but the full session-open didn't within
+2.5s, the node gave up waiting and blind-flushed its queue instead (no grant
+negotiation, no durable-ACK retry). The mothership here is fully modern —
+it just occasionally lost that timing race — so the real session-open would
+still arrive, moments later, while the fallback flush's own event-servicing
+loop was running. That set a `g_syncSessionOpenPending` flag with nothing
+downstream ever positioned to clear it, and `hasCriticalPendingWork()` then
+reported it forever, permanently blocking `PWR_HOLD` release.
+
+Confirmed with the user that mothership-v1 is retired and never deployed
+anywhere in this fleet — the fallback's entire reason for existing no longer
+applies. Fixed by removing it outright rather than patching around it: the
+listen loop now waits the node's full listen window for the real
+session-open instead of bailing at 2.5s (making the race far less likely to
+begin with), and a marker-without-session cycle now just skips and retries
+at the next sync — the local queue is retained, nothing is lost, only
+delayed. As defense in depth, `hasCriticalPendingWork()` now also gates the
+three sync-session pending flags on `g_espNowReady`, so even a flag set
+after the radio is shut down can no longer block power-off — this closes
+the general failure shape, not just the one path that happened to trigger
+it.
+
+Both nodes reflashed (`build=71b8e3a-dirty`) and confirmed booting clean,
+config preserved correctly across the flash. **Not yet field-confirmed**:
+no sync cycle has been observed exercising the code that used to be the
+fallback path, because the fix makes that path's trigger condition
+substantially rarer — the real test is time, watching for the absence of
+the stuck-awake symptom over further sessions.
+
+**Open, unresolved:**
+
+- **`NodeDesiredConfig` / deployment-epoch desync (mothership).** After
+  unpairing and re-pairing node 2, the Field UI showed it as "Ended" with no
+  epoch and no identity — consistent with a node that was never formally
+  redeployed — while it was in fact actively recording and syncing normally.
+  `NodeDesiredConfig.targetState` (the low-level ESP-NOW config, `node_dcfg`
+  NVS) and the deployment-epoch/archive tracking (`DeploymentSlot.epoch`/
+  `endedUnix`) are meant to stay in sync but had drifted apart for this node.
+  Worked around by re-running the deploy wizard, which reconciled both state
+  machines (`[DEPLOY] ENV_D13F98 started deployment 2 as 002`) — but the
+  actual mechanism that let them drift was never found. Traced several
+  candidates (stale `node_dcfg` surviving unpair, `registerNode()` on
+  re-pairing) without a conclusive answer; would need live NVS inspection to
+  actually resolve. Not treated as fixed — a real gap that could recur for
+  any node that gets unpaired and later re-paired without someone remembering
+  to explicitly redeploy it.
+- **Sensor-fault detection has no UI, and item 12 was never actually
+  verified.** `sensorFaultMask` is computed correctly in `main.cpp` but is
+  exposed nowhere in the Field UI — only via `/api/live`. Worse, `/api/live`
+  itself is unreliable for checking it: `expectedSensorMask`,
+  `sensorPresentMask`, and `sensorFaultMask` are all RAM-only and only
+  refresh during an actual sync wake, never during config mode — and the two
+  boot paths are mutually exclusive per boot, so checking via the Field UI
+  in config mode will always read `0` for all three regardless of true
+  state. A plan to persist the fault state (mirroring how `lastReportedBatV`
+  already survives reboots) and render it as a UI chip was drafted, then
+  shelved for the night rather than implemented.
+- **Soil-sensor fault detection cannot work as currently built.** Attempting
+  to verify item 12 by pulling a soil probe produced no fault at all.
+  Traced to `node/firmware/src/sensors/soil_moist_temp.cpp`: both soil
+  probes share one ADS1115 ADC chip, and a disconnected/floating analog
+  channel doesn't fail the way an I2C sensor read does — it just returns
+  whatever stray voltage is on the pin, which runs through the calibration
+  math and reports as a normal, successful (but meaningless) reading.
+  `SNAP_PRESENT_SOIL1`/`SOIL2` can only ever reflect "is the ADS1115 chip
+  itself alive," never "is this specific probe connected." A genuine,
+  pre-existing architectural gap in fault coverage for ADC-based sensors,
+  not something introduced this session — noted, not fixed. The air sensor
+  (SHT41, genuine I2C) would be the correct choice for actually
+  demonstrating fault detection works, and was not retested before the
+  session ended.
+- **Phase 5 (power-cycle recovery)** — deferred to the next session, not
+  started.
