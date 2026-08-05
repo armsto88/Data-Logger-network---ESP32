@@ -1518,8 +1518,18 @@ static bool hasCriticalPendingWork() {
   if (g_pendingTimeSync || g_pendingPairNode || g_pendingPairingResponse ||
       g_pendingUnpair || g_pendingDeploy || g_pendingDeployAck ||
       g_pendingConfigSnapshot || g_pendingNodeConfig || g_pendingPersistConfig ||
-      g_syncSessionOpenPending || g_dumpGrantPending || g_syncReleasePending ||
       g_deployBootstrapPending || g_rearmAlarmsPending) {
+    return true;
+  }
+  // Sync-session signals are only actionable while the radio is up: with
+  // ESP-NOW down the node can neither join a session nor answer a grant, so a
+  // pending one is stale by definition and must not hold PWR_HOLD. Without this
+  // guard a SYNC_SESSION_OPEN arriving late — after the listen window closed but
+  // while the radio is still up during finalizeWakeAndSleep(), or drained from
+  // the event queue by processPowerCut() after shutdown — sets a flag nothing
+  // clears, and the node defers power-off forever until its battery dies.
+  if (g_espNowReady &&
+      (g_syncSessionOpenPending || g_dumpGrantPending || g_syncReleasePending)) {
     return true;
   }
   if (g_sendActive || g_waitingSnapshotAck) return true;
@@ -2400,16 +2410,10 @@ static void handleRtcWakeEvents(bool dataWake, bool syncWake) {
                     targetStr,
                     (unsigned long)SYNC_MARKER_GRACE_SEC);
 
-      const uint32_t windowStart = millis();
-      const uint32_t legacyFallbackAtMs = windowStart + 2500UL;
       while (rtc.now().unixtime() < listenUntilUnix && !g_syncSessionOpenPending) {
         feedWatchdog();
         serviceNodeEvents(8);
         servicePendingNodeConfig();
-        if (g_syncWindowMarkerMs != 0 &&
-            (int32_t)(millis() - legacyFallbackAtMs) >= 0) {
-          break;
-        }
         delay(20);
       }
 
@@ -2499,23 +2503,18 @@ static void handleRtcWakeEvents(bool dataWake, bool syncWake) {
         serviceNodeEvents(12);
         servicePendingNodeConfig();
         shutdownEspNow();
-      } else if (g_syncWindowMarkerMs != 0) {
-        // Rolling-upgrade fallback: an older V2 mothership knows only the
-        // marker protocol. Jitter reduces its original all-at-once burst.
-        const uint32_t markerMs = g_syncWindowMarkerMs;
-        const uint32_t markerDelay = (markerMs >= windowStart) ? (markerMs - windowStart) : 0;
-        uint32_t flushDeadline = windowStart + (uint32_t)SYNC_LISTEN_WINDOW_MS;
-        if ((uint32_t)SYNC_LISTEN_WINDOW_MS > 2000UL) {
-          flushDeadline -= 2000UL;
-        }
-        const uint32_t legacyJitter = coordinatedHelloJitterMs(markerMs);
-        delay(legacyJitter);
-        Serial.printf("📶 Legacy sync marker after %lums; jitter=%lums -> fallback flush\n",
-                      (unsigned long)markerDelay,
-                      (unsigned long)legacyJitter);
-        flushQueuedToMothership(flushDeadline);
       } else {
-        Serial.println("⚠️ Sync marker not seen in listen window; flush skipped this cycle");
+        // Every mothership in this fleet sends SYNC_SESSION_OPEN immediately
+        // after the SYNC_WINDOW_OPEN marker (mothership-v1 is retired), so a
+        // marker with no session means a dropped or delayed frame, never a
+        // marker-only peer. There is deliberately no fallback flush: skip this
+        // cycle and retry at the next sync wake. The queue is retained, so
+        // nothing is lost — only delayed.
+        if (g_syncWindowMarkerMs != 0) {
+          Serial.println("⚠️ Sync marker seen but SYNC_SESSION_OPEN did not arrive in time; flush skipped this cycle");
+        } else {
+          Serial.println("⚠️ Sync marker not seen in listen window; flush skipped this cycle");
+        }
       }
     }
     // Report the receive path regardless of outcome. rx=0 means nothing reached
