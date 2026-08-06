@@ -291,21 +291,15 @@ the stuck-awake symptom over further sessions.
 
 **Open, unresolved:**
 
-- **`NodeDesiredConfig` / deployment-epoch desync (mothership).** After
+- **`NodeDesiredConfig` / deployment-epoch desync (mothership).** ~~After
   unpairing and re-pairing node 2, the Field UI showed it as "Ended" with no
   epoch and no identity — consistent with a node that was never formally
-  redeployed — while it was in fact actively recording and syncing normally.
-  `NodeDesiredConfig.targetState` (the low-level ESP-NOW config, `node_dcfg`
-  NVS) and the deployment-epoch/archive tracking (`DeploymentSlot.epoch`/
-  `endedUnix`) are meant to stay in sync but had drifted apart for this node.
-  Worked around by re-running the deploy wizard, which reconciled both state
-  machines (`[DEPLOY] ENV_D13F98 started deployment 2 as 002`) — but the
-  actual mechanism that let them drift was never found. Traced several
-  candidates (stale `node_dcfg` surviving unpair, `registerNode()` on
-  re-pairing) without a conclusive answer; would need live NVS inspection to
-  actually resolve. Not treated as fixed — a real gap that could recur for
-  any node that gets unpaired and later re-paired without someone remembering
-  to explicitly redeploy it.
+  redeployed — while it was in fact actively recording and syncing normally.~~
+  **Resolved 2026-08-06 — see that entry below.** The real mechanism turned
+  out to be neither of the candidates guessed here: not stale `node_dcfg`,
+  not `registerNode()` on re-pairing. It was a stale RAM registry field read
+  by the ESP-NOW deploy dispatcher. Root-caused, fixed, and confirmed across
+  two independent sync cycles on hardware.
 - **Sensor-fault detection has no UI, and item 12 was never actually
   verified.** `sensorFaultMask` is computed correctly in `main.cpp` but is
   exposed nowhere in the Field UI — only via `/api/live`. Worse, `/api/live`
@@ -333,3 +327,129 @@ the stuck-awake symptom over further sessions.
   session ended.
 - **Phase 5 (power-cycle recovery)** — deferred to the next session, not
   started.
+
+### 2026-08-06 — deployment-epoch desync root-caused and fixed, live on COM4
+
+Continuation of the 2026-08-05 open item, on the same physical fleet
+(ENV_6C0A80 kept untouched as a control throughout; ENV_D13F98 as the
+subject). Firmware `build=71b8e3a-dirty` at the start of the session.
+
+**The candidate mechanisms guessed on 2026-08-05 were wrong, and one of them
+was disproven by reading code before any hardware was touched.** A chain
+starting from `handleNodeHello()` promoting a merely-PAIRED node to DEPLOYED
+was proposed, then ruled out: `sendNodeHello()`'s three call sites in
+`node/firmware/src/main.cpp` are gated on `rtcSynced`, an open sync session,
+or `STATE_DEPLOYED`, and `PAIR_NODE` clears all of those — so a cleanly
+paired, undeployed node sends no HELLO at all. Any explanation requiring one
+assumed its own conclusion. Kept as a documented dead end rather than
+deleted, since the reasoning that ruled it out is itself useful.
+
+**Also established by reading code, then confirmed by hardware, and worth
+recording since it corrects a wrong assumption from 2026-08-05:** unpairing a
+deployed node does **not** reset its epoch to 0. `endDeploymentForUnpair()`
+(`deployment_epoch.cpp`) only sets `endedUnix` on the epoch that was already
+active — the epoch number itself is untouched. Only `beginNewDeployment()`
+advances it. So the "Ended, no epoch" symptom was never "this node was never
+deployed" — it was something actively producing epoch 0 on a **redeploy**.
+
+**Root cause, confirmed on hardware:** `deploySelectedNodes()`
+(`mothership/firmware/v2/src/comms/espnow_config.cpp`) built the
+`DEPLOY_NODE` command's epoch field from `node.deploymentEpoch` — a RAM-only
+field on the `NodeInfo` registry entry — instead of asking the deployment
+store directly. That field is deliberately zeroed whenever a `NodeInfo`
+record is freshly created (`node_registry.cpp`: "a newly discovered node has
+no deployment until Start commits one"), and ENV_D13F98 got a **fresh**
+record mid-session because its own periodic `NODE_STATUS` broadcast
+re-registered it as UNPAIRED before it was ever paired through the UI. The
+stale zero was never refreshed by the time the wizard's Start deployment
+dispatched the command. Captured directly on both consoles:
+
+- Hub: `[DEPLOY] ENV_D13F98: epoch=0 cfgV=2 wakeMin=1 syncMin=18 phase=...`
+- Node: `[DEPLOY] epoch=0 new=1 persisted=1`
+
+The following sync window proved the consequence live: the node was
+genuinely recording and converging (`[SNAP] ... nodeId=ENV_D13F98 seq=178`,
+`CONFIG_ACK converged: ENV_D13F98 v2 (ACTIVE)`, a real alarm-armed sleep
+cycle on its own console) while the Field UI badge read "Ended" — the
+2026-08-05 symptom reproduced on demand, with the exact mechanism named.
+
+A secondary discovery along the way, load-bearing for interpreting the
+above: **the current wizard has no UI path that pairs a node without also
+deploying it.** `start_deployment`'s handler calls `pairNode()` and then
+falls straight through to committing the deployment in the same request
+whenever a node starts UNPAIRED — there is no separate "just pair" action
+anywhere in `config_server.cpp`. `PAIRED` exists in the state enum and is
+counted by `/api/live`, but through the real wizard it is never a state a
+node rests in; it is crossed for a fraction of a second inside one HTTP
+handler. This reframed the investigation: the drift could not be an
+operator accidentally stopping short of redeploying, because that stopping
+point does not exist in the UI.
+
+**Fix:** `deploySelectedNodes()` now reads the epoch via
+`deploymentFindByNodeId(node.nodeId.c_str())` — the deployment store, the
+actual authority — falling back to the registry mirror only if the store has
+no slot for that node. One call site, no changes to `targetState` handling,
+unpair, or either recovery path. For a normal deploy this produces identical
+output to before, since the store already holds the fresh epoch by the time
+this runs; it only changes behavior for the stale-mirror case above.
+
+**Hardware evidence, this session (COM3 + COM4, both live serial capture):**
+
+- Build clean (`mothership-v1-main`, exit 0), flashed to COM4.
+- Start a new deployment clicked directly on the already-registered node
+  (deliberately not via a fresh unpair/re-pair, to isolate the
+  `beginNewDeployment()` path from the registry-recreation confound above).
+  Hub: `[DEPLOY] ENV_D13F98 started deployment 3 as 002` — the
+  `beginNewDeployment()` success line, absent from every capture before the
+  fix — immediately followed by `[DEPLOY] ENV_D13F98: epoch=3 cfgV=2 ...`,
+  now matching.
+  Node: `[DEPLOY] epoch=3 new=1 persisted=1`.
+- Full sync window completed cleanly: real snapshots `seq=179`-`194`,
+  repeated `CONFIG_ACK converged: ENV_D13F98 v2 (ACTIVE)`, node armed its
+  next alarms and slept normally. Field UI stayed correct throughout — no
+  "Ended" badge.
+- A second, independent sync cycle later in the session also came back
+  clean: node still correctly on deployment 3, no drift back to "Ended".
+- **Not independently re-executed after the fix:** the exact original
+  trigger sequence (unpair while deployed, wait for the node's own
+  `NODE_STATUS` to re-register it, re-pair, then deploy). The fix is
+  trigger-agnostic — it changes what `deploySelectedNodes()` reads
+  regardless of why the registry mirror was stale — so it should hold for
+  that sequence too, but this was not independently confirmed on hardware
+  this session.
+
+**Also found, not fixed — a separate, low-priority cosmetic bug noted for
+the record:** during the unpair-only hardware test (before the epoch bug was
+found), `loop()` (`node/firmware/src/main.cpp`) snapshots
+`NodeState st = currentNodeState();` once at the top of each iteration. When
+a pending UNPAIR is serviced later in that same iteration, `st` is not
+recomputed, so branch logic and log output further down in that pass can
+still act on a value that says DEPLOYED for one iteration after the node has
+actually gone UNPAIRED. Observed as a stray `state=2` in the heartbeat line
+and a `🟢 Deployed — work happens on each DS3231 alarm.` print immediately
+after `[STATE] ... -> UNPAIRED`. The underlying flags (`deployedFlag`,
+`mothershipMAC`) and the DS3231 alarm disarm calls are all correct and run
+inside the same UNPAIR block before this — confirmed no functional effect,
+display-only.
+
+**Field UI changes made alongside the fix, same session:** since the
+investigation established `PAIRED` is not a reachable resting state through
+the current wizard, the "Connected" tile was removed from the dashboard's
+three-box fleet summary (`config_server.cpp`), along with the now-dead
+`pairedNodes` variable and its JS updater. The underlying `PAIRED` enum
+value, `/api/live`'s `connected` JSON field, and the per-node "Connected"
+chips elsewhere (station list, node detail page) were deliberately left
+alone — they still reflect a real, if now rarely-observed, state, and
+weren't part of what this pass touched. The KPI grid's CSS
+(`.stats{grid-template-columns:1fr 1fr 1fr}`) was a fixed three-column
+layout; added a `.stats--kpi{grid-template-columns:1fr 1fr}` override,
+scoped to that one strip, so the remaining Active/New tiles fill the row
+instead of leaving a blank third column. Both build-verified and flashed to
+COM4 together with the epoch fix; confirmed visually correct in the field
+session above.
+
+**Not yet done:** committing these changes (staged, not committed pending
+a decision on grouping); deciding whether to annotate the three historical
+V1-era docs that reference the now-removed `mothership/firmware/v1/` tree
+(unrelated repo-cleanup task done the same session, not a field-operation
+change, so not otherwise recorded in this document).

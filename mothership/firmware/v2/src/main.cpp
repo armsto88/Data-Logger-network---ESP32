@@ -306,8 +306,10 @@ void processSnapshot(const DecodedSnapshot& decoded, const uint8_t* mac) {
   for (auto& n : registeredNodes) {
     if (strncmp(n.nodeId.c_str(), decoded.nodeId, 16) == 0 ||
         memcmp(n.mac, mac, 6) == 0) {
-      n.lastSeen = millis();
-      n.isActive = true;
+      // A received snapshot is the strongest possible evidence of contact, and
+      // it must stamp the durable absolute time too — not just the millis-based
+      // session value, which is worthless to the next boot.
+      noteNodeContact(n);
       if (batV && !isnan(*batV)) {
         n.lastReportedBatV = *batV;
       }
@@ -320,13 +322,9 @@ void processSnapshot(const DecodedSnapshot& decoded, const uint8_t* mac) {
       // doesn't flap the dashboard. expectedSensorMask holds capability bits only.
       {
         const uint16_t present  = decoded.sensorPresent;
-        // Normalise the ultrasonic-wind selector to the WIND present bit — a
-        // snapshot only ever reports SNAP_PRESENT_WIND regardless of backend —
-        // and keep only the 9 present bits for the comparison.
-        uint16_t expected = n.expectedSensorMask;  // capability bits, no VALID
-        if (expected & NODE_SENSOR_CFG_WIND_ULTRASONIC)
-          expected = (uint16_t)((expected & ~NODE_SENSOR_CFG_WIND_ULTRASONIC) | SNAP_PRESENT_WIND);
-        expected &= 0x01FF;
+        // Shared normalisation, so the cached mask, this comparison and the UI
+        // can never drift into using different layouts for the same channel.
+        const uint16_t expected = nodeNormalizeSensorMask(n.expectedSensorMask);
         const uint16_t missNow  = (uint16_t)(expected & ~present);
         n.sensorFaultMask   = (uint16_t)(missNow & n.sensorMissPrev);
         n.sensorMissPrev    = missNow;
@@ -551,6 +549,12 @@ static void runCoordinatedSyncWindow(
                         hellos[i].hello.nodeId);
           continue;
         }
+        // An authenticated HELLO is contact, and must be stamped here — before
+        // any of the semantic branches below, all of which can skip out. A
+        // healthy node with an empty queue is released without ever sending a
+        // snapshot, so if this is left to the snapshot path its durable
+        // last-contact time never advances and it looks silent forever.
+        noteNodeContact(*authorizedNode);
         // NODE_HELLO carries the node's persisted applied config version. Treat
         // it as convergence evidence just like CONFIG_ACK/snapshot echo so a
         // lost ACK cannot leave pause/resume reporting stale for another cycle.
@@ -613,6 +617,11 @@ static void runCoordinatedSyncWindow(
             break;
           }
         }
+        // Stamp contact as soon as the sender is authenticated, before the
+        // semantic branches below decide whether recovery applies. A status from
+        // a node reporting itself correctly deployed is still proof we heard it.
+        if (known) noteNodeContact(*known);
+
         const bool reportsUndeployed =
             statuses[i].status.state != (uint8_t)DEPLOYED ||
             statuses[i].status.deployed == 0;
@@ -639,8 +648,7 @@ static void runCoordinatedSyncWindow(
         }
 
         const bool sent = sendDeploymentNow(statuses[i].mac, deploy);
-        known->lastSeen = millis();
-        known->isActive = true;
+        noteNodeContact(*known);
         known->deployPending = true;
         Serial.printf("[RECOVERY] %s -> %.15s after unpaired status (direct=%s)\n",
                       sent ? "DEPLOY_NODE sent" : "DEPLOY_NODE failed",
@@ -661,8 +669,7 @@ static void runCoordinatedSyncWindow(
               memcmp(node.mac, deployAcks[i].mac, 6) == 0 &&
               node.nodeId == String(deployAcks[i].ack.nodeId)) {
             node.deployPending = false;
-            node.lastSeen = millis();
-            node.isActive = true;
+            noteNodeContact(node);
             Serial.printf("[RECOVERY] DEPLOY_ACK confirmed %.15s\n", node.nodeId.c_str());
             break;
           }
@@ -1678,9 +1685,12 @@ void handleSyncWake() {
                                              : (uint8_t)gWakeIntervalMin;
     cfg.syncIntervalMin = (uint16_t)(gSyncIntervalMin > 0 ? gSyncIntervalMin : 15);
     cfg.syncPhaseUnix   = 0;   // sync (A2) is governed by SET_SYNC_SCHED, not this
+    // The NODE_CONFIG payload carries the RAW configured mask — the node needs
+    // the ultrasonic selector to know which wind backend to register.
     cfg.sensorMask      = dc.sensorMask;  // 0 = auto; else SNAP_PRESENT_* + VALID bit
-    // Refresh the RAM cache used by snapshot fault detection (strip the VALID bit
-    // to leave just the capability bits) so faults reflect the current selection.
+    // The cached mask, by contrast, is normalised to the snapshot layout by
+    // setNodeExpectedSensorMask() so fault detection and the UI can compare it
+    // against a snapshot's sensorPresent directly.
     setNodeExpectedSensorMask(n.nodeId.c_str(),
         (dc.sensorMask & NODE_SENSOR_MASK_VALID)
             ? (uint16_t)(dc.sensorMask & ~NODE_SENSOR_MASK_VALID) : 0);
@@ -1708,10 +1718,6 @@ void handleSyncWake() {
 
   Serial.println("[SYNC] Sync window closed");
 
-  // Persist paired-node state (including freshly reported battery voltages)
-  // to NVS so it survives power-off between sync cycles.
-  savePairedNodes();
-
   // Drain packets already accepted before unregistering the producer.
   EspNowSnapSlot finalSlots[4];
   int finalDrained = 0;
@@ -1721,6 +1727,14 @@ void handleSyncWake() {
       processSnapshot(finalSlots[i].snap, finalSlots[i].mac);
     }
   } while (finalDrained > 0);
+
+  // Persist paired-node state (battery voltages, last-contact time and the
+  // configured-sensor fault/debounce state) to NVS so it survives the power-off
+  // between sync cycles. This MUST come after the final drain above: those
+  // snapshots go through processSnapshot() like any other and advance exactly
+  // the same per-node state, so saving first silently discarded whatever the
+  // last few packets of the window changed.
+  savePairedNodes();
 
   // --- NODE_CONFIG reconcile: process CONFIG_ACKs collected this window ---
   // A node ACKs after applying a NODE_CONFIG. An UNPAIRED ack (version matched)

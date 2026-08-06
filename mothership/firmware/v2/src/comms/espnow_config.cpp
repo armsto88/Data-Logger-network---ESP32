@@ -305,8 +305,7 @@ static void onEspNowRecv(const uint8_t* mac, const uint8_t* data, int len) {
       registerNode(mac, st.nodeId, "status", reported);
       for (auto& n : registeredNodes) {
         if (memcmp(n.mac, mac, 6) == 0 || n.nodeId == String(st.nodeId)) {
-          n.lastSeen = millis();
-          n.isActive = true;
+          noteNodeContact(n);
           n.lastRescueMode = (st.rescueMode != 0);
           const bool reportsUndeployed = reported != DEPLOYED || st.deployed == 0;
           if (reportsUndeployed && shouldRecoverKnownDeployedNode(n)) {
@@ -676,7 +675,16 @@ bool deploySelectedNodes(const std::vector<String>& nodeIds) {
                         (unsigned long)gLastSyncBroadcastUnix);
         }
         deployCmd.sensorMask = desired.sensorMask;  // 0 = auto; else SNAP_PRESENT_* + VALID
-        deployCmd.deploymentEpoch = node.deploymentEpoch;
+        // Read the epoch straight from the deployment store rather than the
+        // NodeInfo mirror. The mirror is zeroed whenever a node's registry
+        // entry is freshly (re)created — e.g. a node that re-registers via its
+        // own NODE_STATUS broadcast after being removed at unpair — and is not
+        // guaranteed to be refreshed before this dispatch runs. That let a
+        // node with an ended epoch 1 in the store get redeployed as epoch 0,
+        // which the Field UI still reads as "Ended" (deploymentEndedUnix from
+        // the old slot) while the node was actually live under the new one.
+        const DeploymentSlot* storeSlot = deploymentFindByNodeId(node.nodeId.c_str());
+        deployCmd.deploymentEpoch = storeSlot ? storeSlot->epoch : node.deploymentEpoch;
 
         Serial.printf("[DEPLOY] %s: epoch=%u cfgV=%u wakeMin=%u syncMin=%u phase=%lu\n",
                       nodeId.c_str(),

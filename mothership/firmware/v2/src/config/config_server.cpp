@@ -1182,6 +1182,32 @@ static const char* nodeStateToString(int s) {
   }
 }
 
+// Sentinel for "we have never heard from this node", distinct from "0 min ago".
+static const uint32_t kLastSeenUnknown = 0xFFFFFFFFUL;
+
+// Minutes since this node was last genuinely heard from, or kLastSeenUnknown.
+//
+// NodeInfo::lastSeen is millis()-based and therefore only meaningful within the
+// current session — loadPairedNodes() deliberately restores it as 0, because
+// reloading a record is not evidence anyone has heard from the node. Config mode
+// is a separate boot from the sync wake, and a DEPLOYED node is asleep for all
+// of it, so keying the UI on lastSeen alone made every deployed node read "n/a"
+// forever. lastSeenUnix is the persisted absolute time of last real contact and
+// is the correct fallback; it is what the cloud payload has always reported.
+static uint32_t nodeLastSeenAgeMin(const NodeInfo& n) {
+  if (n.lastSeen > 0) {
+    const uint32_t nowMs = millis();
+    return ((nowMs >= n.lastSeen) ? (nowMs - n.lastSeen) : 0) / 60000UL;
+  }
+  if (n.lastSeenUnix > 0) {
+    const uint32_t nowUnix = getRTCTime();
+    // A hub clock behind the stored stamp (RTC reset/unset) would underflow into
+    // a nonsense age; report unknown rather than a fabricated number.
+    if (nowUnix >= n.lastSeenUnix) return (nowUnix - n.lastSeenUnix) / 60UL;
+  }
+  return kLastSeenUnknown;
+}
+
 // Render `text` as a self-contained, offline QR code SVG (no external assets).
 // Dark modules are drawn as a single SVG path over a white quiet-zone border,
 // so it scans reliably from a laptop webcam. Version 6 / ECC-M comfortably fits
@@ -1262,6 +1288,7 @@ a{color:var(--primary);text-decoration:none}
 
 /* Stats */
 .stats{display:grid;grid-template-columns:1fr 1fr 1fr;gap:var(--sp-1);text-align:center}
+.stats--kpi{grid-template-columns:1fr 1fr}
 .stat{background:#fafafa;border:1px solid var(--border);border-radius:8px;padding:10px}
 .stat strong{display:block;font-size:13px;color:var(--sub);margin-bottom:2px}
 .stat .num{font-size:18px;font-weight:700}
@@ -1735,7 +1762,6 @@ function reconcileNodes(nodes){
 function updateKpis(f){
   var set=function(id,v){ var e=document.getElementById(id); if (e && v!=null) e.textContent=String(v); };
   set('kpi-deployed-num', f.active);
-  set('kpi-paired-num', f.connected);
   set('kpi-unpaired-num', f.new);
 }
 function setText(id,v){ var e=document.getElementById(id); if (e) e.textContent=v; }
@@ -2287,6 +2313,9 @@ static uint32_t gLiveFingerprint = 0;
 static String buildLiveJson() {
   const std::vector<NodeInfo> nodes = getRegisteredNodes();  // snapshot copy (safe read)
   const uint32_t now = millis();
+  // One RTC read per poll (not per node) for the lastSeenUnix fallback below.
+  // Still honours this endpoint's contract: no LittleFS, NVS or upload-queue access.
+  const uint32_t liveNowUnix = getRTCTime();
 
   uint16_t nNew = 0, nConn = 0, nActive = 0, nPending = 0;
   uint32_t fp = 2166136261UL ^ (uint32_t)nodes.size();
@@ -2302,8 +2331,12 @@ static String buildLiveJson() {
     const uint8_t desiredTarget = mirrored ? mirrored->targetState
         : (n.state == DEPLOYED ? (n.recordingPaused ? 3 : 2)
                               : static_cast<uint8_t>(n.state));
+    // Fold the ABSOLUTE last-contact time, not a derived age. An age recomputed
+    // against the current clock changes every second for every node, which would
+    // bump the version on every poll and defeat this fingerprint's whole purpose
+    // as a cheap "did anything actually change" detector.
     fp ^= (uint32_t)n.state + ((uint32_t)n.configVersionApplied << 4) +
-          (n.lastSeen / 1000UL) + battCenti + (mirroredPaused ? 97U : 0U) +
+          n.lastSeenUnix + (n.lastSeen / 1000UL) + battCenti + (mirroredPaused ? 97U : 0U) +
           (uint32_t)(n.nodeId.length() * 131U) + (uint32_t)(n.name.length() * 17U) +
           ((uint32_t)n.expectedSensorMask << 9) + ((uint32_t)n.sensorFaultMask << 20) +
           (mirrored ? ((uint32_t)mirrored->wakeIntervalMin << 24) : 0U) +
@@ -2356,6 +2389,11 @@ static String buildLiveJson() {
     j += ",\"userId\":\""; j += jsonEscapeLocal(n.userId); j += "\"";
     j += ",\"state\":\"";  j += nodeStateToString(n.state); j += "\"";
     if (n.lastSeen > 0 && now >= n.lastSeen) { j += ",\"lastSeenSec\":"; j += String((now - n.lastSeen) / 1000UL); }
+    else if (n.lastSeenUnix > 0 && liveNowUnix >= n.lastSeenUnix) {
+      // Same fallback as the server-rendered pages: a deployed node is asleep
+      // throughout config mode, so millis-based lastSeen stays 0 all session.
+      j += ",\"lastSeenSec\":"; j += String(liveNowUnix - n.lastSeenUnix);
+    }
     else { j += ",\"lastSeenSec\":-1"; }
     if (isnan(n.lastReportedBatV)) { j += ",\"batV\":null"; }
     else { char b[12]; snprintf(b, sizeof(b), "%.2f", n.lastReportedBatV); j += ",\"batV\":"; j += b; }
@@ -2571,7 +2609,6 @@ static void handleRoot() {
 
   auto allNodes      = getRegisteredNodes();
   auto unpairedNodes = getUnpairedNodes();
-  auto pairedNodes   = getPairedNodes();
 
   int deployedNodes = 0;
   for (const auto& node : allNodes) {
@@ -2612,11 +2649,6 @@ static void handleRoot() {
   if (deployedNodes > 0) html += F(" stat--deployed-active");
   html += F("'><strong>Active</strong><span id='kpi-deployed-num' class='num'>");
   html += String(deployedNodes);
-  html += F("</span></div>"
-              "<div class='stat");
-  if (pairedNodes.size() > 0) html += F(" stat--paired-active");
-  html += F("'><strong>Connected</strong><span id='kpi-paired-num' class='num'>");
-  html += String(pairedNodes.size());
   html += F("</span></div>"
               "<div class='stat");
   if (unpairedNodes.size() > 0) html += F(" stat--unpaired-active");
@@ -3449,10 +3481,9 @@ static void handleStationsPage() {
     }
 
     String seenTxt = F("n/a");
-    if (node.lastSeen > 0) {
-      const uint32_t nowMs = millis();
-      const uint32_t ageMin = ((nowMs >= node.lastSeen) ? (nowMs - node.lastSeen) : 0) / 60000UL;
-      seenTxt = String(ageMin) + F(" min ago");
+    {
+      const uint32_t ageMin = nodeLastSeenAgeMin(node);
+      if (ageMin != kLastSeenUnknown) seenTxt = String(ageMin) + F(" min ago");
     }
 
     html += F("<div class='node-select-wrap' data-node-id='");
@@ -3490,6 +3521,26 @@ static void handleStationsPage() {
       html += F("<span class='chip' style='margin-left:4px' title='Deployment number'>D");
       html += String((unsigned)node.deploymentEpoch);
       html += F("</span>");
+    }
+    // Faulted-sensor count. Only configured sensors can fault, so this stays
+    // absent for auto-detect nodes rather than showing a meaningless 0.
+    {
+      const uint16_t nodeFaults =
+          (uint16_t)(node.sensorFaultMask & nodeNormalizeSensorMask(node.expectedSensorMask));
+      if (nodeFaults) {
+        uint8_t faultCount = 0;
+        for (uint8_t b = 0; b < 9; ++b) {
+          if (nodeFaults & (uint16_t)(1u << b)) faultCount++;
+        }
+        // Air temp + RH are one physical sensor; count them once.
+        if ((nodeFaults & SNAP_PRESENT_AIR_TEMP) && (nodeFaults & SNAP_PRESENT_AIR_RH)) {
+          faultCount--;
+        }
+        html += F("<span class='chip chip--bat-low' style='margin-left:4px' "
+                  "title='Configured sensors not reporting'>&#9888; ");
+        html += String((unsigned)faultCount);
+        html += F("</span>");
+      }
     }
     html += F("</div>"
               "<div class='node-status-cell'><span class='node-timing-label'>Battery</span>"
@@ -3914,13 +3965,13 @@ static void handleStationDetail() {
   html += F("<br><strong>Recording every</strong> ");
   html += String(activeIntervalMin);
   html += F(" min");
-  if (target->lastSeen > 0) {
-    const uint32_t nowMs = millis();
-    const uint32_t ageMs = (nowMs >= target->lastSeen) ? (nowMs - target->lastSeen) : 0;
-    const uint32_t ageMin = ageMs / 60000UL;
-    html += F("<br><strong>Last seen</strong> ");
-    html += String(ageMin);
-    html += F(" min ago");
+  {
+    const uint32_t ageMin = nodeLastSeenAgeMin(*target);
+    if (ageMin != kLastSeenUnknown) {
+      html += F("<br><strong>Last seen</strong> ");
+      html += String(ageMin);
+      html += F(" min ago");
+    }
   }
   html += F("</div>");
 
@@ -4051,6 +4102,63 @@ static void handleStationDetail() {
       html += F("' class='btn btn--primary' style='display:block;text-align:center;padding:12px'>"
                 "Start new deployment</a></div>");
     }
+  }
+
+  // --- Sensor health ------------------------------------------------------
+  // Per-channel status for the sensors the operator marked installed. All three
+  // masks are computed on a sync wake and persisted, so this renders truthfully
+  // in config mode even though no snapshot arrives during this boot.
+  {
+    const uint16_t expected = nodeNormalizeSensorMask(target->expectedSensorMask);
+    html += F("<div style='margin-bottom:12px'><strong>Sensor health</strong>");
+    if (expected == 0) {
+      html += F("<div class='help'>No sensors configured yet &mdash; every detected "
+                "sensor is recorded and none can be reported as missing.</div>");
+    } else {
+      const uint16_t faults  = target->sensorFaultMask & expected;
+      const uint16_t present = target->lastSensorPresent;
+      // Per-channel evidence, not "have we ever heard from this node". Every
+      // expected channel lands in exactly one of present/missPrev once a
+      // snapshot has been compared against the CURRENT configuration, so their
+      // union is precisely the set we can say anything about. Keying this on
+      // node contact instead would claim "awaiting data" for a channel after a
+      // HELLO or an ACK, neither of which carries sensor readings.
+      const uint16_t evidence = (uint16_t)(present | target->sensorMissPrev);
+      html += F("<div style='margin-top:6px;display:flex;flex-wrap:wrap;gap:6px'>");
+      struct HealthOption { uint16_t bit; const char* label; };
+      static const HealthOption kHealth[] = {
+        { (uint16_t)(SNAP_PRESENT_AIR_TEMP | SNAP_PRESENT_AIR_RH), "Air" },
+        { SNAP_PRESENT_SPECTRAL, "Spectral" },
+        { SNAP_PRESENT_SOIL1,    "Soil 1" },
+        { SNAP_PRESENT_SOIL2,    "Soil 2" },
+        { SNAP_PRESENT_WIND,     "Wind" },
+        { SNAP_PRESENT_AUX1,     "Aux 1" },
+        { SNAP_PRESENT_AUX2,     "Aux 2" },
+      };
+      for (const HealthOption& opt : kHealth) {
+        if ((expected & opt.bit) == 0) continue;
+        const bool faulted  = (faults & opt.bit) != 0;
+        const bool seen     = (present & opt.bit) != 0;
+        const bool compared = (evidence & opt.bit) != 0;
+        // Never claim "OK" from a record no snapshot has been compared against —
+        // that would read as healthy on no evidence at all.
+        const char* cls = faulted ? "chip chip--bat-low"
+                        : (seen ? "chip chip--bat-ok" : "chip");
+        const char* suffix = faulted ? " not reporting"
+                           : (seen ? " OK"
+                                   : (compared ? " missed once" : " no data yet"));
+        html += F("<span class='"); html += cls; html += F("'>");
+        html += opt.label;
+        html += suffix;
+        html += F("</span>");
+      }
+      html += F("</div>");
+      if (faults) {
+        html += F("<div class='help'>A configured sensor is reported missing after "
+                  "two consecutive snapshots without it.</div>");
+      }
+    }
+    html += F("</div>");
   }
 
   html += F("<div style='margin-bottom:12px'>"
@@ -4783,8 +4891,10 @@ static void handleStationSetupWizard() {
     { SNAP_PRESENT_SPECTRAL,                                   "Spectral (AS7343)",  "" },
     { SNAP_PRESENT_SOIL1,                                      "Soil Probe 1",       "" },
     { SNAP_PRESENT_SOIL2,                                      "Soil Probe 2",       "" },
+    // Ultrasonic wind is decommissioned and deliberately not offered. Reed is
+    // the only wind backend; see handleSetNodeSensors(), which also strips the
+    // selector bit on ingest.
     { SNAP_PRESENT_WIND,                                       "Wind (Reed cup)",    "wind" },
-    { NODE_SENSOR_CFG_WIND_ULTRASONIC,                         "Wind (Ultrasonic)",  "wind" },
     { SNAP_PRESENT_AUX1,                                       "Aux 1",              "" },
     { SNAP_PRESENT_AUX2,                                       "Aux 2",              "" },
   };
@@ -6220,8 +6330,9 @@ static void handleNodeSensorsPage() {
     { SNAP_PRESENT_SPECTRAL,                                   "Spectral (AS7343)",  "" },
     { SNAP_PRESENT_SOIL1,                                      "Soil Probe 1",       "" },
     { SNAP_PRESENT_SOIL2,                                      "Soil Probe 2",       "" },
+    // Ultrasonic wind is decommissioned and deliberately not offered here
+    // either — see the matching list in the deploy wizard.
     { SNAP_PRESENT_WIND,                                       "Wind (Reed cup)",    "wind" },
-    { NODE_SENSOR_CFG_WIND_ULTRASONIC,                         "Wind (Ultrasonic)",  "wind" },
     { SNAP_PRESENT_AUX1,                                       "Aux 1",              "" },
     { SNAP_PRESENT_AUX2,                                       "Aux 2",              "" },
   };
@@ -6269,8 +6380,17 @@ static void handleSetNodeSensors() {
                 "{\"ok\":false,\"error\":\"node_id and mask required\"}");
     return;
   }
-  // Keep only the operator-selectable bits (9 present bits + ultrasonic selector).
-  const uint16_t capBits = (uint16_t)((uint32_t)server.arg("mask").toInt() & NODE_SENSOR_CFG_ALL_BITS);
+  // Keep only the operator-selectable bits, and drop the ultrasonic-wind
+  // selector: that backend is decommissioned and is no longer offered in either
+  // picker, so accepting the bit could only reintroduce it. Rejecting it here
+  // rather than merely hiding the button also means the bit cannot survive in a
+  // stored mask via a hand-crafted or replayed POST — which matters, because
+  // reed (bit 3) and ultrasonic (bit 9) both normalise to the same WIND channel,
+  // so a mask carrying the selector is indistinguishable from reed downstream
+  // and would silently transfer one backend's fault history to the other.
+  const uint16_t capBits = (uint16_t)((uint32_t)server.arg("mask").toInt() &
+                                      NODE_SENSOR_CFG_ALL_BITS &
+                                      ~NODE_SENSOR_CFG_WIND_ULTRASONIC);
   // Always authoritative: even an all-off selection is a deliberate config, so
   // the node stops auto-registering passive sensors. (0 without VALID = auto.)
   const uint16_t storedMask = (uint16_t)(capBits | NODE_SENSOR_MASK_VALID);

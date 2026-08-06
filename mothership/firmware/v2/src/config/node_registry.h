@@ -118,8 +118,21 @@ struct NodeDesiredConfig {
 
 // Update a registered node's cached expected-sensor mask (RAM only) so snapshot
 // fault detection doesn't touch NVS in the hot path. Pass the raw capability
-// bits (NODE_SENSOR_MASK_VALID stripped). No-op if the node isn't registered.
+// bits (NODE_SENSOR_MASK_VALID stripped); they are normalised to the snapshot
+// layout internally. Clears the miss/fault/present history for any channel whose
+// configured state changed, so re-enabling a sensor cannot inherit a stale miss
+// and fault on its first absence instead of its second. No-op if the node isn't
+// registered.
 void setNodeExpectedSensorMask(const char* nodeId, uint16_t capabilityBits);
+
+// Record genuine contact with a node: refreshes both the session-scoped millis
+// stamp and the persisted absolute time, and clears stale-tracking counters.
+//
+// Call this from EVERY path that has just heard from a node. lastSeenUnix used
+// to be written only as a side effect of building the cloud upload payload, so a
+// hub with upload disabled never recorded a real contact time at all and every
+// consumer of it (dashboard, Field UI) read 0 forever.
+void noteNodeContact(NodeInfo& node);
 
 // Fold a node's FW_CAPS report into the registry (RAM only). No-op if the node
 // isn't registered. Called from handleSyncWake after draining the caps queue.

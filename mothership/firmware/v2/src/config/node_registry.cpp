@@ -184,6 +184,14 @@ static String desiredConfigKeyPrefix(const char* nodeId) {
   return String(b);
 }
 
+// Applied on every read AND write of the desired config, so the decommissioned
+// ultrasonic selector cannot enter the system from a stored legacy record, a
+// backend control command, or a hand-crafted POST — the UI pickers were only one
+// of four ingresses. See nodeCanonicalConfiguredMask() in protocol.h.
+static inline uint16_t sanitizeConfiguredSensorMask(uint16_t mask) {
+  return nodeCanonicalConfiguredMask(mask);
+}
+
 NodeDesiredConfig getDesiredConfig(const char* nodeId) {
   Preferences prefs;
   NodeDesiredConfig cfg{};
@@ -207,6 +215,13 @@ NodeDesiredConfig getDesiredConfig(const char* nodeId) {
   cfg.targetState     = prefs.getUChar((key + "t").c_str(), 2);
   cfg.sensorMask      = prefs.getUShort((key + "m").c_str(), 0);  // 0 = auto
   prefs.end();
+  // Strip the decommissioned ultrasonic-wind selector on the way out, keeping
+  // wind itself configured. This is the single chokepoint every consumer reads
+  // through — the sync broadcast, the pickers, backend control — so sanitising
+  // here is what actually removes the backend, rather than only hiding its
+  // button. A record written before decommissioning still carries the bit; it is
+  // migrated once (see migrateLegacyUltrasonicMask) and inert in the meantime.
+  cfg.sensorMask = sanitizeConfiguredSensorMask(cfg.sensorMask);
   return cfg;
 }
 
@@ -235,11 +250,84 @@ void updateStaleNodeStatus(uint32_t nowMs) {
   }
 }
 
+// One-shot migration of a desired-config record written before the ultrasonic
+// wind backend was decommissioned. Split deliberately into a read-only detect
+// and a separate retire step, because the ORDER of the two durable writes is
+// load-bearing.
+//
+// The migration must clear the node's WIND fault history — the channel is now
+// served by a different physical sensor, so inherited miss/fault evidence
+// describes the old one. That reset lives in the packed paired_nodes record,
+// while the trigger (bit 512) lives in node_dcfg: two separate durable writes.
+//
+// Retiring the trigger first is wrong. loadPairedNodes() does not itself save
+// the registry, so a power loss (or simply a config-mode session that never
+// saves) between the two leaves the evidence un-cleared with the trigger already
+// gone, and the migration can never run again. Clearing evidence first is the
+// safe direction: an interruption merely re-runs an idempotent clear next boot.
+static bool legacyUltrasonicMaskPending(const char* nodeId) {
+  if (!nodeId || !nodeId[0]) return false;
+  Preferences prefs;
+  if (!prefs.begin("node_dcfg", true)) return false;
+  const uint16_t stored =
+      prefs.getUShort((desiredConfigKeyPrefix(nodeId) + "m").c_str(), 0);
+  prefs.end();
+  return (stored & NODE_SENSOR_CFG_WIND_ULTRASONIC) != 0;
+}
+
+// Retire the trigger. Call ONLY after the cleared evidence is durable.
+static void retireLegacyUltrasonicMask(const char* nodeId) {
+  if (!nodeId || !nodeId[0]) return;
+  Preferences prefs;
+  if (!prefs.begin("node_dcfg", false)) return;
+  const String maskKey = desiredConfigKeyPrefix(nodeId) + "m";
+  const uint16_t stored = prefs.getUShort(maskKey.c_str(), 0);
+  if (stored & NODE_SENSOR_CFG_WIND_ULTRASONIC) {
+    const uint16_t cleaned = sanitizeConfiguredSensorMask(stored);
+    const bool ok = prefs.putUShort(maskKey.c_str(), cleaned) == sizeof(uint16_t);
+    Serial.printf("[REG] %s: ultrasonic wind decommissioned — mask 0x%04X -> 0x%04X %s\n",
+                  nodeId, (unsigned)stored, (unsigned)cleaned,
+                  ok ? "(wind history cleared)" : "— RETIRE FAILED, will retry next boot");
+  }
+  prefs.end();
+}
+
+void noteNodeContact(NodeInfo& node) {
+  node.lastSeen = millis();
+  node.isActive = true;
+  node.syncStale = false;
+  node.staleMissCount = 0;
+  // Only stamp an absolute time the hub can actually vouch for. A plausible-
+  // looking date is not enough: a DS3231 that lost power keeps counting from
+  // whatever it held, so it can present a perfectly reasonable post-2024
+  // timestamp that is simply wrong. rtcTimeValid() is the same gate the RTC
+  // layer itself uses to decide the clock is untrustworthy, so defer to it
+  // rather than re-deriving a weaker test here.
+  if (!rtcTimeValid()) return;
+  const uint32_t nowUnix = getRTCTime();
+  if (nowUnix < 1704067200UL) return;
+  // Never move a recorded contact backwards. If the clock is corrected downwards
+  // mid-session, the older-but-true stamp is better evidence than a new one
+  // derived from a clock we have just learned was wrong.
+  if (nowUnix > node.lastSeenUnix) node.lastSeenUnix = nowUnix;
+}
+
 void setNodeExpectedSensorMask(const char* nodeId, uint16_t capabilityBits) {
   if (!nodeId) return;
+  const uint16_t normalized = nodeNormalizeSensorMask(capabilityBits);
   for (auto& n : registeredNodes) {
     if (strncmp(n.nodeId.c_str(), nodeId, 16) == 0) {
-      n.expectedSensorMask = capabilityBits;
+      // Forget accumulated evidence for every channel whose configured state
+      // changed. Without this, disabling a sensor mid-debounce and re-enabling it
+      // left sensorMissPrev holding that channel, so its very next absence
+      // latched a fault immediately — one miss, not the two the rule promises.
+      const uint16_t changed = (uint16_t)(n.expectedSensorMask ^ normalized);
+      if (changed) {
+        n.sensorMissPrev    &= (uint16_t)~changed;
+        n.sensorFaultMask   &= (uint16_t)~changed;
+        n.lastSensorPresent &= (uint16_t)~changed;
+      }
+      n.expectedSensorMask = normalized;
       return;
     }
   }
@@ -281,6 +369,11 @@ void setNodeFirmwareCaps(const fw_caps_message_t& caps) {
 bool setDesiredConfig(const char* nodeId, const NodeDesiredConfig& cfg) {
   Preferences prefs;
   const String key = desiredConfigKeyPrefix(nodeId);
+  // Sanitise BEFORE writing, and verify against the sanitised value. Comparing
+  // the read-back (which getDesiredConfig also sanitises) against a caller's
+  // unsanitised copy would report a spurious failure for any caller that still
+  // passes the ultrasonic selector — e.g. a backend control command.
+  const uint16_t storedSensorMask = sanitizeConfiguredSensorMask(cfg.sensorMask);
   if (!prefs.begin("node_dcfg", false)) {
     Serial.println("[REG] setDesiredConfig: NVS open failed");
     return false;
@@ -291,7 +384,7 @@ bool setDesiredConfig(const char* nodeId, const NodeDesiredConfig& cfg) {
   ok = prefs.putUShort((key + "s").c_str(), cfg.syncIntervalMin) == sizeof(uint16_t) && ok;
   ok = prefs.putULong((key + "p").c_str(), cfg.syncPhaseUnix) == sizeof(uint32_t) && ok;
   ok = prefs.putUChar((key + "t").c_str(), cfg.targetState) == sizeof(uint8_t) && ok;
-  ok = prefs.putUShort((key + "m").c_str(), cfg.sensorMask) == sizeof(uint16_t) && ok;
+  ok = prefs.putUShort((key + "m").c_str(), storedSensorMask) == sizeof(uint16_t) && ok;
   prefs.end();
 
   if (!ok) return false;
@@ -301,7 +394,7 @@ bool setDesiredConfig(const char* nodeId, const NodeDesiredConfig& cfg) {
          verify.syncIntervalMin == cfg.syncIntervalMin &&
          verify.syncPhaseUnix == cfg.syncPhaseUnix &&
          verify.targetState == cfg.targetState &&
-         verify.sensorMask == cfg.sensorMask;
+         verify.sensorMask == storedSensorMask;
 }
 
 // -----------------------------------------------------------------------------
@@ -360,10 +453,7 @@ void registerNode(const uint8_t* mac,
       memcpy(existing->mac, mac, 6);
       ensurePeerOnChannel(existing->mac, ESPNOW_CHANNEL);
     }
-    existing->lastSeen = millis();
-    existing->isActive = true;
-    existing->syncStale = false;
-    existing->staleMissCount = 0;
+    noteNodeContact(*existing);
     if (nodeId && nodeId[0] != '\0' && existing->nodeId != String(nodeId)) {
       existing->nodeId = String(nodeId);
     }
@@ -424,6 +514,10 @@ void registerNode(const uint8_t* mac,
   n.lastRescueMode = false;
   n.userId = getNodeUserId(n.nodeId);
   n.name   = getNodeName(n.nodeId);
+
+  // Stamps the absolute contact time too — receiving a packet from a node we had
+  // never registered is still genuine contact.
+  noteNodeContact(n);
 
   registeredNodes.push_back(n);
   ensurePeerOnChannel(mac, ESPNOW_CHANNEL);
@@ -525,6 +619,24 @@ void savePairedNodes() {
     snprintf(key, sizeof(key), "seen%d", idx);
     writeOk = prefs.putUInt(key, n.lastSeenUnix) == sizeof(uint32_t) && writeOk;
 
+    // Configured-sensor fault state. RAM-only until now, which meant the hub
+    // forgot every fault at the power-off between wakes. Two consequences, both
+    // observed: the two-consecutive-miss debounce (sensorMissPrev) restarted
+    // from zero each wake, so a genuine fault never latched when a node
+    // delivered only one snapshot in a window; and config mode — a different
+    // boot from the sync wake that computes these — always rendered 0 for every
+    // node regardless of true state.
+    //
+    // All three ride in ONE key. The NVS partition is a shared 20 KB and this
+    // record set is already the largest tenant in it, so spending three entries
+    // per node where one suffices is capacity this design cannot spare.
+    snprintf(key, sizeof(key), "sen%d", idx);
+    const uint64_t packedSensors =
+        (uint64_t)n.sensorFaultMask |
+        ((uint64_t)n.sensorMissPrev << 16) |
+        ((uint64_t)n.lastSensorPresent << 32);
+    writeOk = prefs.putULong64(key, packedSensors) == sizeof(uint64_t) && writeOk;
+
     idx++;
   }
 
@@ -537,7 +649,8 @@ void savePairedNodes() {
   // Stale records above count are harmless, but remove them after the new count
   // is committed so a shrinking registry does not consume NVS indefinitely.
   if (writeOk && oldCount > count) {
-    const char* prefixes[] = {"mac", "id", "typ", "st", "batv", "lat", "lon", "dep", "pau", "cfgv"};
+    const char* prefixes[] = {"mac", "id", "typ", "st", "batv", "lat", "lon", "dep", "pau",
+                              "cfgv", "seen", "sen"};
     for (int stale = count; stale < oldCount; ++stale) {
       char key[16];
       for (const char* prefix : prefixes) {
@@ -617,6 +730,9 @@ void loadPairedNodes() {
   // getNodeName (which open their own "node_meta" handle). This avoids
   // any interaction between two open Preferences namespaces.
   std::vector<NodeInfo> validatedNodes;
+  // Nodes whose retired-ultrasonic trigger may only be cleared once their reset
+  // wind evidence has been durably saved. See legacyUltrasonicMaskPending().
+  std::vector<String> ultrasonicMigrationPending;
   int restored = 0;
   int skipped  = 0;
 
@@ -740,6 +856,18 @@ void loadPairedNodes() {
     uint32_t savedLastSeenUnix = 0;
     if (prefs.getType(key) == PT_U32) savedLastSeenUnix = prefs.getUInt(key, 0);
 
+    // --- Sensor fault state (optional; absent on records written before this) ---
+    snprintf(key, sizeof(key), "sen%d", i);
+    uint16_t savedFaultMask = 0;
+    uint16_t savedMissPrev = 0;
+    uint16_t savedSensorPresent = 0;
+    if (prefs.getType(key) == PT_U64) {
+      const uint64_t packedSensors = prefs.getULong64(key, 0);
+      savedFaultMask     = (uint16_t)(packedSensors & 0xFFFFULL);
+      savedMissPrev      = (uint16_t)((packedSensors >> 16) & 0xFFFFULL);
+      savedSensorPresent = (uint16_t)((packedSensors >> 32) & 0xFFFFULL);
+    }
+
     // All fields validated — build the NodeInfo record.
     NodeInfo newNode{};
     memcpy(newNode.mac, mac, 6);
@@ -775,6 +903,13 @@ void loadPairedNodes() {
     newNode.lastAppliedTargetState = PENDING_NONE;
     newNode.deployedSinceUnix    = savedDep;
     newNode.recordingPaused      = savedPaused;
+    // Restored so the debounce keeps counting across the power-off between wakes
+    // and config mode can render the fault state the last sync wake computed.
+    // expectedSensorMask is NOT stored here — it is derived below from the
+    // durable desired config, which is its single source of truth.
+    newNode.sensorFaultMask      = savedFaultMask;
+    newNode.sensorMissPrev       = savedMissPrev;
+    newNode.lastSensorPresent    = savedSensorPresent;
     newNode.syncStale            = false;
     newNode.staleMissCount       = 0;
     newNode.lastStaleAssistMs    = 0;
@@ -804,7 +939,30 @@ void loadPairedNodes() {
     // Reconstruct pending state from durable desired-vs-applied truth rather
     // than persisting millis-based transient flags. This survives every cold
     // wake and also migrates old records whose applied version defaults to 0.
+    // Clear wind evidence for a node still carrying the retired ultrasonic
+    // selector. Only the RAM half happens here — the trigger is retired after
+    // this cleared state has been persisted, below.
+    if (legacyUltrasonicMaskPending(newNode.nodeId.c_str())) {
+      newNode.sensorMissPrev    &= (uint16_t)~SNAP_PRESENT_WIND;
+      newNode.sensorFaultMask   &= (uint16_t)~SNAP_PRESENT_WIND;
+      newNode.lastSensorPresent &= (uint16_t)~SNAP_PRESENT_WIND;
+      ultrasonicMigrationPending.push_back(newNode.nodeId);
+    }
     const NodeDesiredConfig desired = getDesiredConfig(newNode.nodeId.c_str());
+    // Republish the operator's configured sensor set into the RAM cache. Without
+    // this it is only ever set by the sync-wake broadcast builder or a live UI
+    // save, so a config-mode boot had no idea which sensors were expected and
+    // could not render fault state at all. Normalised to the snapshot layout so
+    // it stays directly comparable with the restored present/miss/fault masks.
+    newNode.expectedSensorMask = (desired.sensorMask & NODE_SENSOR_MASK_VALID)
+        ? nodeNormalizeSensorMask(desired.sensorMask) : 0;
+    // Drop restored history for channels that are no longer configured. The mask
+    // can have been changed by an operator in a session after the one that wrote
+    // this record, and carrying evidence for a since-disabled sensor would let it
+    // fault on a single miss if it is ever re-enabled.
+    newNode.sensorMissPrev    &= newNode.expectedSensorMask;
+    newNode.sensorFaultMask   &= newNode.expectedSensorMask;
+    newNode.lastSensorPresent &= newNode.expectedSensorMask;
     if (desired.configVersion > newNode.configVersionApplied) {
       newNode.stateChangePending = true;
       newNode.pendingTargetState = desired.targetState == 0
@@ -812,6 +970,17 @@ void loadPairedNodes() {
       newNode.pendingSinceMs = millis();
     }
     registeredNodes.push_back(newNode);
+  }
+
+  // Complete the retired-ultrasonic migration, in the only safe order: persist
+  // the cleared wind evidence FIRST, then retire the trigger that caused it.
+  // Interrupted after the save but before the retire, the next boot simply
+  // repeats an idempotent clear; the reverse order would lose the reset forever.
+  if (!ultrasonicMigrationPending.empty()) {
+    savePairedNodes();
+    for (const String& id : ultrasonicMigrationPending) {
+      retireLegacyUltrasonicMask(id.c_str());
+    }
   }
 
   // If every stored node was rejected as corrupt, wipe the namespace so
@@ -864,6 +1033,10 @@ static const char* fwOtaStateStr(uint8_t s) {
 }
 
 String buildNodesStatusJson(uint32_t nowUnix) {
+  // Retained for call-site compatibility. No longer used: last-contact time is
+  // now stamped at contact time by noteNodeContact() instead of being derived
+  // here, so this serializer no longer needs the current clock.
+  (void)nowUnix;
   String out = "[";
   char nb[16];
   bool first = true;
@@ -871,18 +1044,15 @@ String buildNodesStatusJson(uint32_t nowUnix) {
     if (!first) out += ",";
     first = false;
 
-    // Contact THIS session is authoritative and refreshes the persisted value.
-    // Otherwise fall back to the last genuine contact carried across boots —
-    // never to "now". A node we have not heard from reports its real age, and a
-    // node never heard from reports 0, so the dashboard can say so honestly.
-    uint32_t lastSeenUnix = n.lastSeenUnix;
-    if (n.lastSeen > 0 && nowUnix > 0) {
-      uint32_t ageSec = (millis() - n.lastSeen) / 1000UL;
-      if (ageSec < nowUnix) {
-        lastSeenUnix = nowUnix - ageSec;
-        n.lastSeenUnix = lastSeenUnix;   // persisted by the next savePairedNodes
-      }
-    }
+    // The last genuine contact, stamped at contact time by noteNodeContact().
+    // A node we have not heard from reports its real age, and a node never heard
+    // from reports 0, so the dashboard can say so honestly.
+    //
+    // This deliberately does NOT compute or write the value here. It used to,
+    // which made a serializer the sole writer of durable registry state: a hub
+    // with upload disabled never called this function at all and therefore never
+    // recorded a contact time, so its Field UI read "n/a" for every node forever.
+    const uint32_t lastSeenUnix = n.lastSeenUnix;
 
     out += "{\"nodeId\":\"";  out += jsonEscapeStr(n.nodeId);            out += "\"";
     out += ",\"userId\":\"";  out += jsonEscapeStr(getNodeUserId(n.nodeId)); out += "\"";
