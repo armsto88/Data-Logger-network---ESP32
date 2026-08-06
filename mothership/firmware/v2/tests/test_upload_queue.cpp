@@ -5,15 +5,20 @@
 // could not have caught a schema-migration regression. It now links the real
 // flash_logger / upload_queue / json_payload and asserts against them.
 //
-// Scope note: the assertions below deliberately avoid UploadQueue::init(),
-// which reads and writes the NVS "tx" cursor. Clobbering a bench hub's real
-// upload cursor to run a test is not a trade worth making. Purge/drain
-// behaviour is covered by the bench acceptance run instead.
+// Scope note: the schema assertions below deliberately avoid
+// UploadQueue::init(), which reads the NVS "tx" cursor. Clobbering a bench
+// hub's real upload cursor to run a test is not a trade worth making.
+// Purge/drain behaviour is covered by the bench acceptance run instead.
+// init()'s own contract — idempotency and the retryable failure path — IS
+// covered, at the end of this file. Those cases DO drive the real cursor path,
+// so they back up and restore the NVS cursor keys around themselves; see the
+// note there.
 //
 // /datalog.csv IS written here, so it is backed up and restored around the run.
 
 #include <Arduino.h>
 #include <LittleFS.h>
+#include <Preferences.h>
 
 #include "storage/csv_schema.h"
 #include "storage/flash_logger.h"
@@ -369,6 +374,125 @@ static void testUploadAckCompatibilityHookKeepsCurrentHistory() {
         before > 0 && after == before);
 }
 
+// --- init() contract -------------------------------------------------------
+//
+// The scope note at the top of this file says the schema assertions avoid
+// init() because it touches the NVS "tx" cursor. That reasoning still holds for
+// them, but it left init() itself — including the failure path every caller now
+// has to honour — with no coverage at all.
+//
+// These cases DO drive the real cursor path, and that path can WRITE:
+// validateCursor() calls saveCursor() whenever the stored offset does not match
+// the file on disk. The fixture written here is a one-row file, so on any bench
+// hub carrying genuine upload history the stored offset is far beyond it and
+// that reset branch fires — persisting a wiped cursor to the live namespace and
+// making the hub re-send its whole retained backlog at the next sync.
+//
+// So the cursor keys are saved and put back afterwards, exactly as /datalog.csv
+// is around the whole run. Restoring is verified, not assumed: a silent failure
+// to put the cursor back is the one outcome worse than not running the test.
+static const char* kTxNamespaceForTest = "tx";
+
+// Every key saveCursor() writes. validateCursor() -> saveCursor() is the write
+// path that makes this necessary; the poison keys are not touched by it.
+struct SavedCursorNvs {
+  bool     hadOffset, hadRows, hadLastUpload, hadRetry,
+           hadWake, hadNextAttempt, hadLocalRemoved;
+  uint32_t offset, rows, lastUpload, wake, nextAttempt, localRemoved;
+  uint8_t  retry;
+  bool     opened;
+};
+
+static void backupCursorNvs(SavedCursorNvs& b) {
+  b = SavedCursorNvs{};
+  Preferences p;
+  if (!p.begin(kTxNamespaceForTest, true)) {   // read-only
+    Serial.println("[WARN] could not open \"tx\" to back up the cursor");
+    return;
+  }
+  b.opened = true;
+  b.hadOffset       = p.isKey("cursor_offset"); b.offset       = p.getUInt("cursor_offset", 0);
+  b.hadRows         = p.isKey("rows_uploaded"); b.rows         = p.getUInt("rows_uploaded", 0);
+  b.hadLastUpload   = p.isKey("last_upload");   b.lastUpload   = p.getUInt("last_upload", 0);
+  b.hadRetry        = p.isKey("retry_count");   b.retry        = p.getUChar("retry_count", 0);
+  b.hadWake         = p.isKey("wake_counter");  b.wake         = p.getUInt("wake_counter", 0);
+  b.hadNextAttempt  = p.isKey("next_attempt");  b.nextAttempt  = p.getUInt("next_attempt", 0);
+  b.hadLocalRemoved = p.isKey("local_removed"); b.localRemoved = p.getUInt("local_removed", 0);
+  p.end();
+}
+
+// A key absent before the run is removed again, not written as 0 — otherwise a
+// fresh hub would come out of the test with a cursor it never had.
+static void restoreCursorNvs(const SavedCursorNvs& b) {
+  if (!b.opened) return;
+  Preferences p;
+  if (!p.begin(kTxNamespaceForTest, false)) {   // read-write
+    check("init: cursor NVS restored after the init cases", false);
+    return;
+  }
+  if (b.hadOffset)       p.putUInt("cursor_offset", b.offset);       else p.remove("cursor_offset");
+  if (b.hadRows)         p.putUInt("rows_uploaded", b.rows);         else p.remove("rows_uploaded");
+  if (b.hadLastUpload)   p.putUInt("last_upload", b.lastUpload);     else p.remove("last_upload");
+  if (b.hadRetry)        p.putUChar("retry_count", b.retry);         else p.remove("retry_count");
+  if (b.hadWake)         p.putUInt("wake_counter", b.wake);          else p.remove("wake_counter");
+  if (b.hadNextAttempt)  p.putUInt("next_attempt", b.nextAttempt);   else p.remove("next_attempt");
+  if (b.hadLocalRemoved) p.putUInt("local_removed", b.localRemoved); else p.remove("local_removed");
+
+  const bool restored =
+      p.getUInt("cursor_offset", 0) == (b.hadOffset ? b.offset : 0) &&
+      p.getUInt("rows_uploaded", 0) == (b.hadRows ? b.rows : 0) &&
+      p.getUInt("last_upload", 0)   == (b.hadLastUpload ? b.lastUpload : 0) &&
+      p.getUChar("retry_count", 0)  == (b.hadRetry ? b.retry : 0);
+  p.end();
+  check("init: cursor NVS restored after the init cases", restored);
+}
+
+static void testInitIsIdempotent() {
+  writeDataFile(kCurrentCSVHeader35, (String(kRow31) + "\n").c_str());
+
+  UploadQueue queue;
+  check("init: first call succeeds", queue.init());
+  check("init: reports initialised after success", queue.isInitialised());
+  const UploadCursor first = queue.getCursor();
+
+  // A settings page render calls init() again. It must be a no-op returning
+  // true, not a repeat of recovery + NVS read (that is the "one [UQ] init: per
+  // boot" behaviour the bench check looks for).
+  check("init: second call is idempotent and still succeeds", queue.init());
+  const UploadCursor second = queue.getCursor();
+  check("init: idempotent call leaves the cursor unchanged",
+        first.byteOffset == second.byteOffset &&
+        first.rowsUploaded == second.rowsUploaded &&
+        first.lastUploadUnix == second.lastUploadUnix);
+}
+
+#ifdef UQ_TEST_INIT_FAILURE_HOOK
+static void testFailedInitIsRetryableAndConsumesNothing() {
+  writeDataFile(kCurrentCSVHeader35, (String(kRow31) + "\n").c_str());
+
+  UploadQueue queue;
+  UploadQueue::testForceInitFailure(true);
+  const bool failed = queue.init();
+  check("init: injected failure is reported to the caller", !failed);
+  check("init: failed init does not mark the queue initialised",
+        !queue.isInitialised());
+
+  // The caller's obligation: having seen false, it performs no queue operation.
+  // What the test can assert is the other half — the queue did not quietly
+  // half-initialise and start serving a cursor as if it were real.
+  const UploadCursor afterFail = queue.getCursor();
+  check("init: failed init leaves a default cursor, not a loaded one",
+        afterFail.byteOffset == 0 && afterFail.rowsUploaded == 0 &&
+        afterFail.lastUploadUnix == 0);
+
+  // Retryable: clearing the injected fault and calling again must succeed,
+  // rather than the object being permanently wedged by one bad boot.
+  UploadQueue::testForceInitFailure(false);
+  check("init: a later call retries after a failure", queue.init());
+  check("init: retry marks the queue initialised", queue.isInitialised());
+}
+#endif
+
 // ---------------------------------------------------------------------------
 void setup() {
   Serial.begin(115200);
@@ -396,6 +520,20 @@ void setup() {
   testStampedRowRoundTrip();
   testOversizedRowIsRejectedNotOverflowed();
   testUploadAckCompatibilityHookKeepsCurrentHistory();
+
+  // The init() cases drive the real cursor path, which can write to the live
+  // "tx" cursor (see the note above them). Save it, run them, put it back.
+  {
+    SavedCursorNvs cursorBak;
+    backupCursorNvs(cursorBak);
+    testInitIsIdempotent();
+#ifdef UQ_TEST_INIT_FAILURE_HOOK
+    testFailedInitIsRetryableAndConsumesNothing();
+#else
+    Serial.println("[SKIP] failed-init case needs -D UQ_TEST_INIT_FAILURE_HOOK");
+#endif
+    restoreCursorNvs(cursorBak);
+  }
 
   LittleFS.remove(kDataFile);
   if (hadData) LittleFS.rename(kBackupFile, kDataFile);

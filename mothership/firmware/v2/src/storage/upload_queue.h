@@ -60,9 +60,21 @@ class UploadQueue {
  public:
   UploadQueue();
 
-  // Load cursor from NVS and validate against the current file.
-  // If the file is smaller than the stored offset, reset to header end.
+  // Recover the data file, load the cursor from NVS, and validate it against
+  // the current file. Returns false if recovery or the cursor load failed, in
+  // which case the queue is NOT initialised and every accessor below is
+  // reporting defaults rather than stored state.
+  //
+  // Callers must honour the return value. A failed init leaves a zero cursor,
+  // and a zero cursor is indistinguishable from "nothing uploaded yet" — so a
+  // caller that ignores this either re-uploads history or renders a convincing
+  // zero. Idempotent: once initialised it returns true without redoing the work
+  // (this is what keeps a page load from re-running init), and after a failure a
+  // later call retries.
   bool init();
+
+  // True once init() has succeeded. Accessor values are only meaningful then.
+  bool isInitialised() const { return m_initialised; }
 
   // Read new data from /datalog.csv starting at the cursor, up to maxBytes.
   // The payload is prefixed with the CSV header.  Reading stops at a row
@@ -120,11 +132,21 @@ class UploadQueue {
   void    clearNonRetryableFailures();
   uint8_t nonRetryableFailureCount(uint32_t offset) const;
 
+#ifdef UQ_TEST_INIT_FAILURE_HOOK
+  // Test-only failure injection for init(). Compiled ONLY into the upload-queue
+  // test environment, never into production firmware. This fails the QUEUE
+  // cursor load; it is unrelated to the transmission-settings save hook in
+  // config/transmission_settings.h, which fails a different namespace at a
+  // different layer.
+  static void testForceInitFailure(bool on);
+#endif
+
  private:
   // Persist m_cursor to NVS namespace "tx".
   void saveCursor();
-  // Load m_cursor from NVS.
-  void loadCursor();
+  // Load m_cursor from NVS. Returns false if the namespace could not be opened,
+  // i.e. the cursor in RAM is defaults rather than what is stored.
+  bool loadCursor();
   // Persist the poison-row counters to NVS namespace "tx".
   void savePoisonState();
   // Byte offset of the first data row (end of header line).

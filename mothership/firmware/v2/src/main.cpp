@@ -30,6 +30,7 @@
 #include "comms/espnow_config.h"
 #include "config/config_server.h"
 #include "config/transmission_settings.h"
+#include "config/sim_settings.h"
 #include "storage/upload_queue.h"
 #include "storage/json_payload.h"
 #include "comms/modem_driver.h"
@@ -923,6 +924,11 @@ void performModemUpload(const TransmissionSettings& txSettings, uint32_t session
 
   ModemDriver modem;
   modem.init();
+  {
+    SimSettings sim;
+    loadSimSettings(sim);
+    modem.configureApn(sim.apn, sim.apnUser, sim.apnPass);
+  }
 
   auto sessionExpired = [&]() -> bool {
     return millis() - sessionStartMs > kSyncSessionLimitMs;
@@ -1594,9 +1600,16 @@ void handleSyncWake() {
 
   // Init upload queue (after flash is ready) and enforce retention before
   // logging new data so there is always space for incoming node snapshots.
+  // A failed init leaves a zero cursor. Running retention against that would
+  // evict history the hub has not actually uploaded, so nothing cursor-dependent
+  // runs unless init succeeded.
   if (flashIsReady()) {
-    uploadQueue.init();
-    uploadQueue.emergencyPurgeIfFull(kLittleFsRetentionHighWaterPct);
+    if (uploadQueue.init()) {
+      uploadQueue.emergencyPurgeIfFull(kLittleFsRetentionHighWaterPct);
+    } else {
+      Serial.println("[WARN] Upload queue init failed — skipping retention purge "
+                     "and all cursor-dependent work this wake");
+    }
   }
 
   // Load paired/deployed nodes from NVS so fleet counts and node metadata
@@ -1796,7 +1809,14 @@ void handleSyncWake() {
     sessionTimedOut = true;
   }
 
-  if (!sessionTimedOut && txSettings.enabled && flashIsReady()) {
+  // uploadQueue.isInitialised() gates the whole upload block: every call below
+  // reads or advances the cursor, and on a failed init that cursor is zeros.
+  // Uploading against it would re-send the entire retained history and then
+  // advance from a false position.
+  if (!sessionTimedOut && txSettings.enabled && flashIsReady() &&
+      !uploadQueue.isInitialised()) {
+    Serial.println("[UPLOAD] Upload queue not initialised — skipping upload this wake");
+  } else if (!sessionTimedOut && txSettings.enabled && flashIsReady()) {
     uploadQueue.incrementWakeCounter();
 
     // Determine upload policy: uploadIntervalMin=0 means every wake.

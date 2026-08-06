@@ -96,6 +96,58 @@ cloud OTA. The full field reference remains in
 
 Build success alone does not satisfy these hardware and backend acceptance gates.
 
+## Planned — cloud-provisioning integrity + UX rework (not yet accepted)
+
+Landed in source and building clean as of 2026-08-06. **Nothing below has been
+run on hardware**, so none of it counts as acceptance evidence; it is recorded
+here as planned work with its own gates, deliberately kept out of the evidence
+section below. Flashing waits on Journey A phases 3-5 sign-off.
+
+Outstanding hardware checks:
+
+1. **Forged endpoint rejected.** POST `url=https://evil.example/x` to
+   `/save-settings`; the stored FieldMesh endpoint is unchanged.
+2. **Poisoned state neutralised, durable, visibly stuck.** Pre-store a
+   disallowed endpoint. Confirm upload disabled, key erased, and the
+   `fieldmesh_reprovision_required` marker set. **Reboot** and confirm the
+   warning is still shown on Home, Settings and `/provision` — remediation flips
+   the mode to local-only, so the raw detection condition is false from then on;
+   only the separate durable marker keeps the warning alive.
+   `/set-data-destination` must refuse `mode=fieldmesh` while it is set.
+3. **Key rotation.** After revoking via the existing dashboard revoke action,
+   the old key is rejected (401). Issuing a new key without revoking is *not*
+   recovery.
+4. **Save failure surfaces at every caller.** Build
+   `mothership-v2-hook-tx-save-failure`, POST `/test/tx-fail-save?on=1`, then
+   confirm `/provision-apply`, `/set-data-destination` (both branches),
+   `/set-custom-destination` and `/save-settings` all report failure — four
+   callers, not just provisioning. (Never flash this image for field use.)
+5. **Queue init.** One `[UQ] init:` line per boot; no `nvs_erase_key fail`; with
+   the `mothership-v2-test-upload-queue` hook, a failed init makes manual upload
+   abort and pages read "unavailable", never zeros.
+6. **Copy control.** Android Chrome and iOS Safari: genuinely copies, or honestly
+   reports the fallback. With JS disabled the MAC still selects as one value.
+7. **Fragment entry.** `/provision#FM1.<payload>` opens step 2 in its
+   confirmation state, not step 1.
+8. **iOS scanning.** In-page scan hidden; the camera-app route offered as a
+   normal option (WebKit's Barcode Detection issue is open, not a permanent
+   absence).
+9. **No truncation.** `/`, `/settings`, `/setup` and `/provision` each contain
+   the `<!--FM-PAGE-END-->` marker.
+10. **No `arg missing value: 0`** after "Looks good".
+11. **Wizard renumbering.** `/setup` has 7 steps, not 8; a fresh local-only
+    walkthrough reaches the final step; Back out of the Time step returns to
+    step 1 when no cloud connection was made.
+12. **Status honesty.** Settings shows "FieldMesh configured" and "Last
+    successful upload: …" as two separate facts; no page claims "Connected".
+13. **SIM/APN.** A hub with no `SimSettings` still connects on the preserved
+    default; a changed APN takes effect at the next upload with no reflash; a
+    `"` or newline in the APN field is rejected by the form.
+14. **Real convergence.** The next sync produces a successful authenticated
+    upload **and** `last_seen` advances for this FieldHub in the intended
+    project. Presence in the project proves nothing on its own — a hub is listed
+    from the moment it is registered, so the check is a delta.
+
 ## Acceptance evidence
 
 ### 2026-08-02 — bench FieldHub on COM4

@@ -98,6 +98,15 @@ class ModemDriver {
   // UART is NOT started here — it starts in powerOn() after boot.
   void init();
 
+  // Set the APN (and optional carrier PAP credentials) used when the PDP
+  // context is configured. Call after init() and before powerOn(). Values must
+  // already have passed simSettingsFieldValid() — they are spliced into quoted
+  // AT arguments. Blank apn leaves the built-in default in place; blank user
+  // means no authentication command is issued at all.
+  void configureApn(const String& apn,
+                    const String& user = String(),
+                    const String& pass = String());
+
   // Rail -> PG -> PWRKEY -> boot -> UART ready.
   // Returns true if AT responds.
   bool powerOn();
@@ -159,6 +168,17 @@ class ModemDriver {
   ModemState m_state = ModemState::OFF;
   String m_imei;
   bool m_uartStarted = false;
+
+  // APN + optional carrier credentials. Defaulted in the constructor to the
+  // value that used to be compiled in, so an unconfigured hub is unchanged.
+  String m_apn;
+  String m_apnUser;
+  String m_apnPass;
+
+  // AT+CGDCONT (+ AT+CGAUTH when credentials are set) then AT+CGACT. Shared by
+  // httpsPost() and httpsGetStream(), which each carried their own copy of this
+  // block with the APN hardcoded into it.
+  void configurePdpContext();
 
   // Send cmd\r\n, wait for OK/ERROR. Returns true if OK.
   bool sendAT(const char* cmd, String& response, uint32_t timeoutMs);

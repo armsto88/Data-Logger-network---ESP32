@@ -1,8 +1,32 @@
 #include "config/transmission_settings.h"
 #include <Preferences.h>
 
+#include "system/hardware_identity.h"   // hwEndpointAllowed()
+
 // NVS namespace for all transmission / upload settings.
 static const char* kTxNamespace = "tx";
+
+// Durable re-provisioning marker keys. NVS keys are capped at 15 characters, so
+// the conceptual name (fieldmesh_reprovision_required) is abbreviated here.
+static const char* kReprovReqKey    = "reprov_req";
+static const char* kReprovReasonKey = "reprov_why";
+static const char* kReprovHostKey   = "reprov_host";
+static const char* kReprovKeyPfxKey = "reprov_kpfx";
+
+// Host portion of an https:// URL ("" if it isn't one). Non-secret.
+static String endpointHostOf(const String& url) {
+  if (!url.startsWith("https://")) return String("");
+  const int hostStart = 8;   // strlen("https://")
+  int hostEnd = url.indexOf('/', hostStart);
+  if (hostEnd < 0) hostEnd = url.length();
+  return url.substring(hostStart, hostEnd);
+}
+
+#ifdef TX_TEST_NVS_FAILURE_HOOK
+static bool s_txTestForceSaveFailure = false;
+void txTestForceSaveFailure(bool on) { s_txTestForceSaveFailure = on; }
+bool txTestSaveFailureForced() { return s_txTestForceSaveFailure; }
+#endif
 
 const char* txDestinationModeName(TxDestinationMode mode) {
   switch (mode) {
@@ -11,6 +35,60 @@ const char* txDestinationModeName(TxDestinationMode mode) {
     case TX_DEST_LOCAL_ONLY:
     default:                   return "local_only";
   }
+}
+
+// ---------------------------------------------------------------------------
+// Durable "re-provisioning required" marker
+// ---------------------------------------------------------------------------
+static String reprovStringKey(const char* key) {
+  Preferences prefs;
+  if (!prefs.begin(kTxNamespace, true)) return String("");
+  char buf[128] = {};
+  prefs.getString(key, buf, sizeof(buf));
+  buf[sizeof(buf) - 1] = '\0';
+  prefs.end();
+  return String(buf);
+}
+
+bool txReprovisionRequired() {
+  Preferences prefs;
+  if (!prefs.begin(kTxNamespace, true)) return false;
+  const bool required = prefs.getBool(kReprovReqKey, false);
+  prefs.end();
+  return required;
+}
+
+String txReprovisionReason()    { return reprovStringKey(kReprovReasonKey); }
+String txReprovisionHost()      { return reprovStringKey(kReprovHostKey); }
+String txReprovisionKeyPrefix() { return reprovStringKey(kReprovKeyPfxKey); }
+
+void txSetReprovisionRequired(const char* reason,
+                              const String& host,
+                              const String& keyPrefix) {
+  Preferences prefs;
+  if (!prefs.begin(kTxNamespace, false)) {
+    Serial.println("[TX] NVS begin(\"tx\") failed — re-provision marker NOT set");
+    return;
+  }
+  prefs.putBool(kReprovReqKey, true);
+  prefs.putString(kReprovReasonKey, String(reason ? reason : ""));
+  prefs.putString(kReprovHostKey, host);
+  prefs.putString(kReprovKeyPfxKey, keyPrefix);
+  prefs.end();
+  Serial.printf("[TX] re-provisioning required (reason=%s host=%s)\n",
+                reason ? reason : "", host.c_str());
+}
+
+void txClearReprovisionRequired() {
+  Preferences prefs;
+  if (!prefs.begin(kTxNamespace, false)) return;
+  if (!prefs.getBool(kReprovReqKey, false)) { prefs.end(); return; }
+  prefs.putBool(kReprovReqKey, false);
+  prefs.putString(kReprovReasonKey, String(""));
+  prefs.putString(kReprovHostKey, String(""));
+  prefs.putString(kReprovKeyPfxKey, String(""));
+  prefs.end();
+  Serial.println("[TX] re-provisioning marker cleared");
 }
 
 // ---------------------------------------------------------------------------
@@ -139,6 +217,44 @@ void loadTransmissionSettings(TransmissionSettings& s) {
     s.enabled = false;
   }
 
+  // Fail-closed remediation for a poisoned FieldMesh endpoint.
+  //
+  // A hub that was pointed at an unapproved host (historically possible through
+  // the request-controlled endpoint writers on /save-settings, now removed) has
+  // handed its device key to that host. Firmware cannot un-leak the key, so it
+  // does the two things it can: stop using it, and keep saying so until the
+  // operator revokes it on the dashboard and re-provisions.
+  //
+  // Custom HTTPS is an explicit operator-owned sink and is exempt: it is
+  // supposed to point somewhere off the allow-list.
+  if (s.destinationMode == TX_DEST_FIELDMESH && !hwEndpointAllowed(s.endpointUrl)) {
+    const String badHost = endpointHostOf(s.endpointUrl);
+    // Non-secret prefix only, so the operator can identify which key to revoke.
+    const String keyPrefix = (s.apiKey.length() > 6) ? s.apiKey.substring(0, 6)
+                                                      : String("");
+    Serial.printf("[TX] FieldMesh endpoint host '%s' is not approved — "
+                  "disabling upload and clearing the stored key\n",
+                  badHost.c_str());
+    s.destinationMode = TX_DEST_LOCAL_ONLY;
+    s.enabled         = false;
+    s.apiKey          = String("");
+    s.endpointUrl     = String(DEFAULT_ENDPOINT_URL);
+
+    Preferences fc;
+    if (fc.begin(kTxNamespace, false)) {
+      fc.putUChar("dest_mode", static_cast<uint8_t>(TX_DEST_LOCAL_ONLY));
+      fc.putBool("enabled", false);
+      fc.putString("api_key", String(""));
+      fc.putString("url", s.endpointUrl);
+      fc.end();
+    } else {
+      Serial.println("[TX] NVS begin(rw) failed — fail-closed state not persisted");
+    }
+    // Separate durable marker: the condition above is false from here on, so
+    // without this the warning would disappear after this one load.
+    txSetReprovisionRequired("endpoint_not_allowed", badHost, keyPrefix);
+  }
+
   // Sanity clamp: stale NVS values from the config UI (e.g. old 256 KB
   // default) are larger than the ESP32 free heap can support in a single
   // session.  Anything above 128 KB is almost certainly a leftover and is
@@ -164,76 +280,111 @@ void loadTransmissionSettings(TransmissionSettings& s) {
 // ---------------------------------------------------------------------------
 // saveTransmissionSettings
 // ---------------------------------------------------------------------------
-void saveTransmissionSettings(const TransmissionSettings& s) {
+bool saveTransmissionSettings(const TransmissionSettings& s) {
+#ifdef TX_TEST_NVS_FAILURE_HOOK
+  if (txTestSaveFailureForced()) {
+    Serial.println("[TX] TEST HOOK: forcing save failure");
+    return false;
+  }
+#endif
   Preferences prefs;
   if (!prefs.begin(kTxNamespace, false)) {   // read-write
     Serial.println("[TX] NVS begin(\"tx\") failed — cannot save");
-    return;
+    return false;
   }
 
-  prefs.putBool("enabled", s.enabled);
-  prefs.putUChar("dest_mode", static_cast<uint8_t>(s.destinationMode));
-  prefs.putString("url", s.endpointUrl);
-  prefs.putString("token", s.authToken);
-  prefs.putString("api_key", s.apiKey);
-  prefs.putString("custom_url", s.customEndpointUrl);
-  prefs.putString("custom_token", s.customBearerToken);
-  prefs.putString("mothership_id", s.mothershipId);
-  prefs.putString("project_id", s.projectId);
-  prefs.putString("site_id", s.siteId);
-  prefs.putString("deploy_id", s.deploymentId);
-  prefs.putUShort("upload_min", s.uploadIntervalMin);
-  prefs.putUInt("phase_unix", s.uploadPhaseUnix);
-  prefs.putUShort("min_bat_mv", s.minBatteryMv);
-  prefs.putUInt("max_bytes", s.maxBytesPerSession);
-  prefs.putUChar("max_retries", s.maxRetriesPerWindow);
-  prefs.putBool("allow_manual", s.allowManualUpload);
-  prefs.putBool("use_json", s.useJsonUpload);
+  // Every put*() is checked. Preferences returns the number of bytes stored (0
+  // on failure), so a silent partial write can no longer be reported as a save.
+  bool ok = true;
+  auto note = [&ok](size_t written, const char* key) {
+    if (written == 0) {
+      ok = false;
+      Serial.printf("[TX] NVS write failed for key \"%s\"\n", key);
+    }
+  };
+
+  note(prefs.putBool("enabled", s.enabled), "enabled");
+  note(prefs.putUChar("dest_mode", static_cast<uint8_t>(s.destinationMode)), "dest_mode");
+  note(prefs.putUShort("upload_min", s.uploadIntervalMin), "upload_min");
+  note(prefs.putUInt("phase_unix", s.uploadPhaseUnix), "phase_unix");
+  note(prefs.putUShort("min_bat_mv", s.minBatteryMv), "min_bat_mv");
+  note(prefs.putUInt("max_bytes", s.maxBytesPerSession), "max_bytes");
+  note(prefs.putUChar("max_retries", s.maxRetriesPerWindow), "max_retries");
+  note(prefs.putBool("allow_manual", s.allowManualUpload), "allow_manual");
+  note(prefs.putBool("use_json", s.useJsonUpload), "use_json");
+
+  // putString() of an EMPTY value legitimately stores 0 bytes, so those writes
+  // are checked against remove-or-store semantics instead of a byte count.
+  auto putStr = [&](const char* key, const String& value) {
+    if (value.length() == 0) {
+      // Storing "" is how a field is cleared (e.g. the burned key). remove()
+      // returns false when the key was already absent, which is success here.
+      prefs.remove(key);
+      if (prefs.isKey(key)) {
+        ok = false;
+        Serial.printf("[TX] NVS clear failed for key \"%s\"\n", key);
+      }
+      return;
+    }
+    note(prefs.putString(key, value), key);
+  };
+
+  // "url" belongs here, not on the byte-count path above: an empty endpointUrl
+  // stores 0 bytes exactly like any other empty String, so checking it by count
+  // would report a successful write as a failure — and that false failure would
+  // send the caller into txRecoverAfterFailedSave(), disabling FieldMesh and
+  // demanding re-provisioning over a save that actually worked. Clearing the key
+  // is the correct representation: the loader already treats an absent/empty URL
+  // as "use DEFAULT_ENDPOINT_URL".
+  putStr("url", s.endpointUrl);
+  putStr("token", s.authToken);
+  putStr("api_key", s.apiKey);
+  putStr("custom_url", s.customEndpointUrl);
+  putStr("custom_token", s.customBearerToken);
+  putStr("mothership_id", s.mothershipId);
+  putStr("project_id", s.projectId);
+  putStr("site_id", s.siteId);
+  putStr("deploy_id", s.deploymentId);
 
   prefs.end();
+  if (!ok) {
+    Serial.println("[TX] Settings NOT saved — one or more NVS writes failed");
+    return false;
+  }
   Serial.println("[TX] Settings saved to NVS");
+  return true;
 }
 
 // ---------------------------------------------------------------------------
-// transmissionSettingsToJson
+// txRecoverAfterFailedSave
 // ---------------------------------------------------------------------------
-String transmissionSettingsToJson(const TransmissionSettings& s) {
-  // Escape quotes in strings (basic, sufficient for URLs / IDs).
-  auto esc = [](const String& v) -> String {
-    String out;
-    out.reserve(v.length() + 8);
-    for (size_t i = 0; i < v.length(); i++) {
-      char c = v[i];
-      if (c == '"' || c == '\\') { out += '\\'; out += c; }
-      else { out += c; }
-    }
-    return out;
-  };
+// There is no rollback: Preferences commits each key individually, so a failed
+// save can leave the endpoint written and the key not (or the reverse). All the
+// firmware can do is look at what actually landed and refuse to keep operating
+// on an incoherent credential set.
+bool txRecoverAfterFailedSave() {
+  TransmissionSettings after;
+  loadTransmissionSettings(after);   // may itself apply the fail-closed state
 
-  String j;
-  j.reserve(512);
-  j += "{";
-  j += "\"destinationMode\":\"";
-  j += txDestinationModeName(s.destinationMode);
-  j += "\",";
-  j += "\"enabled\":" + String(s.enabled ? "true" : "false") + ",";
-  j += "\"endpointUrl\":\"" + esc(s.endpointUrl) + "\",";
-  j += "\"authToken\":\"" + esc(s.authToken) + "\",";
-  j += "\"apiKey\":\"" + esc(s.apiKey) + "\",";
-  j += "\"customEndpointUrl\":\"" + esc(s.customEndpointUrl) + "\",";
-  j += "\"mothershipId\":\"" + esc(s.mothershipId) + "\",";
-  j += "\"projectId\":\"" + esc(s.projectId) + "\",";
-  j += "\"siteId\":\"" + esc(s.siteId) + "\",";
-  j += "\"deploymentId\":\"" + esc(s.deploymentId) + "\",";
-  j += "\"uploadIntervalMin\":" + String(s.uploadIntervalMin) + ",";
-  j += "\"uploadPhaseUnix\":" + String(s.uploadPhaseUnix) + ",";
-  j += "\"minBatteryMv\":" + String(s.minBatteryMv) + ",";
-  j += "\"maxBytesPerSession\":" + String(s.maxBytesPerSession) + ",";
-  j += "\"maxRetriesPerWindow\":" + String(s.maxRetriesPerWindow) + ",";
-  j += "\"allowManualUpload\":" + String(s.allowManualUpload ? "true" : "false") + ",";
-  j += "\"useJsonUpload\":" + String(s.useJsonUpload ? "true" : "false");
-  j += "}";
-  return j;
+  if (txReprovisionRequired()) return true;   // already neutralised on load
+
+  const bool incoherent =
+      after.destinationMode == TX_DEST_FIELDMESH &&
+      (!hwEndpointAllowed(after.endpointUrl) || after.apiKey.length() == 0);
+  if (!incoherent) return false;
+
+  Serial.println("[TX] Partial save left an incoherent FieldMesh credential set "
+                 "— applying fail-closed state");
+  Preferences prefs;
+  if (prefs.begin(kTxNamespace, false)) {
+    prefs.putUChar("dest_mode", static_cast<uint8_t>(TX_DEST_LOCAL_ONLY));
+    prefs.putBool("enabled", false);
+    prefs.remove("api_key");
+    prefs.end();
+  }
+  txSetReprovisionRequired("save_failed", endpointHostOf(after.endpointUrl),
+                           String(""));
+  return true;
 }
 
 // ---------------------------------------------------------------------------
