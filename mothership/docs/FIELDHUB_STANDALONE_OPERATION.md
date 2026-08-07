@@ -143,10 +143,17 @@ Outstanding hardware checks:
 13. **SIM/APN.** A hub with no `SimSettings` still connects on the preserved
     default; a changed APN takes effect at the next upload with no reflash; a
     `"` or newline in the APN field is rejected by the form.
-14. **Real convergence.** The next sync produces a successful authenticated
+14. ~~**Real convergence.** The next sync produces a successful authenticated
     upload **and** `last_seen` advances for this FieldHub in the intended
     project. Presence in the project proves nothing on its own — a hub is listed
-    from the moment it is registered, so the check is a delta.
+    from the moment it is registered, so the check is a delta.~~
+    **Partially satisfied 2026-08-07 — see that entry below.** A real,
+    unattended scheduled sync produced three authenticated `200 OK` uploads to
+    the FieldMesh ingest function with server-side `"success":true` bodies, and
+    the operator confirmed the data appeared on the dashboard. The delta check
+    itself (fleet `last_seen` advancing) was not independently re-verified
+    against the dashboard's own display — only that the readings landed and
+    rendered as expected.
 
 ## Acceptance evidence
 
@@ -505,3 +512,135 @@ a decision on grouping); deciding whether to annotate the three historical
 V1-era docs that reference the now-removed `mothership/firmware/v1/` tree
 (unrelated repo-cleanup task done the same session, not a field-operation
 change, so not otherwise recorded in this document).
+
+### 2026-08-07 — local-to-cloud commissioning journey ("Journey A"), live on COM4
+
+Built on `6963872` ("consolidate cloud connect flow, add cellular to
+provision wizard") — the commit that introduced the `/provision` wizard this
+session exercises. All fixes below are **uncommitted working-tree changes**
+as of this entry, flashed and bench-verified but not yet committed. Same
+physical fleet as 2026-08-05/06 (nodes seen this session: `001`/"Node 1",
+`002`/"Node 2", `004`/"Node 4 2nd").
+
+**Unrelated fix landed earlier the same session, kept separate from the
+cloud narrative below but recorded here for completeness:** a node's
+`deployPending` flag (set when `DEPLOY_NODE` is sent, meant to be cleared
+only by a genuine `DEPLOY_ACK`/`NODE_HELLO`) was RAM-only
+(`node_registry.cpp`), so it reset to `false` on every reload — and this hub
+power-cycles on every wake. A node commanded to deploy while powered off
+therefore read "Active" within seconds of the hub restarting, even though it
+had never received the command. Fixed by bit-packing the flag into the
+existing `pau%d` NVS byte (bit 1, alongside `recordingPaused`) instead of
+spending a new NVS entry on the already-largest tenant in a shared 20 KB
+partition. **A second, load-bearing fix was required alongside it:**
+`collectHellos()` (`main.cpp`, the sync-wake HELLO handler) never cleared
+`deployPending` — only the config-mode `handleNodeHello()` did — so
+persisting the flag without also clearing it there would have made every
+healthy node in the fleet read "Not confirmed" forever after one real sync.
+**Hardware evidence:** reproduced live (deployed a powered-off node → card
+read "Not confirmed" → power-cycled the hub → still "Not confirmed",
+confirming the bug; the pre-fix behavior was "Active"), then recovered
+correctly on a real sync window with all 4 nodes responding
+(`rendezvous closed: responders=4 deployed=4`, `CONFIG_ACK converged` for
+all four) — confirmed no false positives on already-healthy nodes.
+
+**The cloud journey being tested:** a hub already recording locally (nodes
+deployed, real sensor data queued from earlier sessions, no cloud
+destination configured) is connected to FieldMesh via `/provision`, then
+"finished." Three bugs surfaced, all in `config_server.cpp`:
+
+1. **The wizard's finish path never triggered an upload.** `handleShutdown()`
+   (behind "Save & Start Recording", `POST /start`) only calls
+   `performManualUpload()` when `gDeployedThisSession || gFieldChangeThisSession
+   || queuedEvents > 0` — all three keyed to node deploy/lifecycle activity.
+   Connecting the hub to the cloud via `/provision-apply` set none of them, so
+   a hub with a real local-recording backlog powered down without uploading
+   it, silently. Fixed by adding `gCloudConnectedThisSession` (set in
+   `handleProvisionApply()` on success, same pattern as the other two flags)
+   **and** `gUploadQueue.getPendingBytes() > 0` as a fourth OR-condition — the
+   latter closes the gap for *any* untracked reason data might be waiting
+   (the very next bug found was exactly such a case).
+   **Not independently hardware-confirmed in the true-positive branch:** every
+   test this session that reached this code path found `pending=0` (see
+   below), so the new `[UI] Field change this session (... pending=%d)` log
+   line was observed correctly staying silent, never observed firing with
+   `pending=1` on real hardware. The eventual successful upload (below) went
+   through the pre-existing scheduled-sync path in `main.cpp`
+   (`performModemUpload()`), not through this fix. Logic reviewed and
+   consistent with the working scheduled path, but flagged here per this
+   document's standard rather than claimed as proven.
+   **A parallel, still-open gap, deliberately not fixed:** `handleSetTransmission()`
+   (the Settings page's main "Save" button, `/save-settings`) also sets none
+   of the four flags when the operator flips "Enable cloud upload" on from
+   Settings rather than through the wizard. Left open because the
+   pending-bytes check already covers the actual risk (unsent data); the flag
+   would only add a heartbeat-style sync on a session with zero pending bytes.
+2. **The Settings page's "Save" button did nothing — confirmed on hardware
+   before the fix.** `handleSettings()` opened a second, nested
+   `<form action='/set-sim-config'>` (Cellular settings) *inside* the
+   still-open `<form action='/save-settings'>`. Nested `<form>` elements are
+   invalid HTML; the browser silently drops the inner `<form>` open tag but
+   still honours its `</form>` close tag, which closed the outer form early —
+   leaving the "Save" button, added after it in source order, outside any
+   form and unable to submit at all. Fixed by closing `/save-settings`
+   immediately after the fields it owns and making Cellular settings a
+   sibling form instead of a nested one. **Hardware evidence:** before the
+   fix, toggling "Allow dashboard changes to nodes" and pressing Save
+   produced no `[TX] Settings saved` line at all. After the fix, the operator
+   confirmed the toggle now persists, and serial showed
+   `[TX] Settings saved to NVS` / `[UI] Transmission settings saved:
+   enabled=1 url=https://...supabase.co/functions/v1/ingest-fieldmesh`.
+3. **QR/camera guidance read as self-contradictory.** The wizard shows two
+   different QR codes with opposite instructions three screens apart: step 1's
+   hub-registration QR says "not your phone's camera app" (it carries a
+   `fieldmesh://` link only the dashboard's own scanner can open); step 2's
+   dashboard connection-code QR says the opposite. Both instructions are
+   correct — they're different codes — but neither referenced the other.
+   Fixed with copy only (no mechanism change): step 1 now forward-references
+   that the next QR is scanned differently, and step 2 explicitly names the
+   contrast against the one just seen. Not independently field-tested with a
+   first-time operator's eyes.
+
+**Hardware evidence — real cloud delivery, this session (COM4, live serial):**
+a scheduled sync-wake (`main.cpp`'s `performModemUpload()`, independent of
+the config-mode fixes above) powered the modem, registered on LTE
+(`rssi=-77dBm`, `op=26203 act=LTE`), and posted three JSON batches to
+`https://unhzttnuayrgqrzeqetz.supabase.co/functions/v1/ingest-fieldmesh`, all
+`HTTP 200`:
+
+```
+[UPLOAD] JSON SUCCESS: HTTP 200, 36 readings
+[UQ] advanceCursor: offset=100437 ts=1786087378 rows+=36 total=437
+...
+[UPLOAD] JSON SUCCESS: HTTP 200, 36 readings
+[UQ] advanceCursor: offset=108794 ts=1786087395 rows+=36 total=473
+...
+[UPLOAD] JSON SUCCESS: HTTP 200, 4 readings
+[UQ] advanceCursor: offset=109708 ts=1786087408 rows+=4 total=477
+```
+
+76 rows total, matching the reported pending count exactly; cursor advanced
+correctly after each POST, no re-send. Response bodies confirmed
+server-side acceptance (`{"success":true,"appended":36,"duplicate":false,...}`).
+Modem shut down gracefully, next sync alarm armed, clean power-off. The
+operator confirmed the data appeared on the dashboard afterward. This is the
+same underlying upload mechanism (`performManualUpload`/`performModemUpload`
+→ `ModemDriver::httpsPost()`) both the wizard-finish fix and the pre-existing
+scheduled path share — so while item 1 above's specific trigger logic wasn't
+directly exercised, the pipeline it would have triggered is now proven live.
+
+**Not run / not resolved this session:**
+
+- `handleShutdown()`'s new `gCloudConnectedThisSession`/pending-bytes branch
+  — logic-reviewed and pattern-matched against working code, not yet
+  observed firing on real hardware (see above).
+- The parallel gap in `handleSetTransmission()` — identified, deliberately
+  left open.
+- `updateStaleNodeStatus()` (unrelated, found while investigating the
+  deploy-confirmation fix) computes node staleness from the millis-based
+  `lastSeen`, which is zero after every boot on this hub — `missed` is
+  always 0 and nothing is ever marked stale. Pre-existing, not touched this
+  session; should compare the persisted `lastSeenUnix` against RTC time
+  instead.
+- QR/camera copy changes have no human-factors confirmation yet — only that
+  the two instructions no longer contradict each other on the page.

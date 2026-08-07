@@ -245,6 +245,14 @@ static bool gDeployedThisSession = false;
 // pending schedule handover pins the wake to the OLD slot).
 static bool gFieldChangeThisSession = false;
 
+// Set true when the operator successfully connects the hub to the cloud this
+// session (handleProvisionApply). Without this, a hub that already had queued
+// data from an earlier local-recording session would connect to the cloud,
+// then power down via "Save & Start Recording" without ever uploading it —
+// the shutdown gate only looked at node deploy/change activity, never at
+// whether a cloud destination was just established.
+static bool gCloudConnectedThisSession = false;
+
 // Upload queue instance for config-mode UI (separate from the sync-wake
 // global in main.cpp, which is only active during a sync wake).
 UploadQueue gUploadQueue;
@@ -1732,12 +1740,16 @@ function flashBtn(btn, ok){
 }
 
 // --- Node cards: incremental, XSS-safe (textContent for device strings) ---
-function chipState(state, paused, pending, desiredTarget, ended, reportedPaused){
+function chipState(state, paused, pending, desiredTarget, ended, reportedPaused, deployUnconfirmed){
   if (pending && Number(desiredTarget)===0) return ['chip chip--state-unpaired','Remove queued'];
   // Ended outranks paused, matching the server-rendered chips. End queues
   // STANDBY and keeps the node DEPLOYED, so every test below would otherwise
   // call an archived deployment "Paused".
   if (ended) return ['chip chip--bat-low','Ended'];
+  // An unconfirmed deploy outranks every queued-config label below it: the node
+  // has never acknowledged the deploy, so it is not hearing us at all and
+  // "Pause queued" / "Update queued" would imply a link that does not exist.
+  if (state==='DEPLOYED' && deployUnconfirmed) return ['chip chip--bat-low','Not confirmed'];
   if (state==='DEPLOYED' && pending && Number(desiredTarget)===3) return ['chip chip--state-paused','Pause queued'];
   // Only a node that is actually paused is resuming. A settings change leaves a
   // pending desired config at targetState 2 as well, and calling that "Resume
@@ -1767,7 +1779,7 @@ function nodeCell(parentClass, labelText, fieldName){
 }
 function applyNodeFields(card, n){
   if (card && card.dataset){ card.dataset.state=n.state||''; card.dataset.paused=n.paused?'1':'0'; }
-  var st=chipState(n.state, n.paused, n.pending, n.desiredTarget, n.deploymentEnded, n.reportedPaused), s=card.querySelector('[data-f="status"]');
+  var st=chipState(n.state, n.paused, n.pending, n.desiredTarget, n.deploymentEnded, n.reportedPaused, n.deployUnconfirmed), s=card.querySelector('[data-f="status"]');
   if (s){ s.className=st[0]; s.textContent=st[1]; }
   var bt=chipBatt(n.batV), b=card.querySelector('[data-f="batt"]');
   if (b){ b.className=bt[0]; b.textContent=bt[1]; }
@@ -2531,6 +2543,11 @@ static String buildLiveJson() {
     j += ",\"recMin\":";  j += String(recMin);
     j += ",\"paused\":";  j += mirroredPaused ? "true" : "false";
     j += ",\"pending\":"; j += (n.stateChangePending || n.deployPending) ? "true" : "false";
+    // Reported separately from "pending" above, which merges two unrelated
+    // meanings. This one is specifically "we sent DEPLOY_NODE and the node has
+    // never confirmed it" — a node that may not be deployed at all, as opposed
+    // to a deployed node with a config change queued.
+    j += ",\"deployUnconfirmed\":"; j += n.deployPending ? "true" : "false";
     j += ",\"desiredTarget\":"; j += String((unsigned)desiredTarget);
     // Needed by chipState(): an ended deployment is state DEPLOYED with STANDBY
     // queued, so without this the live refresh repaints an archived node as
@@ -3613,8 +3630,14 @@ static void handleStationsPage() {
     // view an operator scans before choosing a batch action. Pause and End have
     // different consequences and must not share a word.
     const bool nodeEnded = (node.deploymentEndedUnix != 0);
+    // Deploy commanded but never acknowledged. Rendered here as well as in the
+    // JS chip because this is the FIRST paint: leaving it to the poller would
+    // show "Active" for a second on exactly the node an operator must not
+    // mistake for healthy. Precedence matches chipState().
+    const bool deployUnconfirmed = (node.state == DEPLOYED) && node.deployPending;
     const char* stCls = removePending ? "chip chip--state-unpaired"
                        : nodeEnded ? "chip chip--bat-low"
+                       : deployUnconfirmed ? "chip chip--bat-low"
                        : nodePaused ? "chip chip--state-paused"
                        : (node.state == DEPLOYED) ? "chip chip--state-deployed"
                        : (node.state == PAIRED)   ? "chip chip--state-paired"
@@ -3624,6 +3647,7 @@ static void handleStationsPage() {
     // desired config with targetState 2 and must not read as a resume.
     const char* stTxt = removePending ? "Remove queued"
                        : nodeEnded ? "Ended"
+                       : deployUnconfirmed ? "Not confirmed"
                        : (desiredPending && nodeDesired.targetState == 3) ? "Pause queued"
                        : (desiredPending && nodeDesired.targetState == 2 && node.recordingPaused)
                            ? "Resume queued"
@@ -5584,11 +5608,20 @@ static void handleSettings() {
 
   html += F("</details>");
 
+  // Close the /save-settings form HERE, right after the fields it actually
+  // owns. Cellular settings below must be a SIBLING form, not nested inside
+  // this one — nested <form> elements are invalid HTML, and having a second
+  // <form>...</form> inside this one used to make the browser treat the inner
+  // </form> as closing THIS form early, leaving the "Save" button below outside
+  // any form and unable to submit at all.
+  html += F("<button type='submit' class='btn btn--primary' style='margin-top:12px'>Save</button>");
+  html += F("</form>");
+
   // --- Cellular settings (collapsed, post-connection only) ---
-  // Cellular lives inside the FieldMesh service block because it is only
-  // meaningful when a cloud destination is configured. First-time setup is
-  // handled in the /provision connect flow; this section covers SIM swaps and
-  // carrier changes after the hub is already connected.
+  // Cellular lives inside the FieldMesh service block visually because it is
+  // only meaningful when a cloud destination is configured. First-time setup
+  // is handled in the /provision connect flow; this section covers SIM swaps
+  // and carrier changes after the hub is already connected.
   html += F("<details style='margin-top:14px'>"
             "<summary style='font-weight:bold;cursor:pointer'>Cellular settings</summary>"
             "<form class='async-form' action='/set-sim-config' method='POST' style='margin-top:10px'>"
@@ -5618,9 +5651,6 @@ static void handleSettings() {
             "Leave both blank otherwise. Applies at the next upload attempt.</div>"
             "<button type='submit' class='btn btn--primary' style='margin-top:10px'>"
             "Save cellular settings</button></form></details>");
-
-  html += F("<button type='submit' class='btn btn--primary' style='margin-top:12px'>Save</button>");
-  html += F("</form>");
   html += F("</div>");
   }
 
@@ -6147,8 +6177,9 @@ static String provisionWidgetHtml(const String& onSuccessJs) {
     "<strong>Two ways to enter the code:</strong><br>"
     "1. Open the FieldMesh dashboard on another device, find this FieldHub's connection code, "
     "and paste it below.<br>"
-    "2. Scan the QR code from the dashboard using your phone's camera app, then open the link "
-    "it finds — this page will detect it automatically."
+    "2. \U0001F4F1 <strong>Scan with your phone's camera app</strong> — this is the dashboard's "
+    "QR, different from the one on the previous screen, and yes, this one you scan with your "
+    "own phone. Open the link it finds and this page will detect it automatically."
     "</div>"
     "<textarea id='pv-paste' class='input' rows='3' placeholder='Paste connection code here' "
     "style='font-family:monospace;font-size:13px' autocomplete='off' autocapitalize='off' spellcheck='false'></textarea>"
@@ -6297,7 +6328,8 @@ static void handleProvisionPage() {
             "</div>"
             "<div class='help' style='margin-top:10px'><strong>Scan this with the FieldMesh "
             "dashboard's built-in scanner</strong> — not your phone's camera app. It carries a "
-            "<code>fieldmesh://</code> link that a camera app cannot open.</div>"
+            "<code>fieldmesh://</code> link that a camera app cannot open. (The next step will ask "
+            "you to scan a different QR — that one does use your phone's camera.)</div>"
             "<button type='button' class='btn btn--primary btn--action' style='margin-top:16px' "
             "data-pv-go='2'>I have registered it &mdash; next</button>"
             "</div>");
@@ -6364,15 +6396,18 @@ static void handleProvisionPage() {
   html += F("<div class='section pv-step' data-pv='4' style='display:none'>"
             "<p class='muted' style='margin:0 0 10px'>Step 4 of 4</p>"
             "<h3><span class='chip chip--cfg-ok' style='font-weight:700'>Connection saved</span></h3>"
-            "<p class='muted'>The endpoint and connection key are stored on this FieldHub. It will "
-            "upload during its next sync &mdash; nothing has been sent yet, so there is no upload "
-            "to confirm here.</p>");
+            "<p class='muted'>The endpoint and connection key are stored on this FieldHub. Press "
+            "Finish on the next screen to upload now and power down &mdash; or it will upload "
+            "automatically at the next scheduled sync.</p>");
   if (returnToWizard) {
     html += F("<a href='/setup' class='btn btn--primary btn--action'>Continue setup</a>"
               "<a href='/settings' class='btn btn--sm'>Go to Settings instead</a>");
   } else {
-    html += F("<a href='/settings' class='btn btn--primary btn--action'>Go to Settings</a>"
-              "<a href='/' class='btn btn--sm'>Back to overview</a>");
+    // "Back to overview" is the real finish path — the home page's sticky
+    // "Save & Start Recording" button is what actually uploads and powers
+    // down. Settings has no equivalent action, so it must not outrank this.
+    html += F("<a href='/' class='btn btn--primary btn--action'>Finish &mdash; go upload now</a>"
+              "<a href='/settings' class='btn btn--sm'>Go to Settings instead</a>");
   }
   html += F("</div>");
 
@@ -6478,6 +6513,7 @@ static void handleProvisionApply() {
   Serial.printf("[PROVISION] applied: endpoint=%s keyLen=%u\n",
                 prov.endpoint.c_str(), (unsigned)prov.connectionKey.length());
 
+  gCloudConnectedThisSession = true;
   sendAjaxResult(true, "Provisioned");
 }
 
@@ -6550,7 +6586,8 @@ static void handleSetupWizard() {
             "style='display:block;max-width:220px;height:auto;margin:0 auto'>");
   html += F("</div>"
             "<div class='help' style='margin-top:8px'>Scan with the <strong>FieldMesh dashboard's "
-            "built-in scanner</strong>, not a phone camera app.</div>"
+            "built-in scanner</strong>, not a phone camera app. (The connect step will ask you to "
+            "scan a different QR — that one does use your phone's camera.)</div>"
             "<div style='margin-top:16px'><button type='button' class='btn btn--sm' data-wz='next'>Continue to FieldMesh</button></div>"
             "</div>");
 
@@ -6727,17 +6764,26 @@ static void handleShutdown() {
   // when nothing was deployed or if manual upload is disabled in settings.
   String syncMsg;
   bool syncOk = false;
-  // Sync when ANY lifecycle change happened, or whenever a deployment event is
-  // still queued — the outbox check also covers an event left over from an
-  // earlier session whose upload never landed.
+  // Sync when ANY lifecycle change happened, whenever a deployment event is
+  // still queued (the outbox check also covers an event left over from an
+  // earlier session whose upload never landed), or whenever there is plain
+  // unsent sensor data sitting in the upload queue. That last check matters on
+  // its own: a session where nothing session-tracked happened (e.g. only a
+  // dashboard-control toggle, which sets no flag) can still be sitting on a
+  // backlog of readings from earlier local-only recording that has never been
+  // uploaded — the three flags above all miss that case.
   const uint8_t queuedEvents = deploymentOutboxCount();
+  const bool queueHasPendingData =
+      gUploadQueue.init() && gUploadQueue.getPendingBytes() > 0;
   const bool deployedThisSession =
-      gDeployedThisSession || gFieldChangeThisSession || queuedEvents > 0;
+      gDeployedThisSession || gFieldChangeThisSession ||
+      gCloudConnectedThisSession || queuedEvents > 0 || queueHasPendingData;
   if (deployedThisSession) {
-    Serial.printf("[UI] Field change this session (deploy=%d change=%d queuedEvents=%u)"
+    Serial.printf("[UI] Field change this session (deploy=%d change=%d cloud=%d queuedEvents=%u pending=%d)"
                   " — syncing to dashboard before shutdown\n",
                   gDeployedThisSession ? 1 : 0, gFieldChangeThisSession ? 1 : 0,
-                  (unsigned)queuedEvents);
+                  gCloudConnectedThisSession ? 1 : 0, (unsigned)queuedEvents,
+                  queueHasPendingData ? 1 : 0);
     performManualUpload(syncMsg, syncOk);
     if (syncOk) {
       Serial.printf("[UI] Pre-shutdown sync: %s\n", syncMsg.c_str());
@@ -6747,6 +6793,7 @@ static void handleShutdown() {
   }
   gDeployedThisSession = false;  // reset for the next config session
   gFieldChangeThisSession = false;
+  gCloudConnectedThisSession = false;
 
   gShutdownRequested = true;
   if (isAjaxRequest()) {

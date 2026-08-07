@@ -556,6 +556,14 @@ static void runCoordinatedSyncWindow(
         // snapshot, so if this is left to the snapshot path its durable
         // last-contact time never advances and it looks silent forever.
         noteNodeContact(*authorizedNode);
+        // An authenticated HELLO from a DEPLOYED node is proof it is alive and
+        // running its deployment, so it retires any outstanding deploy command.
+        // This clear is load-bearing now that deployPending is persisted: the
+        // config-mode equivalent lives in handleNodeHello(), which the sync path
+        // never calls, so without it the flag would latch on every healthy node
+        // and the whole fleet would read "Not confirmed". savePairedNodes() runs
+        // after the window closes and commits this.
+        authorizedNode->deployPending = false;
         // NODE_HELLO carries the node's persisted applied config version. Treat
         // it as convergence evidence just like CONFIG_ACK/snapshot echo so a
         // lost ACK cannot leave pause/resume reporting stale for another cycle.

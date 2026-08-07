@@ -603,8 +603,18 @@ void savePairedNodes() {
     snprintf(key, sizeof(key), "dep%d", idx);
     writeOk = prefs.putUInt(key, n.deployedSinceUnix) == sizeof(uint32_t) && writeOk;
 
+    // Two flags in ONE key (bit 0 = recordingPaused, bit 1 = deployPending).
+    // deployPending was RAM-only, which meant the "deploy commanded, not yet
+    // confirmed" fact died at the power-off between wakes — i.e. within seconds,
+    // every time. A node that was never actually reached therefore reloaded as a
+    // plain DEPLOYED record and the UI called it "Active" forever. Packing
+    // rather than adding a key is deliberate: kMaxPairedNodes is 64 and every
+    // NVS primitive costs a 32-byte entry, so a dedicated key would spend ~2 KB
+    // of the shared 20 KB partition on one boolean (see the sen%d note below).
     snprintf(key, sizeof(key), "pau%d", idx);
-    writeOk = prefs.putUChar(key, n.recordingPaused ? 1 : 0) == sizeof(uint8_t) && writeOk;
+    const uint8_t packedFlags = (uint8_t)((n.recordingPaused ? 0x01 : 0x00) |
+                                          (n.deployPending   ? 0x02 : 0x00));
+    writeOk = prefs.putUChar(key, packedFlags) == sizeof(uint8_t) && writeOk;
 
     // Preserve the node-confirmed config version across the FieldHub's complete
     // power-off between wakes. Pending state is reconstructed from this value
@@ -841,10 +851,15 @@ void loadPairedNodes() {
     uint32_t savedDep = 0;
     if (prefs.getType(key) == PT_U32) savedDep = prefs.getUInt(key, 0);
 
-    // --- Recording-paused / standby flag (optional) ---
+    // --- Recording-paused / deploy-pending flags (optional) ---
+    // Bit 0 = recordingPaused, bit 1 = deployPending. Records written before
+    // deployPending was persisted stored a plain 0/1, which reads back here as
+    // paused-only with deployPending false — exactly the previous behaviour.
     snprintf(key, sizeof(key), "pau%d", i);
-    bool savedPaused = false;
-    if (prefs.getType(key) == PT_U8) savedPaused = prefs.getUChar(key, 0) != 0;
+    uint8_t savedFlags = 0;
+    if (prefs.getType(key) == PT_U8) savedFlags = prefs.getUChar(key, 0);
+    const bool savedPaused        = (savedFlags & 0x01) != 0;
+    const bool savedDeployPending = (savedFlags & 0x02) != 0;
 
     // --- Node-confirmed config version (optional; added after initial rollout) ---
     snprintf(key, sizeof(key), "cfgv%d", i);
@@ -894,7 +909,12 @@ void loadPairedNodes() {
     newNode.lastNodeTimestamp    = 0;
     newNode.configVersionApplied = savedConfigVersion;
     newNode.lastConfigPushMs     = 0;
-    newNode.deployPending        = false;
+    // Restored, NOT cleared. A deploy the node never acknowledged must still
+    // read as unconfirmed after the hub power-cycles; clearing it here is what
+    // let an unreached node present as "Active" indefinitely. Every genuine
+    // confirmation path clears it again (DEPLOY_ACK and NODE_HELLO in both
+    // config and sync mode, and registerNode's promotion to DEPLOYED).
+    newNode.deployPending        = savedDeployPending;
     newNode.stateChangePending   = false;
     newNode.pendingTargetState   = PENDING_NONE;
     newNode.pendingSinceMs       = 0;
