@@ -3,6 +3,7 @@
 #include "config/deployment_epoch.h"
 #include "time/rtc_alarm.h"
 #include "storage/flash_logger.h"
+#include "storage/sd_logger.h"
 #include "system/pins.h"
 #include <esp_now.h>
 #include <WiFi.h>
@@ -144,12 +145,20 @@ static void processDecodedSnapshot(const DecodedSnapshot& decoded, const uint8_t
 
   bool persisted = false;
   if (flashIsReady()) {
-    persisted = logDecodedSnapshot(stamped);
-    if (!persisted) {
+    const bool flashSaved = logDecodedSnapshot(stamped);
+    persisted = persisted || flashSaved;
+    if (!flashSaved) {
       Serial.println("[SNAP] Flash logging failed");
     }
-  } else {
-    Serial.println("[SNAP] Flash unavailable; snapshot not durably logged");
+  }
+  if (sdIsReady()) {
+    String archiveRow;
+    const bool sdSaved = formatDecodedSnapshotCSVRow(stamped, archiveRow) &&
+                         sdLogCSVRow(archiveRow);
+    persisted = persisted || sdSaved;
+  }
+  if (!persisted) {
+    Serial.println("[SNAP] No storage accepted the snapshot");
   }
   sendDecodedSnapshotAck(mac, decoded, persisted);
   Serial.printf("[SNAP] %.15s seq=%lu present=0x%04X proto=%u readings=%u\n",
@@ -296,8 +305,7 @@ static void onEspNowRecv(const uint8_t* mac, const uint8_t* data, int len) {
       registerNode(mac, st.nodeId, "status", reported);
       for (auto& n : registeredNodes) {
         if (memcmp(n.mac, mac, 6) == 0 || n.nodeId == String(st.nodeId)) {
-          n.lastSeen = millis();
-          n.isActive = true;
+          noteNodeContact(n);
           n.lastRescueMode = (st.rescueMode != 0);
           const bool reportsUndeployed = reported != DEPLOYED || st.deployed == 0;
           if (reportsUndeployed && shouldRecoverKnownDeployedNode(n)) {
@@ -667,14 +675,33 @@ bool deploySelectedNodes(const std::vector<String>& nodeIds) {
                         (unsigned long)gLastSyncBroadcastUnix);
         }
         deployCmd.sensorMask = desired.sensorMask;  // 0 = auto; else SNAP_PRESENT_* + VALID
+        // Read the epoch straight from the deployment store rather than the
+        // NodeInfo mirror. The mirror is zeroed whenever a node's registry
+        // entry is freshly (re)created — e.g. a node that re-registers via its
+        // own NODE_STATUS broadcast after being removed at unpair — and is not
+        // guaranteed to be refreshed before this dispatch runs. That let a
+        // node with an ended epoch 1 in the store get redeployed as epoch 0,
+        // which the Field UI still reads as "Ended" (deploymentEndedUnix from
+        // the old slot) while the node was actually live under the new one.
+        const DeploymentSlot* storeSlot = deploymentFindByNodeId(node.nodeId.c_str());
+        deployCmd.deploymentEpoch = storeSlot ? storeSlot->epoch : node.deploymentEpoch;
 
-        Serial.printf("[DEPLOY] %s: cfgV=%u wakeMin=%u syncMin=%u phase=%lu\n",
+        Serial.printf("[DEPLOY] %s: epoch=%u cfgV=%u wakeMin=%u syncMin=%u phase=%lu\n",
                       nodeId.c_str(),
+                      (unsigned)deployCmd.deploymentEpoch,
                       (unsigned)deployCmd.configVersion,
                       (unsigned)deployCmd.wakeIntervalMin,
                       (unsigned)deployCmd.syncIntervalMin,
                       (unsigned long)deployCmd.syncPhaseUnix);
 
+        // Config mode starts with only the broadcast peer. A node that was
+        // already deployed (for example, End -> Start New Deployment) is not
+        // paired again, so register its unicast peer here before sending.
+        // ESP_ERR_ESPNOW_NOT_FOUND otherwise makes the direct DEPLOY_NODE
+        // miss; a successful broadcast queue is not proof that the node got it.
+        ensurePeerOnChannel(node.mac, ESPNOW_CHANNEL);
+        esp_wifi_set_channel(ESPNOW_CHANNEL, WIFI_SECOND_CHAN_NONE);
+        delay(10);
         esp_err_t result = esp_now_send(node.mac, (uint8_t*)&deployCmd, sizeof(deployCmd));
         esp_err_t resultBcast = esp_now_send(kBroadcastAddr, (uint8_t*)&deployCmd, sizeof(deployCmd));
 

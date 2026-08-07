@@ -37,8 +37,12 @@ bool nodeConfigStoreSave(const NodeConfigStoreRecord& record);
 uint16_t nodeSensorMaskLoad();
 bool     nodeSensorMaskSave(uint16_t mask);
 
+// Kept separately from the checksummed A/B config record, so an upgrade never
+// invalidates a deployed node's configuration. 0 means legacy or never deployed.
+uint16_t nodeDeploymentEpochLoad();
+bool     nodeDeploymentEpochSave(uint16_t epoch);
+
 #ifdef NODE_CONFIG_STORE_TESTING
 void nodeConfigStoreResetForTest();
 bool nodeConfigStoreCorruptActiveForTest();
 #endif
-

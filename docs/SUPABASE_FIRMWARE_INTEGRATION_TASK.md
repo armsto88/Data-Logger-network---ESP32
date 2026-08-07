@@ -75,6 +75,12 @@ This is an ESP32-based sensor network ("fieldMesh"). The mothership collects dat
 2. **Upload queue** — `UploadQueue` reads CSV from LittleFS, tracks cursor, chunks data, handles retries. The chunking and cursor-advance logic is correct and should be preserved.
 3. **Settings storage** — `TransmissionSettings` struct with `endpointUrl`, `apiKey`, `useJsonUpload`, etc. stored in NVS namespace `"tx"`.
 4. **Config UI** — Settings page already has fields for API key, endpoint URL, QR string. The QR string parser (`url|key`) already works.
+   > **Superseded (historical note).** The `url|key` parser and the `url` field
+   > have since been **removed**: both wrote the FieldMesh endpoint from request
+   > data, bypassing the allow-list, so a direct POST could redirect a hub's
+   > uploads and leak its device key to an unapproved host. Provisioning now goes
+   > through a validated `FM1` payload at `/provision-apply`, which is the only
+   > endpoint writer. Do not restore either field.
 5. **Manual upload handler** — `handleManualUpload()` in `config_server.cpp` already does a blocking upload via the modem.
 
 ### What needs to change
@@ -186,6 +192,10 @@ The current code sends a `{meta, status, readings: []}` document when there's no
 2. **Preserve the upload queue cursor logic** — `csvBytesConsumed` must still be accurate so the cursor advances correctly.
 3. **Keep the CSV fallback path** — if JSON build fails (heap/parse), fall back to CSV POST. But update the CSV fallback to also not append query params when using the Supabase endpoint.
 4. **Don't break the config UI** — the Settings page should still work for entering the API key and endpoint. The QR string parser (`url|key`) should still work.
+   > **Superseded (historical note).** This constraint no longer holds and must
+   > not be honoured: the `url|key` parser and the endpoint field were removed
+   > precisely because they bypassed the endpoint allow-list. Keeping them
+   > working was the bug. See the note in section 4 above.
 5. **Build target:** `pio run -e mothership-v1-main` (PlatformIO, ESP32 Arduino)
 6. **The mothership MAC is `48:9D:31:F8:16:A8`** — the backend team needs this to issue a device API key. Include it in the response.
 7. **Keep changes minimal** — don't refactor the upload queue or modem driver. Only change the JSON format, URL building, and response handling.

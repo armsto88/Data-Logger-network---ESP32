@@ -106,8 +106,38 @@ void sampleAdsIfNeeded() {
   lastMoist2V = v2;
 
 #if SOIL_CWT_THA_MODE
-  lastTemp1C = cwt_tha_temp_c_from_sensor_volts(v0);
-  lastTemp2C = cwt_tha_temp_c_from_sensor_volts(v3);
+  // Per-probe presence, decided by the temperature channel and applied to BOTH
+  // of that probe's channels. Unplugging a probe takes its moisture and
+  // temperature away together, so they must be reported together — and moisture
+  // alone cannot be gated, because a probe sitting in air genuinely reads near
+  // 0 V and would be indistinguishable from a disconnected one.
+  //
+  // An absent channel is published as NaN, which buildReadingsArray() omits from
+  // the snapshot. That clears the channel's SNAP_PRESENT_* bit, which is exactly
+  // what the FieldHub's existing two-consecutive-miss debounce consumes — so this
+  // reaches the Field UI and the cloud with no protocol change.
+  const bool probe1Present = cwt_tha_probe_present(v0);
+  const bool probe2Present = cwt_tha_probe_present(v3);
+
+  if (probe1Present) {
+    lastTemp1C = cwt_tha_temp_c_from_sensor_volts(v0);
+  } else {
+    Serial.printf("[SOIL] probe 1 absent: temp ch reads %.4fV (%.1f C unclamped) — "
+                  "reporting SOIL1 temp+moisture as missing\n",
+                  v0, cwt_tha_temp_c_raw_from_sensor_volts(v0));
+    lastTemp1C  = NAN;
+    lastMoist1V = NAN;
+  }
+
+  if (probe2Present) {
+    lastTemp2C = cwt_tha_temp_c_from_sensor_volts(v3);
+  } else {
+    Serial.printf("[SOIL] probe 2 absent: temp ch reads %.4fV (%.1f C unclamped) — "
+                  "reporting SOIL2 temp+moisture as missing\n",
+                  v3, cwt_tha_temp_c_raw_from_sensor_volts(v3));
+    lastTemp2C  = NAN;
+    lastMoist2V = NAN;
+  }
 #else
   // Legacy thermistor model.
   float r0 = r_from_vnode(mv0 / 1000.0f, V_DIV_SUPPLY, R_FIXED_A0);
@@ -191,7 +221,9 @@ bool read(size_t index, float& outValue) {
     case 3: outValue = lastTemp2C;  break;  // SOIL2_TEMP
     default: return false;
   }
-  return true;
+  // A channel belonging to an absent probe is NaN. Fail the read explicitly
+  // rather than handing back a NaN and relying on the caller to notice.
+  return !isnan(outValue);
 }
 
 } // namespace soil_moist_temp_backend

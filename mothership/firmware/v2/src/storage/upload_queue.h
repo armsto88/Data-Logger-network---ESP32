@@ -7,17 +7,20 @@
 // Upload cursor / queue manager for the Mothership V1 modem upload subsystem.
 //
 // Tracks how much of /datalog.csv has been successfully uploaded to the
-// Google Cloud Function endpoint.  The cursor (byte offset) is persisted in
-// NVS namespace "tx" so it survives deep-sleep / power cycles.
+// remote endpoint. The cursor (byte offset) is persisted in NVS namespace
+// "tx" so it survives deep-sleep / power cycles.
 //
-// Purge strategy: single-file streaming rewrite (no temp index files).
-// Emergency purge: when LittleFS usage exceeds a threshold, discard the
-// oldest 50% of data rows.
+// Upload acknowledgement advances a cursor but does not delete local history.
+// LittleFS is a bounded rolling store: at a safe high-water mark, the oldest
+// rows are removed with a crash-safe streaming rewrite.
+
+static constexpr uint8_t kLittleFsRetentionHighWaterPct = 65;
+static constexpr uint8_t kLittleFsRetentionKeepPct = 40;
 
 // ---------------------------------------------------------------------------
 // CSV header (must match flash_logger.cpp)
 // ---------------------------------------------------------------------------
-static constexpr const char* kUploadCSVHeader = kCurrentCSVHeader31;
+static constexpr const char* kUploadCSVHeader = kCurrentCSVHeader35;
 
 // True while /datalog.csv still carries a pre-epoch header, i.e. queued rows
 // exist that have no deploymentEpoch column. Those rows would follow the
@@ -37,6 +40,7 @@ struct UploadCursor {
   uint8_t  retryCount;      // current retry count within this window
   uint32_t wakeCounter;     // sync-wake counter for upload policy scheduling
   uint32_t nextAttemptUnix; // earliest retry time after reaching retry limit
+  uint32_t rowsRemovedLocally; // cumulative rows evicted from bounded history
 };
 
 // ---------------------------------------------------------------------------
@@ -56,9 +60,21 @@ class UploadQueue {
  public:
   UploadQueue();
 
-  // Load cursor from NVS and validate against the current file.
-  // If the file is smaller than the stored offset, reset to header end.
+  // Recover the data file, load the cursor from NVS, and validate it against
+  // the current file. Returns false if recovery or the cursor load failed, in
+  // which case the queue is NOT initialised and every accessor below is
+  // reporting defaults rather than stored state.
+  //
+  // Callers must honour the return value. A failed init leaves a zero cursor,
+  // and a zero cursor is indistinguishable from "nothing uploaded yet" — so a
+  // caller that ignores this either re-uploads history or renders a convincing
+  // zero. Idempotent: once initialised it returns true without redoing the work
+  // (this is what keeps a page load from re-running init), and after a failure a
+  // later call retries.
   bool init();
+
+  // True once init() has succeeded. Accessor values are only meaningful then.
+  bool isInitialised() const { return m_initialised; }
 
   // Read new data from /datalog.csv starting at the cursor, up to maxBytes.
   // The payload is prefixed with the CSV header.  Reading stops at a row
@@ -78,9 +94,14 @@ class UploadQueue {
   // swaps files and resets the cursor to the header end.
   bool purgeUploaded();
 
-  // If LittleFS usage exceeds thresholdPct, purge the oldest 50% of data
-  // rows via streaming rewrite.  Adjusts the cursor if it was in the
-  // purged region.
+  // One-time compatibility compaction only. A legacy 25/30-column file must be
+  // rewritten after its pending rows drain so new epoch-bearing rows can use
+  // the current header. Current-schema files are deliberately left intact.
+  bool purgeUploadedIfLegacyDrained();
+
+  // If LittleFS usage exceeds thresholdPct, retain a bounded portion of the
+  // newest rows via streaming rewrite. Adjusts the cursor if it was in the
+  // removed region.
   bool emergencyPurgeIfFull(uint8_t thresholdPct);
 
   bool recoverDataFile();
@@ -111,11 +132,21 @@ class UploadQueue {
   void    clearNonRetryableFailures();
   uint8_t nonRetryableFailureCount(uint32_t offset) const;
 
+#ifdef UQ_TEST_INIT_FAILURE_HOOK
+  // Test-only failure injection for init(). Compiled ONLY into the upload-queue
+  // test environment, never into production firmware. This fails the QUEUE
+  // cursor load; it is unrelated to the transmission-settings save hook in
+  // config/transmission_settings.h, which fails a different namespace at a
+  // different layer.
+  static void testForceInitFailure(bool on);
+#endif
+
  private:
   // Persist m_cursor to NVS namespace "tx".
   void saveCursor();
-  // Load m_cursor from NVS.
-  void loadCursor();
+  // Load m_cursor from NVS. Returns false if the namespace could not be opened,
+  // i.e. the cursor in RAM is defaults rather than what is stored.
+  bool loadCursor();
   // Persist the poison-row counters to NVS namespace "tx".
   void savePoisonState();
   // Byte offset of the first data row (end of header line).

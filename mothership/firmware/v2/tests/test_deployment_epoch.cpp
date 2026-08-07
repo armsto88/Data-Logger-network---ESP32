@@ -10,6 +10,7 @@
 
 #include <Arduino.h>
 #include <LittleFS.h>
+#include <stddef.h>
 #include <vector>
 
 #include "config/node_registry.h"
@@ -23,6 +24,57 @@ std::vector<NodeInfo> registeredNodes;
 
 struct MetaEntry { String nodeId, userId, name; };
 static std::vector<MetaEntry> gMeta;
+
+// Frozen v1 fixture shape. This deliberately duplicates the installed record
+// layout instead of using the live DeploymentSlot, which now contains v2's
+// local archive. The migration test would be meaningless if it wrote v2 bytes.
+struct TestDeploymentSlotV1 {
+  uint8_t  mac[6];
+  char     nodeId[kDeployNodeIdLen];
+  uint16_t epoch;
+  uint32_t startedUnix;
+  uint32_t endedUnix;
+  DeploymentBoundary history[kBoundaryHistory];
+  uint8_t  historyCount;
+  uint8_t  pendingOp;
+  uint16_t pendingEpoch;
+  uint32_t pendingUnix;
+  char     stagedUserId[kDeployUserIdLen];
+  char     stagedName[kDeployNameLen];
+  float    stagedLat;
+  float    stagedLon;
+  bool     hasStagedIdentity;
+  bool     inUse;
+};
+
+struct TestDeploymentEventV1 {
+  char     eventId[kDeployEventIdLen];
+  char     nodeId[kDeployNodeIdLen];
+  uint16_t deploymentEpoch;
+  uint32_t deploymentStartedUnix;
+  uint32_t deploymentEndedUnix;
+  char     userId[kDeployUserIdLen];
+  char     name[kDeployNameLen];
+  float    latitude;
+  float    longitude;
+  char     conflictReason[96];
+  bool     inUse;
+};
+
+struct TestDeploymentRecordV1 {
+  uint32_t magic;
+  uint16_t version;
+  uint16_t size;
+  uint32_t generation;
+  TestDeploymentSlotV1 nodes[kMaxDeployNodes];
+  TestDeploymentEventV1 outbox[kMaxOutboxEvents];
+  uint8_t outboxCount;
+  uint8_t reserved[3];
+  uint32_t epochClampCount;
+  uint32_t checksum;
+};
+
+static TestDeploymentRecordV1 gLegacyFixture;
 
 static MetaEntry& metaFor(const String& nodeId) {
   for (auto& m : gMeta) {
@@ -86,11 +138,21 @@ static bool fakeLegacyBacklog(uint32_t* rowsOut) {
   if (rowsOut) *rowsOut = gLegacyRows;
   return gLegacyBacklog;
 }
+static bool cloudEventsDisabled() { return false; }
 
 // ---------------------------------------------------------------------------
 // Harness
 // ---------------------------------------------------------------------------
 static int gPass = 0, gFail = 0;
+
+static uint32_t fixtureFnv1a32(const uint8_t* data, size_t len) {
+  uint32_t h = 2166136261UL;
+  for (size_t i = 0; i < len; ++i) {
+    h ^= data[i];
+    h *= 16777619UL;
+  }
+  return h;
+}
 
 static bool check(const char* name, bool cond) {
   Serial.printf("%s %s\n", cond ? "[PASS]" : "[FAIL]", name);
@@ -122,6 +184,8 @@ static void resetAll() {
   LittleFS.remove("/deploy.bin");
   LittleFS.remove("/deploy.bak");
   LittleFS.remove("/deploy.tmp");
+  LittleFS.remove("/deploy.v1");
+  LittleFS.remove("/deploy.v1.tmp");
   deploymentStoreBegin();
 }
 
@@ -731,6 +795,141 @@ static void testEndThenStartKeepsBothEvents() {
         event2.indexOf("\"deploymentEndedUnix\":0") >= 0);
 }
 
+static void testLocalArchiveSurvivesAckAndReboot() {
+  resetAll();
+  addNode("ENV_A1", 0x01, DEPLOYED);
+  registeredNodes[0].latitude = 51.123456f;
+  registeredNodes[0].longitude = -1.234567f;
+  beginNewDeployment("ENV_A1", "001", "North Hedge", 51.123456f, -1.234567f, 0);
+  const uint32_t started = deploymentFindByNodeId("ENV_A1")->startedUnix;
+  gFakeNow += 86400;
+  const uint32_t ended = gFakeNow;
+  endDeployment("ENV_A1", 1);
+
+  const DeploymentSlot* slot = deploymentFindByNodeId("ENV_A1");
+  check("archive: End creates one local deployment record",
+        slot && slot->archiveCount == 1);
+  const DeploymentArchive* archived =
+      (slot && slot->archiveCount == 1) ? &slot->archive[0] : nullptr;
+  check("archive: exact start and end are retained",
+        archived && archived->startedUnix == started && archived->endedUnix == ended);
+  check("archive: number and name are retained",
+        archived && String(archived->userId) == "001" &&
+        String(archived->name) == "North Hedge");
+  check("archive: known location is retained",
+        archived && (archived->known & DEPLOY_ARCHIVE_LOCATION_KNOWN));
+
+  char eventId[kDeployEventIdLen];
+  deploymentMakeEventId("ENV_A1", 1, eventId, sizeof(eventId));
+  deploymentOutboxRemove(eventId);  // simulate backend acknowledgement
+  deploymentStoreCommit();
+  deploymentStoreResetForTest();
+  deploymentStoreBegin();
+
+  slot = deploymentFindByNodeId("ENV_A1");
+  archived = (slot && slot->archiveCount == 1) ? &slot->archive[0] : nullptr;
+  check("archive: cloud acknowledgement does not delete local history",
+        deploymentOutboxCount() == 0 && archived &&
+        String(archived->name) == "North Hedge");
+}
+
+static void testLocalArchiveIsBoundedNewestFour() {
+  resetAll();
+  addNode("ENV_A1", 0x01, DEPLOYED);
+  for (uint16_t epoch = 1; epoch <= 5; ++epoch) {
+    const String number = normalizeUserId(String(epoch));
+    const String name = "Site " + String(epoch);
+    const uint16_t expected = epoch - 1;
+    beginNewDeployment("ENV_A1", number, name, NAN, NAN, expected);
+    gFakeNow += 3600;
+    endDeployment("ENV_A1", epoch);
+    gFakeNow += 60;
+  }
+  const DeploymentSlot* slot = deploymentFindByNodeId("ENV_A1");
+  check("archive ring: keeps exactly four completed deployments",
+        slot && slot->archiveCount == kLocalDeploymentArchive);
+  check("archive ring: drops the oldest and keeps epochs 2 through 5",
+        slot && slot->archive[0].epoch == 2 && slot->archive[3].epoch == 5);
+}
+
+static void testStandaloneLifecycleDoesNotFillCloudOutbox() {
+  resetAll();
+  deploymentSetCloudEventsEnabledFn(cloudEventsDisabled);
+  addNode("ENV_A1", 0x01, DEPLOYED);
+  bool allSucceeded = true;
+  for (uint16_t epoch = 1; epoch <= 20; ++epoch) {
+    const DeploymentOpResult started = beginNewDeployment(
+        "ENV_A1", normalizeUserId(String(epoch)), "Local site", NAN, NAN, epoch - 1);
+    gFakeNow += 60;
+    const DeploymentOpResult ended = endDeployment("ENV_A1", epoch);
+    gFakeNow += 60;
+    allSucceeded = allSucceeded && started.status == DEPLOY_OK && ended.status == DEPLOY_OK;
+  }
+  check("standalone: more than 16 lifecycle records never hit the cloud outbox limit",
+        allSucceeded);
+  check("standalone: cloud-only outbox remains empty", deploymentOutboxCount() == 0);
+  const DeploymentSlot* slot = deploymentFindByNodeId("ENV_A1");
+  check("standalone: local archive still keeps the newest completed records",
+        slot && slot->archiveCount == kLocalDeploymentArchive &&
+        slot->archive[0].epoch == 17 && slot->archive[3].epoch == 20);
+  deploymentSetCloudEventsEnabledFn(nullptr);
+}
+
+static void acknowledgeWholeOutbox() {
+  String body = "{\"deploymentEventAcks\":[";
+  const uint8_t count = deploymentOutboxCount();
+  for (uint8_t i = 0; i < count; ++i) {
+    const DeploymentEvent* event = deploymentOutboxAt(i);
+    if (!event) continue;
+    if (body[body.length() - 1] != '[') body += ',';
+    body += '"';
+    body += event->eventId;
+    body += '"';
+  }
+  body += "]}";
+  deploymentIngestAckResponse(body);
+}
+
+static void testFieldMeshBackfillDrainsInBoundedWindows() {
+  resetAll();
+  deploymentSetCloudEventsEnabledFn(cloudEventsDisabled);
+  for (uint8_t node = 0; node < 5; ++node) {
+    const String nodeId = "ENV_B" + String((unsigned)node);
+    addNode(nodeId.c_str(), (uint8_t)(0x20 + node), DEPLOYED);
+    for (uint16_t epoch = 1; epoch <= 4; ++epoch) {
+      const DeploymentOpResult started = beginNewDeployment(
+          nodeId, normalizeUserId(String(epoch)), "Local history", NAN, NAN,
+          epoch - 1);
+      gFakeNow += 60;
+      const DeploymentOpResult ended = endDeployment(nodeId, epoch);
+      gFakeNow += 60;
+      check("backfill fixture: local lifecycle succeeds",
+            started.status == DEPLOY_OK && ended.status == DEPLOY_OK);
+    }
+  }
+  check("backfill fixture: standalone history created without cloud events",
+        deploymentOutboxCount() == 0);
+
+  deploymentSetCloudEventsEnabledFn(nullptr);
+  DeploymentBackfillResult first = deploymentQueueFieldMeshBackfill();
+  check("backfill: first pass fills the 16-event transport window",
+        first.committed && first.queued == kMaxOutboxEvents &&
+        first.deferred == 4 && deploymentOutboxCount() == kMaxOutboxEvents);
+  acknowledgeWholeOutbox();
+  check("backfill: acknowledgement frees the first transport window",
+        deploymentOutboxCount() == 0);
+
+  DeploymentBackfillResult second = deploymentQueueFieldMeshBackfill();
+  check("backfill: second pass queues the remaining local history",
+        second.committed && second.queued == 4 && second.deferred == 0 &&
+        deploymentOutboxCount() == 4);
+  acknowledgeWholeOutbox();
+  DeploymentBackfillResult done = deploymentQueueFieldMeshBackfill();
+  check("backfill: acknowledged history is not re-queued",
+        done.committed && done.queued == 0 && done.deferred == 0 &&
+        deploymentOutboxCount() == 0);
+}
+
 static void testUnpairPreservesEndEvent() {
   resetAll();
   addNode("ENV_A1", 0x01, DEPLOYED);
@@ -1000,6 +1199,79 @@ static void testStagedIdentity() {
         !deploymentIdentityIsStaged("ENV_A1"));
 }
 
+static void testV1RecordMigratesWithoutReseeding() {
+  registeredNodes.clear();
+  gMeta.clear();
+  LittleFS.remove("/deploy.bin");
+  LittleFS.remove("/deploy.bak");
+  LittleFS.remove("/deploy.tmp");
+  LittleFS.remove("/deploy.v1");
+  LittleFS.remove("/deploy.v1.tmp");
+
+  memset(&gLegacyFixture, 0, sizeof(gLegacyFixture));
+  gLegacyFixture.magic = 0x4650444DUL;
+  gLegacyFixture.version = 1;
+  gLegacyFixture.size = sizeof(gLegacyFixture);
+  gLegacyFixture.generation = 7;
+
+  TestDeploymentSlotV1& slot = gLegacyFixture.nodes[0];
+  const uint8_t mac[6] = {0xAA, 0xBB, 0xCC, 0x00, 0x00, 0x01};
+  memcpy(slot.mac, mac, sizeof(mac));
+  strncpy(slot.nodeId, "ENV_A1", sizeof(slot.nodeId) - 1);
+  slot.epoch = 2;
+  slot.startedUnix = 1754000000UL;
+  slot.history[0] = {1, 1753000000UL};
+  slot.history[1] = {2, 1754000000UL};
+  slot.historyCount = 2;
+  slot.inUse = true;
+
+  TestDeploymentEventV1& event = gLegacyFixture.outbox[0];
+  strncpy(event.eventId, "LEGACY-EPOCH-1", sizeof(event.eventId) - 1);
+  strncpy(event.nodeId, "ENV_A1", sizeof(event.nodeId) - 1);
+  event.deploymentEpoch = 1;
+  event.deploymentStartedUnix = 1753000000UL;
+  event.deploymentEndedUnix = 1753003600UL;
+  strncpy(event.userId, "001", sizeof(event.userId) - 1);
+  strncpy(event.name, "Old North", sizeof(event.name) - 1);
+  event.latitude = 51.1f;
+  event.longitude = -1.2f;
+  event.inUse = true;
+  gLegacyFixture.outboxCount = 1;
+  gLegacyFixture.checksum = fixtureFnv1a32(
+      reinterpret_cast<const uint8_t*>(&gLegacyFixture),
+      offsetof(TestDeploymentRecordV1, checksum));
+
+  File file = LittleFS.open("/deploy.bin", "w", true);
+  const size_t written = file
+      ? file.write(reinterpret_cast<const uint8_t*>(&gLegacyFixture),
+                   sizeof(gLegacyFixture))
+      : 0;
+  if (file) file.close();
+  check("v1 migration fixture: legacy record written",
+        written == sizeof(gLegacyFixture));
+
+  deploymentStoreResetForTest();
+  check("v1 migration: store opens", deploymentStoreBegin());
+  const DeploymentSlot* migrated = deploymentFindByNodeId("ENV_A1");
+  check("v1 migration: current epoch is preserved instead of reseeded",
+        migrated && migrated->epoch == 2 && migrated->startedUnix == 1754000000UL);
+  check("v1 migration: attribution boundaries are preserved",
+        migrated && migrated->historyCount == 2 && migrated->history[0].epoch == 1);
+  check("v1 migration: queued ended event becomes a complete local archive",
+        migrated && migrated->archiveCount == 1 &&
+        migrated->archive[0].epoch == 1 &&
+        String(migrated->archive[0].name) == "Old North" &&
+        migrated->archive[0].endedUnix == 1753003600UL);
+  check("v1 migration: recovery copy remains for the migration boot",
+        LittleFS.exists("/deploy.v1"));
+
+  deploymentStoreResetForTest();
+  check("v1 migration: new record survives a second boot", deploymentStoreBegin());
+  migrated = deploymentFindByNodeId("ENV_A1");
+  check("v1 migration: verified v2 boot retires recovery copy",
+        migrated && migrated->epoch == 2 && !LittleFS.exists("/deploy.v1"));
+}
+
 static void testSeedFromRegistry() {
   registeredNodes.clear();
   gMeta.clear();
@@ -1110,6 +1382,10 @@ void setup() {
   testStagedCoordinatesNotAppliedUntilStart();
   testFirstDeploymentPublishesStagedIdentity();
   testEndThenStartKeepsBothEvents();
+  testLocalArchiveSurvivesAckAndReboot();
+  testLocalArchiveIsBoundedNewestFour();
+  testStandaloneLifecycleDoesNotFillCloudOutbox();
+  testFieldMeshBackfillDrainsInBoundedWindows();
   testUnpairPreservesEndEvent();
   testConflictKeepsEventQueued();
   testStartedUnixAlwaysPositive();
@@ -1121,6 +1397,7 @@ void setup() {
   testEpochOverflowRejected();
   testStartRejectedOnEndedViaPlainStart();
   testStagedIdentity();
+  testV1RecordMigratesWithoutReseeding();
   testSeedFromRegistry();
   testAwkwardNamesProduceValidJson();
 

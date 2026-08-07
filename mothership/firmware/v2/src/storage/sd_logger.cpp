@@ -1,118 +1,183 @@
 #include "storage/sd_logger.h"
+
+#include "config/deployment_store.h"
+#include "storage/csv_schema.h"
 #include "system/pins.h"
 
 static SPIClass gSDSPI(VSPI);
 static bool gSDReady = false;
-static String gCurrentFile;
+static bool gSDWriteError = false;
 
-// CSV header matching NodeSnapshot fields
-static const char* kCSVHeader = "timestamp_ms,node_id,sensor_type,sensor_label,sensor_id,value,node_timestamp,quality_flags";
+static const char* kSDReadingsFile = "/fieldmesh_readings.csv";
+static const char* kSDDeploymentsFile = "/fieldmesh_deployments.csv";
+static const char* kSDDeploymentsHeader =
+    "eventId,nodeId,deploymentEpoch,startedUnix,endedUnix,userId,name,latitude,longitude";
+
+static String csvCell(const char* value) {
+  String out = "\"";
+  if (value) {
+    for (const char* p = value; *p; ++p) {
+      if (*p == '"') out += '"';
+      out += *p;
+    }
+  }
+  out += '"';
+  return out;
+}
+
+static bool ensureFileHeader(const char* path, const char* header) {
+  if (SD.exists(path)) {
+    File existing = SD.open(path, FILE_READ);
+    if (!existing) return false;
+    String found = existing.readStringUntil('\n');
+    existing.close();
+    found.trim();
+    if (found == String(header)) return true;
+
+    // Never overwrite an unrecognised field file. Move it aside under the first
+    // unused legacy name so the operator can recover it from the card.
+    for (uint16_t suffix = 1; suffix < 1000; ++suffix) {
+      String legacy = String(path) + ".legacy-" + String(suffix);
+      if (SD.exists(legacy)) continue;
+      if (!SD.rename(path, legacy)) return false;
+      Serial.printf("[SD] Preserved incompatible %s as %s\n",
+                    path, legacy.c_str());
+      break;
+    }
+    if (SD.exists(path)) return false;
+  }
+
+  File created = SD.open(path, FILE_WRITE);
+  if (!created) return false;
+  const size_t written = created.println(header);
+  const bool failed = created.getWriteError() || written == 0;
+  created.close();
+  return !failed;
+}
 
 bool initSD() {
+  gSDReady = false;
+  gSDWriteError = false;
   gSDSPI.begin(PIN_SD_SCK, PIN_SD_MISO, PIN_SD_MOSI, PIN_SD_CS);
 
   if (!SD.begin(PIN_SD_CS, gSDSPI, 40000000)) {
     Serial.println("[SD] SD.begin() failed — no card or wiring issue");
-    gSDReady = false;
+    return false;
+  }
+  if (SD.cardType() == CARD_NONE) {
+    Serial.println("[SD] No card attached");
     return false;
   }
 
-  Serial.printf("[SD] Card type: ");
-  switch (SD.cardType()) {
-    case CARD_MMC:    Serial.println("MMC"); break;
-    case CARD_SD:     Serial.println("SD"); break;
-    case CARD_SDHC:   Serial.println("SDHC"); break;
-    case CARD_UNKNOWN: Serial.println("UNKNOWN"); break;
-    default:          Serial.println("NONE"); break;
-  }
-
-  uint64_t totalBytes = SD.totalBytes();
-  Serial.printf("[SD] Total: %.1f MB\n", totalBytes / 1048576.0);
-
-  // Create today's log file with header
-  char filename[32];
-  snprintf(filename, sizeof(filename), "/log_%lu.csv", millis() / 1000);
-  gCurrentFile = String(filename);
-
-  File f = SD.open(gCurrentFile, FILE_WRITE, true);
-  if (f) {
-    f.println(kCSVHeader);
-    f.close();
-    Serial.printf("[SD] Created log file: %s\n", gCurrentFile.c_str());
-  } else {
-    Serial.printf("[SD] Failed to create log file: %s\n", gCurrentFile.c_str());
+  if (!ensureFileHeader(kSDReadingsFile, kCurrentCSVHeader35) ||
+      !ensureFileHeader(kSDDeploymentsFile, kSDDeploymentsHeader)) {
+    Serial.println("[SD] Could not prepare FieldMesh archive files");
+    gSDWriteError = true;
+    return false;
   }
 
   gSDReady = true;
+  Serial.printf("[SD] Archive ready: %.1f MB total, %.1f MB used\n",
+                SD.totalBytes() / 1048576.0,
+                SD.usedBytes() / 1048576.0);
   return true;
 }
 
-bool logSnapshot(const NodeSnapshot* snap) {
-  if (!gSDReady || !gCurrentFile.length()) return false;
+bool sdIsReady() { return gSDReady; }
+bool sdHadWriteError() { return gSDWriteError; }
 
-  char row[256];
-  snprintf(row, sizeof(row), "%lu,%s,%s,%s,%u,%.4f,%lu,%u",
-           millis(),
-           snap->nodeId,
-           snap->sensorType,
-           snap->sensorLabel,
-           snap->sensorId,
-           snap->value,
-           snap->nodeTimestamp,
-           snap->qualityFlags);
-
-  return logCSVRow(String(row));
-}
-
-bool logCSVRow(const String& row) {
-  if (!gSDReady || !gCurrentFile.length()) return false;
-
-  File f = SD.open(gCurrentFile, FILE_APPEND);
-  if (!f) {
-    Serial.println("[SD] Failed to open log file for append");
+bool sdLogCSVRow(const String& row) {
+  if (!gSDReady) return false;
+  File file = SD.open(kSDReadingsFile, FILE_APPEND);
+  if (!file) {
+    gSDWriteError = true;
+    Serial.println("[SD] Could not open readings archive for append");
     return false;
   }
-
-  f.println(row);
-  f.close();
-  return true;
+  const size_t written = file.println(row);
+  const bool failed = file.getWriteError() || written != row.length() + 2;
+  file.close();
+  if (failed) {
+    gSDWriteError = true;
+    Serial.println("[SD] Readings archive write failed; LittleFS fallback remains active");
+  }
+  return !failed;
 }
 
-String getCSVStats() {
-  if (!gSDReady || !gCurrentFile.length()) {
-    return "SD not ready";
+bool sdAppendDeploymentEvent(const char* nodeId, const DeploymentEvent& event) {
+  if (!gSDReady || event.deploymentEndedUnix == 0) return false;
+
+  // End is committed to LittleFS before the node is told to stop. A power loss
+  // can therefore replay this archive write during recovery; key the CSV by the
+  // deterministic event ID so recovery fills a missing row without duplicating
+  // one that already reached the card.
+  const String eventPrefix = csvCell(event.eventId) + ',';
+  File existing = SD.open(kSDDeploymentsFile, FILE_READ);
+  if (!existing) {
+    gSDWriteError = true;
+    return false;
+  }
+  existing.readStringUntil('\n');  // header
+  while (existing.available()) {
+    String line = existing.readStringUntil('\n');
+    if (line.startsWith(eventPrefix)) {
+      existing.close();
+      return true;
+    }
+  }
+  existing.close();
+
+  String row;
+  row.reserve(200);
+  row += csvCell(event.eventId);
+  row += ',';
+  row += csvCell(nodeId);
+  row += ',';
+  row += String((unsigned)event.deploymentEpoch);
+  row += ',';
+  row += String(event.deploymentStartedUnix);
+  row += ',';
+  row += String(event.deploymentEndedUnix);
+  row += ',';
+  row += csvCell(event.userId);
+  row += ',';
+  row += csvCell(event.name);
+  row += ',';
+  if (!isnan(event.latitude) && !isnan(event.longitude) &&
+      (event.latitude != 0.0f || event.longitude != 0.0f)) {
+    row += String(event.latitude, 6);
+    row += ',';
+    row += String(event.longitude, 6);
+  } else {
+    row += ',';
   }
 
-  File f = SD.open(gCurrentFile, FILE_READ);
-  if (!f) {
-    return "Cannot open file";
+  File file = SD.open(kSDDeploymentsFile, FILE_APPEND);
+  if (!file) {
+    gSDWriteError = true;
+    return false;
   }
-
-  int lineCount = 0;
-  while (f.available()) {
-    if (f.read() == '\n') lineCount++;
+  const size_t written = file.println(row);
+  const bool failed = file.getWriteError() || written != row.length() + 2;
+  file.close();
+  if (failed) {
+    gSDWriteError = true;
+    Serial.println("[SD] Deployment archive write failed");
   }
-  f.close();
-
-  uint64_t totalBytes = SD.totalBytes();
-  uint64_t usedBytes = SD.usedBytes();
-
-  char buf[128];
-  snprintf(buf, sizeof(buf), "Lines: %d, Used: %.1f/%.1f MB",
-           lineCount, usedBytes / 1048576.0, totalBytes / 1048576.0);
-  return String(buf);
+  return !failed;
 }
 
-bool createCSVHeader() {
-  if (!gSDReady || !gCurrentFile.length()) return false;
+const char* sdReadingsPath() { return kSDReadingsFile; }
+const char* sdDeploymentsPath() { return kSDDeploymentsFile; }
 
-  File f = SD.open(gCurrentFile, FILE_WRITE, true);
-  if (!f) return false;
-  f.println(kCSVHeader);
-  f.close();
-  return true;
+uint64_t sdReadingsFileSize() {
+  if (!gSDReady || !SD.exists(kSDReadingsFile)) return 0;
+  File file = SD.open(kSDReadingsFile, FILE_READ);
+  if (!file) return 0;
+  const uint64_t size = file.size();
+  file.close();
+  return size;
 }
 
-bool sdIsReady() {
-  return gSDReady;
-}
+uint64_t sdTotalBytes() { return gSDReady ? SD.totalBytes() : 0; }
+uint64_t sdUsedBytes() { return gSDReady ? SD.usedBytes() : 0; }

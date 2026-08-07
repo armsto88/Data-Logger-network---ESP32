@@ -77,7 +77,12 @@ V1/V2 motherships use LittleFS flash (typically ~1 MB usable). The dashboard sho
 ## Cloud Upload
 
 ### Q: How do I enable cloud upload?
-Go to **Settings → Cloud connection**, check "Enable cloud upload", and enter your API key (format `fm_xxxxxxxx`). You can also paste a QR code string of the form `url|key` to set both endpoint and key at once. Save, then use "Finish & Start Recording" to apply.
+Open **Settings → Connect to FieldMesh** (or go straight to `192.168.4.1/provision`). The connect flow has three steps: register the FieldHub in your project using the MAC it shows, scan or paste the connection code the dashboard gives you back, and save. Cloud upload is switched on automatically when the connection is saved.
+
+> **Superseded:** an earlier build let you paste a `url|key` QR string on the Settings page to set the endpoint and key at once. That field and its parser have been **removed**. `url|key` carried an arbitrary endpoint straight into storage, bypassing the endpoint allow-list — a hub could be pointed at an unapproved host, and its connection key handed to whoever controlled it. The endpoint is now writable only by `/provision-apply`, from a validated `FM1` payload whose endpoint must be on the allow-list. Do not reintroduce a free-form endpoint field.
+
+### Q: The FieldHub says "Re-provisioning required". What now?
+It found a stored FieldMesh endpoint that is not an approved host, so it has disabled upload and erased its stored connection key. That key must be assumed exposed. In the dashboard, **revoke** the hub's connection key *first*, then generate a new one and run the connect flow again — generating a replacement does not disable the old key on its own. The warning stays on screen until a valid connection code has been saved.
 
 ### Q: What happens if the upload fails?
 The mothership increments a retry counter and tries again at the next scheduled collection. Failed data stays in the upload queue — it is not lost. The dashboard shows a "Last upload failed" status indicator. Check antenna connection, signal strength, and API key validity.

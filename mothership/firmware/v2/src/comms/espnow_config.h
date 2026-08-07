@@ -26,6 +26,5 @@ bool sendConfigSnapshot(const uint8_t* mac, const char* nodeId);
 // NODE_HELLO handler — updates registry, pushes CONFIG_SNAPSHOT if needed.
 void handleNodeHello(const uint8_t* senderMac, const node_hello_message_t& hello);
 
-// Drain any pending work (no continuous loop).  Currently a no-op but
-// kept for future queue-drain logic.
+// Drain callback-queued recovery work; there is no continuous retry loop.
 void espnowConfigPoll();

@@ -12,7 +12,53 @@
 // Constructor
 // ---------------------------------------------------------------------------
 
-ModemDriver::ModemDriver() {}
+// APN default. This is the value that used to be compiled into both AT+CGDCONT
+// call sites (MODEM_APN, "TM" / Think Mobile), kept here so a hub with nothing
+// saved in SimSettings behaves exactly as before. It is now only a default:
+// configureApn() overrides it from NVS.
+#ifndef MODEM_APN
+#define MODEM_APN "TM"
+#endif
+
+ModemDriver::ModemDriver() : m_apn(MODEM_APN) {}
+
+void ModemDriver::configureApn(const String& apn,
+                               const String& user,
+                               const String& pass) {
+  if (apn.length() > 0) m_apn = apn;
+  m_apnUser = user;
+  m_apnPass = pass;
+  Serial.printf("[Modem] APN configured: %s (auth=%s)\n",
+                m_apn.c_str(), m_apnUser.length() > 0 ? "yes" : "no");
+}
+
+// ---------------------------------------------------------------------------
+// configurePdpContext() — AT+CGDCONT [+ AT+CGAUTH] + AT+CGACT
+// ---------------------------------------------------------------------------
+void ModemDriver::configurePdpContext() {
+  String resp;
+  // The APN and credentials are spliced into quoted AT arguments. They come
+  // from SimSettings, which rejects '"' and any character <= 0x20 (CR/LF
+  // included) before storing — without that a value could close the quote and
+  // append a second AT command.
+  String cgdcont = "AT+CGDCONT=1,\"IP\",\"" + m_apn + "\"";
+  sendAT(cgdcont.c_str(), resp, 5000);
+
+  // Carrier authentication, only when a username is configured.
+  //
+  // Argument order per the A76XX Series AT Command Manual V1.09 §5.2.16:
+  //   AT+CGAUTH=<cid>[,<auth_type>[,<passwd>[,<user>]]]
+  // Note <passwd> comes BEFORE <user> — the reverse of most APN UIs.
+  // <auth_type>: 0 none, 1 PAP, 2 CHAP (3 = PAP-or-CHAP exists only on the
+  // 1803S platform, so it is not used here). PAP is what carriers requiring an
+  // APN login normally document. Max response time is 9000 ms.
+  if (m_apnUser.length() > 0) {
+    String cgauth = "AT+CGAUTH=1,1,\"" + m_apnPass + "\",\"" + m_apnUser + "\"";
+    sendAT(cgauth.c_str(), resp, 10000);
+  }
+
+  sendAT("AT+CGACT=1,1", resp, 10000);
+}
 
 // ---------------------------------------------------------------------------
 // State helpers
@@ -359,18 +405,8 @@ HttpsPostResult ModemDriver::httpsPost(const String& url,
   Serial.printf("[Modem] Parsed: host=%s port=%d path=%s ssl=%d\n",
                 host.c_str(), port, path.c_str(), useSSL ? 1 : 0);
 
-  // 1. Ensure PDP context is active
-  //    APN is configurable via build flag MODEM_APN; defaults to "TM" (Think Mobile).
-  //    Previous default was "internet.eplus.de" (Aldi Talk).
-  {
-    String resp;
-#ifndef MODEM_APN
-#define MODEM_APN "TM"
-#endif
-    String cgdcont = "AT+CGDCONT=1,\"IP\",\"" MODEM_APN "\"";
-    sendAT(cgdcont.c_str(), resp, 5000);
-    sendAT("AT+CGACT=1,1", resp, 10000);
-  }
+  // 1. Ensure PDP context is active (APN from SimSettings via configureApn()).
+  configurePdpContext();
 
   // 2. NETOPEN
   {
@@ -1258,14 +1294,9 @@ HttpsGetStreamResult ModemDriver::httpsGetStream(const String& url,
   Serial.printf("[Modem] Parsed GET: host=%s port=%d path=%s\n", host.c_str(), port, path.c_str());
 
   // PDP context + NETOPEN (mirrors httpsPost()).
+  configurePdpContext();
   {
     String resp;
-#ifndef MODEM_APN
-#define MODEM_APN "TM"
-#endif
-    String cgdcont = "AT+CGDCONT=1,\"IP\",\"" MODEM_APN "\"";
-    sendAT(cgdcont.c_str(), resp, 5000);
-    sendAT("AT+CGACT=1,1", resp, 10000);
     if (!sendAT("AT+NETOPEN", resp, 15000)) {
       // NETOPEN reports an error if already open — tolerate that, fail otherwise.
       if (resp.indexOf("+NETOPEN: 0") < 0 && resp.indexOf("already") < 0) {

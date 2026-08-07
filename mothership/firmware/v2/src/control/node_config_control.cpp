@@ -18,9 +18,15 @@ NodeInfo* findRegisteredNode(const char* nodeId) {
 bool desiredFieldsMatch(const NodeDesiredConfig& cfg,
                         const DispatchNodeConfig& desired,
                         const NodeConfigApplyOptions& options) {
+  // Compare canonical masks on both sides. The registry value is sanitised on
+  // write, so comparing it against a raw dispatcher value would report a
+  // spurious mismatch for any command that carried the retired ultrasonic
+  // selector — defeating the stranded-binding repair this feeds and burning a
+  // fresh wire version on every replay.
   if (cfg.wakeIntervalMin != desired.wakeIntervalMin ||
       cfg.targetState != desired.targetState ||
-      cfg.sensorMask != static_cast<uint16_t>(desired.sensorMask)) return false;
+      nodeCanonicalConfiguredMask(cfg.sensorMask) !=
+          nodeCanonicalConfiguredMask(static_cast<uint16_t>(desired.sensorMask))) return false;
   if (options.overrideSyncSchedule &&
       (cfg.syncIntervalMin != options.syncIntervalMin ||
        cfg.syncPhaseUnix != options.syncPhaseUnix)) return false;
@@ -83,14 +89,27 @@ bool controlResolveBackendNodeConfig(const Command& requested,
   if ((fields & CFG_FIELD_SENSOR_MASK) == 0)
     resolved.payload.sensorMask = existing.sensorMask;
   if (resolved.payload.sensorMask > UINT16_MAX) return false;
+  // Defence in depth: controlApplyNodeConfig() canonicalises at the dispatcher
+  // boundary, but a backend command is resolved here first and this keeps the
+  // resolved form consistent with what will actually be stored.
+  resolved.payload.sensorMask =
+      nodeCanonicalConfiguredMask(static_cast<uint16_t>(resolved.payload.sensorMask));
 
   resolved.configFields = CFG_FIELDS_ALL;
   return true;
 }
 
 NodeConfigApplyResult controlApplyNodeConfig(
-    const Command& command, const NodeConfigApplyOptions& options) {
+    const Command& rawCommand, const NodeConfigApplyOptions& options) {
   NodeConfigApplyResult out{};
+
+  // Canonicalise BEFORE the dispatcher sees it. This is the single shared
+  // boundary every config command passes through — local UI and backend alike —
+  // so sanitising further downstream (in setDesiredConfig) would leave the
+  // dispatcher durably holding a raw mask that the registry never agrees with.
+  Command command = rawCommand;
+  command.payload.sensorMask =
+      nodeCanonicalConfiguredMask(static_cast<uint16_t>(command.payload.sensorMask));
 
   NodeInfo* node = findRegisteredNode(command.payload.nodeId);
   const bool allowedTarget = command.payload.targetState == 2 ||

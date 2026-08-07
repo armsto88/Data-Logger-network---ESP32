@@ -18,9 +18,8 @@
 //   19 soil1Vwc 20 soil1Temp 21 soil2Vwc 22 soil2Temp  23 aux1  24 aux2
 //   25 spectral_clear 26 spectral_nir 27 spectral_gain
 //   28 spectral_integration_ms 29 spectral_saturated
-
-//   30 deploymentEpoch
-static constexpr int kNumCsvColumns = 31;
+//   30 deploymentEpoch 31 userId 32 name 33 latitude 34 longitude
+static constexpr int kNumCsvColumns = 35;
 static constexpr uint16_t kMaxReadingsPerPost = 100;  // backend hard limit
 
 enum CellType {
@@ -73,6 +72,12 @@ static const ColumnMapping kColumnMappings[kNumCsvColumns] = {
   // before this mapping (see the `m.index >= n` break in appendReadingObject),
   // so the key is absent and the backend falls back — no migration needed.
   {30, "deploymentEpoch",         CELL_INT},
+  {31, "userId",                  CELL_STRING},
+  {32, "name",                    CELL_STRING},
+  // Appended by the 33 -> 35 schema bump. Same fallback behaviour: a legacy
+  // 33-field row stops before these mappings, so the keys are simply absent.
+  {33, "latitude",                CELL_NUM_NULLABLE},
+  {34, "longitude",               CELL_NUM_NULLABLE},
 };
 
 // ---------------------------------------------------------------------------
@@ -143,6 +148,15 @@ static bool isFiniteNumberCell(const String& v) {
   return end != v.c_str() && end && *end == '\0' && isfinite(parsed);
 }
 
+// Column layout (see kColumnMappings above): 0-5 are non-numeric/int header
+// fields checked explicitly below; 6-29 are sensor floats; 30 is the
+// deploymentEpoch integer; 31-32 (userId, name) are free-form identity text
+// — NOT numeric, must not be run through isFiniteNumberCell; 33-34
+// (latitude, longitude) are numeric-or-nan again.
+static constexpr int kSensorFieldsEnd     = 30;  // exclusive: fields[6..29]
+static constexpr int kDeploymentEpochIdx  = 30;
+static constexpr int kLocationFieldsStart = 33;  // fields[31..32] (userId, name) unchecked
+
 static bool validReadingRow(const String* fields, int count,
                             bool fallbackTimestampAvailable) {
   if (count < 6) return false;
@@ -155,7 +169,16 @@ static bool validReadingRow(const String* fields, int count,
       !isDecimalIntegerCell(fields[5])) {
     return false;
   }
-  for (int i = 6; i < count; ++i) {
+  const int sensorEnd = count < kSensorFieldsEnd ? count : kSensorFieldsEnd;
+  for (int i = 6; i < sensorEnd; ++i) {
+    if (!isFiniteNumberCell(fields[i])) return false;
+  }
+  if (count > kDeploymentEpochIdx &&
+      !isDecimalIntegerCell(fields[kDeploymentEpochIdx])) {
+    return false;
+  }
+  // fields[31..32] (userId, name) are free text — no numeric constraint.
+  for (int i = kLocationFieldsStart; i < count; ++i) {
     if (!isFiniteNumberCell(fields[i])) return false;
   }
   return true;
@@ -324,10 +347,14 @@ JsonPayload buildJsonUpload(const String& csvChunk,
   // Arduino String reports no error when a grow fails, so the result was a
   // silently truncated payload the backend accepted with "appended": 0.
   //
-  // 31-column rows measure ~780 B of JSON each, verified against a real upload:
-  // 51 readings produced a 39,632 B body. 850 leaves headroom for long node
-  // names and the widest spectral values.
-  const uint32_t kEstBytesPerReading = 850U;
+  // 31-column rows measured ~780 B of JSON each, verified against a real upload:
+  // 51 readings produced a 39,632 B body, and 850 left headroom on that schema.
+  // The 33 -> 35 bump (userId, name, latitude, longitude) adds ~55 B per
+  // reading, and a worst case — a 32-char node name plus full-width
+  // coordinates — lands near 835 B, which all but erased that headroom. 950
+  // restores it. Under-estimating here is not cosmetic: the reserve below is
+  // what stops a fragmented heap from silently truncating the body.
+  const uint32_t kEstBytesPerReading = 950U;
   // Size from the ACTUAL chunk, not the maxReadings ceiling.
   //
   // The caller bounds a chunk by CSV bytes, so maxReadings (100) is an upper

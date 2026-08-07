@@ -67,7 +67,7 @@ This table is **binding** for all user-visible strings in the Field UI. The righ
 | Sync & Power Down | **Start Monitoring** | The button that closes the portal and begins the field cycle |
 | Flash / LittleFS / NVS | **Storage** | Any reference to on-device persistence |
 | ESP-NOW | *(hidden entirely)* | Never shown; the radio is not a user concept |
-| MAC address | *(hidden; Advanced only)* | Shown only in a collapsed About/Debug view |
+| MAC address | *(hidden in daily-use views; **prominent in the Connect flow**)* | Collapsed About/Debug view on Home and elsewhere — but the FieldHub MAC is the identifier the dashboard asks for when registering a hub, so `/provision` step 1 and the Settings "FieldHub identity" section show it large, monospaced, with a copy control. Hiding it there was a real onboarding failure: operators could not find the one value they needed first. |
 | Config version | *(hidden)* | Never shown |
 | Firmware build string | *(Advanced/About only)* | Moved to collapsed section |
 | Cursor offset / retry count | **"Last upload: success / failed"** | Show outcome, not mechanism |
@@ -293,6 +293,17 @@ The portal has four pages. Routes are restructured but the captive portal redire
 
 **Purpose:** All configuration in one place. Plain English. Advanced collapsed.
 
+> **Amended.** Cloud connection is **not** configured on this page. `/provision`
+> owns registration and connection end-to-end; Settings links to it with a single
+> primary "Connect to FieldMesh" action and otherwise only *reports* what is
+> configured. The wireframe below predates that split — read its CLOUD CONNECTION
+> block as the connected-state summary, not as an entry form. Settings also now
+> carries a **FieldHub identity** section (MAC + copy control, outside the
+> FieldMesh gate so an unprovisioned hub can see it) and a **Cellular** section
+> for the SIM APN. "Re-run full setup" sits at the bottom of the page as a
+> secondary action — it used to sit at the top beside a separate "connect field
+> hub" block that launched the same wizard, which read as two different jobs.
+
 **Wireframe:**
 
 ```
@@ -315,11 +326,12 @@ The portal has four pages. Routes are restructured but the captive portal redire
 │  CLOUD CONNECTION                   │
 │  API Key                            │
 │  [ fm_xxxxxxxx                ]     │
-│  QR code string (optional)          │
-│  [ paste url|key here         ]     │
-│  Endpoint (read-only)               │
+│  (QR paste field REMOVED — see      │
+│   supersession note below)          │
+│  Endpoint (set by provisioning)     │
 │  https://....supabase.co/...        │
-│  ● Connected · last upload 14:05    │
+│  FieldMesh configured               │
+│  Last successful upload: 14:05      │
 ├─────────────────────────────────────┤
 │  ▸ Advanced settings                │  ← collapsed <details>
 │    Min battery:    3500 mV          │
@@ -343,9 +355,26 @@ The portal has four pages. Routes are restructured but the captive portal redire
 
 **Cloud connection** folds the current `handleUploadSettings` form fields:
 - API Key field (existing `api_key`).
-- QR paste field (existing `qr_string`, splits on `|`).
 - Endpoint shown read-only (existing behaviour).
-- Status line: "Connected · last upload HH:MM" or "Not set up".
+- Status: **two separate lines**, never merged — "FieldMesh configured" (approved
+  endpoint + stored key) and "Last successful upload: {time}, or never".
+
+> **Superseded — `url|key` QR paste field.** This section previously specified a
+> `qr_string` field that split on `|` to set the endpoint and key at once. Both
+> the field and its parser are **removed**. The reason matters more than the
+> replacement: `url|key` wrote an arbitrary, request-supplied endpoint into
+> storage, bypassing `hwEndpointAllowed()`. A single POST could redirect a hub's
+> uploads — and therefore its device key — to any host. The endpoint is now
+> written only by `/provision-apply`, from a validated `FM1` payload. Do not
+> reintroduce any request-controlled endpoint writer here.
+
+> **Superseded — "Connected" status.** The single-line "Connected · last upload"
+> status is gone. The firmware never verified a connection: nothing contacts the
+> endpoint until the next sync, and `lastUploadUnix` is not scoped to the current
+> endpoint or key, so it can describe an upload made before a key rotation or
+> while custom HTTPS was active. "Connected" would need a configuration
+> generation recorded against the last authenticated upload — that does not exist
+> yet, so the UI states the two facts it can actually check, separately.
 
 **Advanced settings** (collapsed `<details>`, same pattern as current):
 - Min battery (mV)
@@ -476,8 +505,10 @@ flowchart TD
     D --> E[Hub Overview loads\n0 stations, Not set up]
     E --> F[Tap Settings]
     F --> G[Set recording interval\n5 or 10 min]
-    G --> H[Paste API key\nor QR string from dashboard]
-    H --> I[Tap Save]
+    G --> H[Tap Connect to FieldMesh\nopens /provision]
+    H --> H2[Step 1: copy the FieldHub MAC,\nregister the hub in the dashboard]
+    H2 --> H3[Step 2: scan or paste\nthe connection code]
+    H3 --> I[Step 3: Connection saved\nuploads at the next sync]
     I --> J[Tap Add New Station\non Stations page]
     J --> K[Press pair button\non station, hold 3s]
     K --> L[Tap Find New Stations]
@@ -557,7 +588,7 @@ Everything in this section is **excluded from the default view**. Items marked "
 | Hidden concept | Visibility | Reason |
 |---|---|---|
 | ESP-NOW (radio protocol) | Never | Not a user concept |
-| MAC addresses | Advanced only | Useful for support, not for field use |
+| MAC addresses | Advanced only **in daily-use views**; prominent in the Connect flow (`/provision`, Settings → FieldHub identity) | Useful for support, not for day-to-day field use — but the FieldHub MAC *is* the registration identifier, so it must be easy to find while connecting. Scoped to match §3. |
 | Flash / LittleFS / NVS | Never — say "Storage" | Filesystem is mechanism |
 | CCHSEND / modem AT commands | Never | Modem internals |
 | Phase alignment / sync anchors | Never | Scheduling internals |
@@ -575,15 +606,33 @@ Everything in this section is **excluded from the default view**. Items marked "
 ┌─────────────────────────────────────┐
 │  ▾ About / Advanced                 │
 ├─────────────────────────────────────┤
-│  Device ID:     001                 │
+│  FieldHub MAC:  24:6F:28:6C:0A:A0   │
+│                 [ Copy ]            │
+│  FieldHub name: FieldMesh-6C0AA0    │
+│  Radio node ID (internal): 001      │
 │  Firmware:      2.1.0               │
 │  Build:         2026-06-26T10:00Z   │
 │  WiFi network:  fieldmesh-xxxx      │
-│  Hub address:   24:6F:28:6C:0A:A0   │
 │  Portal URL:    http://192.168.4.1  │
+│  Node-radio address (support        │
+│    information): 24:6F:28:6C:0A:A0  │
 │  Radio channel: 11                  │
 └─────────────────────────────────────┘
 ```
+
+Consistent with the amended §3 MAC row: this panel is the *daily-use* placement
+(collapsed), while `/provision` step 1 and Settings → FieldHub identity show the
+same MAC prominently because that is where it is actually needed.
+
+Two naming points, both fixed because they misled operators:
+
+- **"FieldHub name"** is `hwCode()` (`FieldMesh-<last 6 of MAC>`). It is a
+  hardware label, **not** the registration identifier. The Settings page used to
+  present it as the value to register; it strips to 10 hex characters, and
+  `normaliseFieldHubMac()` requires 12, so the dashboard rejected it.
+- **"Node-radio address"** is `getMothershipsMAC()`, which returns the same STA
+  MAC as the FieldHub MAC above. It is labelled as support information so the
+  duplicate value cannot read as a second, different thing to register.
 
 ---
 

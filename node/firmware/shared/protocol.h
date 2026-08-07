@@ -62,6 +62,10 @@ typedef struct deployment_command {
                                // Applied immediately so the first capture after
                                // deploy respects the operator's selection, not
                                // just auto-detect.
+    // Deployment identity from the FieldHub. This uses the packet's former ABI
+    // tail padding, so deployment_command_t remains 92 bytes. 0 means a legacy
+    // FieldHub that does not provide an epoch.
+    uint16_t deploymentEpoch;
 } deployment_command_t;
 
 // Node -> mothership deployment confirmation (sent immediately after apply)
@@ -397,6 +401,43 @@ typedef struct rnt_pairing_t {
 
 // All operator-selectable bits: the 9 present bits (0-8) + the ultrasonic selector.
 #define NODE_SENSOR_CFG_ALL_BITS (0x01FFu | NODE_SENSOR_CFG_WIND_ULTRASONIC)
+
+// Canonical form of a configured mask: folds the decommissioned ultrasonic-wind
+// selector onto the plain WIND bit while preserving every other bit, including
+// NODE_SENSOR_MASK_VALID. A node that had ultrasonic selected still expects
+// wind — now served by the only remaining backend.
+//
+// Distinct from nodeNormalizeSensorMask() below, which additionally reduces to
+// the 9 snapshot present bits. Use THIS one wherever a configured mask is stored,
+// compared or forwarded (desired config, command dispatcher); use that one only
+// when comparing against a snapshot's sensorPresent.
+static inline uint16_t nodeCanonicalConfiguredMask(uint16_t configuredMask) {
+  if (configuredMask & NODE_SENSOR_CFG_WIND_ULTRASONIC) {
+    configuredMask = (uint16_t)((configuredMask & ~NODE_SENSOR_CFG_WIND_ULTRASONIC) |
+                                SNAP_PRESENT_WIND);
+  }
+  return configuredMask;
+}
+
+// Convert an operator-configured mask into the SNAP_PRESENT_* layout a snapshot
+// actually reports, so a configured mask and a snapshot's sensorPresent can be
+// compared bit-for-bit. Folds the config-only ultrasonic selector back onto
+// SNAP_PRESENT_WIND (a snapshot only ever reports the plain WIND bit, whichever
+// backend produced it) and drops everything outside the 9 present bits — the
+// VALID flag included.
+//
+// Every consumer of a configured mask must apply this before comparing against
+// or displaying alongside snapshot data. Doing it ad hoc let the cached expected
+// mask keep bit 9 while fault detection normalised it to bit 3, so the two masks
+// no longer intersected and a configured wind sensor could neither be shown nor
+// reported as faulted.
+static inline uint16_t nodeNormalizeSensorMask(uint16_t configuredMask) {
+  uint16_t m = configuredMask;
+  if (m & NODE_SENSOR_CFG_WIND_ULTRASONIC) {
+    m = (uint16_t)((m & ~NODE_SENSOR_CFG_WIND_ULTRASONIC) | SNAP_PRESENT_WIND);
+  }
+  return (uint16_t)(m & 0x01FFu);
+}
 
 // Passive capability bits: sensors the node cannot probe for on the bus, so they
 // are only registered/read when the configured mask enables them. The remaining

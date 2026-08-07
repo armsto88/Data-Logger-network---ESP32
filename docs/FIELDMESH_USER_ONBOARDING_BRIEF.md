@@ -396,7 +396,12 @@ These are firmware-architecture changes for the `Coder` agent to implement later
 
 - The Field UI (`192.168.4.1`) Upload Settings page:
   - **Remove** the "Endpoint URL" text field (or make it read-only, showing the generic Supabase URL).
-  - **Add** an "API Key" text field (accepts `fm_xxxxxxxx` or a QR-decoded `url|key` string).
+  - **Add** an "API Key" text field (accepts `fm_xxxxxxxx`).
+    > **Superseded:** this field previously also accepted a QR-decoded `url|key`
+    > string. Removed — `url|key` set the endpoint from request data, bypassing
+    > the endpoint allow-list, so a forged POST could point a hub (and its key) at
+    > any host. The endpoint is now set only by `/provision-apply` from a
+    > validated `FM1` payload.
   - **Add** a "Test Upload" button that sends a status-only JSON payload and reports success/failure.
 - The existing `TransmissionSettings` struct gains an `apiKey` field (or reuses `authToken` with a flag indicating "bearer key" vs "query token").
 

@@ -1,16 +1,18 @@
 // Config-mode WiFi AP + web server for Mothership V1.
-// Ported from production main.cpp — adapted to use V1's rtc_alarm.h and
-// flash_logger.h instead of production's rtc_manager.h / sd_manager.h.
+// Ported from production main.cpp and adapted to this target's RTC and storage
+// modules.
 
 #include "config/config_server.h"
 #include "config/node_registry.h"
 #include "config/transmission_settings.h"
+#include "config/sim_settings.h"
 #include "storage/upload_queue.h"
 #include "storage/json_payload.h"
 #include "comms/modem_driver.h"
 #include "comms/espnow_config.h"
 #include "time/rtc_alarm.h"
 #include "storage/flash_logger.h"
+#include "storage/sd_logger.h"
 #include "config/deployment_store.h"
 #include "config/deployment_epoch.h"
 #include "system/power.h"
@@ -243,6 +245,14 @@ static bool gDeployedThisSession = false;
 // pending schedule handover pins the wake to the OLD slot).
 static bool gFieldChangeThisSession = false;
 
+// Set true when the operator successfully connects the hub to the cloud this
+// session (handleProvisionApply). Without this, a hub that already had queued
+// data from an earlier local-recording session would connect to the cloud,
+// then power down via "Save & Start Recording" without ever uploading it —
+// the shutdown gate only looked at node deploy/change activity, never at
+// whether a cloud destination was just established.
+static bool gCloudConnectedThisSession = false;
+
 // Upload queue instance for config-mode UI (separate from the sync-wake
 // global in main.cpp, which is only active during a sync wake).
 UploadQueue gUploadQueue;
@@ -439,11 +449,38 @@ static bool deploymentApplyDesiredState(const String& nodeId, uint8_t targetStat
 }
 
 static uint32_t deploymentNowBridge() { return getRTCTimeUnix(); }
+static bool deploymentArchiveToSd(const char* nodeId, const DeploymentEvent& event) {
+  return !sdIsReady() || sdAppendDeploymentEvent(nodeId, event);
+}
+static bool deploymentCloudEventsEnabled() {
+  TransmissionSettings tx;
+  loadTransmissionSettings(tx);
+  return tx.destinationMode == TX_DEST_FIELDMESH && tx.enabled;
+}
+
+// The legacy-backlog gate exists so unstamped rows already queued cannot be
+// uploaded under the WRONG (new) deployment's epoch by the backend's fallback
+// logic — a risk that only exists if something is actually uploading them. A
+// standalone hub with upload disabled has nowhere to send those rows, and
+// nothing else ever clears a kLegacyCSVHeader* backlog (only a successful
+// upload does), so without this check a standalone hub would be permanently
+// blocked from ever redeploying a node again after its first CSV schema bump.
+static bool deploymentLegacyBacklogGate(uint32_t* pendingRowsOut) {
+  TransmissionSettings tx;
+  loadTransmissionSettings(tx);
+  if (!tx.enabled) {
+    if (pendingRowsOut) *pendingRowsOut = 0;
+    return false;
+  }
+  return uploadQueueHasLegacyRows(pendingRowsOut);
+}
 
 void deploymentBootstrap() {
   deploymentSetConfigApplyFn(deploymentApplyDesiredState);
-  deploymentSetLegacyBacklogFn(uploadQueueHasLegacyRows);
+  deploymentSetLegacyBacklogFn(deploymentLegacyBacklogGate);
   deploymentSetNowFn(deploymentNowBridge);
+  deploymentSetArchiveSinkFn(deploymentArchiveToSd);
+  deploymentSetCloudEventsEnabledFn(deploymentCloudEventsEnabled);
 
   if (!deploymentStoreBegin()) {
     Serial.println("[DEPLOY] Store unavailable — epochs will not be stamped this session");
@@ -1145,6 +1182,57 @@ static String htmlEscape(const String& s) {
   return out;
 }
 
+// Blocking warning shown on Home, Settings and /provision for as long as the
+// durable fieldmesh_reprovision_required marker is set (see
+// transmission_settings.h). The marker outlives the condition that raised it —
+// remediation drops the hub to local-only, so the raw detection test is false
+// from the next boot onward — which is exactly why the warning is driven by the
+// marker and not by the current destination mode.
+//
+// Recovery is a dashboard action first: the exposed key keeps working for
+// whoever holds a copy until it is revoked. Issuing a replacement key alone does
+// not revoke the old one.
+static String buildReprovisionWarning() {
+  if (!txReprovisionRequired()) return String();
+
+  const String host   = txReprovisionHost();
+  const String prefix = txReprovisionKeyPrefix();
+  const String reason = txReprovisionReason();
+
+  String out;
+  out.reserve(900);
+  out += F("<div class='section' style='border-color:#b3261e;background:#fdecea'>"
+           "<h3 style='color:#8c1d18'>Re-provisioning required</h3>");
+  if (reason == "save_failed") {
+    out += F("<p class='muted'>A settings write failed part-way through, leaving this "
+             "FieldHub's cloud credentials in an unknown state. Uploads are disabled "
+             "until it is provisioned again.</p>");
+  } else {
+    out += F("<p class='muted'>This FieldHub was pointed at an endpoint that is not an "
+             "approved FieldMesh host");
+    if (host.length() > 0) {
+      out += F(" (<strong>");
+      out += htmlEscape(host);   // never render stored URL text raw
+      out += F("</strong>)");
+    }
+    out += F(", so its connection key must be treated as exposed. Uploads are "
+             "disabled and the stored key has been erased from this FieldHub.</p>");
+  }
+  out += F("<p class='muted'><strong>To recover:</strong> in the FieldMesh dashboard, "
+           "<em>revoke</em> this FieldHub's connection key");
+  if (prefix.length() > 0) {
+    out += F(" (starts with <code>");
+    out += htmlEscape(prefix);   // non-secret prefix only
+    out += F("</code>)");
+  }
+  out += F(" first, then generate a new one and provision this FieldHub with it. "
+           "Generating a new key without revoking the old one leaves the exposed key "
+           "working.</p>"
+           "<a href='/provision' class='btn btn--primary'>Provision this FieldHub</a>"
+           "</div>");
+  return out;
+}
+
 static const char* nodeStateToString(int s) {
   switch (s) {
     case UNPAIRED: return "UNPAIRED";
@@ -1152,6 +1240,32 @@ static const char* nodeStateToString(int s) {
     case DEPLOYED: return "DEPLOYED";
     default:       return "UNKNOWN";
   }
+}
+
+// Sentinel for "we have never heard from this node", distinct from "0 min ago".
+static const uint32_t kLastSeenUnknown = 0xFFFFFFFFUL;
+
+// Minutes since this node was last genuinely heard from, or kLastSeenUnknown.
+//
+// NodeInfo::lastSeen is millis()-based and therefore only meaningful within the
+// current session — loadPairedNodes() deliberately restores it as 0, because
+// reloading a record is not evidence anyone has heard from the node. Config mode
+// is a separate boot from the sync wake, and a DEPLOYED node is asleep for all
+// of it, so keying the UI on lastSeen alone made every deployed node read "n/a"
+// forever. lastSeenUnix is the persisted absolute time of last real contact and
+// is the correct fallback; it is what the cloud payload has always reported.
+static uint32_t nodeLastSeenAgeMin(const NodeInfo& n) {
+  if (n.lastSeen > 0) {
+    const uint32_t nowMs = millis();
+    return ((nowMs >= n.lastSeen) ? (nowMs - n.lastSeen) : 0) / 60000UL;
+  }
+  if (n.lastSeenUnix > 0) {
+    const uint32_t nowUnix = getRTCTime();
+    // A hub clock behind the stored stamp (RTC reset/unset) would underflow into
+    // a nonsense age; report unknown rather than a fabricated number.
+    if (nowUnix >= n.lastSeenUnix) return (nowUnix - n.lastSeenUnix) / 60UL;
+  }
+  return kLastSeenUnknown;
 }
 
 // Render `text` as a self-contained, offline QR code SVG (no external assets).
@@ -1234,6 +1348,7 @@ a{color:var(--primary);text-decoration:none}
 
 /* Stats */
 .stats{display:grid;grid-template-columns:1fr 1fr 1fr;gap:var(--sp-1);text-align:center}
+.stats--kpi{grid-template-columns:1fr 1fr}
 .stat{background:#fafafa;border:1px solid var(--border);border-radius:8px;padding:10px}
 .stat strong{display:block;font-size:13px;color:var(--sub);margin-bottom:2px}
 .stat .num{font-size:18px;font-weight:700}
@@ -1326,6 +1441,12 @@ body.batch-mode .node-select-control{display:flex}
   background:var(--input-bg-active)
 }
 .help{color:var(--sub);font-size:.85rem;margin-top:6px}
+/* Identifiers meant to be copied by hand. user-select:all makes the value
+   select as one complete unit rather than word-by-word; it does not guarantee
+   a single tap selects it on every browser, so a copy button is still offered
+   alongside. This is the zero-JS backstop. */
+.mono-id{font-family:monospace;user-select:all;-webkit-user-select:all;word-break:break-all}
+.mono-id--lg{display:block;font-size:20px;font-weight:700;letter-spacing:.5px;margin:6px 0}
 .row{display:flex;gap:var(--sp-1);flex-wrap:wrap}
 .col{flex:1 1 220px;min-width:0}
 .subpanel{display:none;margin-top:12px;padding:10px;border:1px solid var(--border);border-radius:8px;background:#fafafa}
@@ -1350,6 +1471,10 @@ body.batch-mode .node-select-control{display:flex}
 .action-choice--start input:checked + span{background:rgba(122,155,112,.25)}
 .action-choice--stop input:checked + span{background:rgba(196,122,90,.25)}
 .action-choice--unpair input:checked + span{background:rgba(196,90,74,.20)}
+button.action-choice{display:block;width:100%;padding:0;border:0;background:transparent;
+  color:inherit;font:inherit;text-align:inherit}
+button.action-choice:focus-visible{outline:none}
+button.action-choice:focus-visible span{outline:2px solid var(--primary);outline-offset:2px}
 /* Two-line variant: action name plus ONE line of consequence. A modifier rather
    than a change to .action-choice span, because the recording-interval picker
    reuses the base class and must stay a single centred line. */
@@ -1615,12 +1740,16 @@ function flashBtn(btn, ok){
 }
 
 // --- Node cards: incremental, XSS-safe (textContent for device strings) ---
-function chipState(state, paused, pending, desiredTarget, ended, reportedPaused){
+function chipState(state, paused, pending, desiredTarget, ended, reportedPaused, deployUnconfirmed){
   if (pending && Number(desiredTarget)===0) return ['chip chip--state-unpaired','Remove queued'];
   // Ended outranks paused, matching the server-rendered chips. End queues
   // STANDBY and keeps the node DEPLOYED, so every test below would otherwise
   // call an archived deployment "Paused".
   if (ended) return ['chip chip--bat-low','Ended'];
+  // An unconfirmed deploy outranks every queued-config label below it: the node
+  // has never acknowledged the deploy, so it is not hearing us at all and
+  // "Pause queued" / "Update queued" would imply a link that does not exist.
+  if (state==='DEPLOYED' && deployUnconfirmed) return ['chip chip--bat-low','Not confirmed'];
   if (state==='DEPLOYED' && pending && Number(desiredTarget)===3) return ['chip chip--state-paused','Pause queued'];
   // Only a node that is actually paused is resuming. A settings change leaves a
   // pending desired config at targetState 2 as well, and calling that "Resume
@@ -1650,7 +1779,7 @@ function nodeCell(parentClass, labelText, fieldName){
 }
 function applyNodeFields(card, n){
   if (card && card.dataset){ card.dataset.state=n.state||''; card.dataset.paused=n.paused?'1':'0'; }
-  var st=chipState(n.state, n.paused, n.pending, n.desiredTarget, n.deploymentEnded, n.reportedPaused), s=card.querySelector('[data-f="status"]');
+  var st=chipState(n.state, n.paused, n.pending, n.desiredTarget, n.deploymentEnded, n.reportedPaused, n.deployUnconfirmed), s=card.querySelector('[data-f="status"]');
   if (s){ s.className=st[0]; s.textContent=st[1]; }
   var bt=chipBatt(n.batV), b=card.querySelector('[data-f="batt"]');
   if (b){ b.className=bt[0]; b.textContent=bt[1]; }
@@ -1703,7 +1832,6 @@ function reconcileNodes(nodes){
 function updateKpis(f){
   var set=function(id,v){ var e=document.getElementById(id); if (e && v!=null) e.textContent=String(v); };
   set('kpi-deployed-num', f.active);
-  set('kpi-paired-num', f.connected);
   set('kpi-unpaired-num', f.new);
 }
 function setText(id,v){ var e=document.getElementById(id); if (e) e.textContent=v; }
@@ -1857,7 +1985,7 @@ function setCurrentTime(){
 const MONTH_SHORT=['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
 function formatHubClock(ms){
   const dt=new Date(ms);
-  return `${String(dt.getUTCHours()).padStart(2,'0')}:${String(dt.getUTCMinutes()).padStart(2,'0')} \u00b7 ${String(dt.getUTCDate()).padStart(2,'0')} ${MONTH_SHORT[dt.getUTCMonth()]} ${dt.getUTCFullYear()}`;
+  return `${String(dt.getUTCHours()).padStart(2,'0')}:${String(dt.getUTCMinutes()).padStart(2,'0')} · ${String(dt.getUTCDate()).padStart(2,'0')} ${MONTH_SHORT[dt.getUTCMonth()]} ${dt.getUTCFullYear()}`;
 }
 function toggleSettings(){
   const panel=document.getElementById('settings-panel');
@@ -1955,7 +2083,10 @@ static void sendAjaxResult(bool ok, const String& message) {
 
 // Page frame helpers are defined further down; declared here so the deployment
 // error responder can render an HTML fallback for non-AJAX form posts.
-static String headCommon(const String& title, const String& actionsHtml, int navActive);
+static String headCommon(const String& title,
+                         const String& actionsHtml = String(),
+                         int navActive = -1,
+                         bool includeCommonJs = true);
 static inline String footCommon();
 
 // Deployment-action failure. AJAX callers (the setup wizard) get a JSON body
@@ -2029,9 +2160,8 @@ static void sendProbeMsConnect() {
 }
 
 // Persistent primary navigation. navActive selects the current destination:
-// 0=Overview, 1=Stations, 2=Export, 3=Settings; <0 emits nothing (child/result
-// pages keep their header Back button). Export is a download route, so its tab is
-// a plain link with no aria-current state. Icons reuse the inline SVGs already in
+// 0=Overview, 1=Stations, 2=Data, 3=Settings; <0 emits nothing (child/result
+// pages keep their header Back button). Icons reuse the inline SVGs already in
 // the page bodies — no external assets.
 static String navBarHtml(int navActive) {
   if (navActive < 0) return String();
@@ -2053,7 +2183,7 @@ static String navBarHtml(int navActive) {
   h += tab("/stations", "Nodes",
            "M12 2a4 4 0 110 8 4 4 0 010-8zm-7 12a3 3 0 110 6 3 3 0 010-6zm14 0a3 3 0 110 6 3 3 0 010-6zM9.3 9.8l-3 3.9 1.6 1.2 3-3.9-1.6-1.2zm5.4 0l-1.6 1.2 3 3.9 1.6-1.2-3-3.9z",
            navActive == 1);
-  h += tab("/export", "Export",
+  h += tab("/export", "Data",
            "M12 3a1 1 0 011 1v8.59l2.3-2.3 1.4 1.42-4.7 4.7-4.7-4.7 1.4-1.42 2.3 2.3V4a1 1 0 011-1zm-7 14h14v2H5v-2z",
            navActive == 2);
   h += tab("/settings", "Settings",
@@ -2063,7 +2193,10 @@ static String navBarHtml(int navActive) {
   return h;
 }
 
-static String headCommon(const String& title, const String& actionsHtml = String(), int navActive = -1) {
+static String headCommon(const String& title,
+                         const String& actionsHtml,
+                         int navActive,
+                         bool includeCommonJs) {
   // No-store on every portal page: phones/captive-portal browsers cache the AP
   // pages aggressively, which repeatedly showed stale UI after a reflash. This
   // header is queued for this request's send(); the belt-and-braces meta tags
@@ -2079,7 +2212,9 @@ static String headCommon(const String& title, const String& actionsHtml = String
   h += F("<meta http-equiv='Cache-Control' content='no-cache, no-store, must-revalidate'>"
          "<meta http-equiv='Pragma' content='no-cache'><meta http-equiv='Expires' content='0'>");
   h += F("<style>"); h += FPSTR(COMMON_CSS); h += F("</style>");
-  h += F("<script>"); h += FPSTR(COMMON_JS);  h += F("</script>");
+  if (includeCommonJs) {
+    h += F("<script>"); h += FPSTR(COMMON_JS); h += F("</script>");
+  }
   h += F("</head><body>");
   h += F("<div id='fm-load' class='fm-load-overlay'><div class='fm-load-box'>"
          "<span class='spinner'></span><span id='fm-load-msg'>Loading&hellip;</span></div></div>");
@@ -2100,7 +2235,68 @@ static String headCommon(const String& title, const String& actionsHtml = String
   return h;
 }
 
-static inline String footCommon() { return String(F("</div></body></html>")); }
+// Truncation marker. A page is built as ONE contiguous String; when the largest
+// contiguous free heap block runs out, String::concat() returns false, appending
+// silently stops, and the page is served looking fine but with its trailing
+// <script> cut off. Because footCommon() is the last thing appended to every
+// page, the presence of this marker in a response is proof the whole page —
+// including the controller script before it — actually made it out.
+//
+// There is no useful byte threshold to test against: truncation depends on the
+// largest contiguous block, not on source size. Assert on the marker instead.
+static inline String footCommon() {
+  return String(F("</div><!--FM-PAGE-END--></body></html>"));
+}
+
+// Delegated [data-copy] handler — a copy control that only ever claims what it
+// actually did.
+//
+// The Clipboard API is secure-context-only and http://192.168.4.1 is not a
+// secure origin, so writeText() is either absent or (Firefox) present and
+// rejecting. Both are handled: the fallback is driven by promise REJECTION, not
+// merely by feature detection.
+//
+// This cannot live in COMMON_JS — the setup wizard deliberately omits that block
+// (includeCommonJs=false) to stop its own trailing controller script being
+// truncated on a fragmented heap — so it is emitted per page instead. The guard
+// makes a double include harmless.
+static String copyHelperJs() {
+  return String(F(
+    "<script>(function(){if(window.__fmCopy)return;window.__fmCopy=1;"
+    "function statusEl(btn){var n=btn.nextElementSibling;"
+    "if(!n||!n.hasAttribute('data-copy-status')){n=document.createElement('div');"
+    "n.setAttribute('data-copy-status','');n.setAttribute('aria-live','polite');"
+    "n.className='help';btn.parentNode.insertBefore(n,btn.nextSibling);}return n;}"
+    "function selectAll(el){try{var r=document.createRange();r.selectNodeContents(el);"
+    "var s=window.getSelection();s.removeAllRanges();s.addRange(r);return true;}"
+    "catch(e){return false;}}"
+    // Off-screen, NOT display:none — a hidden element cannot be selected, and
+    // without a selection execCommand('copy') silently copies nothing.
+    "function legacy(text){var ta=document.createElement('textarea');ta.value=text;"
+    "ta.setAttribute('readonly','');ta.contentEditable='true';"
+    "ta.style.cssText='position:fixed;top:0;left:0;width:1px;height:1px;opacity:0;border:0;padding:0';"
+    "document.body.appendChild(ta);var ok=false;"
+    "try{var r=document.createRange();r.selectNodeContents(ta);"
+    "var s=window.getSelection();s.removeAllRanges();s.addRange(r);"
+    "ta.setSelectionRange(0,text.length);"
+    "ok=(document.execCommand('copy')===true);}catch(e){ok=false;}"
+    "document.body.removeChild(ta);return ok;}"
+    "function finish(btn,src,ok){var st=statusEl(btn);"
+    "var lbl=btn.getAttribute('data-copy-label')||btn.textContent;"
+    "btn.setAttribute('data-copy-label',lbl);"
+    "if(ok){btn.textContent='Copied';st.textContent='Copied to clipboard.';"
+    "setTimeout(function(){btn.textContent=lbl;},1800);}"
+    "else{selectAll(src);st.textContent='Select and copy the highlighted MAC.';}}"
+    "document.addEventListener('click',function(e){var t=e.target;"
+    "while(t&&t!==document&&!(t.getAttribute&&t.getAttribute('data-copy')))t=t.parentNode;"
+    "if(!t||t===document)return;e.preventDefault();"
+    "var src=document.querySelector(t.getAttribute('data-copy'));if(!src)return;"
+    "var text=(src.textContent||'').trim();if(!text)return;"
+    "if(navigator.clipboard&&navigator.clipboard.writeText){"
+    "navigator.clipboard.writeText(text).then(function(){finish(t,src,true);},"
+    "function(){finish(t,src,legacy(text));});}"
+    "else{finish(t,src,legacy(text));}});})();</script>"));
+}
 
 // ---------------------------------------------------------------------------
 // Status JSON (renamed from buildBleStatusDataJson)
@@ -2191,35 +2387,50 @@ static String buildStatusJson() {
   // Upload subsystem status
   TransmissionSettings txSettings;
   loadTransmissionSettings(txSettings);
-  UploadCursor cursor = {0, 0, 0, 0, 0};
+  UploadCursor cursor{};
   uint32_t pendingBytes = 0;
   uint32_t pendingRows = 0;
+  bool queueReady = false;
   if (flashIsReady()) {
-    gUploadQueue.init();
-    cursor = gUploadQueue.getCursor();
-    pendingBytes = gUploadQueue.getPendingBytes();
-    pendingRows = gUploadQueue.getPendingRows();
+    queueReady = gUploadQueue.init();
+    if (queueReady) {
+      cursor = gUploadQueue.getCursor();
+      pendingBytes = gUploadQueue.getPendingBytes();
+      pendingRows = gUploadQueue.getPendingRows();
+    }
   }
   const uint64_t fsTotal = (uint64_t)LittleFS.totalBytes();
   const uint64_t fsUsed  = (uint64_t)LittleFS.usedBytes();
   const uint32_t flashUsagePct = (fsTotal > 0)
     ? (uint32_t)((fsUsed * 100ULL) / fsTotal) : 0;
 
+  // queueReady says whether the cursor-derived numbers below mean anything. When
+  // it is false they are emitted as null, not 0 — a zero here is indistinguishable
+  // from a genuinely empty queue.
+  auto queueNum = [&](uint32_t v) -> String {
+    return queueReady ? String(v) : String("null");
+  };
+
   json += ",\"upload\":{";
+  json += "\"destinationMode\":\"";
+  json += txDestinationModeName(txSettings.destinationMode);
+  json += "\",";
   json += "\"enabled\":";
   json += txSettings.enabled ? "true" : "false";
+  json += ",\"queueReady\":";
+  json += queueReady ? "true" : "false";
   json += ",\"cursorOffset\":";
-  json += String(cursor.byteOffset);
+  json += queueNum(cursor.byteOffset);
   json += ",\"pendingBytes\":";
-  json += String(pendingBytes);
+  json += queueNum(pendingBytes);
   json += ",\"pendingRows\":";
-  json += String(pendingRows);
+  json += queueNum(pendingRows);
   json += ",\"rowsUploaded\":";
-  json += String(cursor.rowsUploaded);
+  json += queueNum(cursor.rowsUploaded);
   json += ",\"lastUploadUnix\":";
-  json += String(cursor.lastUploadUnix);
+  json += queueNum(cursor.lastUploadUnix);
   json += ",\"retryCount\":";
-  json += String(cursor.retryCount);
+  json += queueNum(cursor.retryCount);
   json += ",\"flashUsagePct\":";
   json += String(flashUsagePct);
   json += ",\"flashTotalBytes\":";
@@ -2245,6 +2456,9 @@ static uint32_t gLiveFingerprint = 0;
 static String buildLiveJson() {
   const std::vector<NodeInfo> nodes = getRegisteredNodes();  // snapshot copy (safe read)
   const uint32_t now = millis();
+  // One RTC read per poll (not per node) for the lastSeenUnix fallback below.
+  // Still honours this endpoint's contract: no LittleFS, NVS or upload-queue access.
+  const uint32_t liveNowUnix = getRTCTime();
 
   uint16_t nNew = 0, nConn = 0, nActive = 0, nPending = 0;
   uint32_t fp = 2166136261UL ^ (uint32_t)nodes.size();
@@ -2260,12 +2474,18 @@ static String buildLiveJson() {
     const uint8_t desiredTarget = mirrored ? mirrored->targetState
         : (n.state == DEPLOYED ? (n.recordingPaused ? 3 : 2)
                               : static_cast<uint8_t>(n.state));
+    // Fold the ABSOLUTE last-contact time, not a derived age. An age recomputed
+    // against the current clock changes every second for every node, which would
+    // bump the version on every poll and defeat this fingerprint's whole purpose
+    // as a cheap "did anything actually change" detector.
     fp ^= (uint32_t)n.state + ((uint32_t)n.configVersionApplied << 4) +
-          (n.lastSeen / 1000UL) + battCenti + (mirroredPaused ? 97U : 0U) +
+          n.lastSeenUnix + (n.lastSeen / 1000UL) + battCenti + (mirroredPaused ? 97U : 0U) +
           (uint32_t)(n.nodeId.length() * 131U) + (uint32_t)(n.name.length() * 17U) +
           ((uint32_t)n.expectedSensorMask << 9) + ((uint32_t)n.sensorFaultMask << 20) +
           (mirrored ? ((uint32_t)mirrored->wakeIntervalMin << 24) : 0U) +
-          ((uint32_t)desiredTarget * 2654435761UL);
+          ((uint32_t)desiredTarget * 2654435761UL) +
+          ((uint32_t)n.deploymentEpoch * 2246822519UL) +
+          n.deploymentEndedUnix + ((uint32_t)n.deploymentPendingOp << 28);
     fp *= 16777619UL;  // FNV-style fold — cheap change detector, not a hash guarantee
   }
   fp ^= (gDiscovery.generation * 2654435761UL) + (gDiscovery.active ? 1UL : 0UL) +
@@ -2312,12 +2532,22 @@ static String buildLiveJson() {
     j += ",\"userId\":\""; j += jsonEscapeLocal(n.userId); j += "\"";
     j += ",\"state\":\"";  j += nodeStateToString(n.state); j += "\"";
     if (n.lastSeen > 0 && now >= n.lastSeen) { j += ",\"lastSeenSec\":"; j += String((now - n.lastSeen) / 1000UL); }
+    else if (n.lastSeenUnix > 0 && liveNowUnix >= n.lastSeenUnix) {
+      // Same fallback as the server-rendered pages: a deployed node is asleep
+      // throughout config mode, so millis-based lastSeen stays 0 all session.
+      j += ",\"lastSeenSec\":"; j += String(liveNowUnix - n.lastSeenUnix);
+    }
     else { j += ",\"lastSeenSec\":-1"; }
     if (isnan(n.lastReportedBatV)) { j += ",\"batV\":null"; }
     else { char b[12]; snprintf(b, sizeof(b), "%.2f", n.lastReportedBatV); j += ",\"batV\":"; j += b; }
     j += ",\"recMin\":";  j += String(recMin);
     j += ",\"paused\":";  j += mirroredPaused ? "true" : "false";
     j += ",\"pending\":"; j += (n.stateChangePending || n.deployPending) ? "true" : "false";
+    // Reported separately from "pending" above, which merges two unrelated
+    // meanings. This one is specifically "we sent DEPLOY_NODE and the node has
+    // never confirmed it" — a node that may not be deployed at all, as opposed
+    // to a deployed node with a config change queued.
+    j += ",\"deployUnconfirmed\":"; j += n.deployPending ? "true" : "false";
     j += ",\"desiredTarget\":"; j += String((unsigned)desiredTarget);
     // Needed by chipState(): an ended deployment is state DEPLOYED with STANDBY
     // queued, so without this the live refresh repaints an archived node as
@@ -2343,16 +2573,20 @@ static String buildLiveJson() {
 // Data status section (adapted to use flash_logger instead of SD)
 // ---------------------------------------------------------------------------
 static String buildDataStatusSectionHtml() {
-  bool hasFile = flashIsReady() && LittleFS.exists("/datalog.csv");
+  const bool usingSD = sdIsReady() && SD.exists(sdReadingsPath());
+  bool hasFile = usingSD || (flashIsReady() && LittleFS.exists("/datalog.csv"));
   uint32_t records = 0;
   uint64_t fileBytes = 0;
+  String firstConfirmedSync = "n/a";
   String lastConfirmedSync = "n/a";
 
   if (hasFile) {
-    File file = LittleFS.open("/datalog.csv", "r");
+    File file = usingSD ? SD.open(sdReadingsPath(), FILE_READ)
+                        : LittleFS.open("/datalog.csv", "r");
     if (file) {
       fileBytes = (uint64_t)file.size();
       uint32_t lineNo = 0;
+      String firstDataLine;
       String lastDataLine;
       while (file.available()) {
         String line = file.readStringUntil('\n');
@@ -2361,9 +2595,14 @@ static String buildDataStatusSectionHtml() {
         lineNo++;
         if (lineNo == 1) continue;
         records++;
+        if (firstDataLine.length() == 0) firstDataLine = line;
         lastDataLine = line;
       }
       file.close();
+      if (firstDataLine.length() > 0) {
+        const int comma = firstDataLine.indexOf(',');
+        if (comma > 0) firstConfirmedSync = firstDataLine.substring(0, comma);
+      }
       if (lastDataLine.length() > 0) {
         const int comma = lastDataLine.indexOf(',');
         if (comma > 0) {
@@ -2375,23 +2614,35 @@ static String buildDataStatusSectionHtml() {
     }
   }
 
-  const uint64_t totalBytes = (uint64_t)LittleFS.totalBytes();
-  const uint64_t usedBytes  = (uint64_t)LittleFS.usedBytes();
+  const uint64_t totalBytes = usingSD ? sdTotalBytes() : (uint64_t)LittleFS.totalBytes();
+  const uint64_t usedBytes  = usingSD ? sdUsedBytes() : (uint64_t)LittleFS.usedBytes();
   const uint64_t freeBytes  = (totalBytes > usedBytes) ? (totalBytes - usedBytes) : 0;
+  uint16_t completedDeployments = 0;
+  if (deploymentStoreReady()) {
+    for (size_t i = 0; i < kMaxDeployNodes; ++i) {
+      const DeploymentSlot* slot = deploymentSlotAt(i);
+      if (slot) completedDeployments += slot->archiveCount;
+    }
+  }
 
   String out;
   out.reserve(900);
-  out += F("<div class='section'><h3>Data status</h3>");
+  out += F("<div class='section'><h3>Local data</h3><p><span class='chip chip--cfg-ok'>");
+  out += usingSD ? F("SD card archive") : F("Internal storage");
+  out += F("</span></p>");
 
   out += F("<div class='stats' style='margin:0 0 10px 0'>"
-           "<div class='stat'><strong>Records</strong><span class='num'>");
+           "<div class='stat'><strong>Stored readings</strong><span class='num'>");
   out += String(records);
   out += F("</span></div>"
-           "<div class='stat'><strong>CSV size</strong><span class='num' style='font-size:16px'>");
+           "<div class='stat'><strong>Readings file</strong><span class='num' style='font-size:16px'>");
   out += hasFile ? formatBytesUi(fileBytes) : String("n/a");
   out += F("</span></div>"
            "<div class='stat'><strong>Storage free</strong><span class='num' style='font-size:16px'>");
   out += (totalBytes > 0) ? formatBytesUi(freeBytes) : String("n/a");
+  out += F("</span></div>"
+           "<div class='stat'><strong>Completed deployments</strong><span class='num'>");
+  out += String(completedDeployments);
   out += F("</span></div></div>");
 
   if (!hasFile) {
@@ -2412,31 +2663,66 @@ static String buildDataStatusSectionHtml() {
   out += F("<p class='muted'><strong>Last collection:</strong> ");
   out += lastConfirmedSync;
   out += F("</p>");
+  if (records > 0) {
+    out += F("<p class='muted'><strong>Stored range:</strong> ");
+    out += firstConfirmedSync;
+    out += F(" to ");
+    out += lastConfirmedSync;
+    out += F("</p>");
+  }
 
   // Upload status summary
   TransmissionSettings txSettings;
   loadTransmissionSettings(txSettings);
   UploadCursor cursor = {0, 0, 0, 0, 0};
   uint32_t pendingRows = 0;
+  bool queueReady = false;
   if (flashIsReady()) {
-    gUploadQueue.init();
-    cursor = gUploadQueue.getCursor();
-    pendingRows = gUploadQueue.getPendingRows();
+    queueReady = gUploadQueue.init();
+    if (queueReady) {
+      cursor = gUploadQueue.getCursor();
+      pendingRows = gUploadQueue.getPendingRows();
+    }
   }
-  out += F("<p class='muted'><strong>Cloud upload:</strong> ");
-  out += txSettings.enabled ? String("enabled") : String("disabled");
-  out += F(" &nbsp;|&nbsp; <strong>Readings waiting:</strong> ");
-  out += String(pendingRows);
-  out += F(" &nbsp;|&nbsp; <strong>Readings sent:</strong> ");
-  out += String(cursor.rowsUploaded);
-  if (cursor.lastUploadUnix > 0) {
-    DateTime lastUp(cursor.lastUploadUnix);
-    out += F(" &nbsp;|&nbsp; <strong>Last upload:</strong> ");
-    out += formatDateTimeDisplay(lastUp);
+  if (txSettings.enabled && !queueReady) {
+    out += F("<p class='muted'><strong>Remote upload:</strong> enabled "
+             "&nbsp;|&nbsp; upload status unavailable (queue could not be read).</p>");
+  } else if (txSettings.enabled) {
+    out += F("<p class='muted'><strong>Remote upload:</strong> enabled"
+             " &nbsp;|&nbsp; <strong>Waiting:</strong> ");
+    out += String(pendingRows);
+    out += F(" &nbsp;|&nbsp; <strong>Sent:</strong> ");
+    out += String(cursor.rowsUploaded);
+    if (cursor.lastUploadUnix > 0) {
+      DateTime lastUp(cursor.lastUploadUnix);
+      out += F(" &nbsp;|&nbsp; <strong>Last upload:</strong> ");
+      out += formatDateTimeDisplay(lastUp);
+    }
+    out += F("</p>");
+  } else {
+    out += F("<p class='muted'><strong>Remote upload:</strong> not connected. "
+             "All stored readings remain available for local download.</p>");
   }
-  out += F("</p>");
-
-  out += F("<p class='muted'>Use the Export Data page to download a CSV, or <a href='/settings'>Settings</a> to configure cloud upload.</p></div>");
+  if (!usingSD && cursor.rowsRemovedLocally > 0) {
+    out += F("<p><span class='chip chip--bat-low'>");
+    out += String(cursor.rowsRemovedLocally);
+    out += F(" older readings removed as internal storage filled</span></p>");
+  }
+  if (usingSD) {
+    out += F("<p class='muted'>The SD card keeps the complete archive until the card "
+             "is full or files are removed. Uploading and downloading do not delete it. "
+             "Internal storage continues as the upload cache and fallback.</p>");
+    if (sdHadWriteError()) {
+      out += F("<p><span class='chip chip--bat-low'>An SD write failed this session; "
+               "check the card. Recent readings still use internal fallback storage.</span></p>");
+    }
+  } else {
+    out += F("<p class='muted'>Internal storage keeps a rolling recent history. "
+             "Older readings are removed automatically at the storage limit; "
+             "downloading or uploading does not delete them. Add an SD card for "
+             "capacity-limited complete history.</p>");
+  }
+  out += F("</div>");
   return out;
 }
 
@@ -2444,14 +2730,25 @@ static String buildDataStatusSectionHtml() {
 // Route handlers
 // ---------------------------------------------------------------------------
 static void handleRoot() {
-  // Unprovisioned (no connection key saved) → send the user straight into the
-  // first-run setup wizard instead of the normal home page. Once provisioned,
-  // "/" behaves exactly as before. The wizard itself stays reachable manually
-  // (Settings → "Run setup wizard") regardless of this gate.
+  // First-run setup is keyed to completion of the local wizard, never to a
+  // cloud credential. Existing hubs predate the marker, so a saved FieldMesh
+  // key or any registered node is sufficient migration evidence that they are
+  // already commissioned and must not be trapped in onboarding after upgrade.
   {
-    TransmissionSettings txProbe;
-    loadTransmissionSettings(txProbe);
-    if (txProbe.apiKey.length() == 0) {
+    Preferences setupPrefs;
+    bool setupDone = false;
+    bool hasExplicitMarker = false;
+    if (setupPrefs.begin("ui_setup", true)) {
+      hasExplicitMarker = setupPrefs.isKey("done");
+      setupDone = setupPrefs.getBool("done", false);
+      setupPrefs.end();
+    }
+    if (!hasExplicitMarker) {
+      TransmissionSettings priorTx;
+      loadTransmissionSettings(priorTx);
+      setupDone = priorTx.apiKey.length() > 0 || !getRegisteredNodes().empty();
+    }
+    if (!setupDone) {
       server.sendHeader("Location", "/setup", true);
       server.send(302, "text/plain", "");
       return;
@@ -2461,12 +2758,14 @@ static void handleRoot() {
   String html = headCommon("fieldMesh",
     F("<span id='conn-status' class='conn-dot'>Connected</span>"), 0);
 
+  // Stays at the top of the page for as long as the marker is set.
+  html += buildReprovisionWarning();
+
   char currentTime[24];
   getRTCTimeString(currentTime, sizeof(currentTime));
 
   auto allNodes      = getRegisteredNodes();
   auto unpairedNodes = getUnpairedNodes();
-  auto pairedNodes   = getPairedNodes();
 
   int deployedNodes = 0;
   for (const auto& node : allNodes) {
@@ -2509,11 +2808,6 @@ static void handleRoot() {
   html += String(deployedNodes);
   html += F("</span></div>"
               "<div class='stat");
-  if (pairedNodes.size() > 0) html += F(" stat--paired-active");
-  html += F("'><strong>Connected</strong><span id='kpi-paired-num' class='num'>");
-  html += String(pairedNodes.size());
-  html += F("</span></div>"
-              "<div class='stat");
   if (unpairedNodes.size() > 0) html += F(" stat--unpaired-active");
   html += F("'><strong>New</strong><span id='kpi-unpaired-num' class='num'>");
   html += String(unpairedNodes.size());
@@ -2536,6 +2830,17 @@ static void handleRoot() {
             "<div class='dp-row'><span>New nodes this scan: <strong id='dp-found'>0</strong></span></div>"
             "<div class='dp-msg'>Keep new nodes powered on and in pairing mode.</div></div>"
             "</div>");
+
+  // One upload-queue init + cursor read, shared by the hub-health widget and the
+  // data-destination widget below — they used to init the queue independently on
+  // every page load. A failed init is surfaced as "unavailable"; it must never
+  // render as a zero that reads like real data.
+  UploadCursor homeCursor{};
+  bool homeQueueReady = false;
+  if (flashIsReady()) {
+    homeQueueReady = gUploadQueue.init();
+    if (homeQueueReady) homeCursor = gUploadQueue.getCursor();
+  }
 
   // --- Hub health: battery + storage + last upload (flat, border-only) ---
   {
@@ -2571,15 +2876,13 @@ static void handleRoot() {
     html += F("</span></div>");
     html += F("<div class='stat' style='text-align:left'>"
               "<strong>Last upload</strong><br><span class='num' style='font-size:14px'>");
-    {
-      UploadCursor cursor = {0,0,0,0,0};
-      if (flashIsReady()) { gUploadQueue.init(); cursor = gUploadQueue.getCursor(); }
-      if (cursor.lastUploadUnix > 0) {
-        DateTime lastUp(cursor.lastUploadUnix);
-        html += formatDateTimeDisplay(lastUp);
-      } else {
-        html += F("Never");
-      }
+    if (!homeQueueReady) {
+      html += F("Unavailable");
+    } else if (homeCursor.lastUploadUnix > 0) {
+      DateTime lastUp(homeCursor.lastUploadUnix);
+      html += formatDateTimeDisplay(lastUp);
+    } else {
+      html += F("Never");
     }
     html += F("</span></div>");
     html += F("</div></div>");
@@ -2601,56 +2904,65 @@ static void handleRoot() {
       html += F("Off");
     }
     html += F("</span></div>"
-              "<div class='stat'><strong>Auto upload</strong><span class='num' style='font-size:16px'>");
+              "<div class='stat'><strong>FieldHub sync</strong><span class='num' style='font-size:16px'>");
     html += String(gSyncIntervalMin);
     html += F(" min</span></div>"
-              "<div class='stat'><strong>Next upload</strong><span class='num' style='font-size:16px'><span id='kpi-next-sync'>");
+              "<div class='stat'><strong>Next sync</strong><span class='num' style='font-size:16px'><span id='kpi-next-sync'>");
     html += computeNextCollectionIsoLocal();
     html += F("</span></span></div>"
               "</div>"
               "</div>");
   }
 
-  // --- Cloud upload status (flat; status shown as a chip, not a bare dot) ---
+  // --- Optional data destination (flat; status is text, not just colour) ---
+  //
+  // Two separate facts, never merged into one claim. Line 1 is what is
+  // configured — something the firmware can check. Line 2 is the last
+  // successful upload, which is purely historical: it is not scoped to the
+  // current endpoint or key, so it may predate a key rotation, an endpoint
+  // change, or even this destination mode. Calling the pair "Connected" would
+  // assert a link this firmware has never verified.
   {
     TransmissionSettings txSettings;
     loadTransmissionSettings(txSettings);
-    UploadCursor cursor = {0, 0, 0, 0, 0};
-    if (flashIsReady()) {
-      gUploadQueue.init();
-      cursor = gUploadQueue.getCursor();
-    }
 
     const char* chipCls = "chip";
-    const char* statusLabel = "Upload off";
-    if (txSettings.enabled) {
-      if (cursor.retryCount > 0) {
-        chipCls = "chip chip--bat-med";
-        statusLabel = "Last upload failed";
-      } else {
-        chipCls = "chip chip--cfg-ok";
-        statusLabel = "Connected";
-      }
+    const char* statusLabel = "Stored locally";
+    if (txSettings.destinationMode == TX_DEST_FIELDMESH &&
+        txSettings.apiKey.length() > 0 &&
+        hwEndpointAllowed(txSettings.endpointUrl)) {
+      chipCls = "chip chip--cfg-ok";
+      statusLabel = "FieldMesh configured";
+    } else if (txSettings.destinationMode == TX_DEST_CUSTOM_HTTPS &&
+               txSettings.customEndpointUrl.startsWith("https://")) {
+      chipCls = "chip chip--cfg-ok";
+      statusLabel = "Custom HTTPS configured";
     }
 
     html += F("<div class='section section--flat'>"
-              "<h3>Cloud upload</h3>"
+              "<h3>Data destination</h3>"
               "<p style='margin:4px 0'><span class='");
     html += chipCls;
     html += F("' style='font-weight:600'>");
     html += statusLabel;
     html += F("</span></p>");
-    if (cursor.lastUploadUnix > 0) {
-      DateTime lastUp(cursor.lastUploadUnix);
-      html += F("<p class='muted'>Last upload ");
-      html += formatDateTimeDisplay(lastUp);
+
+    html += F("<p class='muted'>Last successful upload: ");
+    if (!homeQueueReady) {
+      html += F("unavailable");
+    } else if (homeCursor.lastUploadUnix > 0) {
+      html += formatDateTimeDisplay(DateTime(homeCursor.lastUploadUnix));
       html += F(" &middot; ");
-      html += String(cursor.rowsUploaded);
-      html += F(" readings sent</p>");
+      html += String(homeCursor.rowsUploaded);
+      html += F(" readings sent");
     } else {
-      html += F("<p class='muted'>No uploads yet &middot; ");
-      html += String(cursor.rowsUploaded);
-      html += F(" readings sent</p>");
+      html += F("never");
+    }
+    html += F("</p>");
+
+    if (txSettings.destinationMode == TX_DEST_LOCAL_ONLY) {
+      html += F("<p class='muted'>Readings remain on this FieldHub for local download.</p>"
+                "<a href='/provision' class='btn btn--sm'>Connect to FieldMesh</a>");
     }
     html += F("</div>");
   }
@@ -2669,10 +2981,14 @@ static void handleRoot() {
   html += F("<details style='margin:16px 0'>"
             "<summary style='font-weight:bold;cursor:pointer;padding:10px;border:1px solid var(--border);border-radius:8px;background:var(--panel)'>About / Advanced</summary>"
             "<div class='section' style='margin-top:8px'>"
-            "<div class='help'><strong>Hardware code:</strong> ");
+            "<div class='help'><strong>FieldHub MAC:</strong> "
+            "<span id='about-mac' class='mono-id'>");
+  html += htmlEscape(hwMacString());
+  html += F("</span> <button type='button' class='btn btn--sm' data-copy='#about-mac'>Copy</button>"
+            "<br><strong>FieldHub name:</strong> ");
   html += htmlEscape(hwCode());
   // Internal radio node ID retained for diagnostics/compatibility only — this is
-  // NOT the customer-facing FieldHub identity (that is the hardware code/MAC).
+  // NOT the customer-facing FieldHub identity (that is the MAC).
   html += F("<br><strong>Radio node ID (internal):</strong> ");
   html += DEVICE_ID;
   html += F("<br><strong>Firmware:</strong> ");
@@ -2683,7 +2999,10 @@ static void handleRoot() {
             "<div class='help'><strong>WiFi network:</strong> ");
   html += ssid;
   html += F("<br><strong>Portal URL:</strong> http://192.168.4.1/"
-            "<br><strong>Mothership address:</strong> ");
+            // Same STA MAC as the FieldHub MAC above; kept for support/diagnostic
+            // continuity and labelled so it can't be mistaken for a second,
+            // different identifier to register.
+            "<br><strong>Node-radio address (support information):</strong> ");
   html += getMothershipsMAC();
   html += F("<br><strong>Radio channel:</strong> ");
   html += String(ESPNOW_CHANNEL);
@@ -2691,6 +3010,7 @@ static void handleRoot() {
             "</div>"
             "</details>");
 
+  html += copyHelperJs();
   html += footCommon();
   server.send(200, "text/html", html);
 }
@@ -2742,6 +3062,17 @@ static void handleSetTime() {
 static void handleSetRemoteManagement() {
   const bool want = server.hasArg("remote_management") &&
                     server.arg("remote_management") == "1";
+  TransmissionSettings tx;
+  loadTransmissionSettings(tx);
+  if (want && (tx.destinationMode != TX_DEST_FIELDMESH || !tx.enabled ||
+               tx.apiKey.length() == 0)) {
+    if (isAjaxRequest()) {
+      sendAjaxResult(false, "Connect to FieldMesh before enabling dashboard control");
+    } else {
+      server.send(400, "text/plain", "FieldMesh connection required");
+    }
+    return;
+  }
   const bool ok = backendControlSetRemoteManagementEnabled(want);
   if (isAjaxRequest()) {
     if (ok) sendAjaxResult(true, want ? "Dashboard changes allowed" : "Dashboard changes off");
@@ -2752,22 +3083,163 @@ static void handleSetRemoteManagement() {
   server.send(302, "text/plain", "");
 }
 
+static void handleCompleteSetup() {
+  Preferences prefs;
+  if (!prefs.begin("ui_setup", false)) {
+    sendAjaxResult(false, "Could not save setup state");
+    return;
+  }
+  const bool ok = prefs.putBool("done", true) == sizeof(bool);
+  prefs.end();
+  sendAjaxResult(ok, ok ? "FieldHub setup complete" : "Could not save setup state");
+}
+
 static void handleDownloadCSV() {
-  if (!flashIsReady() || !LittleFS.exists("/datalog.csv")) {
+  const bool useSD = sdIsReady() && SD.exists(sdReadingsPath());
+  const bool useFlash = flashIsReady() && LittleFS.exists("/datalog.csv");
+  if (!useSD && !useFlash) {
     server.send(404, "text/plain", "CSV file not found");
     return;
   }
-  File file = LittleFS.open("/datalog.csv", "r");
+  File file = useSD ? SD.open(sdReadingsPath(), FILE_READ)
+                    : LittleFS.open("/datalog.csv", "r");
   if (!file) {
     server.send(404, "text/plain", "CSV file not found");
     return;
   }
   server.sendHeader("Content-Type", "text/csv");
-  server.sendHeader("Content-Disposition", "inline; filename=datalog.csv");
+  server.sendHeader("Content-Disposition", "attachment; filename=fieldmesh-readings.csv");
   server.sendHeader("Connection", "close");
   server.streamFile(file, "text/csv");
   file.close();
   Serial.println("[CSV] file downloaded by client");
+}
+
+static String csvCellLocal(const char* value) {
+  String out = "\"";
+  if (value) {
+    for (const char* p = value; *p; ++p) {
+      if (*p == '"') out += '"';
+      out += *p;
+    }
+  }
+  out += '"';
+  return out;
+}
+
+static void handleDownloadDeployments() {
+  if (sdIsReady() && SD.exists(sdDeploymentsPath())) {
+    File file = SD.open(sdDeploymentsPath(), FILE_READ);
+    if (!file) {
+      server.send(500, "text/plain", "Could not open SD deployment archive");
+      return;
+    }
+    server.sendHeader("Content-Disposition", "attachment; filename=fieldmesh-deployments.csv");
+    server.sendHeader("Connection", "close");
+    server.streamFile(file, "text/csv");
+    file.close();
+    return;
+  }
+  if (!deploymentStoreReady()) {
+    server.send(503, "text/plain", "Deployment storage unavailable");
+    return;
+  }
+
+  server.sendHeader("Content-Disposition", "attachment; filename=deployments.csv");
+  server.sendHeader("Cache-Control", "no-store");
+  server.setContentLength(CONTENT_LENGTH_UNKNOWN);
+  server.send(200, "text/csv", "");
+  server.sendContent(
+      "nodeId,deploymentEpoch,startedUnix,endedUnix,userId,name,latitude,longitude,recordStatus\r\n");
+
+  for (size_t n = 0; n < kMaxDeployNodes; ++n) {
+    const DeploymentSlot* slot = deploymentSlotAt(n);
+    if (!slot) continue;
+    for (uint8_t i = 0; i < slot->archiveCount; ++i) {
+      const DeploymentArchive& archived = slot->archive[i];
+      if (archived.epoch == 0) continue;
+      String row;
+      row.reserve(180);
+      row += csvCellLocal(slot->nodeId);
+      row += ',';
+      row += String((unsigned)archived.epoch);
+      row += ',';
+      if (archived.known & DEPLOY_ARCHIVE_START_KNOWN) row += String(archived.startedUnix);
+      row += ',';
+      if (archived.known & DEPLOY_ARCHIVE_END_KNOWN) row += String(archived.endedUnix);
+      row += ',';
+      if (archived.known & DEPLOY_ARCHIVE_IDENTITY_KNOWN) row += csvCellLocal(archived.userId);
+      row += ',';
+      if (archived.known & DEPLOY_ARCHIVE_IDENTITY_KNOWN) row += csvCellLocal(archived.name);
+      row += ',';
+      if (archived.known & DEPLOY_ARCHIVE_LOCATION_KNOWN) row += String(archived.latitude, 6);
+      row += ',';
+      if (archived.known & DEPLOY_ARCHIVE_LOCATION_KNOWN) row += String(archived.longitude, 6);
+      row += ',';
+      const uint8_t completeMask = DEPLOY_ARCHIVE_START_KNOWN |
+          DEPLOY_ARCHIVE_END_KNOWN | DEPLOY_ARCHIVE_IDENTITY_KNOWN;
+      row += ((archived.known & completeMask) == completeMask)
+          ? "complete" : "partial-from-earlier-software";
+      row += "\r\n";
+      server.sendContent(row);
+    }
+  }
+  server.sendContent("");
+  Serial.println("[DEPLOY] Local deployment archive downloaded");
+}
+
+static void handleDataPage() {
+  String actions = String("<a href='/export' class='btn btn--sm'>Refresh</a>");
+  String html = headCommon("Data", actions, 2);
+  html += buildDataStatusSectionHtml();
+
+  html += F("<div class='section'><h3>Downloads</h3>"
+            "<p class='muted'>Raw CSV files for backup or use in your own tools. "
+            "The FieldHub does not alter or chart the readings here.</p>");
+
+  const bool hasReadings = (sdIsReady() && SD.exists(sdReadingsPath())) ||
+      (flashIsReady() && LittleFS.exists("/datalog.csv"));
+  html += F("<div style='border:1px solid var(--border);border-radius:8px;padding:12px'>"
+            "<div style='display:flex;justify-content:space-between;align-items:center;gap:10px'>"
+            "<strong>Readings CSV</strong>");
+  html += hasReadings
+      ? F("<a href='/download-csv' class='btn btn--primary btn--sm'>Download</a>")
+      : F("<button class='btn btn--sm' disabled>No data yet</button>");
+  html += F("</div>"
+            "<details style='margin-top:8px'>"
+            "<summary class='muted' style='cursor:pointer;font-size:13px'>What's in this file?</summary>"
+            "<p class='muted' style='font-size:13px;margin-top:6px'>One row per sensor reading: "
+            "timestamp, node ID/number/name, battery, environment/soil/spectral/wind sensors, "
+            "GPS location, and the deployment it belongs to.</p>"
+            "</details></div>");
+
+  uint16_t completedDeployments = 0;
+  if (deploymentStoreReady()) {
+    for (size_t i = 0; i < kMaxDeployNodes; ++i) {
+      const DeploymentSlot* slot = deploymentSlotAt(i);
+      if (slot) completedDeployments += slot->archiveCount;
+    }
+  }
+  html += F("<div style='border:1px solid var(--border);border-radius:8px;padding:12px;margin-top:10px'>"
+            "<div style='display:flex;justify-content:space-between;align-items:center;gap:10px'>"
+            "<div><strong>Deployment archive CSV</strong><br>"
+            "<span class='muted' style='font-size:13px'>");
+  html += String(completedDeployments);
+  html += F(" completed deployment");
+  html += (completedDeployments == 1) ? F("") : F("s");
+  html += F("</span></div>"
+            "<a href='/download-deployments' class='btn btn--sm'>Download</a>"
+            "</div>"
+            "<details style='margin-top:8px'>"
+            "<summary class='muted' style='cursor:pointer;font-size:13px'>What's in this file?</summary>"
+            "<p class='muted' style='font-size:13px;margin-top:6px'>One row per completed deployment "
+            "(not per reading): node number/name, GPS location, start/end time, and whether the "
+            "record is complete or partial (from earlier software). With an SD card, records are "
+            "kept for the life of the card; internal storage keeps the latest four per node.</p>"
+            "</details></div></div>");
+
+  html += footCommon();
+  server.send(200, "text/html", html);
 }
 
 static void handleDiscoverNodes() {
@@ -3158,8 +3630,14 @@ static void handleStationsPage() {
     // view an operator scans before choosing a batch action. Pause and End have
     // different consequences and must not share a word.
     const bool nodeEnded = (node.deploymentEndedUnix != 0);
+    // Deploy commanded but never acknowledged. Rendered here as well as in the
+    // JS chip because this is the FIRST paint: leaving it to the poller would
+    // show "Active" for a second on exactly the node an operator must not
+    // mistake for healthy. Precedence matches chipState().
+    const bool deployUnconfirmed = (node.state == DEPLOYED) && node.deployPending;
     const char* stCls = removePending ? "chip chip--state-unpaired"
                        : nodeEnded ? "chip chip--bat-low"
+                       : deployUnconfirmed ? "chip chip--bat-low"
                        : nodePaused ? "chip chip--state-paused"
                        : (node.state == DEPLOYED) ? "chip chip--state-deployed"
                        : (node.state == PAIRED)   ? "chip chip--state-paired"
@@ -3169,6 +3647,7 @@ static void handleStationsPage() {
     // desired config with targetState 2 and must not read as a resume.
     const char* stTxt = removePending ? "Remove queued"
                        : nodeEnded ? "Ended"
+                       : deployUnconfirmed ? "Not confirmed"
                        : (desiredPending && nodeDesired.targetState == 3) ? "Pause queued"
                        : (desiredPending && nodeDesired.targetState == 2 && node.recordingPaused)
                            ? "Resume queued"
@@ -3189,10 +3668,9 @@ static void handleStationsPage() {
     }
 
     String seenTxt = F("n/a");
-    if (node.lastSeen > 0) {
-      const uint32_t nowMs = millis();
-      const uint32_t ageMin = ((nowMs >= node.lastSeen) ? (nowMs - node.lastSeen) : 0) / 60000UL;
-      seenTxt = String(ageMin) + F(" min ago");
+    {
+      const uint32_t ageMin = nodeLastSeenAgeMin(node);
+      if (ageMin != kLastSeenUnknown) seenTxt = String(ageMin) + F(" min ago");
     }
 
     html += F("<div class='node-select-wrap' data-node-id='");
@@ -3230,6 +3708,26 @@ static void handleStationsPage() {
       html += F("<span class='chip' style='margin-left:4px' title='Deployment number'>D");
       html += String((unsigned)node.deploymentEpoch);
       html += F("</span>");
+    }
+    // Faulted-sensor count. Only configured sensors can fault, so this stays
+    // absent for auto-detect nodes rather than showing a meaningless 0.
+    {
+      const uint16_t nodeFaults =
+          (uint16_t)(node.sensorFaultMask & nodeNormalizeSensorMask(node.expectedSensorMask));
+      if (nodeFaults) {
+        uint8_t faultCount = 0;
+        for (uint8_t b = 0; b < 9; ++b) {
+          if (nodeFaults & (uint16_t)(1u << b)) faultCount++;
+        }
+        // Air temp + RH are one physical sensor; count them once.
+        if ((nodeFaults & SNAP_PRESENT_AIR_TEMP) && (nodeFaults & SNAP_PRESENT_AIR_RH)) {
+          faultCount--;
+        }
+        html += F("<span class='chip chip--bat-low' style='margin-left:4px' "
+                  "title='Configured sensors not reporting'>&#9888; ");
+        html += String((unsigned)faultCount);
+        html += F("</span>");
+      }
     }
     html += F("</div>"
               "<div class='node-status-cell'><span class='node-timing-label'>Battery</span>"
@@ -3654,13 +4152,13 @@ static void handleStationDetail() {
   html += F("<br><strong>Recording every</strong> ");
   html += String(activeIntervalMin);
   html += F(" min");
-  if (target->lastSeen > 0) {
-    const uint32_t nowMs = millis();
-    const uint32_t ageMs = (nowMs >= target->lastSeen) ? (nowMs - target->lastSeen) : 0;
-    const uint32_t ageMin = ageMs / 60000UL;
-    html += F("<br><strong>Last seen</strong> ");
-    html += String(ageMin);
-    html += F(" min ago");
+  {
+    const uint32_t ageMin = nodeLastSeenAgeMin(*target);
+    if (ageMin != kLastSeenUnknown) {
+      html += F("<br><strong>Last seen</strong> ");
+      html += String(ageMin);
+      html += F(" min ago");
+    }
   }
   html += F("</div>");
 
@@ -3712,56 +4210,75 @@ static void handleStationDetail() {
     }
     // --- Previous deployments ------------------------------------------
     //
-    // history[] is a bounded ring of (epoch, startedUnix) boundaries kept so a
-    // backlog delivered several deployments late can be attributed to the epoch
-    // it was actually taken under. It is also the ONLY deployment history the
-    // hub holds: the number, name and location a deployment ran under go out in
-    // its outbox event and are not retained once that event is acked. The labels
-    // therefore live in the dashboard, and saying so is better than rendering an
-    // empty name — a blank would read as "that deployment had no name", which is
-    // a different and wrong claim.
-    //
-    // End times are deliberately omitted for past epochs. There is no endedUnix
-    // per boundary, and inferring one from the next epoch's start is wrong
-    // whenever a node sat ended before being redeployed — ENV_6C0A80 on
-    // 2026-08-01 ended at 12:05 and was not restarted until 14:31.
+    // archive[] is separate from the sample-attribution boundary ring. New
+    // records carry the exact identity and exact End time captured at End;
+    // migrated records expose missing fields explicitly rather than guessing.
     const DeploymentSlot* histSlot = deploymentFindByNodeId(target->nodeId.c_str());
-    if (histSlot != nullptr && histSlot->historyCount > 0) {
+    if (histSlot != nullptr && histSlot->archiveCount > 0) {
       static const char* kHistMon[] = {"Jan","Feb","Mar","Apr","May","Jun",
                                        "Jul","Aug","Sep","Oct","Nov","Dec"};
       String rows;
-      // Newest first: the deployment before this one is the one an operator
-      // standing at the station is most likely asking about.
-      for (int i = (int)histSlot->historyCount - 1; i >= 0; --i) {
-        const DeploymentBoundary& b = histSlot->history[i];
-        if (b.epoch == 0) continue;
-        if (b.epoch == target->deploymentEpoch) continue;  // shown in the chip above
-        rows += F("<div class='muted' style='margin:3px 0'>Deployment ");
-        rows += String((unsigned)b.epoch);
-        if (b.startedUnix > 0) {
-          time_t bt = (time_t)b.startedUnix;
+      // Newest first. Include the just-ended current epoch: the chip above
+      // describes the node's lifecycle state, while this section is the
+      // operator's proof that the completed deployment was actually archived.
+      for (int i = (int)histSlot->archiveCount - 1; i >= 0; --i) {
+        const DeploymentArchive& archived = histSlot->archive[i];
+        if (archived.epoch == 0) continue;
+        rows += F("<div style='margin:8px 0'><strong>Deployment ");
+        rows += String((unsigned)archived.epoch);
+        if ((archived.known & DEPLOY_ARCHIVE_IDENTITY_KNOWN) && archived.name[0]) {
+          rows += F(" &middot; ");
+          rows += htmlEscape(archived.name);
+        }
+        if ((archived.known & DEPLOY_ARCHIVE_IDENTITY_KNOWN) && archived.userId[0]) {
+          rows += F(" &middot; ");
+          rows += htmlEscape(archived.userId);
+        }
+        rows += F("</strong><div class='muted'>Stored locally &middot; ");
+        if ((archived.known & DEPLOY_ARCHIVE_START_KNOWN) && archived.startedUnix > 0) {
+          time_t bt = (time_t)archived.startedUnix;
           struct tm* btm = gmtime(&bt);
           char bb[24];
           snprintf(bb, sizeof(bb), "%d %s %02d:%02d",
                    btm->tm_mday, kHistMon[btm->tm_mon], btm->tm_hour, btm->tm_min);
-          rows += F(" &middot; started ");
+          rows += F("Started ");
           rows += bb;
+        } else {
+          rows += F("Start time unavailable");
         }
-        rows += F("</div>");
+        if ((archived.known & DEPLOY_ARCHIVE_END_KNOWN) && archived.endedUnix > 0) {
+          time_t et = (time_t)archived.endedUnix;
+          struct tm* etm = gmtime(&et);
+          char eb[24];
+          snprintf(eb, sizeof(eb), "%d %s %02d:%02d",
+                   etm->tm_mday, kHistMon[etm->tm_mon], etm->tm_hour, etm->tm_min);
+          rows += F(" &middot; Ended ");
+          rows += eb;
+        } else {
+          rows += F(" &middot; End time unavailable");
+        }
+        if (!(archived.known & DEPLOY_ARCHIVE_IDENTITY_KNOWN)) {
+          rows += F("<br>Label unavailable from earlier FieldHub software");
+        }
+        if (archived.known & DEPLOY_ARCHIVE_LOCATION_KNOWN) {
+          rows += F("<br>Location ");
+          rows += String(archived.latitude, 5);
+          rows += F(", ");
+          rows += String(archived.longitude, 5);
+        }
+        rows += F("</div></div>");
       }
       if (rows.length()) {
-        html += F("<div class='section'><h3>Previous deployments</h3>");
+        html += F("<div class='section'><h3>Completed deployments</h3>");
         html += rows;
         // The ring evicts the oldest once full, so a surviving epoch 1 is proof
         // nothing has been dropped. Without this an operator could read a short
         // list as the complete history.
-        if (histSlot->historyCount >= (uint8_t)kBoundaryHistory &&
-            histSlot->history[0].epoch > 1) {
+        if (histSlot->archiveCount >= (uint8_t)kLocalDeploymentArchive &&
+            histSlot->archive[0].epoch > 1) {
           html += F("<div class='muted' style='margin-top:8px'>"
-                    "Earlier deployments are not kept on the FieldHub.</div>");
+                    "Earlier deployment details are not kept in internal storage.</div>");
         }
-        html += F("<div class='muted' style='margin-top:8px'>"
-                  "Numbers and names for past deployments are in the dashboard.</div>");
         html += F("</div>");
       }
     }
@@ -3774,13 +4291,70 @@ static void handleStationDetail() {
     }
   }
 
+  // --- Sensor health ------------------------------------------------------
+  // Per-channel status for the sensors the operator marked installed. All three
+  // masks are computed on a sync wake and persisted, so this renders truthfully
+  // in config mode even though no snapshot arrives during this boot.
+  {
+    const uint16_t expected = nodeNormalizeSensorMask(target->expectedSensorMask);
+    html += F("<div style='margin-bottom:12px'><strong>Sensor health</strong>");
+    if (expected == 0) {
+      html += F("<div class='help'>No sensors configured yet &mdash; every detected "
+                "sensor is recorded and none can be reported as missing.</div>");
+    } else {
+      const uint16_t faults  = target->sensorFaultMask & expected;
+      const uint16_t present = target->lastSensorPresent;
+      // Per-channel evidence, not "have we ever heard from this node". Every
+      // expected channel lands in exactly one of present/missPrev once a
+      // snapshot has been compared against the CURRENT configuration, so their
+      // union is precisely the set we can say anything about. Keying this on
+      // node contact instead would claim "awaiting data" for a channel after a
+      // HELLO or an ACK, neither of which carries sensor readings.
+      const uint16_t evidence = (uint16_t)(present | target->sensorMissPrev);
+      html += F("<div style='margin-top:6px;display:flex;flex-wrap:wrap;gap:6px'>");
+      struct HealthOption { uint16_t bit; const char* label; };
+      static const HealthOption kHealth[] = {
+        { (uint16_t)(SNAP_PRESENT_AIR_TEMP | SNAP_PRESENT_AIR_RH), "Air" },
+        { SNAP_PRESENT_SPECTRAL, "Spectral" },
+        { SNAP_PRESENT_SOIL1,    "Soil 1" },
+        { SNAP_PRESENT_SOIL2,    "Soil 2" },
+        { SNAP_PRESENT_WIND,     "Wind" },
+        { SNAP_PRESENT_AUX1,     "Aux 1" },
+        { SNAP_PRESENT_AUX2,     "Aux 2" },
+      };
+      for (const HealthOption& opt : kHealth) {
+        if ((expected & opt.bit) == 0) continue;
+        const bool faulted  = (faults & opt.bit) != 0;
+        const bool seen     = (present & opt.bit) != 0;
+        const bool compared = (evidence & opt.bit) != 0;
+        // Never claim "OK" from a record no snapshot has been compared against —
+        // that would read as healthy on no evidence at all.
+        const char* cls = faulted ? "chip chip--bat-low"
+                        : (seen ? "chip chip--bat-ok" : "chip");
+        const char* suffix = faulted ? " not reporting"
+                           : (seen ? " OK"
+                                   : (compared ? " missed once" : " no data yet"));
+        html += F("<span class='"); html += cls; html += F("'>");
+        html += opt.label;
+        html += suffix;
+        html += F("</span>");
+      }
+      html += F("</div>");
+      if (faults) {
+        html += F("<div class='help'>A configured sensor is reported missing after "
+                  "two consecutive snapshots without it.</div>");
+      }
+    }
+    html += F("</div>");
+  }
+
   html += F("<div style='margin-bottom:12px'>"
             "<a href='/node-sensors?id=");
   html += target->nodeId;
   html += F("' class='btn btn--sm' style='display:block;text-align:center;padding:12px'>"
             "&#9881; Configure Sensors</a></div>");
 
-  html += F("<form action='/station' method='POST' onsubmit='return confirmRemove()'>"
+  html += F("<form action='/station' method='POST'>"
             "<input type='hidden' name='node_id' value='");
   html += target->nodeId;
   html += F("'>");
@@ -3886,47 +4460,43 @@ static void handleStationDetail() {
     // route forward is the Start new deployment button above.
   } else if (!isDeployed) {
     // New / Connected node — the in-hand deploy path.
-    html += F("<label class='action-choice action-choice--start action-choice--why'>"
-              "<input type='radio' name='action' value='start'>"
-              "<span>Deploy<em>Starts recording and begins this node&rsquo;s first deployment.</em></span></label>");
+    html += F("<button type='submit' name='action' value='start' "
+              "class='action-choice action-choice--start action-choice--why'>"
+              "<span>Deploy<em>Starts recording and begins this node&rsquo;s first deployment.</em></span></button>");
   } else if (displayedPaused) {
     // Paused deployed node — resume remotely at the next sync.
-    html += F("<label class='action-choice action-choice--start action-choice--why'>"
-              "<input type='radio' name='action' value='resume'>"
-              "<span>Resume recording<em>Continues the same deployment and its data history.</em></span></label>");
+    html += F("<button type='submit' name='action' value='resume' "
+              "class='action-choice action-choice--start action-choice--why'>"
+              "<span>Resume recording<em>Continues the same deployment and its data history.</em></span></button>");
   } else {
     // Active deployed node — pause (standby) remotely at the next sync.
-    html += F("<label class='action-choice action-choice--stop action-choice--why'>"
-              "<input type='radio' name='action' value='pause'>"
-              "<span>Pause recording<em>Keeps this deployment. You can resume any time.</em></span></label>");
+    html += F("<button type='submit' name='action' value='pause' "
+              "class='action-choice action-choice--stop action-choice--why'>"
+              "<span>Pause recording<em>Keeps this deployment. You can resume any time.</em></span></button>");
   }
   if (isDeployed && !deploymentEnded && target->deploymentEpoch > 0) {
-    html += F("<label class='action-choice action-choice--stop action-choice--why'>"
-              "<input type='radio' name='action' value='end_deployment'>"
+    html += F("<button type='submit' name='action' value='end_deployment' "
+              "class='action-choice action-choice--stop action-choice--why' "
+              "onclick=\"return confirm('End this deployment? The node stops recording and its number is freed for another node.')\">"
               "<span>End deployment<em>Archives this site&rsquo;s data");
     const String heldNum = getNodeUserId(target->nodeId);
     if (heldNum.length()) {
       html += F(" and frees number ");
       html += htmlEscape(heldNum);
     }
-    html += F(". Cannot be resumed.</em></span></label>");
+    html += F(". Cannot be resumed.</em></span></button>");
   }
-  html += F("<label class='action-choice action-choice--unpair action-choice--why'>"
-            "<input type='radio' name='action' value='unpair'>"
-            "<span>Remove node<em>Ends the deployment, then unpairs the hardware.</em></span></label>"
+  html += F("<button type='submit' name='action' value='unpair' "
+            "class='action-choice action-choice--unpair action-choice--why' "
+            "onclick=\"return confirm('Remove this node? You will need to re-add it with the pair button.')\">"
+            "<span>Remove node<em>Ends the deployment, then unpairs the hardware.</em></span></button>"
             "</div>");
   if (isDeployed) {
     html += F("<div class='muted' style='font-size:12px;margin-top:6px'>Applied at the node&rsquo;s next check-in.</div>");
   }
-  html += F("<button type='submit' class='btn btn--success' style='margin-top:12px'>"
-            "Save Changes</button>"
+  html += F("<button type='submit' name='action' value='none' class='btn btn--success' style='margin-top:12px'>"
+            "Save settings only</button>"
             "</form>");
-
-  html += F("<script>function confirmRemove(){var r=document.querySelector('input[name=action]:checked');"
-            "if(!r)return true;"
-            "if(r.value==='unpair'){return confirm('Remove this node? You will need to re-add it with the pair button.');}"
-            "if(r.value==='end_deployment'){return confirm('End this deployment? The node stops recording and its number is freed for another node.');}"
-            "return true;}</script>");
   html += F("</div>");
   html += footCommon();
   server.send(200, "text/html", html);
@@ -3946,7 +4516,15 @@ static void handleNodeConfigSave() {
     if (n.nodeId == nodeId) { target = &n; break; }
   }
 
-  const bool isCurrentlyDeployed = (target && target->state == DEPLOYED);
+  // The deployment ledger is authoritative for lifecycle state. Normally its
+  // active epoch and the registry's DEPLOYED state change together, but a
+  // pre-fix wizard could commit epoch 1 for a freshly discovered UNPAIRED node
+  // before the radio deploy path refused it. Treat that durable active epoch as
+  // deployed here so retrying the wizard cannot overwrite its identity.
+  const bool hasActiveDeployment = target && target->deploymentEpoch > 0 &&
+      target->deploymentEndedUnix == 0;
+  const bool isCurrentlyDeployed = target &&
+      (target->state == DEPLOYED || hasActiveDeployment);
 
   // A node that has never been deployed, or whose deployment has ended, has no
   // identity to edit — only identity being PROPOSED. Stage it so an abandoned
@@ -4081,6 +4659,7 @@ static void handleNodeConfigSave() {
   bool unpairOk = false;
   bool pauseOk  = false;
   bool resumeOk = false;
+  bool endOk    = false;
 
   // expected_epoch makes Start/End idempotent: a double-submitted form or a
   // retry after a lost response carries the stale epoch and is reported as a
@@ -4095,30 +4674,63 @@ static void handleNodeConfigSave() {
       sendDeploymentError(404, "Node is not registered", "", nodeId);
       return;
     }
+
+    // Discovery creates an UNPAIRED entry. The old wizard skipped this pairing
+    // step, committed the deployment record, then deploySelectedNodes() quite
+    // correctly rejected the UNPAIRED node. Its success redirect therefore
+    // returned straight to the Sensors step. Pair before committing any new
+    // deployment, and restore the local state if the radio command could not
+    // be queued.
+    if (target->state == UNPAIRED) {
+      if (!pairNode(nodeId)) {
+        target->state = UNPAIRED;
+        target->deployPending = false;
+        savePairedNodes();
+        sendDeploymentError(409,
+                            "Could not contact this node to pair it. Keep it powered "
+                            "on and in configuration mode, then try again.",
+                            "", nodeId);
+        return;
+      }
+    }
+
+    // Recover a deployment committed by the old wizard bug. This is also the
+    // safe retry after a lost browser response: it must re-send the deploy
+    // command for the existing epoch, never create epoch 2 or ask the operator
+    // to end the deployment that they just started.
+    const bool resumeActiveDeployment =
+        target->deploymentEpoch > 0 && target->deploymentEndedUnix == 0;
+    uint16_t startedEpoch = target->deploymentEpoch;
+    bool replayedStart = resumeActiveDeployment;
+
     float lat = NAN, lon = NAN;
     if (server.hasArg("lat") && server.hasArg("lon")) {
       lat = server.arg("lat").toFloat();
       lon = server.arg("lon").toFloat();
     }
-    const DeploymentOpResult r =
-        beginNewDeployment(nodeId, userId, name, lat, lon, expectedEpoch);
-    if (r.status != DEPLOY_OK && r.status != DEPLOY_REPLAYED) {
-      const int code = (r.status == DEPLOY_ERR_NUMBER_TAKEN) ? 409 : 400;
-      sendDeploymentError(code, r.message, r.holderLabel, nodeId);
-      return;
+    if (!resumeActiveDeployment) {
+      const DeploymentOpResult r =
+          beginNewDeployment(nodeId, userId, name, lat, lon, expectedEpoch);
+      if (r.status != DEPLOY_OK && r.status != DEPLOY_REPLAYED) {
+        const int code = (r.status == DEPLOY_ERR_NUMBER_TAKEN) ? 409 : 400;
+        sendDeploymentError(code, r.message, r.holderLabel, nodeId);
+        return;
+      }
+      startedEpoch = r.epoch;
+      replayedStart = (r.status == DEPLOY_REPLAYED);
     }
-    if (r.status == DEPLOY_OK) {
-      // The durable ACTIVE config is already queued by beginNewDeployment; this
-      // immediate DEPLOY_NODE is best-effort and only lands if the node is awake
-      // in config mode. Convergence rides the NODE_CONFIG reconcile.
-      std::vector<String> ids;
-      ids.push_back(nodeId);
-      deployOk = deploySelectedNodes(ids);
-      gDeployedThisSession = true;
-    }
+
+    // The durable ACTIVE config is already queued by beginNewDeployment; this
+    // immediate DEPLOY_NODE is best-effort and only lands if the node is awake
+    // in config mode. Convergence rides the NODE_CONFIG reconcile.
+    std::vector<String> ids;
+    ids.push_back(nodeId);
+    deployOk = deploySelectedNodes(ids);
+    gDeployedThisSession = true;
+
     if (isAjaxRequest()) {
-      String j = String("{\"ok\":true,\"epoch\":") + String((unsigned)r.epoch) +
-                 ",\"replayed\":" + (r.status == DEPLOY_REPLAYED ? "true" : "false") +
+      String j = String("{\"ok\":true,\"epoch\":") + String((unsigned)startedEpoch) +
+                 ",\"replayed\":" + (replayedStart ? "true" : "false") +
                  ",\"deploy\":" + (deployOk ? "true" : "false") + "}";
       server.send(200, "application/json", j);
       return;
@@ -4133,9 +4745,32 @@ static void handleNodeConfigSave() {
       sendDeploymentError(400, r.message, "", nodeId);
       return;
     }
+    const DeploymentSlot* endedSlot = deploymentFindByNodeId(nodeId.c_str());
+    if (endedSlot && endedSlot->endedUnix != 0) {
+      for (uint8_t i = 0; i < endedSlot->archiveCount; ++i) {
+        if (endedSlot->archive[i].epoch == endedSlot->epoch &&
+            endedSlot->archive[i].endedUnix == endedSlot->endedUnix) {
+          endOk = true;
+          break;
+        }
+      }
+    }
+    Serial.printf("[DEPLOY] %s End request status=%u epoch=%u ended=%lu archive=%u verified=%d\n",
+                  nodeId.c_str(), (unsigned)r.status,
+                  endedSlot ? (unsigned)endedSlot->epoch : 0U,
+                  endedSlot ? (unsigned long)endedSlot->endedUnix : 0UL,
+                  endedSlot ? (unsigned)endedSlot->archiveCount : 0U,
+                  endOk ? 1 : 0);
+    if (!endOk) {
+      sendDeploymentError(
+          500,
+          "The deployment was not found in local archive storage; no success was reported",
+          "", nodeId);
+      return;
+    }
     gFieldChangeThisSession = true;
     if (isAjaxRequest()) {
-      sendAjaxResult(true, r.message);
+      sendAjaxResult(true, "Deployment archived locally");
       return;
     }
   } else if (action == "none" || action.length() == 0) {
@@ -4302,8 +4937,13 @@ static void handleNodeConfigSave() {
     + nodeId
     + String("' class='btn btn--sm'>Refresh</a>");
   String html = headCommon("Node", actionsHtml);
-  html += F("<div class='section center'>"
-            "<h3>Node settings applied</h3>");
+  html += F("<div class='section center'>");
+  if (endOk) {
+    html += F("<h3>Deployment archived</h3>"
+              "<p><strong>Stored locally.</strong> The node will stop recording at its next check-in.</p>");
+  } else {
+    html += F("<h3>Node settings applied</h3>");
+  }
 
   if (!target) {
     html += F("<p class='muted'>Warning: this node ID is not currently in the registered list.</p>");
@@ -4328,8 +4968,9 @@ static void handleNodeConfigSave() {
   if (revertOk) html += F("<br>Stop monitoring: OK");
   if (pauseOk)  html += F("<br>Pause: SCHEDULED &mdash; the node stops recording at its next sync check-in (stays deployed &amp; resumable)");
   if (resumeOk) html += F("<br>Resume: SCHEDULED &mdash; the node resumes recording at its next sync check-in");
+  if (endOk)    html += F("<br>End deployment: ARCHIVED LOCALLY");
   if (unpairOk) html += F("<br>Remove node: SCHEDULED &mdash; completes when the node confirms at its next sync");
-  if (!pairOk && !deployOk && !revertOk && !pauseOk && !resumeOk && !unpairOk) {
+  if (!pairOk && !deployOk && !revertOk && !pauseOk && !resumeOk && !endOk && !unpairOk) {
     html += F("<br>No lifecycle change requested.");
   }
   html += F("</p>"
@@ -4437,8 +5078,10 @@ static void handleStationSetupWizard() {
     { SNAP_PRESENT_SPECTRAL,                                   "Spectral (AS7343)",  "" },
     { SNAP_PRESENT_SOIL1,                                      "Soil Probe 1",       "" },
     { SNAP_PRESENT_SOIL2,                                      "Soil Probe 2",       "" },
+    // Ultrasonic wind is decommissioned and deliberately not offered. Reed is
+    // the only wind backend; see handleSetNodeSensors(), which also strips the
+    // selector bit on ingest.
     { SNAP_PRESENT_WIND,                                       "Wind (Reed cup)",    "wind" },
-    { NODE_SENSOR_CFG_WIND_ULTRASONIC,                         "Wind (Ultrasonic)",  "wind" },
     { SNAP_PRESENT_AUX1,                                       "Aux 1",              "" },
     { SNAP_PRESENT_AUX2,                                       "Aux 2",              "" },
   };
@@ -4506,7 +5149,10 @@ static void handleStationSetupWizard() {
   html += F(
     "var TOTAL=4,cur=startStep||1;"
     "var steps=[].slice.call(document.querySelectorAll('.wz-step'));"
-    "function post(u,d){var b=Object.keys(d).map(function(k){return encodeURIComponent(k)+'='+encodeURIComponent(d[k]);}).join('&')+'&ajax=1';"
+    // See the hub wizard: push 'ajax=1' before joining so an empty payload never
+    // produces a body with a leading '&'.
+    "function post(u,d){var p=Object.keys(d).map(function(k){return encodeURIComponent(k)+'='+encodeURIComponent(d[k]);});"
+    "p.push('ajax=1');var b=p.join('&');"
     "return fetch(u,{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:b}).then(function(r){return r.json();});}"
     "function chip(ok,txt){return \"<span class='chip \"+(ok?'chip--cfg-ok':'chip--bat-low')+\"' style='font-weight:600'>\"+txt+\"</span>\";}"
     "function show(n){cur=Math.max(1,Math.min(TOTAL,n));"
@@ -4582,18 +5228,175 @@ static String formatUploadTime(uint32_t unixSec) {
   return formatDateTimeDisplay(dt);
 }
 
-static void handleSettings() {
+// POST /set-data-destination — local recording is a complete operating mode,
+// not an unprovisioned error state. FieldMesh may only be selected after its
+// device credential exists. Custom HTTPS is configured through its own form so
+// its acknowledgement contract stays explicit.
+static void handleSetDataDestination() {
+  const String mode = server.arg("mode");
   TransmissionSettings tx;
   loadTransmissionSettings(tx);
 
-  UploadCursor cursor = {0, 0, 0, 0, 0};
+  if (mode == "local_only") {
+    if (!backendControlSetRemoteManagementEnabled(false)) {
+      sendAjaxResult(false, "Could not disable dashboard control");
+      return;
+    }
+    tx.destinationMode = TX_DEST_LOCAL_ONLY;
+    tx.enabled = false;
+    if (!saveTransmissionSettings(tx)) {
+      txRecoverAfterFailedSave();
+      sendAjaxResult(false, "Could not save data destination — settings storage failed");
+      return;
+    }
+    sendAjaxResult(true, "Using local storage only");
+    return;
+  }
+
+  if (mode == "fieldmesh") {
+    // A hub whose key was exposed to an unapproved endpoint stays locked out of
+    // FieldMesh until it is re-provisioned, even though an apiKey may exist
+    // again by now — the burned key has to be revoked on the dashboard first.
+    if (txReprovisionRequired()) {
+      sendAjaxResult(false, "Re-provisioning required before FieldMesh upload can be re-enabled");
+      return;
+    }
+    if (tx.apiKey.length() == 0) {
+      sendAjaxResult(false, "Connect to FieldMesh before enabling uploads");
+      return;
+    }
+    tx.destinationMode = TX_DEST_FIELDMESH;
+    tx.enabled = true;
+    if (!saveTransmissionSettings(tx)) {
+      txRecoverAfterFailedSave();
+      sendAjaxResult(false, "Could not enable FieldMesh upload — settings storage failed");
+      return;
+    }
+    sendAjaxResult(true, "FieldMesh upload enabled");
+    return;
+  }
+
+  sendAjaxResult(false, "Unsupported data destination");
+}
+
+static void handleSetCustomDestination() {
+  TransmissionSettings tx;
+  loadTransmissionSettings(tx);
+  String url = server.arg("custom_url");
+  url.trim();
+  bool unsafeUrlChar = false;
+  for (size_t i = 0; i < url.length(); ++i) {
+    const char c = url[i];
+    if ((uint8_t)c <= 0x20 || c == '"') { unsafeUrlChar = true; break; }
+  }
+  if (!url.startsWith("https://") || url.length() < 12 || url.length() > 240 ||
+      unsafeUrlChar) {
+    sendAjaxResult(false, "Enter a valid HTTPS endpoint URL");
+    return;
+  }
+
+  String token = server.arg("custom_token");
+  token.trim();
+  if (token.length() > 192 || token.indexOf('\r') >= 0 || token.indexOf('\n') >= 0) {
+    sendAjaxResult(false, "Bearer token is too long or invalid");
+    return;
+  }
+  if (server.hasArg("clear_token") && server.arg("clear_token") == "1") {
+    tx.customBearerToken = "";
+  } else if (token.length() > 0) {
+    tx.customBearerToken = token;
+  }
+  tx.customEndpointUrl = url;
+  tx.destinationMode = TX_DEST_CUSTOM_HTTPS;
+  tx.enabled = true;
+  if (!backendControlSetRemoteManagementEnabled(false)) {
+    sendAjaxResult(false, "Could not disable dashboard control");
+    return;
+  }
+  if (!saveTransmissionSettings(tx)) {
+    txRecoverAfterFailedSave();
+    sendAjaxResult(false, "Could not save the custom endpoint — settings storage failed");
+    return;
+  }
+  sendAjaxResult(true, "Custom HTTPS upload saved; it will be tested at the next sync");
+}
+
+// POST /set-sim-config — cellular APN + optional carrier credentials.
+//
+// Every field is validated before it is stored, because these values end up
+// spliced into quoted AT command arguments (AT+CGDCONT / AT+CGAUTH). A '"' or a
+// CR/LF would close the argument and let the rest of the value run as a second
+// AT command. Same validation idiom as handleSetCustomDestination().
+static void handleSetSimConfig() {
+  SimSettings sim;
+  loadSimSettings(sim);
+
+  String apn = server.arg("apn");
+  apn.trim();
+  if (apn.length() == 0) {
+    sendAjaxResult(false, "APN is required");
+    return;
+  }
+  if (!simSettingsFieldValid(apn, SIM_APN_MAX_LEN)) {
+    sendAjaxResult(false, "APN contains spaces, quotes or control characters, or is too long");
+    return;
+  }
+
+  String user = server.arg("apn_user");
+  user.trim();
+  if (!simSettingsFieldValid(user, SIM_AUTH_MAX_LEN)) {
+    sendAjaxResult(false, "Username contains spaces, quotes or control characters, or is too long");
+    return;
+  }
+
+  String pass = server.arg("apn_pass");
+  pass.trim();
+  if (!simSettingsFieldValid(pass, SIM_AUTH_MAX_LEN)) {
+    sendAjaxResult(false, "Password contains spaces, quotes or control characters, or is too long");
+    return;
+  }
+
+  sim.apn     = apn;
+  sim.apnUser = user;
+  // Blank password keeps the stored one (same contract as the API-key field),
+  // unless the operator explicitly asks to clear it.
+  if (server.hasArg("clear_pass") && server.arg("clear_pass") == "1") {
+    sim.apnPass = "";
+  } else if (pass.length() > 0) {
+    sim.apnPass = pass;
+  }
+  // A username with no password at all would send AT+CGAUTH with an empty
+  // credential; treat that as a configuration error rather than dialling out
+  // with half a login.
+  if (sim.apnUser.length() > 0 && sim.apnPass.length() == 0) {
+    sendAjaxResult(false, "Enter the APN password as well, or clear the username");
+    return;
+  }
+
+  if (!saveSimSettings(sim)) {
+    sendAjaxResult(false, "Could not save cellular settings — storage write failed");
+    return;
+  }
+  sendAjaxResult(true, "Cellular settings saved; they apply at the next upload attempt");
+}
+
+static void handleSettings() {
+  TransmissionSettings tx;
+  loadTransmissionSettings(tx);
+  SimSettings sim;
+  loadSimSettings(sim);
+
+  UploadCursor cursor{};
   uint32_t pendingBytes = 0;
   uint32_t pendingRows = 0;
+  bool queueReady = false;
   if (flashIsReady()) {
-    gUploadQueue.init();
-    cursor = gUploadQueue.getCursor();
-    pendingBytes = gUploadQueue.getPendingBytes();
-    pendingRows = gUploadQueue.getPendingRows();
+    queueReady = gUploadQueue.init();
+    if (queueReady) {
+      cursor = gUploadQueue.getCursor();
+      pendingBytes = gUploadQueue.getPendingBytes();
+      pendingRows = gUploadQueue.getPendingRows();
+    }
   }
   const uint64_t fsTotal = (uint64_t)LittleFS.totalBytes();
   const uint64_t fsUsed  = (uint64_t)LittleFS.usedBytes();
@@ -4605,10 +5408,7 @@ static void handleSettings() {
 
   html += F("<div id='ui-status' class='help' style='display:none;margin-bottom:10px;border:1px solid var(--border);border-radius:8px;padding:8px 10px'></div>");
 
-  // Re-run the guided setup wizard (pre-filled with current values) for anyone
-  // who'd rather step through onboarding again than hunt through this page.
-  html += F("<div class='section section--flat' style='margin-bottom:10px'>"
-            "<a href='/setup' class='btn btn--sm'>Run setup wizard</a></div>");
+  html += buildReprovisionWarning();
 
   // --- Schedule change pending (only rendered during a transition) ---
   html += buildScheduleTransitionBanner();
@@ -4645,9 +5445,100 @@ static void handleSettings() {
   html += F("</p>");
   html += F("</div>");
 
-  // --- Cloud connection ---
+  // --- Data destination --------------------------------------------------
+  // Local operation is complete in its own right. FieldMesh connection is an
+  // optional service choice, never the condition for entering the portal.
+  html += F("<div class='section'><h3>Data destination</h3>");
+  const bool fieldMeshConfigured = tx.destinationMode == TX_DEST_FIELDMESH &&
+                                   tx.apiKey.length() > 0 &&
+                                   hwEndpointAllowed(tx.endpointUrl);
+  if (fieldMeshConfigured) {
+    // Two independent facts. "FieldMesh configured" is checkable here: an
+    // approved endpoint plus a stored key. The upload time below is history and
+    // is NOT scoped to this endpoint or this key — it can predate a rotation, or
+    // even a spell in custom-HTTPS mode. Merging them into "Connected" would
+    // assert something the firmware has never verified; that needs configuration
+    // generation tracking, which does not exist yet.
+    html += F("<p><span class='chip chip--cfg-ok' style='font-weight:600'>FieldMesh configured</span></p>"
+              "<p class='muted'>Approved endpoint and connection key are stored. Readings upload "
+              "during FieldHub syncs; local fleet management works either way.</p>"
+              "<p class='muted'><strong>Last successful upload:</strong> ");
+    if (!queueReady)                  html += F("unavailable");
+    else if (cursor.lastUploadUnix>0) html += formatUploadTime(cursor.lastUploadUnix);
+    else                              html += F("never");
+    html += F("</p>"
+              "<form class='async-form' action='/set-data-destination' method='POST'>"
+              "<input type='hidden' name='mode' value='local_only'>"
+              "<button type='submit' class='btn btn--sm'>Use local storage only</button></form>");
+  } else if (tx.destinationMode == TX_DEST_CUSTOM_HTTPS &&
+             tx.customEndpointUrl.startsWith("https://")) {
+    html += F("<p><span class='chip chip--cfg-ok' style='font-weight:600'>Custom HTTPS endpoint</span></p>"
+              "<p class='muted' style='word-break:break-all'>");
+    html += htmlEscape(tx.customEndpointUrl);
+    html += F("</p><p class='muted'>Your server owns storage and validation. Local fleet management "
+              "and downloads remain available independently.</p>"
+              "<form class='async-form' action='/set-data-destination' method='POST'>"
+              "<input type='hidden' name='mode' value='local_only'>"
+              "<button type='submit' class='btn btn--sm'>Use local storage only</button></form>"
+              "<a href='/provision' class='btn btn--sm' style='margin-top:8px'>Connect to FieldMesh instead</a>");
+  } else {
+    html += F("<p><span class='chip chip--cfg-ok' style='font-weight:600'>Local storage only</span></p>"
+              "<p class='muted'>No account is required. Configure nodes, record data and download it "
+              "directly from this FieldHub.</p>"
+              "<a href='/provision' class='btn btn--primary btn--action'>Connect to FieldMesh</a>"
+              "<div class='help'>Registers this FieldHub with a FieldMesh project and stores its "
+              "connection key. Takes two screens: this one and the dashboard.</div>");
+  }
+  html += F("<details style='margin-top:12px'><summary style='font-weight:600;cursor:pointer'>"
+            "Send to your own server</summary>"
+            "<form class='async-form' action='/set-custom-destination' method='POST' style='margin-top:10px'>"
+            "<label class='label' for='custom_url'>HTTPS ingest endpoint</label>"
+            "<input class='input' id='custom_url' name='custom_url' type='url' required "
+            "placeholder='https://example.org/fieldmesh' value='");
+  html += htmlEscape(tx.customEndpointUrl);
+  html += F("'><label class='label' for='custom_token' style='margin-top:10px'>"
+            "Bearer token (optional)</label>"
+            "<input class='input' id='custom_token' name='custom_token' type='password' maxlength='192' "
+            "placeholder='Leave blank to keep the saved token'>");
+  if (tx.customBearerToken.length() > 0) {
+    html += F("<label class='label'><input type='checkbox' name='clear_token' value='1'> "
+              "Remove saved token</label>");
+  }
+  html += F("<div class='help'>The FieldHub POSTs its JSON batch format and treats any 2xx "
+            "response as a durable acknowledgement. Only return 2xx after your server has saved "
+            "the readings. The endpoint cannot provide FieldMesh charts, alerts or remote control.</div>"
+            "<button type='submit' class='btn btn--primary' style='margin-top:10px'>"
+            "Use custom HTTPS</button></form></details>");
+  html += F("</div>");
+
+  // --- Cellular section removed from Settings — it now lives in the
+  // /provision connect flow (first-time) and inside the FieldMesh service
+  // block below (post-connection SIM swaps). Showing it as a standalone
+  // section before the hub is connected was meaningless: the APN only matters
+  // when there is a cloud destination to upload to.
+
+  // --- FieldHub hardware identity -----------------------------------------
+  // Deliberately OUTSIDE the FieldMesh gate below: an unprovisioned hub is
+  // exactly the hub that needs its MAC, because the MAC is what registers it in
+  // the dashboard in the first place.
+  html += F("<div class='section'><h3>FieldHub identity</h3>"
+            "<label class='label'>FieldHub MAC</label>"
+            "<span id='settings-mac' class='mono-id mono-id--lg'>");
+  html += htmlEscape(hwMacString());
+  html += F("</span>"
+            "<button type='button' class='btn btn--sm' data-copy='#settings-mac'>Copy MAC</button>"
+            "<div class='help'>This is the identifier the FieldMesh dashboard asks for when you "
+            "add a FieldHub to a project.</div>"
+            "<label class='label' style='margin-top:12px'>FieldHub name</label>"
+            "<p class='muted' style='font-size:14px;font-weight:600'>");
+  html += htmlEscape(hwCode());
+  html += F("</p><div class='help'>A friendly hardware label derived from the MAC. It is not the "
+            "registration identifier.</div>"
+            "</div>");
+
+  if (fieldMeshConfigured) {
   html += F("<div class='section'>");
-  html += F("<h3>Cloud connection</h3>");
+  html += F("<h3>FieldMesh service</h3>");
 
   html += F("<form class='async-form' action='/save-settings' method='POST'>");
 
@@ -4671,55 +5562,32 @@ static void handleSettings() {
   html += F("<input class='input' id='api_key' name='api_key' type='password' placeholder='Enter new key to replace' value=''>");
   html += F("<div class='help'>Leave blank to keep the current key, or enter a new <code>fm_xxxxxxxx</code> API key from the fieldMesh dashboard.</div>");
 
-  html += F("<label class='label' for='qr_string' style='margin-top:10px'>QR code string (optional)</label>");
-  html += F("<input class='input' id='qr_string' name='qr_string' type='text' placeholder='Paste url|key here'>");
-  html += F("<div class='help'>If you have a QR code string of the form <code>url|key</code>, paste it here to set both endpoint and API key at once.</div>");
-
-  html += F("<label class='label' style='margin-top:10px'>Endpoint (read-only)</label>");
+  // The endpoint is displayed, never editable. It is set by /provision-apply
+  // alone, from an allow-list-validated FM1 payload.
+  html += F("<label class='label' style='margin-top:10px'>Endpoint (set by provisioning)</label>");
   html += F("<p class='muted' style='word-break:break-all;font-size:13px'>");
   html += htmlEscape(tx.endpointUrl);
   html += F("</p>");
 
-  // FieldHub hardware identity — the customer-facing code + canonical MAC used
-  // to register this hub in the dashboard. No customer-facing "Device ID".
-  html += F("<label class='label' style='margin-top:10px'>FieldHub hardware code</label>");
-  html += F("<p class='muted' style='font-size:14px;font-weight:600'>");
-  html += htmlEscape(hwCode());
-  html += F("</p>");
-  html += F("<label class='label'>Hardware MAC</label>");
-  html += F("<p class='muted' style='font-family:monospace;font-size:13px'>");
-  html += htmlEscape(hwMacString());
-  html += F("</p>");
-  html += F("<div class='help'>Use the code on the home screen to register this FieldHub in the FieldMesh dashboard, then scan the provisioning code it gives you.</div>");
-
-  // Cloud status line
+  // Status: two facts, stated separately. Line 1 is verifiable configuration.
+  // Line 2 is history that is not scoped to the current key or endpoint, so it
+  // must never be presented as evidence that this configuration works.
   {
-    const char* dotColour = "#6b7280";
-    const char* statusLabel = "Upload off";
-    if (tx.enabled) {
-      if (tx.apiKey.length() > 0) {
-        if (cursor.retryCount > 0) {
-          dotColour = "#c47a5a";
-          statusLabel = "Last upload failed";
-        } else {
-          dotColour = "#7a9b70";
-          statusLabel = "Connected";
-        }
-      } else {
-        dotColour = "#c47a5a";
-        statusLabel = "Not set up";
-      }
-    }
-    html += F("<p style='margin:8px 0'><span style='display:inline-block;width:12px;height:12px;border-radius:50%;background:");
-    html += dotColour;
-    html += F(";margin-right:8px;vertical-align:middle'></span><strong>");
-    html += statusLabel;
-    html += F("</strong>");
-    if (cursor.lastUploadUnix > 0) {
-      html += F(" &middot; last upload ");
+    html += F("<p style='margin:8px 0'><strong>FieldMesh configured</strong> "
+              "<span class='muted'>&mdash; approved endpoint and connection key stored</span></p>");
+    html += F("<p style='margin:4px 0'><strong>Last successful upload:</strong> ");
+    if (!queueReady) {
+      html += F("unavailable");
+    } else if (cursor.lastUploadUnix > 0) {
       html += formatUploadTime(cursor.lastUploadUnix);
+      if (cursor.retryCount > 0) html += F(" &middot; a later attempt failed");
+    } else {
+      html += F("never");
     }
     html += F("</p>");
+    if (!tx.enabled) {
+      html += F("<p class='muted'>Cloud upload is currently switched off below.</p>");
+    }
   }
 
   // --- Advanced settings (collapsed) ---
@@ -4740,30 +5608,74 @@ static void handleSettings() {
 
   html += F("</details>");
 
+  // Close the /save-settings form HERE, right after the fields it actually
+  // owns. Cellular settings below must be a SIBLING form, not nested inside
+  // this one — nested <form> elements are invalid HTML, and having a second
+  // <form>...</form> inside this one used to make the browser treat the inner
+  // </form> as closing THIS form early, leaving the "Save" button below outside
+  // any form and unable to submit at all.
   html += F("<button type='submit' class='btn btn--primary' style='margin-top:12px'>Save</button>");
   html += F("</form>");
+
+  // --- Cellular settings (collapsed, post-connection only) ---
+  // Cellular lives inside the FieldMesh service block visually because it is
+  // only meaningful when a cloud destination is configured. First-time setup
+  // is handled in the /provision connect flow; this section covers SIM swaps
+  // and carrier changes after the hub is already connected.
+  html += F("<details style='margin-top:14px'>"
+            "<summary style='font-weight:bold;cursor:pointer'>Cellular settings</summary>"
+            "<form class='async-form' action='/set-sim-config' method='POST' style='margin-top:10px'>"
+            "<label class='label' for='fm-apn'>APN</label>"
+            "<input class='input' id='fm-apn' name='apn' type='text' required maxlength='100' "
+            "autocomplete='off' autocapitalize='off' spellcheck='false' value='");
+  html += htmlEscape(sim.apn);
+  html += F("'><div class='help'>No spaces or quotation marks.</div>"
+            "<label class='label' for='fm-apn-user' style='margin-top:10px'>Username (optional)</label>"
+            "<input class='input' id='fm-apn-user' name='apn_user' type='text' maxlength='64' "
+            "autocomplete='off' autocapitalize='off' spellcheck='false' value='");
+  html += htmlEscape(sim.apnUser);
+  html += F("'><label class='label' for='fm-apn-pass' style='margin-top:10px'>Password (optional)</label>");
+  if (sim.apnPass.length() > 0) {
+    html += F("<p class='muted'>Password saved (last 4: ");
+    html += htmlEscape(sim.apnPass.substring(
+        sim.apnPass.length() >= 4 ? sim.apnPass.length() - 4 : 0));
+    html += F(")</p>");
+  }
+  html += F("<input class='input' id='fm-apn-pass' name='apn_pass' type='password' maxlength='64' "
+            "placeholder='Leave blank to keep the saved password'>");
+  if (sim.apnPass.length() > 0) {
+    html += F("<label class='label'><input type='checkbox' name='clear_pass' value='1'> "
+              "Remove saved password</label>");
+  }
+  html += F("<div class='help'>Only needed for carriers that require a PAP login on the APN. "
+            "Leave both blank otherwise. Applies at the next upload attempt.</div>"
+            "<button type='submit' class='btn btn--primary' style='margin-top:10px'>"
+            "Save cellular settings</button></form></details>");
   html += F("</div>");
+  }
 
   // --- Storage + manual upload status ---
   html += F("<div class='section'><h3>Storage</h3>");
   html += F("<div class='stats' style='margin:0 0 10px 0'>");
   html += F("<div class='stat'><strong>Readings waiting</strong><span class='num' style='font-size:16px'>");
-  html += String(pendingRows);
+  html += queueReady ? String(pendingRows) : String(F("n/a"));
   html += F("</span></div>");
   html += F("<div class='stat'><strong>Last upload</strong><span class='num' style='font-size:14px'>");
-  html += formatUploadTime(cursor.lastUploadUnix);
+  html += queueReady ? formatUploadTime(cursor.lastUploadUnix) : String(F("unavailable"));
   html += F("</span></div>");
   html += F("<div class='stat'><strong>Storage used</strong><span class='num' style='font-size:16px'>");
   html += String(storagePct);
   html += F("%</span></div></div>");
 
-  if (tx.allowManualUpload) {
+  if (tx.enabled && tx.allowManualUpload) {
     html += F("<form action='/manual-upload' method='POST'>");
     html += F("<input type='hidden' name='ajax' value='1'>");
     html += F("<button type='submit' class='btn btn--warn'>Upload now (30-60s)</button>");
     html += F("</form>");
-  } else {
+  } else if (tx.enabled) {
     html += F("<p class='muted'>Manual upload is disabled in advanced settings.</p>");
+  } else {
+    html += F("<p class='muted'>Readings are stored locally. Connect a data service to enable uploads.</p>");
   }
 
   html += F("</div>");
@@ -4775,32 +5687,27 @@ static void handleSettings() {
             "</form>"
             "</div>");
 
+  html += copyHelperJs();
   html += footCommon();
   server.send(200, "text/html", html);
 }
 
+// POST /set-transmission (alias /save-settings) — the general Settings save.
+//
+// This handler NEVER sets the FieldMesh endpoint. The endpoint is a security
+// boundary: only /provision-apply may write it, and only from an FM1 payload
+// whose endpoint passed the allow-list. Two request-controlled writers used to
+// live here — a `url` argument, and a legacy pipe-delimited QR string that
+// carried an endpoint and a key in one field — and both were reachable by a
+// direct POST regardless of what the page rendered. The absence of an <input>
+// is a property of the HTML, not a server-side control. (The literal token for
+// that legacy format is kept out of this file so the pre-flash grep gate over
+// src/ can stay a plain "must be zero"; the supersession notes live in docs/.)
 static void handleSetTransmission() {
   TransmissionSettings tx;
   tx.enabled          = server.hasArg("enabled") && server.arg("enabled") == "1";
-  tx.endpointUrl      = server.arg("url");
   tx.apiKey           = server.arg("api_key");  // may be blank; preserved below
   // authToken / siteId / deploymentId inputs are hidden — carried from prev below.
-
-  // QR code string: if present and contains '|', split into url|key.
-  String qrString = server.arg("qr_string");
-  qrString.trim();
-  if (qrString.length() > 0) {
-    int pipeIdx = qrString.indexOf('|');
-    if (pipeIdx > 0) {
-      tx.endpointUrl = qrString.substring(0, pipeIdx);
-      tx.apiKey      = qrString.substring(pipeIdx + 1);
-      Serial.printf("[UI] QR string parsed: endpoint set, key length=%u\n",
-                    (unsigned)tx.apiKey.length());
-    } else {
-      // No pipe — treat the whole string as an API key.
-      tx.apiKey = qrString;
-    }
-  }
   tx.allowManualUpload = server.hasArg("allow_manual") && server.arg("allow_manual") == "1";
 
   // Remote dashboard control is a plain on/off — enabling it isn't a big deal
@@ -4814,6 +5721,7 @@ static void handleSetTransmission() {
   // (which forces them), along with the phase anchor this form doesn't edit.
   TransmissionSettings prev;
   loadTransmissionSettings(prev);
+  tx.destinationMode    = prev.destinationMode;
   tx.uploadPhaseUnix     = prev.uploadPhaseUnix;
   tx.uploadIntervalMin   = prev.uploadIntervalMin;
   tx.minBatteryMv        = prev.minBatteryMv;
@@ -4822,29 +5730,35 @@ static void handleSetTransmission() {
   tx.useJsonUpload = prev.useJsonUpload;
   tx.mothershipId = prev.mothershipId;  // not editable via this form yet
   tx.projectId = prev.projectId;        // not editable via this form yet
+  tx.customEndpointUrl = prev.customEndpointUrl;
+  tx.customBearerToken = prev.customBearerToken;
   tx.authToken    = prev.authToken;     // legacy fields hidden — preserve stored values
   tx.siteId       = prev.siteId;
   tx.deploymentId = prev.deploymentId;
-  // Keep the previous API key if the form field was left blank (no QR string).
+  // Keep the previous API key if the form field was left blank.
   if (tx.apiKey.length() == 0 || tx.apiKey.indexOf("\u2022") >= 0) {
     tx.apiKey = prev.apiKey;
   }
-  // The Settings page renders the endpoint read-only (no <input name='url'>),
-  // so server.arg("url") is always "" except via the legacy qr_string pipe
-  // format. Without this, every plain Settings save would silently wipe the
-  // endpoint set by /provision-apply back to blank (masked today only because
-  // the load-time fallback happens to match the sole allow-listed endpoint).
-  if (tx.endpointUrl.length() == 0) {
-    tx.endpointUrl = prev.endpointUrl;
-  }
+  // The endpoint is carried through UNCONDITIONALLY and is never read from the
+  // request here. See the handler comment: /provision-apply is the only writer.
+  tx.endpointUrl = prev.endpointUrl;
 
-  if (!backendControlSetRemoteManagementEnabled(remoteRequested)) {
+  const bool remoteEffective = remoteRequested &&
+      tx.destinationMode == TX_DEST_FIELDMESH && tx.enabled && tx.apiKey.length() > 0;
+  if (!backendControlSetRemoteManagementEnabled(remoteEffective)) {
     if (isAjaxRequest()) sendAjaxResult(false, "Could not persist remote management setting");
     else server.send(500, "text/plain", "Could not persist remote management setting");
     return;
   }
 
-  saveTransmissionSettings(tx);
+  if (!saveTransmissionSettings(tx)) {
+    txRecoverAfterFailedSave();
+    const char* msg = "Settings not saved — storage write failed. "
+                      "Check the FieldHub and try again.";
+    if (isAjaxRequest()) sendAjaxResult(false, msg);
+    else                 server.send(500, "text/plain", msg);
+    return;
+  }
   Serial.printf("[UI] Transmission settings saved: enabled=%d url=%s site=%s\n",
                 tx.enabled ? 1 : 0, tx.endpointUrl.c_str(), tx.siteId.c_str());
 
@@ -4893,6 +5807,11 @@ static void performManualUpload(String& resultMsg, bool& ok) {
   resultMsg = "";
   ok = false;
 
+  if (!tx.enabled || tx.destinationMode == TX_DEST_LOCAL_ONLY) {
+    resultMsg = "Remote upload is not enabled";
+    return;
+  }
+
   if (!tx.allowManualUpload) {
     resultMsg = "Manual upload is disabled in settings";
     return;
@@ -4903,20 +5822,31 @@ static void performManualUpload(String& resultMsg, bool& ok) {
 
   if (!flashIsReady()) {
     resultMsg = "Storage not ready — cannot read data";
+  } else if (!gUploadQueue.init()) {
+    // Abort rather than upload from a zero cursor: that would re-send retained
+    // history and then advance the cursor from a position that was never real.
+    resultMsg = "Upload status unavailable — upload queue could not be read";
   } else {
-    gUploadQueue.init();
     // A deployment event rides in the STATUS object, not in readings, so an
     // empty reading queue must not count as "nothing to send". Observed on the
     // bench: an End was archived on the hub, the pre-shutdown sync correctly
     // fired with queuedEvents=1, and then bailed here because the CSV buffer
     // was empty — so the archive still never reached the dashboard.
-    const uint8_t manQueuedEvents = deploymentOutboxCount();
+    const bool manFieldMesh = tx.destinationMode == TX_DEST_FIELDMESH;
+    const bool manCustomHttps = tx.destinationMode == TX_DEST_CUSTOM_HTTPS;
+    if (manFieldMesh) deploymentQueueFieldMeshBackfill();
+    const uint8_t manQueuedEvents = manFieldMesh ? deploymentOutboxCount() : 0;
     if (gUploadQueue.getPendingBytes() == 0 && manQueuedEvents == 0) {
       resultMsg = "No new data to upload";
       ok = true;
     } else {
       ModemDriver modem;
       modem.init();
+      {
+        SimSettings sim;
+        loadSimSettings(sim);
+        modem.configureApn(sim.apn, sim.apnUser, sim.apnPass);
+      }
 
       // Resting battery reading, before the modem rail loads it down.
       const float manRestingBatV = readBatteryVoltage();
@@ -4930,7 +5860,7 @@ static void performManualUpload(String& resultMsg, bool& ok) {
         // Batch upload: up to 100 readings per POST. Loop a bounded number of
         // POSTs per click so a manual upload drains a useful amount without
         // tying up config mode indefinitely.
-        const String authHeader = tx.apiKey.length() > 0 ? tx.apiKey : tx.authToken;
+        const String authHeader = buildUploadAuth(tx);
         const String url = buildUploadUrl(tx);
         const int kMaxManualPosts = 6;   // up to ~600 readings per click
         int posts = 0;
@@ -5008,7 +5938,7 @@ static void performManualUpload(String& resultMsg, bool& ok) {
           mothershipFirmwareStatusJson(),
           backendControlStatusJson(),
           (uint8_t)(flashCsvSchemaIsCurrent() ? 1 : 0),
-          deploymentOutboxToJson(),
+          manFieldMesh ? deploymentOutboxToJson() : String("[]"),
           deploymentEpochClampCount()
         };
 
@@ -5027,19 +5957,24 @@ static void performManualUpload(String& resultMsg, bool& ok) {
             // Malformed row(s) skipped by the builder — advance past them and
             // keep going, don't POST or error out.
             gUploadQueue.advanceCursor(payload.startOffset + json.csvBytesConsumed, getRTCTimeUnix());
-            gUploadQueue.purgeUploaded();
+            gUploadQueue.purgeUploadedIfLegacyDrained();
             continue;
           }
           if (!json.ok || json.rowCount == 0) { lastErr = "JSON build failed (heap?)"; break; }
 
           HttpsPostResult result = modem.httpsPost(url, json.body, "application/json", authHeader);
           posts++;
-          if (result.httpStatus == 200) {
+          const bool accepted = manCustomHttps
+              ? (result.httpStatus >= 200 && result.httpStatus < 300)
+              : (result.httpStatus == 200);
+          if (accepted) {
             // Same guard as the scheduled path: HTTP 200 does not mean the rows
-            // were stored, and advancing the cursor deletes them. See the note
+            // were stored, and advancing the remote-delivery cursor loses the
+            // chance to retry them. See the note
             // in main.cpp performModemUpload.
-            const int appended = jsonResponseAppendedCount(result.responseBody);
-            if (appended == 0 && json.rowCount > 0 &&
+            const int appended = manFieldMesh
+                ? jsonResponseAppendedCount(result.responseBody) : (int)json.rowCount;
+            if (manFieldMesh && appended == 0 && json.rowCount > 0 &&
                 !jsonResponseIsDuplicate(result.responseBody)) {
               Serial.printf("[UI] REFUSING to advance: sent %u readings, backend "
                             "stored 0 — rows stay on flash\n",
@@ -5052,14 +5987,15 @@ static void performManualUpload(String& resultMsg, bool& ok) {
             }
             gUploadQueue.advanceCursor(payload.startOffset + json.csvBytesConsumed, getRTCTimeUnix(),
                                        json.rowCount);
-            gUploadQueue.purgeUploaded();
+            gUploadQueue.purgeUploadedIfLegacyDrained();
             gUploadQueue.resetRetryCount();
             sent += json.rowCount;
-            ingestBackendResponseFromUi(result.responseBody);
-          } else if (result.httpStatus == 401 || result.httpStatus == 400) {
+            if (manFieldMesh) ingestBackendResponseFromUi(result.responseBody);
+          } else if (result.httpStatus >= 400 && result.httpStatus < 500 &&
+                     result.httpStatus != 408 && result.httpStatus != 429) {
             char buf[80];
-            snprintf(buf, sizeof(buf), "HTTP %d (%s)",
-                     result.httpStatus, result.httpStatus == 401 ? "unauthorized" : "bad request");
+            snprintf(buf, sizeof(buf), "HTTP %d (request rejected)",
+                     result.httpStatus);
             lastErr = String(buf);
             stop = true;  // not transient — don't increment retry counter
           } else {
@@ -5149,34 +6085,44 @@ static void handleUploadStatus() {
   UploadCursor cursor = {0, 0, 0, 0, 0};
   uint32_t pendingBytes = 0;
   uint32_t pendingRows = 0;
+  bool queueReady = false;
   if (flashIsReady()) {
-    gUploadQueue.init();
-    cursor = gUploadQueue.getCursor();
-    pendingBytes = gUploadQueue.getPendingBytes();
-    pendingRows = gUploadQueue.getPendingRows();
+    queueReady = gUploadQueue.init();
+    if (queueReady) {
+      cursor = gUploadQueue.getCursor();
+      pendingBytes = gUploadQueue.getPendingBytes();
+      pendingRows = gUploadQueue.getPendingRows();
+    }
   }
   const uint64_t fsTotal = (uint64_t)LittleFS.totalBytes();
   const uint64_t fsUsed  = (uint64_t)LittleFS.usedBytes();
   const uint32_t flashUsagePct = (fsTotal > 0)
     ? (uint32_t)((fsUsed * 100ULL) / fsTotal) : 0;
 
+  // Cursor-derived values are null, never 0, when the queue could not be read.
+  auto queueNum = [&](uint32_t v) -> String {
+    return queueReady ? String(v) : String("null");
+  };
+
   String json;
   json.reserve(320);
   json += "{";
   json += "\"enabled\":";
   json += tx.enabled ? "true" : "false";
+  json += ",\"queueReady\":";
+  json += queueReady ? "true" : "false";
   json += ",\"cursorOffset\":";
-  json += String(cursor.byteOffset);
+  json += queueNum(cursor.byteOffset);
   json += ",\"pendingBytes\":";
-  json += String(pendingBytes);
+  json += queueNum(pendingBytes);
   json += ",\"pendingRows\":";
-  json += String(pendingRows);
+  json += queueNum(pendingRows);
   json += ",\"rowsUploaded\":";
-  json += String(cursor.rowsUploaded);
+  json += queueNum(cursor.rowsUploaded);
   json += ",\"lastUploadUnix\":";
-  json += String(cursor.lastUploadUnix);
+  json += queueNum(cursor.lastUploadUnix);
   json += ",\"retryCount\":";
-  json += String(cursor.retryCount);
+  json += queueNum(cursor.retryCount);
   json += ",\"flashUsagePct\":";
   json += String(flashUsagePct);
   json += ",\"flashTotalBytes\":";
@@ -5225,22 +6171,34 @@ static void handleApiIdentity() {
 static String provisionWidgetHtml(const String& onSuccessJs) {
   String h = F(
     "<div id='pv-empty'>"
-    "<p class='muted'>Paste the connection code shown in the FieldMesh dashboard, or scan it.</p>"
+    // Primary guidance: the dashboard shows a QR. The two ways to get the code
+    // onto this page are stated up front so the user is never left guessing.
+    "<div class='help' style='border:1px solid var(--border);border-radius:8px;padding:10px;margin-bottom:12px'>"
+    "<strong>Two ways to enter the code:</strong><br>"
+    "1. Open the FieldMesh dashboard on another device, find this FieldHub's connection code, "
+    "and paste it below.<br>"
+    "2. \U0001F4F1 <strong>Scan with your phone's camera app</strong> — this is the dashboard's "
+    "QR, different from the one on the previous screen, and yes, this one you scan with your "
+    "own phone. Open the link it finds and this page will detect it automatically."
+    "</div>"
     "<textarea id='pv-paste' class='input' rows='3' placeholder='Paste connection code here' "
     "style='font-family:monospace;font-size:13px' autocomplete='off' autocapitalize='off' spellcheck='false'></textarea>"
     "<button id='pv-paste-go' class='btn btn--primary' style='margin-top:8px;width:100%'>Use pasted code</button>"
     "<div style='margin-top:14px'>"
     "<button id='pv-scan-go' class='btn' style='width:100%' hidden>Scan with camera</button>"
     "<p id='pv-scan-unsupported' class='muted' style='display:none'>"
-    "Camera scanning isn't supported on this browser — paste the code instead, "
-    "or scan the QR with your phone's camera app and open the link it finds.</p>"
+    "Camera scanning isn't supported on this browser. Scan the QR with your phone's camera app "
+    "instead, then open the link it finds.</p>"
     "<video id='pv-video' style='display:none;width:100%;border-radius:8px;margin-top:8px' playsinline muted></video>"
     "</div></div>"
     "<div id='pv-confirm' style='display:none'>"
     "<p>Endpoint: <strong id='pv-host'></strong></p>"
     "<p><span class='chip chip--cfg-ok' style='font-weight:600'>Connection key received</span></p>"
-    "<p class='muted'>Applying this will connect the FieldHub to your project and test the connection.</p>"
-    "<button id='pv-apply' class='btn btn--primary'>Apply &amp; connect</button> "
+    // Nothing contacts the endpoint here. The first real request happens at the
+    // next sync, so this must not be described as a connection test.
+    "<p class='muted'>This stores the endpoint and connection key on the FieldHub. "
+    "Nothing is contacted now &mdash; the FieldHub will upload during its next sync.</p>"
+    "<button id='pv-apply' class='btn btn--primary'>Save connection</button> "
     "<button id='pv-cancel' class='btn btn--sm'>Cancel</button></div>"
     "<div id='pv-error' style='display:none'><p><span class='chip chip--bat-low' style='font-weight:600'>"
     "Invalid provisioning code</span></p><p class='muted' id='pv-error-msg'></p>"
@@ -5254,10 +6212,14 @@ static String provisionWidgetHtml(const String& onSuccessJs) {
     "var stream=null;"
     "function stopScan(){if(stream){stream.getTracks().forEach(function(t){t.stop();});stream=null;}"
     "document.getElementById('pv-video').style.display='none';}"
+    // The host page may want to follow the widget's state (e.g. /provision jumps
+    // straight to its "enter the code" step when a scanned link arrives with a
+    // payload already in the fragment). Optional: undefined elsewhere.
+    "function stage(s){if(window.pvStage)window.pvStage(s);}"
     "function reset(){stopScan();X.style.display='none';R.style.display='none';C.style.display='none';"
-    "E.style.display='block';}"
+    "E.style.display='block';stage('empty');}"
     "function fail(m){stopScan();E.style.display='none';C.style.display='none';R.style.display='none';"
-    "X.style.display='block';document.getElementById('pv-error-msg').textContent=m||'';}"
+    "X.style.display='block';document.getElementById('pv-error-msg').textContent=m||'';stage('error');}"
     "document.getElementById('pv-retry').addEventListener('click',reset);"
     "function tryPayload(raw){"
     "raw=(raw||'').trim();"
@@ -5270,7 +6232,7 @@ static String provisionWidgetHtml(const String& onSuccessJs) {
     "var host;try{host=new URL(payload.endpoint).host;}catch(e){host=payload.endpoint;}"
     "stopScan();E.style.display='none';X.style.display='none';"
     "document.getElementById('pv-host').textContent=host;C.style.display='block';"
-    "C.dataset.raw=raw;"
+    "C.dataset.raw=raw;stage('confirm');"
     "}"
     "document.getElementById('pv-paste-go').addEventListener('click',function(){"
     "tryPayload(document.getElementById('pv-paste').value);});"
@@ -5315,8 +6277,12 @@ static String provisionWidgetHtml(const String& onSuccessJs) {
     "});"
     "}else{document.getElementById('pv-scan-unsupported').style.display='block';}"
     // Fragment auto-detect last, so a scanned/tapped QR link still works.
+    // Only treat the fragment as a provisioning payload if it actually looks
+    // like one. Any other hash (a deep link, a stray '#') would otherwise land
+    // the widget in an error state the operator never asked for and, on
+    // /provision, may not even be looking at.
     "var fragRaw=(location.hash||'').replace(/^#/,'');"
-    "if(fragRaw){tryPayload(fragRaw);}"
+    "if(fragRaw.indexOf('FM1.')>=0){tryPayload(fragRaw);}"
     "})();</script>");
   return h;
 }
@@ -5326,23 +6292,175 @@ static String provisionWidgetHtml(const String& onSuccessJs) {
 // (http://192.168.4.1/provision#FM1.<base64url-payload>); it stays available
 // independent of the setup wizard.
 static void handleProvisionPage() {
-  String html = headCommon("Connect FieldHub", F("<a href='/' class='btn btn--sm'>Back</a>"));
-  html += F("<div class='section'><h3>Connect this FieldHub</h3>");
-  // Success continues INTO the setup wizard rather than dead-ending here. This
-  // matters for the common case where the user scans the dashboard QR with their
-  // phone's native camera: that opens this /provision page (often in a different
-  // browser than the wizard), and without this the wizard would be abandoned.
-  // The wizard is server-driven and resumes from device state, so continuing —
-  // even in a new browser — picks up exactly where setup should go next.
-  html += provisionWidgetHtml(F(
-    "R.style.display='block';"
-    "R.innerHTML=\"<p><span class='chip chip--cfg-ok' style='font-weight:600'>Connected</span></p>"
-    "<p class='muted'>This FieldHub is now connected. Continue setup to finish.</p>"
-    "<a href='/setup' class='btn btn--primary' style='width:100%;text-align:center'>Continue setup</a>\";"));
+  // Return context is CLIENT-supplied (?return=setup on a link the wizard
+  // renders), so it is parsed as a closed enum and nothing from the request is
+  // ever interpolated into HTML, JavaScript or a redirect target. Anything that
+  // is not exactly "setup" is ignored and the standalone flow is used.
+  const bool returnToWizard = (server.arg("return") == "setup");
+
+  // This page owns registration and connection, and uses none of COMMON_JS —
+  // dropping that block frees ~20.9 KB of the single contiguous String this
+  // response has to fit in. navActive = -1: it is a flow, not a tab.
+  String html = headCommon("Connect FieldHub",
+                           F("<a href='/settings' class='btn btn--sm'>Settings</a>"),
+                           -1, false);
+
+  html += buildReprovisionWarning();
+
+  // --- Step 1 — Register this FieldHub ------------------------------------
+  html += F("<div class='section pv-step' data-pv='1'>"
+            "<p class='muted' style='margin:0 0 10px'>Step 1 of 4</p>"
+            "<h3>Register this FieldHub</h3>"
+            "<p class='muted'>On another device, open the FieldMesh dashboard, go to your "
+            "project's FieldHubs page and add this hub using the address below. You will need "
+            "two screens: this one, and the dashboard.</p>"
+            "<label class='label'>FieldHub MAC</label>"
+            "<span id='pv-mac' class='mono-id mono-id--lg'>");
+  html += htmlEscape(hwMacString());
+  html += F("</span>"
+            "<button type='button' class='btn btn--sm' data-copy='#pv-mac'>Copy MAC</button>"
+            "<div style='margin-top:14px;text-align:center'>");
+  // Served from its own route, never inlined: embedding the SVG path alongside
+  // the shared CSS and this page's script has previously exhausted the largest
+  // contiguous heap block, truncating the trailing controller.
+  html += F("<img src='/hardware-qr.svg' loading='lazy' alt='FieldHub registration QR' "
+            "style='display:block;max-width:220px;height:auto;margin:0 auto'>"
+            "</div>"
+            "<div class='help' style='margin-top:10px'><strong>Scan this with the FieldMesh "
+            "dashboard's built-in scanner</strong> — not your phone's camera app. It carries a "
+            "<code>fieldmesh://</code> link that a camera app cannot open. (The next step will ask "
+            "you to scan a different QR — that one does use your phone's camera.)</div>"
+            "<button type='button' class='btn btn--primary btn--action' style='margin-top:16px' "
+            "data-pv-go='2'>I have registered it &mdash; next</button>"
+            "</div>");
+
+  // --- Step 2 — Enter the connection code ---------------------------------
+  html += F("<div class='section pv-step' data-pv='2' style='display:none'>"
+            "<p class='muted' style='margin:0 0 10px'>Step 2 of 4</p>"
+            "<h3>Enter the connection code</h3>"
+            "<p class='muted'>The FieldMesh dashboard shows a connection code and QR for this "
+            "FieldHub. Paste the code below, or scan the QR with your phone's camera app and open "
+            "the link.</p>");
+  html += provisionWidgetHtml(F("if(window.pvSaved)window.pvSaved();"));
+  html += F("<div style='margin-top:12px'>"
+            "<button type='button' class='btn btn--sm' data-pv-go='1'>Back</button></div>"
+            "</div>");
+
+  // --- Step 3 — Cellular (APN) -------------------------------------------
+  // Cellular is part of the connect flow, not a separate Settings concern:
+  // the APN only matters once the hub has a cloud destination, and presenting
+  // it here gives the user one guided journey (register → code → cellular →
+  // done) instead of a connect button plus a disconnected APN form elsewhere.
+  {
+    SimSettings sim;
+    loadSimSettings(sim);
+    html += F("<div class='section pv-step' data-pv='3' style='display:none'>"
+              "<p class='muted' style='margin:0 0 10px'>Step 3 of 4</p>"
+              "<h3>Cellular settings</h3>"
+              "<p class='muted'>The APN your SIM's carrier requires for the mobile network. "
+              "Leave it as-is unless you change SIM or carrier.</p>"
+              "<form id='pv-sim-form' style='margin-top:10px'>"
+              "<label class='label' for='pv-apn'>APN</label>"
+              "<input class='input' id='pv-apn' name='apn' type='text' required maxlength='100' "
+              "autocomplete='off' autocapitalize='off' spellcheck='false' value='");
+    html += htmlEscape(sim.apn);
+    html += F("'><div class='help'>No spaces or quotation marks.</div>"
+              "<label class='label' for='pv-apn-user' style='margin-top:10px'>Username (optional)</label>"
+              "<input class='input' id='pv-apn-user' name='apn_user' type='text' maxlength='64' "
+              "autocomplete='off' autocapitalize='off' spellcheck='false' value='");
+    html += htmlEscape(sim.apnUser);
+    html += F("'><label class='label' for='pv-apn-pass' style='margin-top:10px'>Password (optional)</label>");
+    if (sim.apnPass.length() > 0) {
+      html += F("<p class='muted'>Password saved (last 4: ");
+      html += htmlEscape(sim.apnPass.substring(
+          sim.apnPass.length() >= 4 ? sim.apnPass.length() - 4 : 0));
+      html += F(")</p>");
+    }
+    html += F("<input class='input' id='pv-apn-pass' name='apn_pass' type='password' maxlength='64' "
+              "placeholder='Leave blank to keep the saved password'>");
+    if (sim.apnPass.length() > 0) {
+      html += F("<label class='label'><input type='checkbox' name='clear_pass' value='1'> "
+                "Remove saved password</label>");
+    }
+    html += F("<div class='help'>Only needed for carriers that require a PAP login on the APN. "
+              "Leave both blank otherwise.</div>"
+              "<div id='pv-sim-result' class='help' style='margin-top:8px'></div>"
+              "<div style='margin-top:10px'>"
+              "<button type='button' class='btn btn--sm' data-pv-go='2'>Back</button> "
+              "<button type='button' class='btn btn--sm' id='pv-sim-skip'>Skip</button> "
+              "<button type='button' class='btn btn--primary' id='pv-sim-save'>Save &amp; continue</button>"
+              "</div></form></div>");
+  }
+
+  // --- Step 4 — Saved ------------------------------------------------------
+  html += F("<div class='section pv-step' data-pv='4' style='display:none'>"
+            "<p class='muted' style='margin:0 0 10px'>Step 4 of 4</p>"
+            "<h3><span class='chip chip--cfg-ok' style='font-weight:700'>Connection saved</span></h3>"
+            "<p class='muted'>The endpoint and connection key are stored on this FieldHub. Press "
+            "Finish on the next screen to upload now and power down &mdash; or it will upload "
+            "automatically at the next scheduled sync.</p>");
+  if (returnToWizard) {
+    html += F("<a href='/setup' class='btn btn--primary btn--action'>Continue setup</a>"
+              "<a href='/settings' class='btn btn--sm'>Go to Settings instead</a>");
+  } else {
+    // "Back to overview" is the real finish path — the home page's sticky
+    // "Save & Start Recording" button is what actually uploads and powers
+    // down. Settings has no equivalent action, so it must not outrank this.
+    html += F("<a href='/' class='btn btn--primary btn--action'>Finish &mdash; go upload now</a>"
+              "<a href='/settings' class='btn btn--sm'>Go to Settings instead</a>");
+  }
   html += F("</div>");
+
+  // --- Controller ---------------------------------------------------------
+  // A scanned dashboard QR lands on /provision#FM1.<payload>. The widget's
+  // fragment auto-detect fires immediately, so without this the operator would
+  // be looking at "register this hub" while a confirmation they cannot see sits
+  // in step 2 — i.e. asked to register after having already registered.
+  html += F("<script>(function(){"
+            "var steps=[].slice.call(document.querySelectorAll('.pv-step'));"
+            "function show(n){steps.forEach(function(s){"
+            "s.style.display=(parseInt(s.dataset.pv,10)===n)?'block':'none';});window.scrollTo(0,0);}"
+            "window.pvSaved=function(){show(3);};"
+            // Widget stage changes: a payload present at load (valid OR malformed)
+            // belongs on step 2, where its confirmation/error state already is.
+            "window.pvStage=function(s){if(s==='confirm'||s==='error')show(2);};"
+            "document.addEventListener('click',function(e){var t=e.target;"
+            "while(t&&t!==document&&!(t.getAttribute&&t.getAttribute('data-pv-go')))t=t.parentNode;"
+            "if(!t||t===document)return;show(parseInt(t.getAttribute('data-pv-go'),10));});"
+            // Cellular step: save via AJAX to /set-sim-config, then advance to step 4.
+            "var simForm=document.getElementById('pv-sim-form');"
+            "function simPost(){var p=['apn='+encodeURIComponent(document.getElementById('pv-apn').value),"
+            "'apn_user='+encodeURIComponent(document.getElementById('pv-apn-user').value),"
+            "'apn_pass='+encodeURIComponent(document.getElementById('pv-apn-pass').value)];"
+            "if(document.querySelector('[name=clear_pass]')&&document.querySelector('[name=clear_pass]').checked)p.push('clear_pass=1');"
+            "p.push('ajax=1');"
+            "return fetch('/set-sim-config',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:p.join('&')}).then(function(r){return r.json();});}"
+            "var simBtn=document.getElementById('pv-sim-save');"
+            "simBtn.addEventListener('click',function(){var b=this,lab=b.textContent;b.disabled=true;b.textContent='Saving...';"
+            "simPost().then(function(j){b.disabled=false;b.textContent=lab;"
+            "var r=document.getElementById('pv-sim-result');"
+            "if(j.ok){r.innerHTML=\"<span class='chip chip--cfg-ok' style='font-weight:600'>Saved</span>\";show(4);}"
+            "else{r.innerHTML=\"<span class='chip chip--bat-low' style='font-weight:600'>\"+(j.message||'Could not save')+\"</span>\";}"
+            "}).catch(function(){b.disabled=false;b.textContent=lab;"
+            "document.getElementById('pv-sim-result').innerHTML=\"<span class='chip chip--bat-low' style='font-weight:600'>Network error</span>\";});});"
+            "document.getElementById('pv-sim-skip').addEventListener('click',function(){show(4);});"
+            "show((location.hash||'').indexOf('FM1.')>=0?2:1);"
+            "})();</script>");
+
+  html += copyHelperJs();
   html += footCommon();
   server.sendHeader("Cache-Control", "no-store");
   server.send(200, "text/html", html);
+}
+
+// Keep the generated QR outside the already-large setup response. Embedding its
+// SVG path alongside the shared CSS/JS and both wizard controllers can exhaust
+// the largest contiguous heap block before the setup controller is appended,
+// leaving a visible page whose buttons have no event handlers.
+static void handleHardwareQrSvg() {
+  const String svg = renderQrSvg(hwRegisterUri(hwMacString()));
+  server.sendHeader("Cache-Control", "no-store");
+  server.send(200, "image/svg+xml", svg);
 }
 
 // POST /provision-apply — body is the raw "FM1.<base64url>" payload (text/plain,
@@ -5374,35 +6492,55 @@ static void handleProvisionApply() {
   loadTransmissionSettings(tx);
   tx.endpointUrl = prov.endpoint;
   tx.apiKey      = prov.connectionKey;
+  tx.destinationMode = TX_DEST_FIELDMESH;
   // Auto-enable cloud upload on a successful provision. Applying a connection
   // key is an explicit "connect this hub" action, so there is no reason to make
   // the user then separately hunt for and tick an "Enable cloud upload" box —
   // that silent extra step was a reported onboarding snag.
   tx.enabled     = true;
-  saveTransmissionSettings(tx);
+  if (!saveTransmissionSettings(tx)) {
+    // No rollback exists — Preferences commits key by key. Look at what actually
+    // landed and fail closed if it is incoherent, then tell the operator to
+    // retry rather than reporting a connection that may not be stored.
+    txRecoverAfterFailedSave();
+    Serial.println("[PROVISION] save failed — credentials not stored");
+    sendAjaxResult(false, "Could not store the connection — try provisioning again");
+    return;
+  }
+  // Only a successfully persisted, valid FM1 payload clears the marker.
+  txClearReprovisionRequired();
   // Log only non-secret facts — never the key.
   Serial.printf("[PROVISION] applied: endpoint=%s keyLen=%u\n",
                 prov.endpoint.c_str(), (unsigned)prov.connectionKey.length());
 
+  gCloudConnectedThisSession = true;
   sendAjaxResult(true, "Provisioned");
 }
 
 // GET /setup — first-run onboarding wizard. One server-rendered page whose
 // steps are shown/hidden client-side (same pattern as the provision widget),
 // each step reusing the existing per-setting endpoints so there is no duplicate
-// server logic. The wizard is intentionally hub-focused — get the FieldHub
-// online and under dashboard control — and does NOT deal with node deployment
-// (pairing/discovery is the node manager's job):
-//   1 Register (manual MAC entry / QR)  2 Connect (shared provision widget)
-//   3 Cloud confirmed  4 Dashboard control (/set-remote-management)
-//   5 Time (/set-time)  6 Recording interval (/set-wake-interval — the upload/
-//   sync cadence is auto-derived from this, never set by the user)  7 Review
-//   8 Finish (/start). The start step is computed from device state so a
+// server logic. Local recording is the default path; FieldMesh connection is an
+// optional branch. The wizard does NOT deal with node deployment (pairing and
+// discovery are the node manager's job):
+//   1 Choose local or FieldMesh  2 Connect (LINKS OUT to /provision, which owns
+//   registration and connection)  3 Dashboard control (/set-remote-management)
+//   4 Time (/set-time)  5 Recording interval (/set-wake-interval — the upload/
+//   sync cadence is auto-derived from this, never set by the user)  6 Review
+//   7 Finish (/start). The start step is computed from device state so a
 // mid-flow refresh doesn't force redoing completed steps.
+//
+// The wizard used to embed the provisioning widget and then show a "Cloud
+// confirmed" step. Both are gone: the widget lives on /provision only, and with
+// the in-page connection removed the confirmation step had no content left —
+// the confirmation now happens on /provision itself. Returning from /provision
+// lands on Dashboard control via the state-derived start step below.
 static void handleSetupWizard() {
   TransmissionSettings tx;
   loadTransmissionSettings(tx);
   const bool hasKey  = tx.apiKey.length() > 0;
+  const bool connectedToFieldMesh =
+      tx.destinationMode == TX_DEST_FIELDMESH && tx.enabled && hasKey;
   const bool hasTime = getRTCTimeUnix() >= kMinValidPhaseUnix;
   const bool remoteEnabled = backendControlRemoteManagementEnabled();
   const String mac = hwMacString();
@@ -5419,49 +6557,58 @@ static void handleSetupWizard() {
   // browser). Once connected, land on the first post-connect config step so the
   // rest of setup (Dashboard control → Time → Recording) still gets walked;
   // registration + connect are already done at that point.
-  int startStep = hasKey ? 4 : 1;
+  int startStep = connectedToFieldMesh ? 3 : 1;
 
-  String html = headCommon("Set up FieldHub", F("<a href='/' class='btn btn--sm'>Exit</a>"));
+  // This wizard owns its interactions and does not use the live-dashboard
+  // poller/forms in COMMON_JS. Omitting that unrelated 21 KB block keeps the
+  // final wizard controller in the response on the ESP32's fragmented heap.
+  String html = headCommon("Set up FieldHub",
+                           F("<a href='/' class='btn btn--sm'>Exit</a>"),
+                           -1, false);
   html += F("<div class='section'>"
-            "<p class='muted' style='margin:0 0 10px'>Setup &middot; step <span id='wz-cur'>1</span> of 8</p>");
+            "<p class='muted' style='margin:0 0 10px'>FieldHub setup</p>");
 
-  // Step 1 — Register
+  // Step 1 — choose the standalone or connected path
   html += F("<div class='wz-step' data-step='1'>"
-            "<h3>1. Register this FieldHub</h3>"
-            "<p class='muted'>In the FieldMesh dashboard, add a new FieldHub using this address:</p>"
-            "<div class='help'><strong>Hardware MAC</strong><br>"
-            "<span id='wz-mac' style='font-family:monospace;font-size:20px;font-weight:700'>");
+            "<h3>Set up this FieldHub</h3>"
+            "<p class='muted'>Set up local recording first. No account or connection key is required.</p>"
+            "<button type='button' class='btn btn--primary' style='width:100%' id='wz-local'>Set up local recording</button>"
+            "<div id='wz-local-result' class='help' style='margin-top:8px'></div>"
+            "<button type='button' class='btn' style='width:100%;margin-top:8px' data-wz='goto' data-goto='2'>Connect to FieldMesh (optional)</button>"
+            "<p class='muted' style='margin-top:14px'>FieldHub hardware identity:</p>"
+            "<div class='help'><strong>FieldHub MAC</strong><br>"
+            "<span id='wz-mac' class='mono-id mono-id--lg'>");
   html += htmlEscape(mac);
   html += F("</span></div>"
-            "<button type='button' class='btn btn--sm' style='margin-top:10px' id='wz-copy'>Copy MAC</button>"
-            "<details style='margin-top:10px'><summary style='font-size:14px;color:var(--sub);cursor:pointer'>Or scan instead</summary>"
-            "<div style='margin-top:8px;text-align:center'>");
-  html += renderQrSvg(hwRegisterUri(mac));
-  html += F("</div></details>"
-            "<div style='margin-top:16px'><button type='button' class='btn btn--primary' data-wz='next'>I've registered — continue</button></div>"
+            "<button type='button' class='btn btn--sm' style='margin-top:10px' data-copy='#wz-mac'>Copy MAC</button>"
+            "<div style='margin-top:10px;text-align:center'>");
+  html += F("<img src='/hardware-qr.svg' loading='lazy' alt='FieldHub registration QR' "
+            "style='display:block;max-width:220px;height:auto;margin:0 auto'>");
+  html += F("</div>"
+            "<div class='help' style='margin-top:8px'>Scan with the <strong>FieldMesh dashboard's "
+            "built-in scanner</strong>, not a phone camera app. (The connect step will ask you to "
+            "scan a different QR — that one does use your phone's camera.)</div>"
+            "<div style='margin-top:16px'><button type='button' class='btn btn--sm' data-wz='next'>Continue to FieldMesh</button></div>"
             "</div>");
 
-  // Step 2 — Connect (shared provision widget; success records cloud state +
-  // endpoint host for the Review step, then advances to step 3).
+  // Step 2 — Connect. Links out to /provision, which owns registration and
+  // connection; ?return=setup is read back as a closed enum there so the user
+  // is offered the way back into this wizard. The wizard resumes from device
+  // state, so returning in a different browser still works.
   html += F("<div class='wz-step' data-step='2' style='display:none'>"
-            "<h3>2. Connect to FieldMesh</h3>");
-  html += provisionWidgetHtml(F(
-    "if(window.wzConnected)window.wzConnected(document.getElementById('pv-host').textContent);"));
-  html += F("<div style='margin-top:12px'><button type='button' class='btn btn--sm' data-wz='back'>Back</button></div>"
+            "<h3>Connect to FieldMesh</h3>"
+            "<p class='muted'>Optional: connect the paid service for remote history and management. "
+            "Local operation remains available without it.</p>"
+            "<p class='muted'>Connecting takes two screens &mdash; this FieldHub and the FieldMesh "
+            "dashboard. The connect flow walks through both, including cellular settings for the "
+            "mobile network.</p>"
+            "<a href='/provision?return=setup' class='btn btn--primary btn--action'>Open the connect flow</a>"
+            "<div style='margin-top:12px'><button type='button' class='btn btn--sm' data-wz='back'>Back</button></div>"
             "</div>");
 
-  // Step 3 — Cloud confirmed
+  // Step 3 — Dashboard control
   html += F("<div class='wz-step' data-step='3' style='display:none'>"
-            "<h3>3. Cloud upload</h3>"
-            "<p><span class='chip chip--cfg-ok' style='font-weight:600'>Cloud upload: Enabled</span></p>"
-            "<p class='muted'>Connecting this FieldHub turned on cloud upload automatically. Data will upload to your project during collection rounds.</p>"
-            "<div style='margin-top:12px'><button type='button' class='btn btn--sm' data-wz='back'>Back</button> "
-            "<button type='button' class='btn btn--primary' data-wz='next'>Continue</button></div>"
-            "</div>");
-
-  // Step 4 — Dashboard control
-  html += F("<div class='wz-step' data-step='4' style='display:none'>"
-            "<h3>4. Dashboard control</h3>"
+            "<h3>Dashboard control</h3>"
             "<p class='muted'>Let this FieldHub be configured from the dashboard. Changes you make in the dashboard reach nodes during the next sync. You can change this later in Settings.</p>"
             "<label class='label'><input type='checkbox' id='wz-remote'");
   if (remoteEnabled) html += F(" checked");
@@ -5471,9 +6618,9 @@ static void handleSetupWizard() {
             "<button type='button' class='btn btn--primary' data-wz='next'>Continue</button></div>"
             "</div>");
 
-  // Step 5 — Time
-  html += F("<div class='wz-step' data-step='5' style='display:none'>"
-            "<h3>5. Set the clock</h3>"
+  // Step 4 — Time
+  html += F("<div class='wz-step' data-step='4' style='display:none'>"
+            "<h3>Set the clock</h3>"
             "<p class='muted'>Sets the FieldHub clock from this device (stored as UTC). This is the time reference for the whole fleet.</p>"
             "<p>This device (UTC): <strong id='wz-time-now'>--</strong></p>"
             "<button type='button' class='btn btn--primary' id='wz-time-set'>Use this time</button>"
@@ -5484,12 +6631,12 @@ static void handleSetupWizard() {
   html += F(">Continue</button></div>"
             "</div>");
 
-  // Step 6 — Recording interval (last config step). The upload/sync cadence is
+  // Step 5 — Recording interval (last config step). The upload/sync cadence is
   // auto-derived from this by handleSetWakeInterval (computeAutoSyncMin) — the
   // user never sets a sync schedule directly, so there is no sync UI here.
-  html += F("<div class='wz-step' data-step='6' style='display:none'>"
-            "<h3>6. Recording interval</h3>"
-            "<p class='muted'>How often should nodes record a reading? Uploads are scheduled automatically from this.</p>"
+  html += F("<div class='wz-step' data-step='5' style='display:none'>"
+            "<h3>Recording interval</h3>"
+            "<p class='muted'>How often should nodes record a reading? Fleet collection rounds are scheduled automatically from this.</p>"
             "<div id='wz-int-row' style='display:flex;flex-wrap:wrap;gap:6px'>");
   for (size_t i = 0; i < kAllowedCount; ++i) {
     html += F("<button type='button' class='btn btn--sm wz-int");
@@ -5506,22 +6653,23 @@ static void handleSetupWizard() {
             "<button type='button' class='btn btn--primary' data-wz='next'>Continue</button></div>"
             "</div>");
 
-  // Step 7 — Review
-  html += F("<div class='wz-step' data-step='7' style='display:none'>"
+  // Step 6 — Review
+  html += F("<div class='wz-step' data-step='6' style='display:none'>"
             "<h3>Review</h3>"
             "<div id='wz-review'></div>"
             "<div style='margin-top:14px'><button type='button' class='btn btn--sm' data-wz='back'>Back</button> "
-            "<button type='button' class='btn btn--primary' data-wz='goto' data-goto='8'>Looks good</button></div>"
+            "<button type='button' class='btn btn--primary' id='wz-complete'>Looks good</button></div>"
+            "<div id='wz-complete-result' class='help' style='margin-top:8px'></div>"
             "</div>");
 
-  // Step 8 — Done. The wizard only sets the hub up; it deliberately does NOT
+  // Step 7 — Done. The wizard only sets the hub up; it deliberately does NOT
   // power down here (that would drop the AP). It hands the user back to the main
   // overview, where they press the existing "Finish & Start Recording" button
   // when ready. Node deployment has its own dedicated flow in the node manager,
   // so the hub wizard makes no mention of it.
-  html += F("<div class='wz-step' data-step='8' style='display:none'>"
+  html += F("<div class='wz-step' data-step='7' style='display:none'>"
             "<h3><span class='chip chip--cfg-ok' style='font-weight:700'>FieldHub ready</span></h3>"
-            "<p class='muted'>Your FieldHub is connected and configured. When everything's in place, "
+            "<p class='muted'>Your FieldHub is configured for recording. When everything's in place, "
             "press <strong>Finish &amp; Start Recording</strong> on the home screen.</p>"
             "<a href='/' class='btn btn--primary' style='width:100%;text-align:center'>Go to overview</a>"
             "<div style='margin-top:10px'><button type='button' class='btn btn--sm' data-wz='back'>Back</button></div>"
@@ -5532,17 +6680,21 @@ static void handleSetupWizard() {
   // --- Wizard controller ---
   html += F("<script>(function(){var INIT=");
   html += F("{\"startStep\":");        html += String(startStep);
-  html += F(",\"cloudEnabled\":");     html += (tx.enabled && hasKey) ? F("true") : F("false");
-  html += F(",\"endpointHost\":\"");   html += host; html += F("\"");
+  html += F(",\"cloudEnabled\":");     html += connectedToFieldMesh ? F("true") : F("false");
+  html += F(",\"endpointHost\":\"");   html += jsonEscapeLocal(host); html += F("\"");
   html += F(",\"interval\":");         html += String(gWakeIntervalMin);
   html += F(",\"remote\":");           html += remoteEnabled ? F("true") : F("false");
   html += F("};");
   html += F(
-    "var TOTAL=8,cur=INIT.startStep||1;"
+    "var TOTAL=7,cur=INIT.startStep||1;"
     "var S={cloud:INIT.cloudEnabled,host:INIT.endpointHost,interval:INIT.interval,"
     "remote:INIT.remote,time:false};"
     "var steps=[].slice.call(document.querySelectorAll('.wz-step'));"
-    "function post(u,d){var b=Object.keys(d).map(function(k){return encodeURIComponent(k)+'='+encodeURIComponent(d[k]);}).join('&')+'&ajax=1';"
+    // 'ajax=1' joins the array rather than being concatenated after it: with an
+    // empty object the old form produced a body starting with '&', which
+    // WebServer::_parseArguments logs as an empty first argument.
+    "function post(u,d){var p=Object.keys(d).map(function(k){return encodeURIComponent(k)+'='+encodeURIComponent(d[k]);});"
+    "p.push('ajax=1');var b=p.join('&');"
     "return fetch(u,{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:b}).then(function(r){return r.json();});}"
     "function row(k,v){return \"<p style='margin:4px 0'><strong>\"+k+\":</strong> \"+v+\"</p>\";}"
     "function chip(ok,txt){return \"<span class='chip \"+(ok?'chip--cfg-ok':'chip--bat-low')+\"' style='font-weight:600'>\"+txt+\"</span>\";}"
@@ -5553,25 +6705,35 @@ static void handleSetupWizard() {
     "row('Recording interval',iv);}"
     "function show(n){cur=Math.max(1,Math.min(TOTAL,n));"
     "steps.forEach(function(s){s.style.display=(parseInt(s.dataset.step,10)===cur)?'block':'none';});"
-    "document.getElementById('wz-cur').textContent=cur;"
-    "if(cur===7)renderReview();"
+    "if(cur===6)renderReview();"
     "window.scrollTo(0,0);}"
     "window.wzGo=show;"
-    "window.wzConnected=function(host){S.cloud=true;if(host)S.host=host;show(3);};"
+    "document.getElementById('wz-local').addEventListener('click',function(){"
+    "var b=this,label=b.textContent;b.disabled=true;b.textContent='Saving...';"
+    "post('/set-data-destination',{mode:'local_only'}).then(function(j){"
+    "if(!j.ok)throw new Error(j.message||'Could not save local mode');"
+    "S.cloud=false;S.host='';S.remote=false;document.getElementById('wz-remote').checked=false;show(4);"
+    "}).catch(function(e){b.disabled=false;b.textContent=label;"
+    "document.getElementById('wz-local-result').innerHTML=chip(false,e.message||'Could not save local mode');});});"
+    "document.getElementById('wz-complete').addEventListener('click',function(){"
+    "var b=this;b.disabled=true;post('/complete-setup',{}).then(function(j){"
+    "if(!j.ok)throw new Error(j.message||'Could not finish setup');show(7);"
+    "}).catch(function(e){b.disabled=false;document.getElementById('wz-complete-result').innerHTML="
+    "chip(false,e.message||'Could not finish setup');});});"
     "document.addEventListener('click',function(e){var t=e.target;while(t&&t!==document&&!t.getAttribute('data-wz'))t=t.parentNode;"
     "if(!t||t===document)return;var a=t.getAttribute('data-wz');"
-    "if(a==='next'||a==='skip')show(cur+1);else if(a==='back')show(cur-1);"
+    // 'Set up local recording' jumps straight from step 1 to Time (now step 4),
+    // skipping Connect and Dashboard control, so Back out of Time must return to
+    // step 1 rather than walking back through steps the user never saw. Index
+    // re-derived for the 7-step numbering — Time is 4, not 5.
+    "if(a==='next'||a==='skip')show(cur+1);else if(a==='back')show((cur===4&&!S.cloud)?1:cur-1);"
     "else if(a==='goto')show(parseInt(t.getAttribute('data-goto'),10));});"
-    // Step 1 copy
-    "document.getElementById('wz-copy').addEventListener('click',function(){"
-    "var t=document.getElementById('wz-mac').textContent;if(navigator.clipboard)navigator.clipboard.writeText(t);"
-    "this.textContent='Copied';var b=this;setTimeout(function(){b.textContent='Copy MAC';},1500);});"
-    // Step 4 dashboard control — immediate chip reinforcement
+    // Step 3 dashboard control — immediate chip reinforcement
     "document.getElementById('wz-remote').addEventListener('change',function(){"
     "var on=this.checked;post('/set-remote-management',{remote_management:on?1:0}).then(function(j){"
     "S.remote=on;document.getElementById('wz-remote-result').innerHTML="
     "on?chip(true,'Dashboard control on'):\"<span class='chip' style='font-weight:600'>Dashboard control off</span>\";});});"
-    // Step 5 time
+    // Step 4 time
     "function nowUtc(){var n=new Date(),z=function(x){return String(x).padStart(2,'0');};"
     "return z(n.getUTCHours())+':'+z(n.getUTCMinutes())+':'+z(n.getUTCSeconds())+' '+z(n.getUTCDate())+'-'+z(n.getUTCMonth()+1)+'-'+n.getUTCFullYear();}"
     "function tickClock(){var el=document.getElementById('wz-time-now');if(el)el.textContent=nowUtc();}"
@@ -5580,14 +6742,15 @@ static void handleSetupWizard() {
     "post('/set-time',{datetime:nowUtc()}).then(function(j){"
     "document.getElementById('wz-time-result').innerHTML=chip(j.ok,j.ok?'Clock set':(j.message||'Failed'));"
     "if(j.ok){S.time=true;document.getElementById('wz-time-next').disabled=false;}});});"
-    // Step 6 recording interval (sync cadence auto-derived server-side)
+    // Step 5 recording interval (sync cadence auto-derived server-side)
     "[].forEach.call(document.querySelectorAll('.wz-int'),function(b){b.addEventListener('click',function(){"
     "var v=parseInt(b.getAttribute('data-int'),10);post('/set-wake-interval',{interval:v}).then(function(j){"
     "S.interval=v;[].forEach.call(document.querySelectorAll('.wz-int'),function(x){x.classList.remove('btn--primary');});"
     "b.classList.add('btn--primary');"
-    "document.getElementById('wz-int-result').innerHTML=chip(true,'Recording every '+v+' min &middot; uploads scheduled automatically');});});});"
+    "document.getElementById('wz-int-result').innerHTML=chip(true,'Recording every '+v+' min &middot; collection scheduled automatically');});});});"
     "show(cur);"
     "})();</script>");
+  html += copyHelperJs();
   html += footCommon();
   server.sendHeader("Cache-Control", "no-store");
   server.send(200, "text/html", html);
@@ -5601,17 +6764,26 @@ static void handleShutdown() {
   // when nothing was deployed or if manual upload is disabled in settings.
   String syncMsg;
   bool syncOk = false;
-  // Sync when ANY lifecycle change happened, or whenever a deployment event is
-  // still queued — the outbox check also covers an event left over from an
-  // earlier session whose upload never landed.
+  // Sync when ANY lifecycle change happened, whenever a deployment event is
+  // still queued (the outbox check also covers an event left over from an
+  // earlier session whose upload never landed), or whenever there is plain
+  // unsent sensor data sitting in the upload queue. That last check matters on
+  // its own: a session where nothing session-tracked happened (e.g. only a
+  // dashboard-control toggle, which sets no flag) can still be sitting on a
+  // backlog of readings from earlier local-only recording that has never been
+  // uploaded — the three flags above all miss that case.
   const uint8_t queuedEvents = deploymentOutboxCount();
+  const bool queueHasPendingData =
+      gUploadQueue.init() && gUploadQueue.getPendingBytes() > 0;
   const bool deployedThisSession =
-      gDeployedThisSession || gFieldChangeThisSession || queuedEvents > 0;
+      gDeployedThisSession || gFieldChangeThisSession ||
+      gCloudConnectedThisSession || queuedEvents > 0 || queueHasPendingData;
   if (deployedThisSession) {
-    Serial.printf("[UI] Field change this session (deploy=%d change=%d queuedEvents=%u)"
+    Serial.printf("[UI] Field change this session (deploy=%d change=%d cloud=%d queuedEvents=%u pending=%d)"
                   " — syncing to dashboard before shutdown\n",
                   gDeployedThisSession ? 1 : 0, gFieldChangeThisSession ? 1 : 0,
-                  (unsigned)queuedEvents);
+                  gCloudConnectedThisSession ? 1 : 0, (unsigned)queuedEvents,
+                  queueHasPendingData ? 1 : 0);
     performManualUpload(syncMsg, syncOk);
     if (syncOk) {
       Serial.printf("[UI] Pre-shutdown sync: %s\n", syncMsg.c_str());
@@ -5621,6 +6793,7 @@ static void handleShutdown() {
   }
   gDeployedThisSession = false;  // reset for the next config session
   gFieldChangeThisSession = false;
+  gCloudConnectedThisSession = false;
 
   gShutdownRequested = true;
   if (isAjaxRequest()) {
@@ -5694,8 +6867,9 @@ static void handleNodeSensorsPage() {
     { SNAP_PRESENT_SPECTRAL,                                   "Spectral (AS7343)",  "" },
     { SNAP_PRESENT_SOIL1,                                      "Soil Probe 1",       "" },
     { SNAP_PRESENT_SOIL2,                                      "Soil Probe 2",       "" },
+    // Ultrasonic wind is decommissioned and deliberately not offered here
+    // either — see the matching list in the deploy wizard.
     { SNAP_PRESENT_WIND,                                       "Wind (Reed cup)",    "wind" },
-    { NODE_SENSOR_CFG_WIND_ULTRASONIC,                         "Wind (Ultrasonic)",  "wind" },
     { SNAP_PRESENT_AUX1,                                       "Aux 1",              "" },
     { SNAP_PRESENT_AUX2,                                       "Aux 2",              "" },
   };
@@ -5743,8 +6917,17 @@ static void handleSetNodeSensors() {
                 "{\"ok\":false,\"error\":\"node_id and mask required\"}");
     return;
   }
-  // Keep only the operator-selectable bits (9 present bits + ultrasonic selector).
-  const uint16_t capBits = (uint16_t)((uint32_t)server.arg("mask").toInt() & NODE_SENSOR_CFG_ALL_BITS);
+  // Keep only the operator-selectable bits, and drop the ultrasonic-wind
+  // selector: that backend is decommissioned and is no longer offered in either
+  // picker, so accepting the bit could only reintroduce it. Rejecting it here
+  // rather than merely hiding the button also means the bit cannot survive in a
+  // stored mask via a hand-crafted or replayed POST — which matters, because
+  // reed (bit 3) and ultrasonic (bit 9) both normalise to the same WIND channel,
+  // so a mask carrying the selector is indistinguishable from reed downstream
+  // and would silently transfer one backend's fault history to the other.
+  const uint16_t capBits = (uint16_t)((uint32_t)server.arg("mask").toInt() &
+                                      NODE_SENSOR_CFG_ALL_BITS &
+                                      ~NODE_SENSOR_CFG_WIND_ULTRASONIC);
   // Always authoritative: even an all-off selection is a deliberate config, so
   // the node stops auto-registering passive sensors. (0 without VALID = auto.)
   const uint16_t storedMask = (uint16_t)(capBits | NODE_SENSOR_MASK_VALID);
@@ -5940,6 +7123,7 @@ void startConfigServer() {
   server.on("/shutdown", HTTP_POST, handleShutdown);
   server.on("/set-time", HTTP_POST, handleSetTime);
   server.on("/download-csv", HTTP_GET, handleDownloadCSV);
+  server.on("/download-deployments", HTTP_GET, handleDownloadDeployments);
   server.on("/discover-nodes", HTTP_POST, handleDiscoverNodes);
   server.on("/set-wake-interval", HTTP_POST, handleSetWakeInterval);
   server.on("/set-sync-mode", HTTP_POST, handleSetSyncMode);
@@ -5978,17 +7162,35 @@ void startConfigServer() {
   server.on("/revert-node", HTTP_POST, handleRevertNode);
 
   server.on("/settings", HTTP_GET, handleSettings);
+  server.on("/set-data-destination", HTTP_POST, handleSetDataDestination);
+  server.on("/set-custom-destination", HTTP_POST, handleSetCustomDestination);
   server.on("/set-transmission", HTTP_POST, handleSetTransmission);
+  server.on("/set-sim-config", HTTP_POST, handleSetSimConfig);
   server.on("/manual-upload", HTTP_POST, handleManualUpload);
   server.on("/upload-status", HTTP_GET, handleUploadStatus);
 
+#ifdef TX_TEST_NVS_FAILURE_HOOK
+  // Test-only. Present ONLY in the dedicated hook build environment, never in
+  // production firmware — the #ifdef is the gate, so there is no route to find
+  // on a shipped hub. Toggles injected saveTransmissionSettings() failure so the
+  // four settings-save callers can be checked for honest failure reporting.
+  server.on("/test/tx-fail-save", HTTP_POST, []() {
+    const bool on = server.arg("on") == "1";
+    txTestForceSaveFailure(on);
+    sendAjaxResult(true, on ? "tx save failure injection ON"
+                            : "tx save failure injection OFF");
+  });
+#endif
+
   // Hardware identity + secure connection-key provisioning.
   server.on("/api/identity", HTTP_GET, handleApiIdentity);
+  server.on("/hardware-qr.svg", HTTP_GET, handleHardwareQrSvg);
   server.on("/provision", HTTP_GET, handleProvisionPage);
   server.on("/provision-apply", HTTP_POST, handleProvisionApply);
 
   // First-run onboarding wizard + the lightweight per-setting endpoint it needs.
   server.on("/setup", HTTP_GET, handleSetupWizard);
+  server.on("/complete-setup", HTTP_POST, handleCompleteSetup);
   server.on("/set-remote-management", HTTP_POST, handleSetRemoteManagement);
 
   // --- Legacy route aliases (backwards compatibility) ---
@@ -6013,10 +7215,7 @@ void startConfigServer() {
   server.on("/find-stations", HTTP_POST, handleDiscoverNodes);
   server.on("/set-recording-interval", HTTP_POST, handleSetWakeInterval);
   server.on("/save-settings", HTTP_POST, handleSetTransmission);
-  server.on("/export", HTTP_GET, []() {
-    server.sendHeader("Location", "/download-csv", true);
-    server.send(302, "text/plain", "");
-  });
+  server.on("/export", HTTP_GET, handleDataPage);
 
   // Shared control revision + local self-update (§4.2, §7.1)
   server.on("/api/control", HTTP_GET, handleControlStatus);

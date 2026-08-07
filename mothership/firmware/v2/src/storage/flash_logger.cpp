@@ -1,19 +1,81 @@
 #include "storage/flash_logger.h"
 #include "storage/csv_schema.h"
+#include "config/node_registry.h"
 #include "protocol.h"
 #include <LittleFS.h>
 #include <time.h>
 #include <math.h>
+#include <stdarg.h>
 
 static const char* kFlashFile = "/datalog.csv";
+
+// Row scratch buffer for every CSV builder below. A 35-column row with all 24
+// sensors populated, a 32-character node name and full-width coordinates
+// measures ~443 bytes, so 512 left barely any headroom: a node reporting
+// legitimately wide values would overflow and have its row REJECTED, which is
+// silent data loss. 640 removes that cliff for ~128 bytes of stack.
+static constexpr size_t kCsvRowBufBytes = 640;
+
+// Bounded append shared by every row builder below.
+//
+// snprintf() returns the length it WOULD have written, so the running offset in
+// the builders deliberately keeps growing past the end of the row buffer — that
+// is how they detect a row that did not fit. The hazard is what the NEXT call
+// then computes: `buf + offset` points past the array, and `bufSize - offset`
+// is size_t arithmetic that WRAPS to ~4 GB rather than going negative, so the
+// bounds argument that should clamp the write instead authorises an unbounded
+// one straight through the stack frame.
+//
+// Once the offset has reached bufSize there is nothing left to write, so skip
+// the call entirely and return 0. The caller's total stays >= bufSize, which is
+// exactly what its "did this row fit" check tests — overflow is still detected,
+// it just can no longer corrupt the stack on the way there.
+static int appendFmt(char* buf, size_t bufSize, int offset, const char* fmt, ...)
+    __attribute__((format(printf, 4, 5)));
+
+static int appendFmt(char* buf, size_t bufSize, int offset, const char* fmt, ...) {
+  if (offset < 0 || (size_t)offset >= bufSize) return 0;
+  va_list ap;
+  va_start(ap, fmt);
+  const int need = vsnprintf(buf + offset, bufSize - offset, fmt, ap);
+  va_end(ap);
+  return need;
+}
 
 // Format a float as "%.3f" or "nan" if NaN. ESP32 newlib snprintf produces
 // garbage for NaN with %.3f, so guard with isnan() and emit a literal.
 static int appendFloat(char* buf, size_t bufSize, int offset, float val) {
   if (isnan(val)) {
-    return snprintf(buf + offset, bufSize - offset, "%s", "nan");
+    return appendFmt(buf, bufSize, offset, "%s", "nan");
   }
-  return snprintf(buf + offset, bufSize - offset, "%.3f", val);
+  return appendFmt(buf, bufSize, offset, "%.3f", val);
+}
+
+// Latitude/longitude get 6 decimal places (~0.11 m), not the 3 used for
+// sensor readings — see FIELDMESH_SPATIAL_LOCATION_PLAN.md.
+static int appendCoord(char* buf, size_t bufSize, int offset, float val) {
+  if (isnan(val)) {
+    return appendFmt(buf, bufSize, offset, "%s", "nan");
+  }
+  return appendFmt(buf, bufSize, offset, "%.6f", val);
+}
+
+// Operator-entered identity text (node name) reaches the CSV verbatim, and the
+// name field accepts any character the Field UI form submits. These cells are
+// written UNQUOTED, and the upload parser (json_payload.cpp splitCsvRow) is a
+// plain comma split with no quote handling, so a comma or newline inside a name
+// silently re-frames the row: the column count no longer matches, and
+// formatDecodedSnapshotCSVRow's final gate then rejects the row entirely —
+// nothing reaches flash or SD and the node is NACKed into re-sending forever.
+// Replace the framing characters rather than quoting them, so the column count
+// stays exact for every consumer of this file.
+static String csvSafeCell(const String& v) {
+  String out = v;
+  for (size_t i = 0; i < out.length(); ++i) {
+    const char c = out[i];
+    if (c == ',' || c == '\r' || c == '\n') out.setCharAt(i, ' ');
+  }
+  return out;
 }
 
 // ---------------------------------------------------------------------------
@@ -177,7 +239,7 @@ void decodedToV1(const DecodedSnapshot& decoded, node_snapshot_t& out) {
 static int appendSensor(char* buf, size_t bufSize, int offset,
                         const DecodedSnapshot& d, uint16_t sensorId) {
   const float* p = d.find(sensorId);
-  if (!p) return snprintf(buf + offset, bufSize - offset, "%s", "nan");
+  if (!p) return appendFmt(buf, bufSize, offset, "%s", "nan");
   return appendFloat(buf, bufSize, offset, *p);
 }
 
@@ -226,7 +288,7 @@ bool formatDecodedSnapshotCSVRow(const DecodedSnapshot& decoded, String& outRow)
   // Build the SAME CSV row format as logSnapshotRow(), but source the float
   // values from the DecodedSnapshot readings so V1 and V2 produce identical
   // output. Missing sensors become "nan".
-  char row[512];
+  char row[kCsvRowBufBytes];
   int n = snprintf(row, sizeof(row),
     "%s,%.15s,%lu,%u,%u,%u,",
     tsBuf,
@@ -237,34 +299,44 @@ bool formatDecodedSnapshotCSVRow(const DecodedSnapshot& decoded, String& outRow)
     (unsigned)decoded.configVersion);
   if (n <= 0) return false;
 
-  n += appendSensor(row, sizeof(row), n, decoded, SENSOR_ID_BAT_V);       n += snprintf(row + n, sizeof(row) - n, ",");
-  n += appendSensor(row, sizeof(row), n, decoded, SENSOR_ID_AIR_TEMP);    n += snprintf(row + n, sizeof(row) - n, ",");
-  n += appendSensor(row, sizeof(row), n, decoded, SENSOR_ID_AIR_RH);      n += snprintf(row + n, sizeof(row) - n, ",");
-  n += appendSensor(row, sizeof(row), n, decoded, SENSOR_ID_SPECTRAL_415); n += snprintf(row + n, sizeof(row) - n, ",");
-  n += appendSensor(row, sizeof(row), n, decoded, SENSOR_ID_SPECTRAL_445); n += snprintf(row + n, sizeof(row) - n, ",");
-  n += appendSensor(row, sizeof(row), n, decoded, SENSOR_ID_SPECTRAL_480); n += snprintf(row + n, sizeof(row) - n, ",");
-  n += appendSensor(row, sizeof(row), n, decoded, SENSOR_ID_SPECTRAL_515); n += snprintf(row + n, sizeof(row) - n, ",");
-  n += appendSensor(row, sizeof(row), n, decoded, SENSOR_ID_SPECTRAL_555); n += snprintf(row + n, sizeof(row) - n, ",");
-  n += appendSensor(row, sizeof(row), n, decoded, SENSOR_ID_SPECTRAL_590); n += snprintf(row + n, sizeof(row) - n, ",");
-  n += appendSensor(row, sizeof(row), n, decoded, SENSOR_ID_SPECTRAL_630); n += snprintf(row + n, sizeof(row) - n, ",");
-  n += appendSensor(row, sizeof(row), n, decoded, SENSOR_ID_SPECTRAL_680); n += snprintf(row + n, sizeof(row) - n, ",");
-  n += appendSensor(row, sizeof(row), n, decoded, SENSOR_ID_WIND_SPEED);  n += snprintf(row + n, sizeof(row) - n, ",");
-  n += appendSensor(row, sizeof(row), n, decoded, SENSOR_ID_WIND_DIR);    n += snprintf(row + n, sizeof(row) - n, ",");
-  n += appendSensor(row, sizeof(row), n, decoded, SENSOR_ID_SOIL1_VWC);   n += snprintf(row + n, sizeof(row) - n, ",");
-  n += appendSensor(row, sizeof(row), n, decoded, SENSOR_ID_SOIL1_TEMP);  n += snprintf(row + n, sizeof(row) - n, ",");
-  n += appendSensor(row, sizeof(row), n, decoded, SENSOR_ID_SOIL2_VWC);   n += snprintf(row + n, sizeof(row) - n, ",");
-  n += appendSensor(row, sizeof(row), n, decoded, SENSOR_ID_SOIL2_TEMP);  n += snprintf(row + n, sizeof(row) - n, ",");
-  n += appendSensor(row, sizeof(row), n, decoded, SENSOR_ID_AUX1);        n += snprintf(row + n, sizeof(row) - n, ",");
-  n += appendSensor(row, sizeof(row), n, decoded, SENSOR_ID_AUX2);        n += snprintf(row + n, sizeof(row) - n, ",");
+  n += appendSensor(row, sizeof(row), n, decoded, SENSOR_ID_BAT_V);       n += appendFmt(row, sizeof(row), n, ",");
+  n += appendSensor(row, sizeof(row), n, decoded, SENSOR_ID_AIR_TEMP);    n += appendFmt(row, sizeof(row), n, ",");
+  n += appendSensor(row, sizeof(row), n, decoded, SENSOR_ID_AIR_RH);      n += appendFmt(row, sizeof(row), n, ",");
+  n += appendSensor(row, sizeof(row), n, decoded, SENSOR_ID_SPECTRAL_415); n += appendFmt(row, sizeof(row), n, ",");
+  n += appendSensor(row, sizeof(row), n, decoded, SENSOR_ID_SPECTRAL_445); n += appendFmt(row, sizeof(row), n, ",");
+  n += appendSensor(row, sizeof(row), n, decoded, SENSOR_ID_SPECTRAL_480); n += appendFmt(row, sizeof(row), n, ",");
+  n += appendSensor(row, sizeof(row), n, decoded, SENSOR_ID_SPECTRAL_515); n += appendFmt(row, sizeof(row), n, ",");
+  n += appendSensor(row, sizeof(row), n, decoded, SENSOR_ID_SPECTRAL_555); n += appendFmt(row, sizeof(row), n, ",");
+  n += appendSensor(row, sizeof(row), n, decoded, SENSOR_ID_SPECTRAL_590); n += appendFmt(row, sizeof(row), n, ",");
+  n += appendSensor(row, sizeof(row), n, decoded, SENSOR_ID_SPECTRAL_630); n += appendFmt(row, sizeof(row), n, ",");
+  n += appendSensor(row, sizeof(row), n, decoded, SENSOR_ID_SPECTRAL_680); n += appendFmt(row, sizeof(row), n, ",");
+  n += appendSensor(row, sizeof(row), n, decoded, SENSOR_ID_WIND_SPEED);  n += appendFmt(row, sizeof(row), n, ",");
+  n += appendSensor(row, sizeof(row), n, decoded, SENSOR_ID_WIND_DIR);    n += appendFmt(row, sizeof(row), n, ",");
+  n += appendSensor(row, sizeof(row), n, decoded, SENSOR_ID_SOIL1_VWC);   n += appendFmt(row, sizeof(row), n, ",");
+  n += appendSensor(row, sizeof(row), n, decoded, SENSOR_ID_SOIL1_TEMP);  n += appendFmt(row, sizeof(row), n, ",");
+  n += appendSensor(row, sizeof(row), n, decoded, SENSOR_ID_SOIL2_VWC);   n += appendFmt(row, sizeof(row), n, ",");
+  n += appendSensor(row, sizeof(row), n, decoded, SENSOR_ID_SOIL2_TEMP);  n += appendFmt(row, sizeof(row), n, ",");
+  n += appendSensor(row, sizeof(row), n, decoded, SENSOR_ID_AUX1);        n += appendFmt(row, sizeof(row), n, ",");
+  n += appendSensor(row, sizeof(row), n, decoded, SENSOR_ID_AUX2);        n += appendFmt(row, sizeof(row), n, ",");
   // Extended AS7341 outputs (appended so existing column indices are stable).
-  n += appendSensor(row, sizeof(row), n, decoded, SENSOR_ID_SPECTRAL_CLEAR); n += snprintf(row + n, sizeof(row) - n, ",");
-  n += appendSensor(row, sizeof(row), n, decoded, SENSOR_ID_SPECTRAL_NIR);   n += snprintf(row + n, sizeof(row) - n, ",");
-  n += appendSensor(row, sizeof(row), n, decoded, SENSOR_ID_SPECTRAL_GAIN);  n += snprintf(row + n, sizeof(row) - n, ",");
-  n += appendSensor(row, sizeof(row), n, decoded, SENSOR_ID_SPECTRAL_ATIME); n += snprintf(row + n, sizeof(row) - n, ",");
+  n += appendSensor(row, sizeof(row), n, decoded, SENSOR_ID_SPECTRAL_CLEAR); n += appendFmt(row, sizeof(row), n, ",");
+  n += appendSensor(row, sizeof(row), n, decoded, SENSOR_ID_SPECTRAL_NIR);   n += appendFmt(row, sizeof(row), n, ",");
+  n += appendSensor(row, sizeof(row), n, decoded, SENSOR_ID_SPECTRAL_GAIN);  n += appendFmt(row, sizeof(row), n, ",");
+  n += appendSensor(row, sizeof(row), n, decoded, SENSOR_ID_SPECTRAL_ATIME); n += appendFmt(row, sizeof(row), n, ",");
   n += appendSensor(row, sizeof(row), n, decoded, SENSOR_ID_SPECTRAL_SAT);
   // Deployment epoch (column 31, appended so every existing index is stable).
   // Integer, not a sensor value: 0 means legacy/unresolved.
-  n += snprintf(row + n, sizeof(row) - n, ",%u", (unsigned)decoded.deploymentEpoch);
+  n += appendFmt(row, sizeof(row), n, ",%u", (unsigned)decoded.deploymentEpoch);
+  // Node identity appended as CSV columns 32 and 33 for local downloads.
+  const String userId = csvSafeCell(getNodeUserId(String(decoded.nodeId)));
+  const String nodeName = csvSafeCell(getNodeName(String(decoded.nodeId)));
+  n += appendFmt(row, sizeof(row), n, ",%s", userId.c_str());
+  n += appendFmt(row, sizeof(row), n, ",%s", nodeName.c_str());
+  // Node location appended as CSV columns 34 and 35 (nan when unset).
+  n += appendFmt(row, sizeof(row), n, ",");
+  n += appendCoord(row, sizeof(row), n, getNodeLatitude(String(decoded.nodeId)));
+  n += appendFmt(row, sizeof(row), n, ",");
+  n += appendCoord(row, sizeof(row), n, getNodeLongitude(String(decoded.nodeId)));
 
   if (n <= 0 || n >= static_cast<int>(sizeof(row))) return false;
   outRow = String(row);
@@ -293,8 +365,10 @@ bool logDecodedSnapshot(const DecodedSnapshot& decoded) {
 // CSV header matching node_snapshot_t fields.
 // Columns: datetime, nodeId, seqNum, sensorPresent, qualityFlags, configVersion,
 //          batVoltage, airTemp, airHumidity, spectral[8], windSpeed, windDir,
-//          soil1Vwc, soil1Temp, soil2Vwc, soil2Temp, aux1, aux2
-static const char* kCSVHeader = kCurrentCSVHeader31;
+//          soil1Vwc, soil1Temp, soil2Vwc, soil2Temp, aux1, aux2,
+//          spectral_clear, spectral_nir, spectral_gain, spectral_integration_ms,
+//          spectral_saturated, deploymentEpoch, userId, name, latitude, longitude
+static const char* kCSVHeader = kCurrentCSVHeader35;
 
 static bool gFlashReady = false;
 static bool gFlashMountFailed = false;
@@ -353,18 +427,21 @@ bool initFlash() {
     f.close();
 
     // EVERY legacy header must be recognised here. An unrecognised header sets
-    // gFlashReady = false and stops all logging, so omitting the 30-column case
-    // when the current header became 31 columns would brick logging on every
-    // hub that upgrades.
+    // gFlashReady = false and stops all logging, so omitting a prior column
+    // count when the current header gains columns would brick logging on
+    // every hub that upgrades.
     const bool isLegacy25 = (firstLine == String(kLegacyCSVHeader25));
     const bool isLegacy30 = (firstLine == String(kLegacyCSVHeader30));
-    if (isLegacy25 || isLegacy30) {
+    const bool isLegacy31 = (firstLine == String(kLegacyCSVHeader31));
+    const bool isLegacy33 = (firstLine == String(kLegacyCSVHeader33));
+    if (isLegacy25 || isLegacy30 || isLegacy31 || isLegacy33) {
+      const int legacyCols = isLegacy25 ? 25 : (isLegacy30 ? 30 : (isLegacy31 ? 31 : 33));
       if (hasDataRows) {
         Serial.printf("[FLASH] Legacy %d-column CSV has queued rows; preserving until upload drain\n",
-                      isLegacy25 ? 25 : 30);
+                      legacyCols);
       } else {
         Serial.printf("[FLASH] Empty legacy %d-column CSV; upgrading header to %u columns\n",
-                      isLegacy25 ? 25 : 30, (unsigned)kCurrentCSVColumnCount);
+                      legacyCols, (unsigned)kCurrentCSVColumnCount);
         if (!flashCreateCSVHeader()) {
           gFlashReady = false;
           return false;
@@ -424,7 +501,7 @@ bool logSnapshotRow(const node_snapshot_t* snap) {
 
   // Build CSV row from node_snapshot_t fields. Non-float fields first, then
   // each float via appendFloat() to avoid newlib NaN garbage from %.3f.
-  char row[512];
+  char row[kCsvRowBufBytes];
   int n = snprintf(row, sizeof(row),
     "%s,%.15s,%lu,%u,%u,%u,",
     tsBuf,
@@ -435,27 +512,35 @@ bool logSnapshotRow(const node_snapshot_t* snap) {
     snap->configVersion);
   if (n <= 0) return false;
 
-  n += appendFloat(row, sizeof(row), n, snap->batVoltage);   n += snprintf(row + n, sizeof(row) - n, ",");
-  n += appendFloat(row, sizeof(row), n, snap->airTemp);      n += snprintf(row + n, sizeof(row) - n, ",");
-  n += appendFloat(row, sizeof(row), n, snap->airHumidity);  n += snprintf(row + n, sizeof(row) - n, ",");
+  n += appendFloat(row, sizeof(row), n, snap->batVoltage);   n += appendFmt(row, sizeof(row), n, ",");
+  n += appendFloat(row, sizeof(row), n, snap->airTemp);      n += appendFmt(row, sizeof(row), n, ",");
+  n += appendFloat(row, sizeof(row), n, snap->airHumidity);  n += appendFmt(row, sizeof(row), n, ",");
   for (int i = 0; i < 8; i++) {
     n += appendFloat(row, sizeof(row), n, snap->spectral[i]);
-    n += snprintf(row + n, sizeof(row) - n, ",");
+    n += appendFmt(row, sizeof(row), n, ",");
   }
-  n += appendFloat(row, sizeof(row), n, snap->windSpeed);    n += snprintf(row + n, sizeof(row) - n, ",");
-  n += appendFloat(row, sizeof(row), n, snap->windDir);      n += snprintf(row + n, sizeof(row) - n, ",");
-  n += appendFloat(row, sizeof(row), n, snap->soil1Vwc);     n += snprintf(row + n, sizeof(row) - n, ",");
-  n += appendFloat(row, sizeof(row), n, snap->soil1Temp);    n += snprintf(row + n, sizeof(row) - n, ",");
-  n += appendFloat(row, sizeof(row), n, snap->soil2Vwc);     n += snprintf(row + n, sizeof(row) - n, ",");
-  n += appendFloat(row, sizeof(row), n, snap->soil2Temp);    n += snprintf(row + n, sizeof(row) - n, ",");
-  n += appendFloat(row, sizeof(row), n, snap->aux1);         n += snprintf(row + n, sizeof(row) - n, ",");
+  n += appendFloat(row, sizeof(row), n, snap->windSpeed);    n += appendFmt(row, sizeof(row), n, ",");
+  n += appendFloat(row, sizeof(row), n, snap->windDir);      n += appendFmt(row, sizeof(row), n, ",");
+  n += appendFloat(row, sizeof(row), n, snap->soil1Vwc);     n += appendFmt(row, sizeof(row), n, ",");
+  n += appendFloat(row, sizeof(row), n, snap->soil1Temp);    n += appendFmt(row, sizeof(row), n, ",");
+  n += appendFloat(row, sizeof(row), n, snap->soil2Vwc);     n += appendFmt(row, sizeof(row), n, ",");
+  n += appendFloat(row, sizeof(row), n, snap->soil2Temp);    n += appendFmt(row, sizeof(row), n, ",");
+  n += appendFloat(row, sizeof(row), n, snap->aux1);         n += appendFmt(row, sizeof(row), n, ",");
   n += appendFloat(row, sizeof(row), n, snap->aux2);
   // Extended AS7341 columns — absent in the V1 snapshot struct, emit nan.
   // Trailing 0 is deploymentEpoch: this path has no registry lookup, so the
   // epoch is unresolved and the backend falls back.
-  n += snprintf(row + n, sizeof(row) - n, ",nan,nan,nan,nan,nan,0");
+  const String userId = csvSafeCell(getNodeUserId(String(snap->nodeId)));
+  const String nodeName = csvSafeCell(getNodeName(String(snap->nodeId)));
+  n += appendFmt(row, sizeof(row), n, ",nan,nan,nan,nan,nan,0,%s,%s,",
+                userId.c_str(), nodeName.c_str());
+  n += appendCoord(row, sizeof(row), n, getNodeLatitude(String(snap->nodeId)));
+  n += appendFmt(row, sizeof(row), n, ",");
+  n += appendCoord(row, sizeof(row), n, getNodeLongitude(String(snap->nodeId)));
 
-  if (n <= 0) return false;
+  // Same overflow gate as formatDecodedSnapshotCSVRow: a truncated row is short
+  // a trailing column and must not reach the queue as a mis-framed line.
+  if (n <= 0 || n >= static_cast<int>(sizeof(row))) return false;
   return flashLogCSVRow(String(row));
 }
 
@@ -487,7 +572,7 @@ bool logSnapshotBatch(const node_snapshot_t* snapshots, int count) {
 
     // Build CSV row. Non-float fields first, then each float via
     // appendFloat() to avoid newlib NaN garbage from %.3f.
-    char row[512];
+    char row[kCsvRowBufBytes];
     int n = snprintf(row, sizeof(row),
       "%s,%.15s,%lu,%u,%u,%u,",
       tsBuf,
@@ -498,27 +583,39 @@ bool logSnapshotBatch(const node_snapshot_t* snapshots, int count) {
       snap->configVersion);
     if (n <= 0) continue;
 
-    n += appendFloat(row, sizeof(row), n, snap->batVoltage);   n += snprintf(row + n, sizeof(row) - n, ",");
-    n += appendFloat(row, sizeof(row), n, snap->airTemp);      n += snprintf(row + n, sizeof(row) - n, ",");
-    n += appendFloat(row, sizeof(row), n, snap->airHumidity);  n += snprintf(row + n, sizeof(row) - n, ",");
+    n += appendFloat(row, sizeof(row), n, snap->batVoltage);   n += appendFmt(row, sizeof(row), n, ",");
+    n += appendFloat(row, sizeof(row), n, snap->airTemp);      n += appendFmt(row, sizeof(row), n, ",");
+    n += appendFloat(row, sizeof(row), n, snap->airHumidity);  n += appendFmt(row, sizeof(row), n, ",");
     for (int i = 0; i < 8; i++) {
       n += appendFloat(row, sizeof(row), n, snap->spectral[i]);
-      n += snprintf(row + n, sizeof(row) - n, ",");
+      n += appendFmt(row, sizeof(row), n, ",");
     }
-    n += appendFloat(row, sizeof(row), n, snap->windSpeed);    n += snprintf(row + n, sizeof(row) - n, ",");
-    n += appendFloat(row, sizeof(row), n, snap->windDir);      n += snprintf(row + n, sizeof(row) - n, ",");
-    n += appendFloat(row, sizeof(row), n, snap->soil1Vwc);     n += snprintf(row + n, sizeof(row) - n, ",");
-    n += appendFloat(row, sizeof(row), n, snap->soil1Temp);    n += snprintf(row + n, sizeof(row) - n, ",");
-    n += appendFloat(row, sizeof(row), n, snap->soil2Vwc);     n += snprintf(row + n, sizeof(row) - n, ",");
-    n += appendFloat(row, sizeof(row), n, snap->soil2Temp);    n += snprintf(row + n, sizeof(row) - n, ",");
-    n += appendFloat(row, sizeof(row), n, snap->aux1);         n += snprintf(row + n, sizeof(row) - n, ",");
+    n += appendFloat(row, sizeof(row), n, snap->windSpeed);    n += appendFmt(row, sizeof(row), n, ",");
+    n += appendFloat(row, sizeof(row), n, snap->windDir);      n += appendFmt(row, sizeof(row), n, ",");
+    n += appendFloat(row, sizeof(row), n, snap->soil1Vwc);     n += appendFmt(row, sizeof(row), n, ",");
+    n += appendFloat(row, sizeof(row), n, snap->soil1Temp);    n += appendFmt(row, sizeof(row), n, ",");
+    n += appendFloat(row, sizeof(row), n, snap->soil2Vwc);     n += appendFmt(row, sizeof(row), n, ",");
+    n += appendFloat(row, sizeof(row), n, snap->soil2Temp);    n += appendFmt(row, sizeof(row), n, ",");
+    n += appendFloat(row, sizeof(row), n, snap->aux1);         n += appendFmt(row, sizeof(row), n, ",");
     n += appendFloat(row, sizeof(row), n, snap->aux2);
     // Extended AS7341 columns — absent in the V1 snapshot struct, emit nan.
-    n += snprintf(row + n, sizeof(row) - n, ",nan,nan,nan,nan,nan");
+    const String userId = csvSafeCell(getNodeUserId(String(snap->nodeId)));
+    const String nodeName = csvSafeCell(getNodeName(String(snap->nodeId)));
+    n += appendFmt(row, sizeof(row), n, ",nan,nan,nan,nan,nan,0,%s,%s,",
+                  userId.c_str(), nodeName.c_str());
+    n += appendCoord(row, sizeof(row), n, getNodeLatitude(String(snap->nodeId)));
+    n += appendFmt(row, sizeof(row), n, ",");
+    n += appendCoord(row, sizeof(row), n, getNodeLongitude(String(snap->nodeId)));
 
-    if (n > 0) {
+    // Same overflow gate as formatDecodedSnapshotCSVRow: a row that did not fit
+    // is short a trailing column, so writing it would append a mis-framed line
+    // to the queue rather than a detectably absent one.
+    if (n > 0 && n < static_cast<int>(sizeof(row))) {
       f.println(row);
       written++;
+    } else if (n >= static_cast<int>(sizeof(row))) {
+      Serial.printf("[FLASH] Batch row %d exceeded the %u-byte row buffer; skipped\n",
+                    i, (unsigned)sizeof(row));
     }
   }
   f.close();

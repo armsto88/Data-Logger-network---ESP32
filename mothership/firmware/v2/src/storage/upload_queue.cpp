@@ -6,14 +6,16 @@ static const char* kDataFile    = "/datalog.csv";
 static const char* kTempFile    = "/datalog_tmp.csv";
 static const char* kBackupFile  = "/datalog_bak.csv";
 
-// Any header older than the current one. Both must be recognised: a hub can be
-// carrying a 25- or a 30-column file depending on which firmware it upgraded
-// from, and either way the queued rows must be preserved and drained, not
-// deleted or misparsed.
+// Any header older than the current one. All must be recognised: a hub can be
+// carrying a 25-, 30-, 31-, or 33-column file depending on which firmware it
+// upgraded from, and either way the queued rows must be preserved and
+// drained, not deleted or misparsed.
 static bool isLegacyCSVHeader(String header) {
   header.trim();
   return header == String(kLegacyCSVHeader25) ||
-         header == String(kLegacyCSVHeader30);
+         header == String(kLegacyCSVHeader30) ||
+         header == String(kLegacyCSVHeader31) ||
+         header == String(kLegacyCSVHeader33);
 }
 
 bool uploadQueueHasLegacyRows(uint32_t* pendingRowsOut) {
@@ -77,14 +79,37 @@ UploadQueue::UploadQueue()
   m_cursor.retryCount     = 0;
   m_cursor.wakeCounter    = 0;
   m_cursor.nextAttemptUnix = 0;
+  m_cursor.rowsRemovedLocally = 0;
 }
 
+#ifdef UQ_TEST_INIT_FAILURE_HOOK
+static bool s_uqTestForceInitFailure = false;
+void UploadQueue::testForceInitFailure(bool on) { s_uqTestForceInitFailure = on; }
+#endif
+
 bool UploadQueue::init() {
+  // Idempotent. Config-server pages call this on every render; without this the
+  // queue re-ran recovery and re-read NVS several times per page load.
+  if (m_initialised) return true;
+
+#ifdef UQ_TEST_INIT_FAILURE_HOOK
+  if (s_uqTestForceInitFailure) {
+    Serial.println("[UQ] TEST HOOK: forcing init failure");
+    return false;   // m_initialised stays false, so a later call retries
+  }
+#endif
+
   if (!recoverDataFile()) {
     Serial.println("[UQ] init: data-file recovery failed");
     return false;
   }
-  loadCursor();
+  if (!loadCursor()) {
+    Serial.println("[UQ] init: cursor load failed");
+    return false;
+  }
+  // validateCursor() is deliberately not a third success gate. Its contract is
+  // "normalise, never fail": a missing file or an out-of-range offset is a
+  // self-healing reset, not an error, so it stays void.
   validateCursor();
   m_initialised = true;
   Serial.printf("[UQ] init: offset=%u rows=%u wakes=%u\n",
@@ -97,15 +122,17 @@ bool UploadQueue::init() {
 // ---------------------------------------------------------------------------
 // NVS load / save
 // ---------------------------------------------------------------------------
-void UploadQueue::loadCursor() {
+bool UploadQueue::loadCursor() {
   Preferences prefs;
-  // Open read-write so we can remove a stale key left by older firmware.
-  // NVS keys are limited to 15 characters; "last_upload_unix" (17 chars)
-  // exceeds that limit and triggers KEY_TOO_LONG errors on every putUInt()
-  // call in this namespace until it is removed.
-  if (!prefs.begin(kTxNamespace, false)) {   // read-write
-    Serial.println("[UQ] NVS begin(\"tx\") failed — cursor defaults to 0");
-    return;
+  // Read-only. This used to open read-write purely to remove a stale
+  // "last_upload_unix" key supposedly left by older firmware — but that key is
+  // 16 characters against NVS's 15-character limit, so it can never have been
+  // written, and Preferences::getType() short-circuits to PT_INVALID for an
+  // over-length key without consulting NVS. The removal and its guard were both
+  // permanently dead; a read-only open is now sufficient.
+  if (!prefs.begin(kTxNamespace, true)) {   // read-only
+    Serial.println("[UQ] NVS begin(\"tx\") failed — cursor unavailable");
+    return false;
   }
   m_cursor.byteOffset    = prefs.getUInt("cursor_offset", 0);
   m_cursor.rowsUploaded   = prefs.getUInt("rows_uploaded", 0);
@@ -114,13 +141,13 @@ void UploadQueue::loadCursor() {
   m_cursor.wakeCounter    = prefs.getUInt("wake_counter", 0);
   // NVS keys are limited to 15 characters; keep this key deliberately short.
   m_cursor.nextAttemptUnix = prefs.getUInt("next_attempt", 0);
+  m_cursor.rowsRemovedLocally = prefs.getUInt("local_removed", 0);
   // Poison-row tracking. The hub cold-boots between wakes, so an in-RAM counter
   // could never reach the threshold — it has to be durable.
   m_poisonOffset = prefs.getUInt("poison_off", 0);
   m_poisonCount  = prefs.getUChar("poison_n", 0);
-  // Clean up stale key from older firmware (NVS keys max 15 chars).
-  prefs.remove("last_upload_unix");
   prefs.end();
+  return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -131,7 +158,7 @@ void UploadQueue::loadCursor() {
 // queue: the non-retryable branch deliberately does not advance the cursor, so
 // every later session rebuilds the same chunk and takes the same rejection.
 // Nothing drains, deploymentTrackingVersion never turns on, and
-// emergencyPurgeIfFull() eventually discards the oldest half of the buffer —
+// emergencyPurgeIfFull() eventually discards the oldest part of the buffer —
 // so the "safe" non-advancing path loses MORE data than skipping, just later
 // and silently.
 //
@@ -178,6 +205,7 @@ void UploadQueue::saveCursor() {
   prefs.putUChar("retry_count", m_cursor.retryCount);
   prefs.putUInt("wake_counter", m_cursor.wakeCounter);
   prefs.putUInt("next_attempt", m_cursor.nextAttemptUnix);
+  prefs.putUInt("local_removed", m_cursor.rowsRemovedLocally);
   prefs.end();
 }
 
@@ -568,6 +596,18 @@ bool UploadQueue::purgeUploaded() {
   return true;
 }
 
+bool UploadQueue::purgeUploadedIfLegacyDrained() {
+  File file = LittleFS.open(kDataFile, "r");
+  if (!file) return false;
+  String header = file.readStringUntil('\n');
+  file.close();
+  header.trim();
+  if (!isLegacyCSVHeader(header)) return true;
+  if (getPendingRows() > 0) return true;
+  Serial.println("[UQ] Legacy upload queue drained; upgrading CSV without retaining legacy rows");
+  return purgeUploaded();
+}
+
 // ---------------------------------------------------------------------------
 // emergencyPurgeIfFull
 // ---------------------------------------------------------------------------
@@ -610,8 +650,10 @@ bool UploadQueue::emergencyPurgeIfFull(uint8_t thresholdPct) {
     return true;
   }
 
-  uint32_t rowsToKeep = totalDataRows / 2;        // keep newest 50%
-  uint32_t rowsToSkip = totalDataRows - rowsToKeep; // discard oldest 50%
+  uint32_t rowsToKeep =
+      (totalDataRows * (uint32_t)kLittleFsRetentionKeepPct) / 100U;
+  if (rowsToKeep == 0 && totalDataRows > 0) rowsToKeep = 1;
+  uint32_t rowsToSkip = totalDataRows - rowsToKeep;
 
   Serial.printf("[UQ] emergencyPurge: totalRows=%u skip=%u keep=%u\n",
                 (unsigned)totalDataRows, (unsigned)rowsToSkip, (unsigned)rowsToKeep);
@@ -700,6 +742,7 @@ bool UploadQueue::emergencyPurgeIfFull(uint8_t thresholdPct) {
       m_cursor.byteOffset = headerEndOffset();
     }
   }
+  m_cursor.rowsRemovedLocally += rowsToSkip;
   saveCursor();
 
   Serial.printf("[UQ] emergencyPurge: done, copied %u bytes, cursor=%u\n",

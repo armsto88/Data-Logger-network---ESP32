@@ -9,10 +9,20 @@
 static DeploymentConfigApplyFn   gConfigApply   = nullptr;
 static DeploymentLegacyBacklogFn gLegacyBacklog = nullptr;
 static DeploymentNowFn           gNow           = nullptr;
+static DeploymentArchiveSinkFn   gArchiveSink   = nullptr;
+static DeploymentCloudEventsEnabledFn gCloudEventsEnabled = nullptr;
 
 void deploymentSetConfigApplyFn(DeploymentConfigApplyFn fn)     { gConfigApply = fn; }
 void deploymentSetLegacyBacklogFn(DeploymentLegacyBacklogFn fn) { gLegacyBacklog = fn; }
 void deploymentSetNowFn(DeploymentNowFn fn)                     { gNow = fn; }
+void deploymentSetArchiveSinkFn(DeploymentArchiveSinkFn fn)     { gArchiveSink = fn; }
+void deploymentSetCloudEventsEnabledFn(DeploymentCloudEventsEnabledFn fn) {
+  gCloudEventsEnabled = fn;
+}
+
+static bool cloudEventsEnabled() {
+  return gCloudEventsEnabled ? gCloudEventsEnabled() : true;
+}
 
 static uint32_t nowUnix() { return gNow ? gNow() : 0; }
 
@@ -149,6 +159,10 @@ void deploymentSeedFromRegistry() {
       s->epoch       = 1;
       s->startedUnix = seedStart;
       s->endedUnix   = 0;
+      // Connected pre-epoch hubs were backend-migrated before this firmware was
+      // allowed to ship. Standalone hubs have no such server record and must be
+      // eligible for backfill if they connect later.
+      s->activeFieldMeshAcked = cloudEventsEnabled();
       s->historyCount = 0;
       deploymentPushBoundary(*s, 1, seedStart);
       Serial.printf("[DEPLOY] Seeded %s as epoch 1 (since %lu)\n",
@@ -211,6 +225,7 @@ static void finalizeStartFromPending(DeploymentSlot& slot, const String& nodeId,
   slot.epoch       = newEpoch;
   slot.startedUnix = startedAt;
   slot.endedUnix   = 0;
+  slot.activeFieldMeshAcked = false;
   deploymentPushBoundary(slot, newEpoch, startedAt);
 
   slot.pendingOp    = DEPLOY_OP_NONE;
@@ -219,7 +234,7 @@ static void finalizeStartFromPending(DeploymentSlot& slot, const String& nodeId,
 
   DeploymentEvent event;
   fillEvent(slot, event);
-  deploymentOutboxUpsert(event);
+  if (cloudEventsEnabled()) deploymentOutboxUpsert(event);
 }
 
 void deploymentRecoverPending() {
@@ -255,9 +270,16 @@ void deploymentRecoverPending() {
       }
     } else if (s->pendingOp == DEPLOY_OP_END_STANDBY) {
       // End commits the ended-ness FIRST, so the archive record is safe; only
-      // the STANDBY request is outstanding. Re-queue it.
+      // the STANDBY request is outstanding. Re-queue it. Also replay the SD
+      // append: its deterministic event ID makes this idempotent and closes the
+      // power-loss gap between the LittleFS commit and card write.
       Serial.printf("[DEPLOY] Recovery: %s ended but STANDBY unconfirmed — re-queuing\n",
                     n.nodeId.c_str());
+      DeploymentEvent endedEvent;
+      fillEvent(*s, endedEvent);
+      if (gArchiveSink && !gArchiveSink(s->nodeId, endedEvent)) {
+        Serial.println("[DEPLOY] Recovery: SD deployment archive remains unavailable");
+      }
       if (applyDesiredState(n.nodeId, 3)) {
         s->pendingOp   = DEPLOY_OP_NONE;
         s->pendingUnix = 0;
@@ -355,7 +377,7 @@ DeploymentOpResult beginNewDeployment(const String& nodeId,
   // phase 2 has queued ACTIVE the transition can only go forward, so there is
   // no later point at which "no room for the event" can be reported without
   // either losing the record or stranding the node.
-  {
+  if (cloudEventsEnabled()) {
     char eventId[kDeployEventIdLen];
     deploymentMakeEventId(nodeId.c_str(), newEpoch, eventId, sizeof(eventId));
     if (!deploymentOutboxHasRoomFor(eventId)) {
@@ -480,26 +502,36 @@ static DeploymentOpResult endDeploymentInternal(const String& nodeId,
   // failed radio queue would be worse than a visible pending stop. The event
   // captures the identity the deployment had at this moment, before any wizard
   // can replace it.
-  const uint32_t priorEnd = slot->endedUnix;
+  const DeploymentSlot slotBefore = *slot;
   slot->endedUnix = now;
   slot->pendingOp = queueStandby ? DEPLOY_OP_END_STANDBY : DEPLOY_OP_NONE;
   slot->pendingUnix = now;
 
   DeploymentEvent event;
   fillEvent(*slot, event);
-  if (!deploymentOutboxUpsert(event)) {
-    slot->endedUnix = priorEnd;
-    slot->pendingOp = DEPLOY_OP_NONE;
+  DeploymentEvent priorQueuedEvent{};
+  const bool hadQueuedEvent = deploymentOutboxGet(event.eventId, priorQueuedEvent);
+  const bool queueCloudEvent = cloudEventsEnabled() || hadQueuedEvent;
+  if (queueCloudEvent && !deploymentOutboxUpsert(event)) {
+    *slot = slotBefore;
     return makeResult(DEPLOY_ERR_OUTBOX_FULL,
                       "Upload pending deployment changes before ending another",
                       slot->epoch);
   }
+  deploymentArchiveUpsert(*slot, event);
   if (!deploymentStoreCommit()) {
-    slot->endedUnix = priorEnd;
-    slot->pendingOp = DEPLOY_OP_NONE;
-    deploymentOutboxRemove(event.eventId);
+    *slot = slotBefore;
+    if (hadQueuedEvent) deploymentOutboxUpsert(priorQueuedEvent);
+    else if (queueCloudEvent) deploymentOutboxRemove(event.eventId);
     return makeResult(DEPLOY_ERR_PERSIST, "Could not save the end of the deployment",
                       slot->epoch);
+  }
+
+  // The LittleFS record above is authoritative for lifecycle recovery. SD is a
+  // best-effort, capacity-limited long-term export, so a missing/full card must
+  // never turn a correctly committed End back into a failed deployment action.
+  if (gArchiveSink && !gArchiveSink(slot->nodeId, event)) {
+    Serial.println("[DEPLOY] End committed, but SD deployment archive write failed");
   }
 
   const uint16_t epoch = slot->epoch;
@@ -586,18 +618,20 @@ DeploymentOpResult ensureFirstDeployment(const String& nodeId) {
   slot->epoch       = 1;
   slot->startedUnix = now;
   slot->endedUnix   = 0;
+  slot->activeFieldMeshAcked = false;
   deploymentPushBoundary(*slot, 1, now);
 
   DeploymentEvent event;
   fillEvent(*slot, event);
-  if (!deploymentOutboxUpsert(event)) {
+  const bool queueCloudEvent = cloudEventsEnabled();
+  if (queueCloudEvent && !deploymentOutboxUpsert(event)) {
     *slot = slotBefore;
     return makeResult(DEPLOY_ERR_OUTBOX_FULL,
                       "Upload pending deployment changes before deploying", 0);
   }
   if (!deploymentStoreCommit()) {
     *slot = slotBefore;
-    deploymentOutboxRemove(event.eventId);
+    if (queueCloudEvent) deploymentOutboxRemove(event.eventId);
     return makeResult(DEPLOY_ERR_PERSIST, "Could not save the deployment", 0);
   }
 
@@ -642,13 +676,101 @@ bool deploymentStageIdentity(const String& nodeId,
 }
 
 bool deploymentTouchActiveEvent(const String& nodeId) {
-  const DeploymentSlot* cs = deploymentFindByNodeId(nodeId.c_str());
-  if (!cs || !slotHasActiveDeployment(*cs)) return false;
+  const DeploymentSlot* current = deploymentFindByNodeId(nodeId.c_str());
+  if (!current || !slotHasActiveDeployment(*current)) return false;
+  const NodeInfo* node = findNode(nodeId);
+  DeploymentSlot* slot = deploymentSlotFor(node ? node->mac : nullptr,
+                                           nodeId.c_str());
+  if (!slot) return false;
 
   DeploymentEvent event;
-  fillEvent(*cs, event);
-  if (!deploymentOutboxUpsert(event)) return false;
+  fillEvent(*slot, event);
+  slot->activeFieldMeshAcked = false;
+  if (!cloudEventsEnabled() && !deploymentOutboxHasEvent(event.eventId)) {
+    return deploymentStoreCommit();
+  }
+  if (!deploymentOutboxUpsert(event)) {
+    // Preserve the dirty marker even when the transport window is full. The
+    // connected backfill pass will queue the refreshed record after an ack
+    // frees a slot.
+    deploymentStoreCommit();
+    return false;
+  }
   return deploymentStoreCommit();
+}
+
+static void fillArchivedEvent(const DeploymentSlot& slot,
+                              const DeploymentArchive& archived,
+                              DeploymentEvent& event) {
+  memset(&event, 0, sizeof(event));
+  deploymentMakeEventId(slot.nodeId, archived.epoch,
+                        event.eventId, sizeof(event.eventId));
+  strncpy(event.nodeId, slot.nodeId, sizeof(event.nodeId) - 1);
+  event.deploymentEpoch = archived.epoch;
+  event.deploymentStartedUnix = archived.startedUnix;
+  event.deploymentEndedUnix = archived.endedUnix;
+  strncpy(event.userId, archived.userId, sizeof(event.userId) - 1);
+  strncpy(event.name, archived.name, sizeof(event.name) - 1);
+  event.latitude = (archived.known & DEPLOY_ARCHIVE_LOCATION_KNOWN)
+      ? archived.latitude : NAN;
+  event.longitude = (archived.known & DEPLOY_ARCHIVE_LOCATION_KNOWN)
+      ? archived.longitude : NAN;
+  event.inUse = true;
+}
+
+DeploymentBackfillResult deploymentQueueFieldMeshBackfill() {
+  DeploymentBackfillResult result{0, 0, true};
+  if (!deploymentStoreReady()) {
+    result.committed = false;
+    return result;
+  }
+
+  const uint8_t completeArchive = DEPLOY_ARCHIVE_START_KNOWN |
+      DEPLOY_ARCHIVE_END_KNOWN | DEPLOY_ARCHIVE_IDENTITY_KNOWN;
+  bool dirty = false;
+
+  auto queueEvent = [&](const DeploymentEvent& event) {
+    if (deploymentOutboxHasEvent(event.eventId)) return;
+    if (!deploymentOutboxHasRoomFor(event.eventId)) {
+      result.deferred++;
+      return;
+    }
+    if (deploymentOutboxUpsert(event)) {
+      result.queued++;
+      dirty = true;
+    } else {
+      result.deferred++;
+    }
+  };
+
+  for (size_t n = 0; n < kMaxDeployNodes; ++n) {
+    const DeploymentSlot* slot = deploymentSlotAt(n);
+    if (!slot) continue;
+    for (uint8_t i = 0; i < slot->archiveCount; ++i) {
+      const DeploymentArchive& archived = slot->archive[i];
+      if (archived.fieldMeshAcked || archived.epoch == 0 ||
+          (archived.known & completeArchive) != completeArchive) continue;
+      DeploymentEvent event;
+      fillArchivedEvent(*slot, archived, event);
+      queueEvent(event);
+    }
+    if (slot->startedUnix > 0 && slot->endedUnix == 0 &&
+        !slot->activeFieldMeshAcked) {
+      DeploymentEvent event;
+      fillEvent(*slot, event);
+      queueEvent(event);
+    }
+  }
+
+  if (dirty && !deploymentStoreCommit()) {
+    result.committed = false;
+    Serial.println("[DEPLOY] FieldMesh history backfill could not be persisted");
+  }
+  if (result.queued || result.deferred) {
+    Serial.printf("[DEPLOY] FieldMesh history backfill: queued=%u deferred=%u\n",
+                  (unsigned)result.queued, (unsigned)result.deferred);
+  }
+  return result;
 }
 
 // ---------------------------------------------------------------------------

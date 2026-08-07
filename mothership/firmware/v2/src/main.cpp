@@ -30,6 +30,7 @@
 #include "comms/espnow_config.h"
 #include "config/config_server.h"
 #include "config/transmission_settings.h"
+#include "config/sim_settings.h"
 #include "storage/upload_queue.h"
 #include "storage/json_payload.h"
 #include "comms/modem_driver.h"
@@ -286,20 +287,30 @@ void processSnapshot(const DecodedSnapshot& decoded, const uint8_t* mac) {
 
   bool persisted = false;
   if (flashIsReady()) {
-    persisted = logDecodedSnapshot(stamped);
-    if (!persisted) {
+    const bool flashSaved = logDecodedSnapshot(stamped);
+    persisted = persisted || flashSaved;
+    if (!flashSaved) {
       Serial.println("[SNAP] Flash logging failed");
     }
-  } else {
-    Serial.println("[SNAP] Flash unavailable; snapshot not durably logged");
+  }
+  if (sdIsReady()) {
+    String archiveRow;
+    const bool sdSaved = formatDecodedSnapshotCSVRow(stamped, archiveRow) &&
+                         sdLogCSVRow(archiveRow);
+    persisted = persisted || sdSaved;
+  }
+  if (!persisted) {
+    Serial.println("[SNAP] No storage accepted the snapshot");
   }
   sendSnapshotAck(mac, decoded, persisted);
 
   for (auto& n : registeredNodes) {
     if (strncmp(n.nodeId.c_str(), decoded.nodeId, 16) == 0 ||
         memcmp(n.mac, mac, 6) == 0) {
-      n.lastSeen = millis();
-      n.isActive = true;
+      // A received snapshot is the strongest possible evidence of contact, and
+      // it must stamp the durable absolute time too — not just the millis-based
+      // session value, which is worthless to the next boot.
+      noteNodeContact(n);
       if (batV && !isnan(*batV)) {
         n.lastReportedBatV = *batV;
       }
@@ -312,13 +323,9 @@ void processSnapshot(const DecodedSnapshot& decoded, const uint8_t* mac) {
       // doesn't flap the dashboard. expectedSensorMask holds capability bits only.
       {
         const uint16_t present  = decoded.sensorPresent;
-        // Normalise the ultrasonic-wind selector to the WIND present bit — a
-        // snapshot only ever reports SNAP_PRESENT_WIND regardless of backend —
-        // and keep only the 9 present bits for the comparison.
-        uint16_t expected = n.expectedSensorMask;  // capability bits, no VALID
-        if (expected & NODE_SENSOR_CFG_WIND_ULTRASONIC)
-          expected = (uint16_t)((expected & ~NODE_SENSOR_CFG_WIND_ULTRASONIC) | SNAP_PRESENT_WIND);
-        expected &= 0x01FF;
+        // Shared normalisation, so the cached mask, this comparison and the UI
+        // can never drift into using different layouts for the same channel.
+        const uint16_t expected = nodeNormalizeSensorMask(n.expectedSensorMask);
         const uint16_t missNow  = (uint16_t)(expected & ~present);
         n.sensorFaultMask   = (uint16_t)(missNow & n.sensorMissPrev);
         n.sensorMissPrev    = missNow;
@@ -454,6 +461,7 @@ static bool buildRecoveryDeploy(const NodeInfo& node, uint16_t activeSyncMin,
   deploy.syncIntervalMin = activeSyncMin;
   deploy.syncPhaseUnix = activeSyncPhase;
   deploy.sensorMask = desired.sensorMask;  // 0 = auto; else SNAP_PRESENT_* + VALID
+  deploy.deploymentEpoch = node.deploymentEpoch;
   return true;
 }
 
@@ -542,6 +550,20 @@ static void runCoordinatedSyncWindow(
                         hellos[i].hello.nodeId);
           continue;
         }
+        // An authenticated HELLO is contact, and must be stamped here — before
+        // any of the semantic branches below, all of which can skip out. A
+        // healthy node with an empty queue is released without ever sending a
+        // snapshot, so if this is left to the snapshot path its durable
+        // last-contact time never advances and it looks silent forever.
+        noteNodeContact(*authorizedNode);
+        // An authenticated HELLO from a DEPLOYED node is proof it is alive and
+        // running its deployment, so it retires any outstanding deploy command.
+        // This clear is load-bearing now that deployPending is persisted: the
+        // config-mode equivalent lives in handleNodeHello(), which the sync path
+        // never calls, so without it the flag would latch on every healthy node
+        // and the whole fleet would read "Not confirmed". savePairedNodes() runs
+        // after the window closes and commits this.
+        authorizedNode->deployPending = false;
         // NODE_HELLO carries the node's persisted applied config version. Treat
         // it as convergence evidence just like CONFIG_ACK/snapshot echo so a
         // lost ACK cannot leave pause/resume reporting stale for another cycle.
@@ -604,6 +626,11 @@ static void runCoordinatedSyncWindow(
             break;
           }
         }
+        // Stamp contact as soon as the sender is authenticated, before the
+        // semantic branches below decide whether recovery applies. A status from
+        // a node reporting itself correctly deployed is still proof we heard it.
+        if (known) noteNodeContact(*known);
+
         const bool reportsUndeployed =
             statuses[i].status.state != (uint8_t)DEPLOYED ||
             statuses[i].status.deployed == 0;
@@ -630,8 +657,7 @@ static void runCoordinatedSyncWindow(
         }
 
         const bool sent = sendDeploymentNow(statuses[i].mac, deploy);
-        known->lastSeen = millis();
-        known->isActive = true;
+        noteNodeContact(*known);
         known->deployPending = true;
         Serial.printf("[RECOVERY] %s -> %.15s after unpaired status (direct=%s)\n",
                       sent ? "DEPLOY_NODE sent" : "DEPLOY_NODE failed",
@@ -652,8 +678,7 @@ static void runCoordinatedSyncWindow(
               memcmp(node.mac, deployAcks[i].mac, 6) == 0 &&
               node.nodeId == String(deployAcks[i].ack.nodeId)) {
             node.deployPending = false;
-            node.lastSeen = millis();
-            node.isActive = true;
+            noteNodeContact(node);
             Serial.printf("[RECOVERY] DEPLOY_ACK confirmed %.15s\n", node.nodeId.c_str());
             break;
           }
@@ -907,6 +932,11 @@ void performModemUpload(const TransmissionSettings& txSettings, uint32_t session
 
   ModemDriver modem;
   modem.init();
+  {
+    SimSettings sim;
+    loadSimSettings(sim);
+    modem.configureApn(sim.apn, sim.apnUser, sim.apnPass);
+  }
 
   auto sessionExpired = [&]() -> bool {
     return millis() - sessionStartMs > kSyncSessionLimitMs;
@@ -957,9 +987,10 @@ void performModemUpload(const TransmissionSettings& txSettings, uint32_t session
 
     // Supabase: header-only Bearer auth, JSON array body, no query params.
     // The legacy Google Apps Script path (apiKey empty) still appends action.
-    const bool isSupabase = txSettings.apiKey.length() > 0;
-    const String authHeader = txSettings.apiKey.length() > 0
-        ? txSettings.apiKey : txSettings.authToken;
+    const bool isFieldMesh = txSettings.destinationMode == TX_DEST_FIELDMESH;
+    const bool isCustomHttps = txSettings.destinationMode == TX_DEST_CUSTOM_HTTPS;
+    const String authHeader = buildUploadAuth(txSettings);
+    if (isFieldMesh) deploymentQueueFieldMeshBackfill();
 
     const uint32_t totalPendingRows = uploadQueue.getPendingRows();
     Serial.printf("[UPLOAD] JSON path: %u pending rows, %u per POST\n",
@@ -1049,7 +1080,7 @@ void performModemUpload(const TransmissionSettings& txSettings, uint32_t session
       // Only claim epoch support once the on-disk CSV schema is current — i.e.
       // no unstamped legacy rows are still queued.
       (uint8_t)(flashCsvSchemaIsCurrent() ? 1 : 0),
-      deploymentOutboxToJson(),
+      isFieldMesh ? deploymentOutboxToJson() : String("[]"),
       deploymentEpochClampCount()
     };
 
@@ -1070,22 +1101,24 @@ void performModemUpload(const TransmissionSettings& txSettings, uint32_t session
                                          getRTCTime());
       if (json.ok && json.rowCount == 0 && json.csvBytesConsumed > 0) {
         // The row(s) in this chunk were malformed and skipped by the builder.
-        // Advance past them (and purge) so the cursor doesn't stall — do NOT
+        // Advance past them so the cursor doesn't stall — do NOT
         // POST or treat as an error.
         Serial.printf("[UPLOAD] JSON: skipped malformed row(s), advancing %u bytes\n",
                       (unsigned)json.csvBytesConsumed);
         nowUnix = getRTCTime();
         uploadQueue.advanceCursor(payload.startOffset + json.csvBytesConsumed, nowUnix);
-        uploadQueue.purgeUploaded();
+        uploadQueue.purgeUploadedIfLegacyDrained();
         continue;
       }
       if (!json.ok || json.rowCount == 0) {
         // Build failed (heap) — fall back to a CSV POST for this chunk.
+        if (isCustomHttps) {
+          Serial.println("[UPLOAD] Custom JSON build failed; refusing an undocumented CSV fallback");
+          uploadQueue.incrementRetryCount(retryNowUnix, retryCooldownSec);
+          break;
+        }
         Serial.println("[UPLOAD] JSON build failed/empty — falling back to CSV POST");
         String url = buildUploadUrl(txSettings);
-        if (!isSupabase) {
-          url += (url.indexOf('?') >= 0) ? "&action=uploadSync" : "?action=uploadSync";
-        }
         HttpsPostResult result = modem.httpsPost(url, payload.csvData,
                                                  "text/csv", authHeader);
         if (result.httpStatus == 200) {
@@ -1094,7 +1127,7 @@ void performModemUpload(const TransmissionSettings& txSettings, uint32_t session
           nowUnix = getRTCTime();
           uploadQueue.advanceCursor(payload.startOffset + payload.byteLength, nowUnix,
                                     payload.rowEstimate);
-          uploadQueue.purgeUploaded();
+          uploadQueue.purgeUploadedIfLegacyDrained();
           uploadQueue.resetRetryCount();
           anyJsonSuccess = true;
           firstChunk = false;
@@ -1116,11 +1149,6 @@ void performModemUpload(const TransmissionSettings& txSettings, uint32_t session
                     json.byteLength, (unsigned)json.rowCount, (unsigned)json.csvBytesConsumed);
 
       String url = buildUploadUrl(txSettings);
-      if (!isSupabase) {
-        url += (url.indexOf('?') >= 0)
-            ? (firstChunk ? "&action=uploadSync" : "&action=uploadData")
-            : (firstChunk ? "?action=uploadSync" : "?action=uploadData");
-      }
 
       if (sessionExpired()) {
         Serial.println("[WATCHDOG] Session timeout before JSON POST - forcing shutdown");
@@ -1133,22 +1161,27 @@ void performModemUpload(const TransmissionSettings& txSettings, uint32_t session
       HttpsPostResult result = modem.httpsPost(url, json.body,
                                                "application/json", authHeader);
 
-      if (result.httpStatus == 200) {
+      const bool accepted = isCustomHttps
+          ? (result.httpStatus >= 200 && result.httpStatus < 300)
+          : (result.httpStatus == 200);
+      if (accepted) {
         // HTTP 200 is NOT proof the readings were stored. Check the backend's
-        // own count before deleting anything.
+        // own count before advancing the remote-delivery cursor.
         //
         // On 2026-08-01 a truncated payload went out claiming 76 readings, the
         // backend answered 200 with "appended": 0, and the cursor advanced and
-        // purged them anyway — 74 readings destroyed. The build fault itself is
+        // advanced past them anyway — 74 readings were lost remotely. The build fault itself is
         // fixed in json_payload.cpp; this guard is what makes any future
         // occurrence cost a retry instead of the data.
         //
         // A recognised DUPLICATE payload is the one case where 0 is correct:
         // the backend already holds those rows, so the cursor must still
         // advance or a lost response wedges the queue on data already stored.
-        const int appended = jsonResponseAppendedCount(result.responseBody);
-        const bool wasDuplicate = jsonResponseIsDuplicate(result.responseBody);
-        if (appended == 0 && json.rowCount > 0 && !wasDuplicate) {
+        const int appended = isFieldMesh
+            ? jsonResponseAppendedCount(result.responseBody) : (int)json.rowCount;
+        const bool wasDuplicate = isFieldMesh &&
+            jsonResponseIsDuplicate(result.responseBody);
+        if (isFieldMesh && appended == 0 && json.rowCount > 0 && !wasDuplicate) {
           Serial.printf("[UPLOAD] REFUSING to advance: sent %u readings, backend "
                         "stored 0 and it is not a duplicate — rows stay on flash\n",
                         (unsigned)json.rowCount);
@@ -1159,27 +1192,30 @@ void performModemUpload(const TransmissionSettings& txSettings, uint32_t session
           ingestBackendResponse(result.responseBody);
           break;
         }
-        if (appended > 0 && (uint32_t)appended < (uint32_t)json.rowCount) {
+        if (isFieldMesh && appended > 0 &&
+            (uint32_t)appended < (uint32_t)json.rowCount) {
           // Partial. The shortfall is row-level duplicates the backend skipped,
           // which are already stored, so advancing is correct — but say so.
           Serial.printf("[UPLOAD] partial store: sent %u, appended %d (rest already present)\n",
                         (unsigned)json.rowCount, appended);
         }
-        Serial.printf("[UPLOAD] JSON SUCCESS: HTTP 200, %u readings\n",
-                      (unsigned)json.rowCount);
+        Serial.printf("[UPLOAD] JSON SUCCESS: HTTP %d, %u readings\n",
+                      result.httpStatus, (unsigned)json.rowCount);
         nowUnix = getRTCTime();
         uploadQueue.advanceCursor(payload.startOffset + json.csvBytesConsumed, nowUnix,
                                   json.rowCount);
-        uploadQueue.purgeUploaded();
+        uploadQueue.purgeUploadedIfLegacyDrained();
         uploadQueue.resetRetryCount();
         uploadQueue.clearNonRetryableFailures();
         anyJsonSuccess = true;
         firstChunk = false;
         // Commit readings first: control parsing never invalidates a successful
         // data POST or rewinds the existing upload cursor.
-        const BackendIngestResult ingest =
-            ingestBackendResponse(result.responseBody);
-        controlReportDirty = controlReportDirty || ingest.commandCount > 0;
+        if (isFieldMesh) {
+          const BackendIngestResult ingest =
+              ingestBackendResponse(result.responseBody);
+          controlReportDirty = controlReportDirty || ingest.commandCount > 0;
+        }
         // Continue loop for next chunk if more rows remain.
       } else if (isNonRetryableHttpStatus(result.httpStatus)) {
         // Not transient: bad payload or bad credentials.  Do NOT advance the
@@ -1191,7 +1227,7 @@ void performModemUpload(const TransmissionSettings& txSettings, uint32_t session
         // to advance wedges the queue permanently: every later session rebuilds
         // the same chunk and takes the same rejection, nothing ever drains,
         // deploymentTrackingVersion never turns on, and emergencyPurgeIfFull()
-        // eventually discards the oldest half of the buffer anyway. That loses
+        // eventually discards the oldest part of the buffer anyway. That loses
         // MORE data than skipping, later and silently.
         //
         // Isolate the ACTUAL cause before discarding anything. A 4xx can come
@@ -1200,6 +1236,11 @@ void performModemUpload(const TransmissionSettings& txSettings, uint32_t session
         Serial.printf("[UPLOAD] JSON non-retryable HTTP %d (%s) at offset %u, %u rows\n",
                       result.httpStatus, nonRetryableHttpReason(result.httpStatus),
                       (unsigned)payload.startOffset, (unsigned)json.rowCount);
+
+        if (isCustomHttps) {
+          Serial.println("[UPLOAD] Custom endpoint rejected the batch; cursor unchanged");
+          break;
+        }
 
         // 401/403 are whole-payload credential failures. No row caused them and
         // no row can fix them: stop, discard nothing.
@@ -1225,7 +1266,7 @@ void performModemUpload(const TransmissionSettings& txSettings, uint32_t session
               nowUnix = getRTCTime();
               uploadQueue.advanceCursor(payload.startOffset + rowsOnly.csvBytesConsumed,
                                         nowUnix, rowsOnly.rowCount);
-              uploadQueue.purgeUploaded();
+              uploadQueue.purgeUploadedIfLegacyDrained();
               uploadQueue.resetRetryCount();
               uploadQueue.clearNonRetryableFailures();
               anyJsonSuccess = true;
@@ -1252,7 +1293,7 @@ void performModemUpload(const TransmissionSettings& txSettings, uint32_t session
           nowUnix = getRTCTime();
           uploadQueue.advanceCursor(payload.startOffset + single.csvBytesConsumed,
                                     nowUnix, 1);
-          uploadQueue.purgeUploaded();
+          uploadQueue.purgeUploadedIfLegacyDrained();
           uploadQueue.resetRetryCount();
           uploadQueue.clearNonRetryableFailures();
           anyJsonSuccess = true;
@@ -1304,7 +1345,7 @@ void performModemUpload(const TransmissionSettings& txSettings, uint32_t session
     // and remains healthy. Supabase accepts the canonical batch shape with an
     // empty readings[] array and records a zero-reading sync_session while
     // refreshing mothership_status and nodes.
-    if (totalPendingRows == 0 && isSupabase && !sessionExpired()) {
+    if (totalPendingRows == 0 && isFieldMesh && !sessionExpired()) {
       JsonPayload heartbeat = buildJsonUpload(String(), 1, FW_SEMVER,
                                                &statusCtx, getRTCTime());
       if (!heartbeat.ok) {
@@ -1341,7 +1382,7 @@ void performModemUpload(const TransmissionSettings& txSettings, uint32_t session
     // that request has already been built. Report the new durable cursor,
     // result and desired node state immediately instead of leaving the
     // dashboard at "offered, not acknowledged" until the next sync wake.
-    if (controlReportDirty && isSupabase && !sessionExpired()) {
+    if (controlReportDirty && isFieldMesh && !sessionExpired()) {
       fPending = 0;
       fPaused = 0;
       for (const auto& node : getRegisteredNodes()) {
@@ -1402,10 +1443,10 @@ void performModemUpload(const TransmissionSettings& txSettings, uint32_t session
     // deferred), fetch+verify+install now while the modem is live and the
     // session budget allows. Runs only after the status/control upload above,
     // so a slow ~1 MB download never risks the readings upload or command ACKs.
-    maybeRunCloudOta(modem, sessionStartMs);
+    if (isFieldMesh) maybeRunCloudOta(modem, sessionStartMs);
 
-    // Emergency purge + graceful shutdown.
-    uploadQueue.emergencyPurgeIfFull(80);
+    // Enforce the bounded LittleFS retention window, then shut down cleanly.
+    uploadQueue.emergencyPurgeIfFull(kLittleFsRetentionHighWaterPct);
     modem.gracefulShutdown();
     Serial.println("[UPLOAD] Modem upload sequence complete (JSON path)");
     return;
@@ -1441,15 +1482,15 @@ void performModemUpload(const TransmissionSettings& txSettings, uint32_t session
     uint32_t nowUnix = getRTCTime();
     uploadQueue.advanceCursor(payload.startOffset + payload.byteLength, nowUnix,
                               payload.rowEstimate);
-    uploadQueue.purgeUploaded();
+    uploadQueue.purgeUploadedIfLegacyDrained();
     uploadQueue.resetRetryCount();
   } else {
     Serial.printf("[UPLOAD] FAIL: HTTP %d, %s\n", result.httpStatus, result.errorDetail.c_str());
     uploadQueue.incrementRetryCount(retryNowUnix, retryCooldownSec);
   }
 
-  // 7. Emergency purge check (regardless of upload success)
-  uploadQueue.emergencyPurgeIfFull(80);
+  // 7. Bounded local-retention check (regardless of upload success)
+  uploadQueue.emergencyPurgeIfFull(kLittleFsRetentionHighWaterPct);
 
   // 8. Graceful shutdown
   modem.gracefulShutdown();
@@ -1562,14 +1603,21 @@ void handleSyncWake() {
   if (!initFlash()) {
     Serial.println("[WARN] Flash init failed — continuing without snapshot logging/upload queue");
   } else {
-    Serial.println("[STORAGE] Active snapshot/upload storage: FLASH (LittleFS)");
+    Serial.println("[STORAGE] LittleFS upload cache and fallback ready");
   }
 
-  // Init upload queue (after flash is ready) and emergency-purge before
+  // Init upload queue (after flash is ready) and enforce retention before
   // logging new data so there is always space for incoming node snapshots.
+  // A failed init leaves a zero cursor. Running retention against that would
+  // evict history the hub has not actually uploaded, so nothing cursor-dependent
+  // runs unless init succeeded.
   if (flashIsReady()) {
-    uploadQueue.init();
-    uploadQueue.emergencyPurgeIfFull(80);
+    if (uploadQueue.init()) {
+      uploadQueue.emergencyPurgeIfFull(kLittleFsRetentionHighWaterPct);
+    } else {
+      Serial.println("[WARN] Upload queue init failed — skipping retention purge "
+                     "and all cursor-dependent work this wake");
+    }
   }
 
   // Load paired/deployed nodes from NVS so fleet counts and node metadata
@@ -1658,9 +1706,12 @@ void handleSyncWake() {
                                              : (uint8_t)gWakeIntervalMin;
     cfg.syncIntervalMin = (uint16_t)(gSyncIntervalMin > 0 ? gSyncIntervalMin : 15);
     cfg.syncPhaseUnix   = 0;   // sync (A2) is governed by SET_SYNC_SCHED, not this
+    // The NODE_CONFIG payload carries the RAW configured mask — the node needs
+    // the ultrasonic selector to know which wind backend to register.
     cfg.sensorMask      = dc.sensorMask;  // 0 = auto; else SNAP_PRESENT_* + VALID bit
-    // Refresh the RAM cache used by snapshot fault detection (strip the VALID bit
-    // to leave just the capability bits) so faults reflect the current selection.
+    // The cached mask, by contrast, is normalised to the snapshot layout by
+    // setNodeExpectedSensorMask() so fault detection and the UI can compare it
+    // against a snapshot's sensorPresent directly.
     setNodeExpectedSensorMask(n.nodeId.c_str(),
         (dc.sensorMask & NODE_SENSOR_MASK_VALID)
             ? (uint16_t)(dc.sensorMask & ~NODE_SENSOR_MASK_VALID) : 0);
@@ -1688,10 +1739,6 @@ void handleSyncWake() {
 
   Serial.println("[SYNC] Sync window closed");
 
-  // Persist paired-node state (including freshly reported battery voltages)
-  // to NVS so it survives power-off between sync cycles.
-  savePairedNodes();
-
   // Drain packets already accepted before unregistering the producer.
   EspNowSnapSlot finalSlots[4];
   int finalDrained = 0;
@@ -1701,6 +1748,14 @@ void handleSyncWake() {
       processSnapshot(finalSlots[i].snap, finalSlots[i].mac);
     }
   } while (finalDrained > 0);
+
+  // Persist paired-node state (battery voltages, last-contact time and the
+  // configured-sensor fault/debounce state) to NVS so it survives the power-off
+  // between sync cycles. This MUST come after the final drain above: those
+  // snapshots go through processSnapshot() like any other and advance exactly
+  // the same per-node state, so saving first silently discarded whatever the
+  // last few packets of the window changed.
+  savePairedNodes();
 
   // --- NODE_CONFIG reconcile: process CONFIG_ACKs collected this window ---
   // A node ACKs after applying a NODE_CONFIG. An UNPAIRED ack (version matched)
@@ -1743,7 +1798,7 @@ void handleSyncWake() {
     }
   }
 
-  // Stop the WiFi-task producer before upload or purge code touches files.
+  // Stop the WiFi-task producer before upload or retention code touches files.
   deinitEspNowSync();
 
   // Recompute per-node stale status now the window has closed and lastSeen
@@ -1762,7 +1817,14 @@ void handleSyncWake() {
     sessionTimedOut = true;
   }
 
-  if (!sessionTimedOut && txSettings.enabled && flashIsReady()) {
+  // uploadQueue.isInitialised() gates the whole upload block: every call below
+  // reads or advances the cursor, and on a failed init that cursor is zeros.
+  // Uploading against it would re-send the entire retained history and then
+  // advance from a false position.
+  if (!sessionTimedOut && txSettings.enabled && flashIsReady() &&
+      !uploadQueue.isInitialised()) {
+    Serial.println("[UPLOAD] Upload queue not initialised — skipping upload this wake");
+  } else if (!sessionTimedOut && txSettings.enabled && flashIsReady()) {
     uploadQueue.incrementWakeCounter();
 
     // Determine upload policy: uploadIntervalMin=0 means every wake.
@@ -1780,7 +1842,9 @@ void handleSyncWake() {
       if (batMv >= txSettings.minBatteryMv) {
         if (!uploadQueue.maxRetriesExceeded(txSettings.maxRetriesPerWindow, getRTCTime())) {
           const bool needsStatusHeartbeat =
-              txSettings.useJsonUpload && txSettings.apiKey.length() > 0;
+              txSettings.useJsonUpload &&
+              txSettings.destinationMode == TX_DEST_FIELDMESH &&
+              txSettings.apiKey.length() > 0;
           if (uploadQueue.getPendingBytes() > 0 || needsStatusHeartbeat) {
             performModemUpload(txSettings, sessionStartMs);
             if (millis() - sessionStartMs > kSyncSessionLimitMs) {
@@ -1923,20 +1987,18 @@ void handleConfigWake() {
   Serial.println("[CFG-DBG] Step 1 done: initRTC");
   Serial.flush();
 
-  // Step 2: Init storage: try SD first, fall back to flash (LittleFS)
+  // Step 2: Init the SD archive and LittleFS upload cache independently.
   Serial.println("[CFG-DBG] Step 2: initSD / initFlash...");
   Serial.flush();
   if (!initSD()) {
-    Serial.println("[WARN] SD card init failed — falling back to flash (LittleFS)");
-    if (!initFlash()) {
-      Serial.println("[WARN] Flash init also failed — continuing without logging");
-    } else {
-      Serial.println("[STORAGE] Active storage: FLASH (LittleFS)");
-    }
+    Serial.println("[WARN] SD archive unavailable — internal rolling storage remains supported");
   } else {
-    Serial.println("[STORAGE] Active storage: SD card");
-    // Also init flash as a secondary store for the config server's CSV view.
-    initFlash();
+    Serial.println("[STORAGE] SD field archive ready");
+  }
+  if (!initFlash()) {
+    Serial.println("[WARN] LittleFS init failed — upload cache and internal fallback unavailable");
+  } else {
+    Serial.println("[STORAGE] LittleFS upload cache and fallback ready");
   }
   Serial.println("[CFG-DBG] Step 2 done: initSD / initFlash");
   Serial.flush();
