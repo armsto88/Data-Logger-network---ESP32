@@ -955,10 +955,29 @@ void performModemUpload(const TransmissionSettings& txSettings, uint32_t session
     return;
   }
 
-  // 2. Wait for network registration (60s timeout — will fail without antenna)
-  Serial.println("[UPLOAD] Waiting for network registration (60s timeout)...");
+  // 2. Wait for network registration (will fail without antenna).
+  //
+  // This was 60 s, which is a WARM-start budget: a modem that can re-camp on
+  // the cell cached in its own NVM (and the SIM's EF_LOCI) registers in under
+  // a second, as it does on every routine wake. It is not enough for a COLD
+  // start — first power-up in a new region, or after a long spell off-air —
+  // where the module must run a full band sweep and a roaming PLMN search.
+  //
+  // Measured on the Australia bring-up (tests/bringup_modem_roaming_warmup.cpp,
+  // 2026-08-15): a genuine cold registration completed at t≈71 s from modem
+  // power-on. waitForNetwork() starts ~9 s in, so 60 s expired a few seconds
+  // BEFORE the network came up, and the hub skipped the upload with no
+  // diagnostic beyond "timeout". The warm case then registered in 0 s.
+  //
+  // 150 s covers that cold case with margin and costs nothing when warm — the
+  // call returns as soon as CREG/CEREG reports registered. It also still fits
+  // inside kSyncSessionLimitMs (300 s): a full observed wake cycle, ESP-NOW
+  // collection through upload and power-down, took 90 s.
+  static constexpr uint32_t kNetworkRegTimeoutMs = 150000UL;
+  Serial.printf("[UPLOAD] Waiting for network registration (%lus timeout)...\n",
+                (unsigned long)(kNetworkRegTimeoutMs / 1000));
   const uint32_t regStartMs = millis();
-  if (!modem.waitForNetwork(60000)) {
+  if (!modem.waitForNetwork(kNetworkRegTimeoutMs)) {
     Serial.println("[UPLOAD] Network registration failed/timeout — skipping upload");
     modem.gracefulShutdown();
     uploadQueue.incrementRetryCount(retryNowUnix, retryCooldownSec);
