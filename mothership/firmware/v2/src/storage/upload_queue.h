@@ -112,6 +112,17 @@ class UploadQueue {
   uint32_t getPendingBytes() const;
   uint32_t getPendingRows() const;
 
+  // Data rows currently held in /datalog.csv, uploaded and pending alike.
+  //
+  // Distinct from getPendingRows(), which counts only from the cursor to EOF.
+  // Uploading advances the cursor and never shrinks the file — the log is the
+  // hub's own record, kept for standalone operation and direct download — so the
+  // two diverge as soon as anything uploads, and only a retention purge brings
+  // this figure back down. status.dataLog.records was previously fed
+  // getPendingRows(), duplicating status.upload.pendingRows and under-reporting
+  // the log by whatever had already been sent.
+  uint32_t getTotalRows() const;
+
   // Wake / retry policy helpers
   bool shouldUploadThisWake(uint8_t policyIntervalWakes) const;
   void incrementWakeCounter();

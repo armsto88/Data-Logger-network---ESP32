@@ -411,6 +411,67 @@ static void testRetryIdempotency() {
         endAgain.status == DEPLOY_REPLAYED);
 }
 
+// The stale-epoch CAS guard returns BEFORE phase 3, so it publishes no staged
+// identity and queues no outbox event. Reporting that as a replay is correct for
+// a genuine double submit and catastrophic for a FIRST attempt whose epoch is
+// stale for some other reason: the operator is told the deployment started, the
+// dashboard is never told it exists, and the number and name sit in staging
+// forever.
+//
+// That is the 2026-08-19 field incident. Four nodes were re-paired after a
+// project transfer, registerNode() zeroed their registry mirror, nothing
+// re-synced it before the wizard rendered, so every form posted expected_epoch=0
+// against a store holding epoch 1. All four "succeeded" and none existed.
+//
+// Staged identity is the discriminator. A real repeat has none — the first
+// submit's phase 3 published and cleared it. A stale first attempt still does.
+static void testStaleEpochWithStagedIdentityFailsLoudly() {
+  resetAll();
+  addNode("ENV_A1", 0x01, DEPLOYED);
+  beginNewDeployment("ENV_A1", "001", "North Hedge", NAN, NAN, 0);
+  gFakeNow += 3600;
+  endDeployment("ENV_A1", 1);
+
+  // The transfer case: slot ended at epoch 1, the operator stages the next
+  // deployment's identity, and the form they submit from carries a stale 0.
+  const String number = "002";
+  const String name   = "South Gate";
+  deploymentStageIdentity("ENV_A1", &number, &name, nullptr, nullptr);
+
+  const uint8_t outboxBefore = deploymentOutboxCount();
+  const DeploymentOpResult stale =
+      beginNewDeployment("ENV_A1", "002", "South Gate", NAN, NAN, 0);
+
+  check("stale start: reported as an error, not a replay",
+        stale.status == DEPLOY_ERR_STATE);
+  check("stale start: carries a message the UI can show",
+        stale.message.length() > 0);
+  check("stale start: epoch did not change", epochOf("ENV_A1") == 1);
+  check("stale start: queued no event",
+        deploymentOutboxCount() == outboxBefore);
+
+  // Identity must stay staged. Publishing it here would relabel the ARCHIVED
+  // epoch-1 deployment, which is the whole reason staging exists.
+  check("stale start: archived identity untouched",
+        getNodeUserId("ENV_A1") == "001" && getNodeName("ENV_A1") == "North Hedge");
+  const DeploymentSlot* s = deploymentFindByNodeId("ENV_A1");
+  check("stale start: staging preserved for the retry",
+        s && s->hasStagedIdentity && String(s->stagedUserId) == "002");
+
+  // Retrying against a correctly rendered form commits and publishes.
+  const DeploymentOpResult ok =
+      beginNewDeployment("ENV_A1", "002", "South Gate", NAN, NAN, 1);
+  check("stale start: retry with the true epoch commits", ok.status == DEPLOY_OK);
+  check("stale start: retry publishes the staged identity",
+        getNodeUserId("ENV_A1") == "002" && getNodeName("ENV_A1") == "South Gate");
+
+  // And an ordinary double submit — stale epoch, nothing staged — stays a replay.
+  const DeploymentOpResult repeat =
+      beginNewDeployment("ENV_A1", "002", "South Gate", NAN, NAN, 1);
+  check("stale start: ordinary double submit remains a replay",
+        repeat.status == DEPLOY_REPLAYED);
+}
+
 // F4: a failed desired-config queue must not leave a live epoch the node knows
 // nothing about.
 static void testStartRollsBackWhenConfigFails() {
@@ -1372,6 +1433,7 @@ void setup() {
   testFourNodePermute();
   testRtcUnsetRejects();
   testRetryIdempotency();
+  testStaleEpochWithStagedIdentityFailsLoudly();
   testStartRollsBackWhenConfigFails();
   testStartLeavesIntentPendingWhenCompensationFails();
   testStartRollbackRestoresWholeSlot();

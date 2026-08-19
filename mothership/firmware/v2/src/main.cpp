@@ -1083,7 +1083,11 @@ void performModemUpload(const TransmissionSettings& txSettings, uint32_t session
       FW_SEMVER, FW_BUILD, getRTCTime(),
       hwMacString(),  // canonical factory STA MAC — matches portal/identity/AP/QR
       fPending, txSettings.enabled,
-      uploadQueue.getPendingRows(), (uint64_t)getCSVFileSize(), String(""),
+      // dataLogRecords: rows held in the log, NOT rows pending upload. Feeding
+      // getPendingRows() here duplicated status.upload.pendingRows and reported a
+      // log of ~550 rows as ~68, because uploading advances the cursor without
+      // shrinking the file.
+      uploadQueue.getTotalRows(), (uint64_t)getCSVFileSize(), String(""),
       buildNodesStatusJson(nowUnix),
       buildTransmissionStatusJson(txSettings),
       (gSyncMode == SYNC_MODE_DAILY)

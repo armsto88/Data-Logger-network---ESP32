@@ -374,6 +374,38 @@ static void testUploadAckCompatibilityHookKeepsCurrentHistory() {
         before > 0 && after == before);
 }
 
+// status.dataLog.records was fed getPendingRows(), which made it a duplicate of
+// status.upload.pendingRows and under-reported the log by everything already
+// uploaded — a ~550-row log reporting 68. getTotalRows() is the whole log.
+//
+// Deliberately does not call init() or advanceCursor(), both of which touch the
+// NVS "tx" cursor; see the scope note at the top of this file. A default-
+// constructed queue has a zero cursor, which is enough to pin the distinction:
+// getTotalRows() starts at the end of the header, getPendingRows() starts
+// wherever the cursor points — at zero that is the header itself.
+static void testTotalRowsCountsTheWholeLog() {
+  String rows;
+  for (int i = 0; i < 5; ++i) {
+    rows += kRow33;
+    rows += ",nan,nan\n";
+  }
+  writeDataFile(kCurrentCSVHeader35, rows.c_str());
+
+  UploadQueue queue;
+  check("total rows: counts every data row held in the log",
+        queue.getTotalRows() == 5);
+  check("total rows: skips the header, unlike a scan from offset zero",
+        queue.getPendingRows() == 6 && queue.getTotalRows() == 5);
+
+  writeDataFile(kCurrentCSVHeader35, "");
+  check("total rows: header-only log reports zero rows",
+        queue.getTotalRows() == 0);
+
+  writeDataFile(kCurrentCSVHeader35, (String(kRow33) + ",nan,nan\n").c_str());
+  check("total rows: single-row log reports one row",
+        queue.getTotalRows() == 1);
+}
+
 // --- init() contract -------------------------------------------------------
 //
 // The scope note at the top of this file says the schema assertions avoid
@@ -520,6 +552,7 @@ void setup() {
   testStampedRowRoundTrip();
   testOversizedRowIsRejectedNotOverflowed();
   testUploadAckCompatibilityHookKeepsCurrentHistory();
+  testTotalRowsCountsTheWholeLog();
 
   // The init() cases drive the real cursor path, which can write to the live
   // "tx" cursor (see the note above them). Save it, run them, put it back.

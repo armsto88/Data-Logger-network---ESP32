@@ -357,6 +357,24 @@ uint32_t UploadQueue::getPendingRows() const {
   return rows;
 }
 
+// The same scan as getPendingRows(), starting at the end of the header instead of
+// at the cursor, so it counts every data row still on flash. Equal to
+// getPendingRows() only while nothing has been uploaded yet.
+uint32_t UploadQueue::getTotalRows() const {
+  File f = LittleFS.open(kDataFile, "r");
+  if (!f) return 0;
+  if (!f.seek(headerEndOffset())) {
+    f.close();
+    return 0;
+  }
+  uint32_t rows = 0;
+  while (f.available()) {
+    if (f.read() == '\n') rows++;
+  }
+  f.close();
+  return rows;
+}
+
 // ---------------------------------------------------------------------------
 // getNewData
 // ---------------------------------------------------------------------------

@@ -4049,6 +4049,12 @@ static void handleBatchNodeAction() {
 }
 
 static void handleStationDetail() {
+  // This page emits the hidden expected_epoch that makes Start/End idempotent.
+  // It is read from the registry mirror, which is stale for any node paired since
+  // boot — see handleNodeConfigSave(). Rendering a stale value makes the POST's
+  // compare-and-swap reject a genuine new deployment as a replay.
+  deploymentSyncRegistryMirror();
+
   String nodeId = server.arg("id");
   if (nodeId.length() == 0) nodeId = server.arg("node_id");
 
@@ -4503,6 +4509,16 @@ static void handleStationDetail() {
 }
 
 static void handleNodeConfigSave() {
+  // The deployment store is the authority; NodeInfo's deployment* fields are only
+  // a mirror of it, and registerNode() zeroes them for a newly paired node. Only
+  // deploymentSyncRegistryMirror() refills them, and it does not run on pairing —
+  // so a node paired since boot reads epoch 0 here while the store still holds its
+  // real epoch. Three decisions below consume that mirror: hasActiveDeployment,
+  // the expectedEpoch fallback, and resumeActiveDeployment. The last one skips
+  // beginNewDeployment() entirely, which publishes staged identity and queues the
+  // outbox event — so a stale mirror silently drops both. Refresh before reading.
+  deploymentSyncRegistryMirror();
+
   String nodeId   = server.arg("node_id");
   String userId   = server.arg("user_id");
   String name     = server.arg("name");
@@ -4989,6 +5005,10 @@ static void handleNodeConfigSave() {
 // start to deploy) and /set-node-sensors — so there is no new persistence logic.
 //   1 Identify (ID + name)  2 Sensors  3 Location  4 Deploy.
 static void handleStationSetupWizard() {
+  // Same reason as handleStationDetail(): the wizard bakes `var EPOCH=` into its
+  // script from the registry mirror and posts it back as expected_epoch.
+  deploymentSyncRegistryMirror();
+
   String nodeId = server.arg("id");
   if (nodeId.length() == 0) nodeId = server.arg("node_id");
 
@@ -5469,7 +5489,17 @@ static void handleSettings() {
     html += F("</p>"
               "<form class='async-form' action='/set-data-destination' method='POST'>"
               "<input type='hidden' name='mode' value='local_only'>"
-              "<button type='submit' class='btn btn--sm'>Use local storage only</button></form>");
+              "<button type='submit' class='btn btn--sm'>Use local storage only</button></form>"
+              // Moving a FieldHub to another project is a routine request, and without
+              // this link the only way through was "local storage only" and back — a
+              // detour that parks the hub in a mode where cloudEventsEnabled() is false,
+              // so any deployment action taken in that window is never queued for upload.
+              // The custom-HTTPS branch below has always offered the equivalent.
+              "<a href='/provision' class='btn btn--sm' style='margin-top:8px'>"
+              "Connect to a different project</a>"
+              "<div class='help'>Registers this FieldHub with a different FieldMesh project "
+              "and replaces its connection key. End any active deployments and sync first, so "
+              "this project keeps its readings and deployment history.</div>");
   } else if (tx.destinationMode == TX_DEST_CUSTOM_HTTPS &&
              tx.customEndpointUrl.startsWith("https://")) {
     html += F("<p><span class='chip chip--cfg-ok' style='font-weight:600'>Custom HTTPS endpoint</span></p>"
@@ -5924,7 +5954,9 @@ static void performManualUpload(String& resultMsg, bool& ok) {
           FW_SEMVER, FW_BUILD, manNowUnix,
           WiFi.macAddress(),
           mPending, tx.enabled,
-          gUploadQueue.getPendingRows(), (uint64_t)getCSVFileSize(), String(""),
+          // dataLogRecords: rows held in the log, not rows pending upload — see the
+          // matching comment in main.cpp's StatusContext.
+          gUploadQueue.getTotalRows(), (uint64_t)getCSVFileSize(), String(""),
           buildNodesStatusJson(manNowUnix),
           buildTransmissionStatusJson(tx),
           (gSyncMode == SYNC_MODE_DAILY)

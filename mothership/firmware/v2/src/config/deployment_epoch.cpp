@@ -328,7 +328,30 @@ DeploymentOpResult beginNewDeployment(const String& nodeId,
   // Idempotency: a repeat of an already-applied Start (double submit, lost
   // response) carries the stale prior epoch. Report the current state instead
   // of incrementing again.
+  //
+  // But this return is BEFORE phase 3, so it never reaches
+  // publishStagedIdentity() and never queues an outbox event. A caller whose
+  // epoch is stale for any reason OTHER than a genuine repeat therefore gets a
+  // success status for a deployment that does not exist, with the operator's
+  // number and name left in staging forever. That is exactly how a whole
+  // four-node deployment was silently lost in the field on 2026-08-19.
+  //
+  // Staged identity is the discriminator. A genuine repeat has none: the first
+  // submit's phase 3 already published and cleared it. Identity still staged
+  // means this is a FIRST attempt carrying a stale epoch, so fail loudly and let
+  // the operator retry against a freshly rendered form.
+  //
+  // Deliberately do NOT publish the staged identity here. The previous
+  // deployment has ended, and writing this number and name onto its archived
+  // record is precisely what staging exists to prevent.
   if (expectedEpoch != slot->epoch) {
+    if (slot->hasStagedIdentity) {
+      Serial.printf("[DEPLOY] %s stale Start: expected epoch %u, store holds %u\n",
+                    nodeId.c_str(), (unsigned)expectedEpoch, (unsigned)slot->epoch);
+      return makeResult(DEPLOY_ERR_STATE,
+                        "This page is out of date — reload the node and try again",
+                        slot->epoch);
+    }
     return makeResult(DEPLOY_REPLAYED,
                       "This deployment has already been started", slot->epoch);
   }
