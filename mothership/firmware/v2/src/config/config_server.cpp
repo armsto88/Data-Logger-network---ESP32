@@ -1953,7 +1953,7 @@ function wireAsyncForms(){
               if (btn){
                 btn.classList.remove('is-loading');
                 btn.classList.add(ok ? 'is-ok' : 'is-err');
-                btn.textContent = ok ? '✓ Finished — powering down' : '✗ Sync failed — powering down';
+                btn.textContent = ok ? '\u2713 Done \u2014 safe to leave' : '\u2717 Not finished \u2014 check status';
                 btn.disabled = true;  // stay disabled — the board is shutting down
               }
               FM.bump();
@@ -6835,10 +6835,19 @@ static void handleShutdown() {
 
   gShutdownRequested = true;
   if (isAjaxRequest()) {
-    String msg = "Sync & power down — arming sync alarm";
+    String msg = "Configuration saved. Nothing new to upload. "
+                 "Powering down — safe to leave.";
     if (deployedThisSession) {
-      msg = syncOk ? (String("Synced to dashboard: ") + syncMsg + " — powering down")
-                   : String("Deployed but sync skipped — powering down");
+      // Two INDEPENDENT facts, and the operator needs both. Config and
+      // deployment state are already durable in NVS by the time we get here;
+      // whether the upload got through is a separate question. The old wording
+      // ("Deployed but sync skipped") reported only the second and left the
+      // first unstated, so a failed upload read as a failed setup.
+      msg = syncOk
+          ? (String("Configuration saved. Readings uploaded (") + syncMsg +
+             "). Powering down — safe to leave.")
+          : String("Configuration saved and readings kept on the FieldHub. "
+                   "Upload will retry at the next sync. Powering down — safe to leave.");
     }
     sendAjaxResult(true, msg);
     return;
