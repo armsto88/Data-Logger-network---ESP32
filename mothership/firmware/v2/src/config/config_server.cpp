@@ -1924,12 +1924,18 @@ function wireAsyncForms(){
         var isStart = action.indexOf('/start')>=0;
         setBtnLoading(btn, btnLabelFor(form, btn));
         if (isFind) FM.startDiscoveryUi();  // immediate panel + fast polling
-        if (isStart) showUiStatus('Syncing to dashboard… this takes 30-60s', 'progress');
+        if (isStart) showUiStatus('Saving and uploading… this can take several minutes if there is a backlog. Do not power off.', 'progress');
 
         var ctrl = fmAbort();
         // /start runs a blocking modem upload (30-60s) before responding — the
         // default 15s timeout would abort it mid-upload. Give it 120s.
-        var timeoutMs = isStart ? 120000 : 15000;
+        // 120 s was not enough. The Finish action runs performManualUpload()
+        // synchronously, and with a backlog that is up to kMaxManualPosts POSTs
+        // — measured at ~3.5 min of POSTing alone, before modem power-up and
+        // network registration. The client aborted first, so the operator saw
+        // "Request timed out" while the upload was in fact still running and
+        // succeeding. Allow more than the server's own 5-minute session limit.
+        var timeoutMs = isStart ? 360000 : 15000;
         var to = ctrl ? setTimeout(function(){ ctrl.abort(); }, timeoutMs) : null;
         fetch(form.action, {method:'POST', body:asFormBody(form),
               headers:{'Content-Type':'application/x-www-form-urlencoded'},
