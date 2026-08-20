@@ -5975,8 +5975,14 @@ static void performManualUpload(String& resultMsg, bool& ok) {
         };
 
         while (posts < kMaxManualPosts && gUploadQueue.getPendingRows() > 0 && !stop) {
-          // Same 8 KB bound as the scheduled path - see kJsonChunkBytes.
-          UploadPayload payload = gUploadQueue.getNewData(8192);
+          // Must match kJsonChunkBytes in main.cpp. FIELD FIX 2026-08-20:
+          // both were 8192, which inflates to ~35 KB of JSON and makes
+          // httpsPost()'s `httpReq += payload` fail its ~36 KB contiguous
+          // realloc silently — only the 221-byte header block reaches CCHSEND.
+          // This literal is why lowering the constant in main.cpp alone did not
+          // fix the manual/pre-shutdown path. Hoist to a shared header so the
+          // two cannot drift again.
+          UploadPayload payload = gUploadQueue.getNewData(2048);
           if (payload.byteLength == 0) break;
 
           // Status object only on the first POST of this click (it doesn't

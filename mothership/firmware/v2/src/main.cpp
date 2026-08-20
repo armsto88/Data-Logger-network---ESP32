@@ -1002,7 +1002,16 @@ void performModemUpload(const TransmissionSettings& txSettings, uint32_t session
     // 2026-08-01 truncation happened. The upload LOOPS over chunks, so a smaller
     // chunk costs an extra POST rather than leaving anything behind - and it is
     // what keeps the peak flat as the fleet grows.
-    constexpr uint32_t kJsonChunkBytes     = 8192;   // ~37 rows of CSV
+    constexpr uint32_t kJsonChunkBytes     = 2048;   // ~9 rows of CSV
+    // FIELD FIX 2026-08-20: was 8192. An 8 KB CSV chunk inflates to ~35 KB of
+    // JSON, and httpsPost() then does `httpReq += payload` — a ~36 KB contiguous
+    // realloc on top of the payload already in RAM. That append fails silently
+    // (Arduino String discards concat()'s return), so only the 221-byte header
+    // block reaches CCHSEND while Content-Length still claims 35675. The server
+    // waits, closes, and the failure surfaces as "Incomplete SSL HTTP response",
+    // which reads like a network fault. 2048 keeps the payload near 9 KB.
+    // Proper fix is to send headers and body as separate CCHSEND calls so the
+    // concatenation disappears entirely — bench work, not a field change.
 
     // Supabase: header-only Bearer auth, JSON array body, no query params.
     // The legacy Google Apps Script path (apiKey empty) still appends action.
