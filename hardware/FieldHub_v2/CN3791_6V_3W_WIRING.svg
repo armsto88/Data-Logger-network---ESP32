@@ -1,0 +1,203 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="1120" viewBox="0 0 1600 1120">
+  <defs>
+    <style>
+      .bg { fill: #ffffff; }
+      .wire { fill: none; stroke: #17823b; stroke-width: 4; stroke-linecap: round; stroke-linejoin: round; }
+      .sense { fill: none; stroke: #7048b8; stroke-width: 3; stroke-linecap: round; stroke-linejoin: round; }
+      .part { fill: #fffaf0; stroke: #9b341c; stroke-width: 3; }
+      .ic { fill: #f3f7ff; stroke: #1d4ed8; stroke-width: 4; }
+      .protect { fill: #fff1f2; stroke: #be123c; stroke-width: 3; }
+      .node { fill: #17823b; }
+      .title { font-family: sans-serif; font-size: 34px; font-weight: 700; fill: #111827; }
+      .subtitle { font-family: sans-serif; font-size: 24px; font-weight: 600; fill: #374151; }
+      .label { font-family: sans-serif; font-size: 22px; fill: #111827; }
+      .small { font-family: sans-serif; font-size: 18px; fill: #374151; }
+      .pin { font-family: monospace; font-size: 20px; font-weight: 700; fill: #172554; }
+      .note { font-family: sans-serif; font-size: 19px; fill: #7c2d12; }
+      .net { font-family: monospace; font-size: 20px; font-weight: 700; fill: #166534; }
+    </style>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto">
+      <path d="M0,0 L10,5 L0,10 z" fill="#17823b"/>
+    </marker>
+  </defs>
+
+  <rect class="bg" width="1600" height="1120"/>
+  <text class="title" x="55" y="55">Hub v2 — CN3791 solar charger wiring</text>
+  <text class="subtitle" x="55" y="90">1S Li-ion · nominal 6 V / 3 W panel · 600 mA charge limit</text>
+
+  <!-- Main power path -->
+  <text class="net" x="48" y="172">PANEL+</text>
+  <line class="wire" x1="55" y1="210" x2="145" y2="210"/>
+  <rect class="part" x="145" y="182" width="125" height="56" rx="5"/>
+  <text class="label" x="168" y="205">F_IN</text>
+  <text class="small" x="154" y="229">1.1 A / 16 V</text>
+  <line class="wire" x1="270" y1="210" x2="355" y2="210"/>
+  <circle class="node" cx="305" cy="210" r="7"/>
+  <text class="net" x="276" y="140">SOL_FUSED</text>
+
+  <text class="net" x="48" y="326">PANEL-</text>
+  <line class="wire" x1="145" y1="320" x2="185" y2="320"/>
+  <path class="wire" d="M160 320 H210 M168 332 H202 M177 344 H193"/>
+
+  <!-- Input TVS -->
+  <line class="wire" x1="305" y1="210" x2="305" y2="280"/>
+  <rect class="protect" x="255" y="280" width="100" height="64" rx="5"/>
+  <text class="label" x="271" y="307">TVS</text>
+  <text class="small" x="266" y="333">SMF12A</text>
+  <text class="small" x="365" y="301">K</text>
+  <text class="small" x="365" y="335">A</text>
+  <line class="wire" x1="305" y1="344" x2="305" y2="385"/>
+  <path class="wire" d="M280 385 H330 M288 397 H322 M297 409 H313"/>
+
+  <!-- Reverse protection PMOS -->
+  <rect class="protect" x="355" y="155" width="190" height="110" rx="8"/>
+  <text class="label" x="386" y="182">M2 AO3407A</text>
+  <text class="small" x="366" y="214">D pin 3</text>
+  <text class="small" x="464" y="214">S pin 2</text>
+  <text class="small" x="399" y="249">G pin 1</text>
+  <line class="wire" x1="545" y1="210" x2="650" y2="210"/>
+  <circle class="node" cx="590" cy="210" r="7"/>
+  <text class="net" x="554" y="172">SOLAR_IN</text>
+  <line class="wire" x1="450" y1="265" x2="450" y2="292"/>
+  <rect class="part" x="410" y="292" width="80" height="45" rx="4"/>
+  <text class="small" x="424" y="321">22 k</text>
+  <line class="wire" x1="450" y1="337" x2="450" y2="385"/>
+  <path class="wire" d="M425 385 H475 M433 397 H467 M442 409 H458"/>
+
+  <!-- Input capacitors -->
+  <line class="wire" x1="590" y1="210" x2="590" y2="292"/>
+  <rect class="part" x="530" y="292" width="120" height="66" rx="5"/>
+  <text class="small" x="542" y="317">10 uF / 16 V</text>
+  <text class="small" x="552" y="344">+ 100 nF</text>
+  <line class="wire" x1="590" y1="358" x2="590" y2="385"/>
+  <path class="wire" d="M565 385 H615 M573 397 H607 M582 409 H598"/>
+
+  <!-- Switching PMOS -->
+  <rect class="part" x="650" y="155" width="190" height="110" rx="8"/>
+  <text class="label" x="681" y="182">M1 AO3407A</text>
+  <text class="small" x="662" y="214">S pin 2</text>
+  <text class="small" x="760" y="214">D pin 3</text>
+  <text class="small" x="694" y="249">G pin 1</text>
+  <line class="wire" x1="840" y1="210" x2="915" y2="210"/>
+  <circle class="node" cx="880" cy="210" r="7"/>
+  <text class="net" x="853" y="172">SW</text>
+
+  <!-- Catch diode -->
+  <line class="wire" x1="880" y1="210" x2="880" y2="280"/>
+  <rect class="part" x="834" y="280" width="92" height="67" rx="5"/>
+  <text class="label" x="850" y="306">D2</text>
+  <text class="small" x="841" y="333">Schottky</text>
+  <text class="small" x="936" y="299">K</text>
+  <text class="small" x="936" y="337">A</text>
+  <line class="wire" x1="880" y1="347" x2="880" y2="385"/>
+  <path class="wire" d="M855 385 H905 M863 397 H897 M872 409 H888"/>
+
+  <!-- Inductor and sense resistor -->
+  <line class="wire" x1="915" y1="210" x2="950" y2="210"/>
+  <rect class="part" x="950" y="182" width="125" height="56" rx="5"/>
+  <text class="label" x="976" y="205">L_CHG</text>
+  <text class="small" x="986" y="229">22 uH</text>
+  <line class="wire" x1="1075" y1="210" x2="1130" y2="210"/>
+  <circle class="node" cx="1110" cy="210" r="7"/>
+  <text class="net" x="1058" y="172">SENSE_HI</text>
+  <rect class="part" x="1130" y="182" width="150" height="56" rx="5"/>
+  <text class="label" x="1164" y="205">RCS</text>
+  <text class="small" x="1148" y="229">0.200 ohm</text>
+  <line class="wire" x1="1280" y1="210" x2="1510" y2="210" marker-end="url(#arrow)"/>
+  <circle class="node" cx="1325" cy="210" r="7"/>
+  <text class="net" x="1300" y="172">BAT_BUS</text>
+  <text class="small" x="1372" y="195">to Q37, battery</text>
+  <text class="small" x="1372" y="225">and system supply</text>
+
+  <!-- Output caps -->
+  <line class="wire" x1="1325" y1="210" x2="1325" y2="292"/>
+  <rect class="part" x="1260" y="292" width="130" height="66" rx="5"/>
+  <text class="small" x="1272" y="317">22 uF / 10 V</text>
+  <text class="small" x="1287" y="344">+ 100 nF</text>
+  <line class="wire" x1="1325" y1="358" x2="1325" y2="385"/>
+  <path class="wire" d="M1300 385 H1350 M1308 397 H1342 M1317 409 H1333"/>
+
+  <!-- CN3791 pinout -->
+  <rect class="ic" x="590" y="500" width="430" height="350" rx="12"/>
+  <circle cx="620" cy="530" r="8" fill="#1d4ed8"/>
+  <text class="subtitle" x="731" y="535">U_CHG CN3791</text>
+  <text class="small" x="735" y="565">top view</text>
+
+  <text class="pin" x="610" y="585">1  VG</text>
+  <text class="pin" x="610" y="645">2  GND</text>
+  <text class="pin" x="610" y="705">3  CHRG</text>
+  <text class="pin" x="610" y="765">4  DONE</text>
+  <text class="pin" x="610" y="825">5  COM</text>
+
+  <text class="pin" x="890" y="585">DRV  10</text>
+  <text class="pin" x="890" y="645">VCC   9</text>
+  <text class="pin" x="890" y="705">CSP   8</text>
+  <text class="pin" x="890" y="765">BAT   7</text>
+  <text class="pin" x="890" y="825">MPPT  6</text>
+
+  <!-- Pin 10 to M1 gate -->
+  <path class="wire" d="M1020 578 H1080 V455 H745 V265"/>
+  <text class="small" x="870" y="445">DRV to M1 gate pin 1</text>
+
+  <!-- Pin 9 VCC to SOLAR_IN -->
+  <path class="wire" d="M1020 638 H1120 V470 H590 V210"/>
+  <text class="small" x="1030" y="625">VCC</text>
+
+  <!-- Pin 8 and pin 7 Kelvin sense -->
+  <path class="sense" d="M1020 698 H1160 V430 H1110 V210"/>
+  <path class="sense" d="M1020 758 H1205 V450 H1325 V210"/>
+  <text class="small" x="1168" y="425">Kelvin to RCS pad</text>
+  <text class="small" x="1213" y="475">Kelvin to RCS pad</text>
+
+  <!-- Pin 1 VG capacitor to VCC -->
+  <line class="wire" x1="590" y1="578" x2="505" y2="578"/>
+  <rect class="part" x="400" y="550" width="105" height="56" rx="5"/>
+  <text class="small" x="415" y="574">C_VG</text>
+  <text class="small" x="414" y="597">100 nF</text>
+  <path class="wire" d="M400 578 H370 V470 H590"/>
+  <text class="note" x="330" y="530">C_VG goes between pins 1 and 9</text>
+
+  <!-- Ground pin -->
+  <line class="wire" x1="590" y1="638" x2="545" y2="638"/>
+  <path class="wire" d="M520 638 H570 M528 650 H562 M537 662 H553"/>
+
+  <!-- CHRG and DONE LED callouts -->
+  <line class="wire" x1="590" y1="698" x2="545" y2="698"/>
+  <rect class="part" x="220" y="675" width="325" height="46" rx="5"/>
+  <text class="small" x="237" y="704">SOLAR_IN -> 4.7 k -> LED A-to-K</text>
+  <line class="wire" x1="590" y1="758" x2="545" y2="758"/>
+  <rect class="part" x="220" y="735" width="325" height="46" rx="5"/>
+  <text class="small" x="237" y="764">SOLAR_IN -> 4.7 k -> LED A-to-K</text>
+  <text class="note" x="70" y="672">LED cathodes connect to pins 3 and 4.</text>
+
+  <!-- COM network -->
+  <line class="wire" x1="590" y1="818" x2="505" y2="818"/>
+  <rect class="part" x="415" y="795" width="90" height="46" rx="5"/>
+  <text class="small" x="431" y="824">120 R</text>
+  <line class="wire" x1="415" y1="818" x2="380" y2="818"/>
+  <rect class="part" x="270" y="795" width="110" height="46" rx="5"/>
+  <text class="small" x="283" y="824">220 nF</text>
+  <line class="wire" x1="270" y1="818" x2="235" y2="818"/>
+  <path class="wire" d="M210 818 H260 M218 830 H252 M227 842 H243"/>
+  <text class="small" x="290" y="875">Pin 5 -> 120 ohm -> 220 nF -> GND (series)</text>
+
+  <!-- MPPT divider -->
+  <line class="wire" x1="1020" y1="818" x2="1140" y2="818"/>
+  <circle class="node" cx="1100" cy="818" r="7"/>
+  <rect class="part" x="1140" y="765" width="125" height="46" rx="5"/>
+  <text class="small" x="1152" y="795">402 k TOP</text>
+  <path class="wire" d="M1265 788 H1435 V470 H590"/>
+  <text class="small" x="1268" y="770">to SOLAR_IN</text>
+  <rect class="part" x="1140" y="830" width="125" height="46" rx="5"/>
+  <text class="small" x="1155" y="860">100 k BOT</text>
+  <path class="wire" d="M1100 818 V853 H1140 M1265 853 H1310 V900"/>
+  <path class="wire" d="M1285 900 H1335 M1293 912 H1327 M1302 924 H1318"/>
+  <text class="note" x="1070" y="957">402 k programs about 6.05 V Vmp.</text>
+  <text class="note" x="1070" y="983">Use 357 k if panel Vmp is 5.5 V.</text>
+
+  <!-- Footer notes -->
+  <rect x="55" y="985" width="930" height="102" rx="8" fill="#f9fafb" stroke="#9ca3af" stroke-width="2"/>
+  <text class="small" x="75" y="1017">Critical polarity: D2 cathode to SW, TVS cathode to SOLAR_FUSED.</text>
+  <text class="small" x="75" y="1047">CSP and BAT must be Kelvin-routed directly to opposite RCS pads.</text>
+  <text class="small" x="75" y="1077">All ground symbols are electrically common; keep switching-current loops physically compact.</text>
+</svg>
