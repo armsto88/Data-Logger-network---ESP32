@@ -70,16 +70,17 @@ void clearConfigLatch() {
 }
 
 float readBatteryVoltage() {
-  uint32_t sum = 0;
+  // Calibrated pin millivolts (eFuse Vref characterisation). The previous maths
+  // scaled raw counts by an assumed 3.3 V full scale, but at ADC_11db the
+  // ESP32's full scale is nearer 3.9 V, so it read ~14% low (3.18 V on a
+  // 3.7 V cell) and sat under the 3.5 V upload / OTA battery guards.
+  uint32_t sumMv = 0;
   for (int i = 0; i < BAT_ADC_SAMPLES; i++) {
-    sum += analogRead(PIN_BATTERY_ADC);
+    sumMv += analogReadMilliVolts(PIN_BATTERY_ADC);
   }
-  float avg = static_cast<float>(sum) / BAT_ADC_SAMPLES;
+  const float pinV = static_cast<float>(sumMv) / BAT_ADC_SAMPLES / 1000.0f;
   // V_bat = V_adc × (R1 + R2) / R2
-  // V_adc = avg × VREF / ADC_MAX
-  // V_bat = avg × VREF × (R1 + R2) / (R2 × ADC_MAX)
-  float vBat = avg * BAT_ADC_VREF * (BAT_DIVIDER_R1 + BAT_DIVIDER_R2) / (BAT_DIVIDER_R2 * BAT_ADC_MAX);
-  return vBat;
+  return pinV * (BAT_DIVIDER_R1 + BAT_DIVIDER_R2) / BAT_DIVIDER_R2;
 }
 
 void setLed(bool on) {
