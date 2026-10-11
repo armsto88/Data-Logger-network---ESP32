@@ -5599,7 +5599,8 @@ static void handleSettings() {
   html += F("<div class='help'>Leave blank to keep the current key, or enter a new <code>fm_xxxxxxxx</code> API key from the fieldMesh dashboard.</div>");
 
   // The endpoint is displayed, never editable. It is set by /provision-apply
-  // alone, from an allow-list-validated FM1 payload.
+  // alone, from an allow-list-validated provisioning code (an FM1 payload, or
+  // the reply to a redeemed FM2 one-time code).
   html += F("<label class='label' style='margin-top:10px'>Endpoint (set by provisioning)</label>");
   html += F("<p class='muted' style='word-break:break-all;font-size:13px'>");
   html += htmlEscape(tx.endpointUrl);
@@ -5732,7 +5733,8 @@ static void handleSettings() {
 //
 // This handler NEVER sets the FieldMesh endpoint. The endpoint is a security
 // boundary: only /provision-apply may write it, and only from an FM1 payload
-// whose endpoint passed the allow-list. Two request-controlled writers used to
+// or a redeemed FM2 code's reply whose endpoint passed the allow-list. Two
+// request-controlled writers used to
 // live here — a `url` argument, and a legacy pipe-delimited QR string that
 // carried an endpoint and a key in one field — and both were reachable by a
 // direct POST regardless of what the page rendered. The absence of an <input>
@@ -6222,7 +6224,7 @@ static String provisionWidgetHtml(const String& onSuccessJs) {
     "1. Open the FieldMesh dashboard on another device, find this FieldHub's connection code, "
     "and paste it below.<br>"
     "2. \U0001F4F1 <strong>Scan with your phone's camera app</strong> — this is the dashboard's "
-    "QR, different from the one on the previous screen, and yes, this one you scan with your "
+    "QR, different from the one in step 1, and yes, this one you scan with your "
     "own phone. Open the link it finds and this page will detect it automatically."
     "</div>"
     "<textarea id='pv-paste' class='input' rows='3' placeholder='Paste connection code here' "
@@ -6237,22 +6239,27 @@ static String provisionWidgetHtml(const String& onSuccessJs) {
     "</div></div>"
     "<div id='pv-confirm' style='display:none'>"
     "<p>Endpoint: <strong id='pv-host'></strong></p>"
-    "<p><span class='chip chip--cfg-ok' style='font-weight:600'>Connection key received</span></p>"
-    // Nothing contacts the endpoint here. The first real request happens at the
-    // next sync, so this must not be described as a connection test.
-    "<p class='muted'>This stores the endpoint and connection key on the FieldHub. "
-    "Nothing is contacted now &mdash; the FieldHub will upload during its next sync.</p>"
-    "<button id='pv-apply' class='btn btn--primary'>Save connection</button> "
+    // The two code formats do different things on confirm, and the page must
+    // say which is about to happen. An FM1 code only stores a key: nothing
+    // contacts the endpoint until the next sync, so it must not be described as
+    // a connection test. An FM2 one-time code is redeemed right now over the
+    // mobile network. The chip, note and button text are set by tryPayload().
+    "<p><span id='pv-chip' class='chip chip--cfg-ok' style='font-weight:600'></span></p>"
+    "<p class='muted' id='pv-note'></p>"
+    "<button id='pv-apply' class='btn btn--primary'></button> "
     "<button id='pv-cancel' class='btn btn--sm'>Cancel</button></div>"
     "<div id='pv-error' style='display:none'><p><span class='chip chip--bat-low' style='font-weight:600'>"
     "Invalid provisioning code</span></p><p class='muted' id='pv-error-msg'></p>"
     "<button id='pv-retry' class='btn'>Try again</button></div>"
     "<div id='pv-result' style='display:none'></div>");
-  // Payload parsing + confirmation. The key is never logged or rendered.
+  // Payload parsing + confirmation. Neither the key nor the one-time code is
+  // ever logged or rendered. This script is a convenience only: the firmware
+  // re-validates everything in /provision-apply.
   h += F(
     "<script>(function(){"
     "var E=document.getElementById('pv-empty'),C=document.getElementById('pv-confirm'),"
-    "X=document.getElementById('pv-error'),R=document.getElementById('pv-result');"
+    "X=document.getElementById('pv-error'),R=document.getElementById('pv-result'),"
+    "A=document.getElementById('pv-apply');"
     "var stream=null;"
     "function stopScan(){if(stream){stream.getTracks().forEach(function(t){t.stop();});stream=null;}"
     "document.getElementById('pv-video').style.display='none';}"
@@ -6261,44 +6268,74 @@ static String provisionWidgetHtml(const String& onSuccessJs) {
     // payload already in the fragment). Optional: undefined elsewhere.
     "function stage(s){if(window.pvStage)window.pvStage(s);}"
     "function reset(){stopScan();X.style.display='none';R.style.display='none';C.style.display='none';"
-    "E.style.display='block';stage('empty');}"
+    "C.dataset.raw='';E.style.display='block';stage('empty');}"
     "function fail(m){stopScan();E.style.display='none';C.style.display='none';R.style.display='none';"
     "X.style.display='block';document.getElementById('pv-error-msg').textContent=m||'';stage('error');}"
     "document.getElementById('pv-retry').addEventListener('click',reset);"
+    // x = one-time exchange code (an FM2 payload or a bare fmp_ token), as
+    // opposed to an FM1 payload that carries the connection key itself.
     "function tryPayload(raw){"
     "raw=(raw||'').trim();"
-    "var i=raw.indexOf('FM1.');if(i<0){fail('Unrecognised code — no FM1 code found.');return;}"
-    "raw=raw.slice(i);"
+    "var x=/^fmp_[A-Za-z0-9_-]{43}$/.test(raw),host='FieldMesh';"
+    "if(!x){"
+    "var m=raw.match(/FM([12])\\.[A-Za-z0-9_=-]+/);"
+    "if(!m){fail('Unrecognised code — no FieldMesh code found.');return;}"
+    "raw=m[0];"
     "var b64=raw.slice(4).replace(/-/g,'+').replace(/_/g,'/');"
     "while(b64.length%4){b64+='=';}"
-    "var payload;try{payload=JSON.parse(atob(b64));}catch(e){fail('Could not read the code.');return;}"
-    "if(payload.v!==1||!payload.endpoint||!payload.connectionKey){fail('Code is missing required fields.');return;}"
-    "var host;try{host=new URL(payload.endpoint).host;}catch(e){host=payload.endpoint;}"
-    "stopScan();E.style.display='none';X.style.display='none';"
-    "document.getElementById('pv-host').textContent=host;C.style.display='block';"
-    "C.dataset.raw=raw;stage('confirm');"
+    "var payload;try{payload=JSON.parse(atob(b64));}catch(e){payload=null;}"
+    "if(!payload){fail('Could not read the code.');return;}"
+    "var ep;"
+    "if(m[1]==='1'&&payload.v===1&&payload.endpoint&&payload.connectionKey){ep=payload.endpoint;}"
+    "else if(m[1]==='2'&&payload.v===2&&payload.redemptionEndpoint&&payload.token){x=true;ep=payload.redemptionEndpoint;}"
+    "else{fail('Code is missing required fields.');return;}"
+    "try{host=new URL(ep).host;}catch(e){host=ep;}"
     "}"
+    "stopScan();E.style.display='none';X.style.display='none';R.style.display='none';"
+    "document.getElementById('pv-host').textContent=host;"
+    "document.getElementById('pv-chip').textContent=x?'One-time code received':'Connection key received';"
+    "document.getElementById('pv-note').textContent=x"
+    "?'The FieldHub will now use its mobile connection to collect its connection key from FieldMesh. "
+    "Keep this page open — it can take up to two minutes. The code works once and expires "
+    "10 minutes after the dashboard created it.'"
+    ":'This stores the endpoint and connection key on the FieldHub. Nothing is contacted now — "
+    "the FieldHub will upload during its next sync.';"
+    // Re-arm the button every time: a failed attempt leaves it disabled, and
+    // with a network exchange behind it, retrying is now the common case.
+    "A.disabled=false;A.textContent=x?'Connect now':'Save connection';"
+    "C.style.display='block';C.dataset.raw=raw;C.dataset.x=x?'1':'';stage('confirm');"
+    "}"
+    // A failed attempt keeps the code so "Try again" is one tap: a redemption
+    // that never reached FieldMesh has not spent it.
+    "function again(){if(C.dataset.raw){tryPayload(C.dataset.raw);}else{reset();}}"
+    "function failed(m){C.style.display='none';R.style.display='block';"
+    "R.innerHTML=\"<p><span class='chip chip--bat-low' style='font-weight:600'>Could not connect</span></p>"
+    "<p class='muted' id='pv-rmsg'></p>\";"
+    "document.getElementById('pv-rmsg').textContent=m||'';"
+    "var rb=document.createElement('button');rb.className='btn';rb.textContent='Try again';rb.onclick=again;"
+    "R.appendChild(rb);"
+    "var nb=document.createElement('button');nb.className='btn btn--sm';nb.textContent='Use a different code';"
+    "nb.onclick=reset;R.appendChild(nb);}"
     "document.getElementById('pv-paste-go').addEventListener('click',function(){"
     "tryPayload(document.getElementById('pv-paste').value);});"
     "document.getElementById('pv-cancel').addEventListener('click',reset);"
-    "document.getElementById('pv-apply').addEventListener('click',function(){"
-    "var btn=this;btn.disabled=true;btn.textContent='Applying...';"
+    "A.addEventListener('click',function(){"
+    "var x=C.dataset.x==='1';A.disabled=true;"
+    "A.textContent=x?'Contacting FieldMesh — up to 2 minutes...':'Applying...';"
     "fetch('/provision-apply',{method:'POST',headers:{'Content-Type':'text/plain'},body:C.dataset.raw})"
     ".then(function(r){return r.json();}).then(function(j){"
     "C.style.display='none';"
-    "if(j.ok){if(history.replaceState){history.replaceState(null,'',location.pathname);}");
+    "if(j.ok){C.dataset.raw='';document.getElementById('pv-paste').value='';"
+    "if(history.replaceState){history.replaceState(null,'',location.pathname);}");
   h += onSuccessJs;   // injected success behavior (standalone result vs. wizard advance)
   h += F("}"
-    "else{R.style.display='block';"
-    "R.innerHTML=\"<p><span class='chip chip--bat-low' style='font-weight:600'>Could not connect</span></p>"
-    "<p class='muted' id='pv-rmsg'></p>\";"
-    "document.getElementById('pv-rmsg').textContent=j.message||'';"
-    "var rb=document.createElement('button');rb.className='btn';rb.textContent='Try again';rb.onclick=reset;"
-    "R.appendChild(rb);}"
-    "}).catch(function(){C.style.display='none';R.style.display='block';"
-    "R.innerHTML=\"<p class='muted'>Network error while applying. Try again.</p>\";"
-    "var rb=document.createElement('button');rb.className='btn';rb.textContent='Try again';rb.onclick=reset;"
-    "R.appendChild(rb);});"
+    "else{failed(j.message);}"
+    // The phone can drop off the AP or give up on the request while the hub is
+    // still talking to FieldMesh. The hub remembers a code it has just
+    // redeemed, so trying the same one again reports the connection it made.
+    "}).catch(function(){failed(x"
+    "?'Lost contact with the FieldHub while it was connecting. Rejoin its Wi-Fi if needed, then try again.'"
+    ":'Network error while applying. Try again.');});"
     "});"
     // In-page camera scan (progressive enhancement): stays inside this tab —
     // no OS camera-app handoff, so the phone's Wi-Fi association to the
@@ -6326,15 +6363,15 @@ static String provisionWidgetHtml(const String& onSuccessJs) {
     // the widget in an error state the operator never asked for and, on
     // /provision, may not even be looking at.
     "var fragRaw=(location.hash||'').replace(/^#/,'');"
-    "if(fragRaw.indexOf('FM1.')>=0){tryPayload(fragRaw);}"
+    "if(/FM[12]\\./.test(fragRaw)){tryPayload(fragRaw);}"
     "})();</script>");
   return h;
 }
 
 // GET /provision — standalone connection-key provisioning page. This is the
 // documented external contract for the dashboard's QR
-// (http://192.168.4.1/provision#FM1.<base64url-payload>); it stays available
-// independent of the setup wizard.
+// (http://192.168.4.1/provision#FM2.<base64url-payload>, and the older
+// #FM1.<base64url-payload>); it stays available independent of the setup wizard.
 static void handleProvisionPage() {
   // Return context is CLIENT-supplied (?return=setup on a link the wizard
   // renders), so it is parsed as a closed enum and nothing from the request is
@@ -6372,36 +6409,26 @@ static void handleProvisionPage() {
             "</div>"
             "<div class='help' style='margin-top:10px'><strong>Scan this with the FieldMesh "
             "dashboard's built-in scanner</strong> — not your phone's camera app. It carries a "
-            "<code>fieldmesh://</code> link that a camera app cannot open. (The next step will ask "
+            "<code>fieldmesh://</code> link that a camera app cannot open. (Step 3 will ask "
             "you to scan a different QR — that one does use your phone's camera.)</div>"
             "<button type='button' class='btn btn--primary btn--action' style='margin-top:16px' "
             "data-pv-go='2'>I have registered it &mdash; next</button>"
             "</div>");
 
-  // --- Step 2 — Enter the connection code ---------------------------------
-  html += F("<div class='section pv-step' data-pv='2' style='display:none'>"
-            "<p class='muted' style='margin:0 0 10px'>Step 2 of 4</p>"
-            "<h3>Enter the connection code</h3>"
-            "<p class='muted'>The FieldMesh dashboard shows a connection code and QR for this "
-            "FieldHub. Paste the code below, or scan the QR with your phone's camera app and open "
-            "the link.</p>");
-  html += provisionWidgetHtml(F("if(window.pvSaved)window.pvSaved();"));
-  html += F("<div style='margin-top:12px'>"
-            "<button type='button' class='btn btn--sm' data-pv-go='1'>Back</button></div>"
-            "</div>");
-
-  // --- Step 3 — Cellular (APN) -------------------------------------------
-  // Cellular is part of the connect flow, not a separate Settings concern:
-  // the APN only matters once the hub has a cloud destination, and presenting
-  // it here gives the user one guided journey (register → code → cellular →
-  // done) instead of a connect button plus a disconnected APN form elsewhere.
+  // --- Step 2 — Cellular (APN) -------------------------------------------
+  // Cellular is part of the connect flow, not a separate Settings concern, and
+  // it comes BEFORE the code: a one-time (FM2) code is redeemed over the mobile
+  // network the moment it is confirmed, so the APN has to be right first. One
+  // guided journey (register → cellular → code → done) instead of a connect
+  // button plus a disconnected APN form elsewhere.
   {
     SimSettings sim;
     loadSimSettings(sim);
-    html += F("<div class='section pv-step' data-pv='3' style='display:none'>"
-              "<p class='muted' style='margin:0 0 10px'>Step 3 of 4</p>"
+    html += F("<div class='section pv-step' data-pv='2' style='display:none'>"
+              "<p class='muted' style='margin:0 0 10px'>Step 2 of 4</p>"
               "<h3>Cellular settings</h3>"
               "<p class='muted'>The APN your SIM's carrier requires for the mobile network. "
+              "The FieldHub uses this connection in the next step to collect its connection key. "
               "Leave it as-is unless you change SIM or carrier.</p>"
               "<form id='pv-sim-form' style='margin-top:10px'>"
               "<label class='label' for='pv-apn'>APN</label>"
@@ -6430,11 +6457,23 @@ static void handleProvisionPage() {
               "Leave both blank otherwise.</div>"
               "<div id='pv-sim-result' class='help' style='margin-top:8px'></div>"
               "<div style='margin-top:10px'>"
-              "<button type='button' class='btn btn--sm' data-pv-go='2'>Back</button> "
+              "<button type='button' class='btn btn--sm' data-pv-go='1'>Back</button> "
               "<button type='button' class='btn btn--sm' id='pv-sim-skip'>Skip</button> "
               "<button type='button' class='btn btn--primary' id='pv-sim-save'>Save &amp; continue</button>"
               "</div></form></div>");
   }
+
+  // --- Step 3 — Enter the connection code ---------------------------------
+  html += F("<div class='section pv-step' data-pv='3' style='display:none'>"
+            "<p class='muted' style='margin:0 0 10px'>Step 3 of 4</p>"
+            "<h3>Enter the connection code</h3>"
+            "<p class='muted'>The FieldMesh dashboard shows a connection code and QR for this "
+            "FieldHub. Paste the code below, or scan the QR with your phone's camera app and open "
+            "the link.</p>");
+  html += provisionWidgetHtml(F("if(window.pvSaved)window.pvSaved();"));
+  html += F("<div style='margin-top:12px'>"
+            "<button type='button' class='btn btn--sm' data-pv-go='2'>Back</button></div>"
+            "</div>");
 
   // --- Step 4 — Saved ------------------------------------------------------
   html += F("<div class='section pv-step' data-pv='4' style='display:none'>"
@@ -6456,22 +6495,24 @@ static void handleProvisionPage() {
   html += F("</div>");
 
   // --- Controller ---------------------------------------------------------
-  // A scanned dashboard QR lands on /provision#FM1.<payload>. The widget's
-  // fragment auto-detect fires immediately, so without this the operator would
-  // be looking at "register this hub" while a confirmation they cannot see sits
-  // in step 2 — i.e. asked to register after having already registered.
+  // A scanned dashboard QR lands on /provision#FM2.<payload> (or the older
+  // #FM1.<payload>). The widget's fragment auto-detect fires immediately, so
+  // without this the operator would be looking at "register this hub" while a
+  // confirmation they cannot see sits in step 3 — i.e. asked to register after
+  // having already registered. Step 3's Back button still reaches the cellular
+  // step if the redemption reports no mobile network.
   html += F("<script>(function(){"
             "var steps=[].slice.call(document.querySelectorAll('.pv-step'));"
             "function show(n){steps.forEach(function(s){"
             "s.style.display=(parseInt(s.dataset.pv,10)===n)?'block':'none';});window.scrollTo(0,0);}"
-            "window.pvSaved=function(){show(3);};"
+            "window.pvSaved=function(){show(4);};"
             // Widget stage changes: a payload present at load (valid OR malformed)
-            // belongs on step 2, where its confirmation/error state already is.
-            "window.pvStage=function(s){if(s==='confirm'||s==='error')show(2);};"
+            // belongs on step 3, where its confirmation/error state already is.
+            "window.pvStage=function(s){if(s==='confirm'||s==='error')show(3);};"
             "document.addEventListener('click',function(e){var t=e.target;"
             "while(t&&t!==document&&!(t.getAttribute&&t.getAttribute('data-pv-go')))t=t.parentNode;"
             "if(!t||t===document)return;show(parseInt(t.getAttribute('data-pv-go'),10));});"
-            // Cellular step: save via AJAX to /set-sim-config, then advance to step 4.
+            // Cellular step: save via AJAX to /set-sim-config, then advance to step 3.
             "var simForm=document.getElementById('pv-sim-form');"
             "function simPost(){var p=['apn='+encodeURIComponent(document.getElementById('pv-apn').value),"
             "'apn_user='+encodeURIComponent(document.getElementById('pv-apn-user').value),"
@@ -6483,12 +6524,12 @@ static void handleProvisionPage() {
             "simBtn.addEventListener('click',function(){var b=this,lab=b.textContent;b.disabled=true;b.textContent='Saving...';"
             "simPost().then(function(j){b.disabled=false;b.textContent=lab;"
             "var r=document.getElementById('pv-sim-result');"
-            "if(j.ok){r.innerHTML=\"<span class='chip chip--cfg-ok' style='font-weight:600'>Saved</span>\";show(4);}"
+            "if(j.ok){r.innerHTML=\"<span class='chip chip--cfg-ok' style='font-weight:600'>Saved</span>\";show(3);}"
             "else{r.innerHTML=\"<span class='chip chip--bat-low' style='font-weight:600'>\"+(j.message||'Could not save')+\"</span>\";}"
             "}).catch(function(){b.disabled=false;b.textContent=lab;"
             "document.getElementById('pv-sim-result').innerHTML=\"<span class='chip chip--bat-low' style='font-weight:600'>Network error</span>\";});});"
-            "document.getElementById('pv-sim-skip').addEventListener('click',function(){show(4);});"
-            "show((location.hash||'').indexOf('FM1.')>=0?2:1);"
+            "document.getElementById('pv-sim-skip').addEventListener('click',function(){show(3);});"
+            "show(/FM[12]\\./.test(location.hash||'')?3:1);"
             "})();</script>");
 
   html += copyHelperJs();
@@ -6507,12 +6548,107 @@ static void handleHardwareQrSvg() {
   server.send(200, "image/svg+xml", svg);
 }
 
-// POST /provision-apply — body is the raw "FM1.<base64url>" payload (text/plain,
-// so the key never lands in a URL/query/log). Firmware is authoritative: it
-// re-decodes and validates server-side (never trusting the client), enforces
-// the endpoint allow-list, and only then persists. A malformed/disallowed
-// payload leaves existing stored credentials untouched. The plaintext key is
-// never serial-printed, echoed, or included in any response.
+// The last one-time code this session redeemed and stored successfully. A
+// phone can drop off the AP, or give up on its request, while the hub is still
+// talking to FieldMesh, and then retry the same code after the hub has already
+// stored its key. Without this the retry would report "code already used" for
+// a hub that is in fact connected. RAM only; a redeemed code is spent.
+static String sRedeemedExchangeToken;
+
+// Redeem a one-time exchange code for this hub's connection key over its own
+// LTE link (FM2). Blocking, like performManualUpload(): the modem powers on,
+// registers and makes one HTTPS POST — typically 30-90 s. Returns true with
+// `cred` populated only for a complete 2xx response that passed validation;
+// otherwise `message` is an operator-facing explanation that says whether the
+// code is still usable. Neither the code nor the key is ever logged: the
+// driver's response-body logging is switched off for the exchange and only
+// status/size facts are printed here.
+static bool redeemProvisioningToken(const ProvisioningPayload& prov,
+                                    RedeemedCredential& cred,
+                                    String& message) {
+  // The response carries a permanent credential, so it never travels in clear
+  // text — not even in a development build that widens the endpoint allow-list.
+  if (!prov.redemptionEndpoint.startsWith("https://")) {
+    message = "Provisioning requires an HTTPS endpoint";
+    return false;
+  }
+
+  ModemDriver modem;
+  modem.init();
+  {
+    SimSettings sim;
+    loadSimSettings(sim);
+    modem.configureApn(sim.apn, sim.apnUser, sim.apnPass);
+  }
+  modem.setResponseBodyLogging(false);
+
+  if (!modem.powerOn()) {
+    message = "Modem power-on failed. The code was not used — try again.";
+    return false;
+  }
+  if (!modem.waitForNetwork(60000)) {
+    modem.gracefulShutdown();
+    message = "No mobile network. Check the SIM, antenna and cellular settings, "
+              "then try again — the code was not used.";
+    return false;
+  }
+
+  const HttpsPostResult res = modem.httpsPost(
+      prov.redemptionEndpoint,
+      hwBuildRedemptionRequest(prov.exchangeToken, hwMacString()),
+      "application/json");
+  modem.gracefulShutdown();
+
+  Serial.printf("[PROVISION] redeem: http=%d complete=%d bodyLen=%u\n",
+                res.httpStatus, res.responseComplete ? 1 : 0,
+                (unsigned)res.responseBody.length());
+
+  // Without a complete response there is no telling whether FieldMesh saw the
+  // request, so the code may or may not be spent. (The driver's "assume
+  // success" statuses for an unparsed reply are deliberately not trusted here.)
+  if (!res.responseComplete) {
+    message = "FieldMesh did not answer over the mobile network. Try again — "
+              "if the code is then refused, create a new one on the dashboard.";
+    return false;
+  }
+  if (res.httpStatus == 401) {
+    message = "FieldMesh refused this code: it is invalid, expired or already "
+              "used. Create a new code on the dashboard.";
+    return false;
+  }
+  if (res.httpStatus == 408 || res.httpStatus == 429 || res.httpStatus >= 500) {
+    message = String("FieldMesh is temporarily unavailable (HTTP ") + res.httpStatus +
+              "). Try again in a minute — if the code is then refused, create a "
+              "new one on the dashboard.";
+    return false;
+  }
+  if (res.httpStatus < 200 || res.httpStatus >= 300) {
+    message = String("FieldMesh rejected the request (HTTP ") + res.httpStatus +
+              "). Create a new code on the dashboard and try again.";
+    return false;
+  }
+
+  const RedeemParseResult parsed = hwParseRedemptionResponse(res.responseBody, cred);
+  if (parsed != REDEEM_OK) {
+    // A 2xx means the code is spent, so retrying it cannot help.
+    Serial.printf("[PROVISION] redeem response rejected: %s\n", hwRedeemResultStr(parsed));
+    message = "FieldMesh sent a reply this FieldHub could not accept. Create a "
+              "new code on the dashboard and try again.";
+    return false;
+  }
+  return true;
+}
+
+// POST /provision-apply — body is the raw provisioning code (text/plain, so
+// neither a key nor a one-time code ever lands in a URL/query/log): an
+// "FM1.<base64url>" payload carrying the connection key, or an
+// "FM2.<base64url>" payload / bare "fmp_" code that is exchanged for the key
+// over LTE first. Firmware is authoritative: it re-decodes and validates
+// server-side (never trusting the client), enforces the endpoint allow-list
+// on both the code and the redemption reply, and only then persists. A
+// malformed/disallowed payload or a failed exchange leaves existing stored
+// credentials untouched. The plaintext key is never serial-printed, echoed, or
+// included in any response.
 static void handleProvisionApply() {
   String payload = server.hasArg("plain") ? server.arg("plain") : String("");
   payload.trim();
@@ -6524,9 +6660,30 @@ static void handleProvisionApply() {
     const char* msg =
         (r == PROV_ENDPOINT_NOT_ALLOWED) ? "Endpoint not approved for FieldMesh" :
         (r == PROV_BAD_VERSION)          ? "Unsupported provisioning code version" :
+        (r == PROV_HARDWARE_MISMATCH)    ? "This code was created for a different FieldHub" :
                                            "Provisioning code could not be read";
     sendAjaxResult(false, msg);
     return;
+  }
+
+  const bool exchange = (prov.kind == PROV_KIND_EXCHANGE);
+  String endpoint = prov.endpoint;
+  String connectionKey = prov.connectionKey;
+  if (exchange) {
+    if (sRedeemedExchangeToken.length() > 0 &&
+        prov.exchangeToken == sRedeemedExchangeToken) {
+      Serial.println("[PROVISION] code already redeemed this session — reporting stored connection");
+      sendAjaxResult(true, "Provisioned");
+      return;
+    }
+    RedeemedCredential cred;
+    String message;
+    if (!redeemProvisioningToken(prov, cred, message)) {
+      sendAjaxResult(false, message);
+      return;
+    }
+    endpoint = cred.endpoint;
+    connectionKey = cred.connectionKey;
   }
 
   // Apply onto existing settings: connectionKey -> Bearer apiKey, endpoint ->
@@ -6534,8 +6691,8 @@ static void handleProvisionApply() {
   // preserved. Only reached for a valid, approved payload.
   TransmissionSettings tx;
   loadTransmissionSettings(tx);
-  tx.endpointUrl = prov.endpoint;
-  tx.apiKey      = prov.connectionKey;
+  tx.endpointUrl = endpoint;
+  tx.apiKey      = connectionKey;
   tx.destinationMode = TX_DEST_FIELDMESH;
   // Auto-enable cloud upload on a successful provision. Applying a connection
   // key is an explicit "connect this hub" action, so there is no reason to make
@@ -6548,14 +6705,20 @@ static void handleProvisionApply() {
     // retry rather than reporting a connection that may not be stored.
     txRecoverAfterFailedSave();
     Serial.println("[PROVISION] save failed — credentials not stored");
-    sendAjaxResult(false, "Could not store the connection — try provisioning again");
+    // A redeemed one-time code is spent even though its key was lost here, so
+    // the operator needs a fresh one; an FM1 code can simply be applied again.
+    sendAjaxResult(false, exchange
+        ? "Could not store the connection — create a new code on the dashboard and try again"
+        : "Could not store the connection — try provisioning again");
     return;
   }
-  // Only a successfully persisted, valid FM1 payload clears the marker.
+  // Only a successfully persisted, valid credential clears the marker.
   txClearReprovisionRequired();
+  if (exchange) sRedeemedExchangeToken = prov.exchangeToken;
   // Log only non-secret facts — never the key.
-  Serial.printf("[PROVISION] applied: endpoint=%s keyLen=%u\n",
-                prov.endpoint.c_str(), (unsigned)prov.connectionKey.length());
+  Serial.printf("[PROVISION] applied (%s): endpoint=%s keyLen=%u\n",
+                exchange ? "one-time code" : "direct key",
+                endpoint.c_str(), (unsigned)connectionKey.length());
 
   gCloudConnectedThisSession = true;
   sendAjaxResult(true, "Provisioned");
