@@ -6362,8 +6362,17 @@ static String provisionWidgetHtml(const String& onSuccessJs) {
     // like one. Any other hash (a deep link, a stray '#') would otherwise land
     // the widget in an error state the operator never asked for and, on
     // /provision, may not even be looking at.
+    //
+    // The code is a secret, even a short-lived one, so it leaves the address
+    // bar and the browser history the moment it has been read — not only on
+    // success. An exchange takes up to two minutes and can fail or be
+    // abandoned; until then the page keeps the code in memory for retries.
+    // pvFromLink tells the host page a link brought the operator here, since
+    // the fragment it would otherwise check is gone by the time it runs.
     "var fragRaw=(location.hash||'').replace(/^#/,'');"
-    "if(/FM[12]\\./.test(fragRaw)){tryPayload(fragRaw);}"
+    "if(/FM[12]\\./.test(fragRaw)){window.pvFromLink=true;"
+    "if(history.replaceState){history.replaceState(null,'',location.pathname+location.search);}"
+    "tryPayload(fragRaw);}"
     "})();</script>");
   return h;
 }
@@ -6529,7 +6538,7 @@ static void handleProvisionPage() {
             "}).catch(function(){b.disabled=false;b.textContent=lab;"
             "document.getElementById('pv-sim-result').innerHTML=\"<span class='chip chip--bat-low' style='font-weight:600'>Network error</span>\";});});"
             "document.getElementById('pv-sim-skip').addEventListener('click',function(){show(3);});"
-            "show(/FM[12]\\./.test(location.hash||'')?3:1);"
+            "show(window.pvFromLink?3:1);"
             "})();</script>");
 
   html += copyHelperJs();

@@ -214,6 +214,24 @@ Outstanding hardware checks:
 9. **No truncation.** `/provision` still ends with `<!--FM-PAGE-END-->`: the
    page body grew by about 1.1 KB.
 10. **FM1 still works** until the dashboard switch-over is complete.
+11. **Code leaves the address bar.** After opening a scanned link the URL is
+    `/provision` with no fragment, before Connect now is pressed and after a
+    failed attempt; **Try again** still works.
+
+**Blocking for production — the modem does not authenticate the server.**
+Found in the 2026-10-11 review; it predates this change. `modem_driver.cpp`
+sets `AT+CSSLCFG="authmode",0,0` and `"ignorelocaltime",0,1` for uploads and
+for the OTA download, exactly as bring-up left it ("no cert verification" in
+`MOTHERSHIP_V1_BRINGUP_RESULTS_2026-06-19.md`). TLS therefore encrypts the link
+but does not prove the far end is FieldMesh. Anyone who can redirect a hub's
+traffic (a rogue base station, DNS) can read what it sends: today that is the
+permanent key on every upload, and with FM2 also the one-time code and the key
+it buys. FM2 does not make this worse, but it is the reason FM2's guarantees
+stop at the modem. Fixing it is bench work, not a code edit: load a CA bundle
+covering the host's issuers (`AT+CCERTDOWN`), switch to `authmode` 1, stop
+ignoring local time, and test valid, expired, wrong-host and wrong-CA
+certificates. Whether this modem firmware checks the hostname at all needs
+confirming first.
 
 Known gap, deliberately not addressed here: the setup AP still uses the shared
 `fieldmesh` WPA2 key and the portal has no authentication of its own, so anyone
