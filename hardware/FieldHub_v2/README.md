@@ -6,6 +6,7 @@ This directory contains the fabrication releases for the FieldHub/Hub v2 board.
 
 | Release | Contents | Review |
 |---|---|---|
+| `revisions/2026-10-10-r6` | **Printed five-board prototype release:** EasyEDA Pro project, Gerbers, BOM, and pick-and-place data | [Manufacturing release record](revisions/2026-10-10-r6/REVIEW.md) |
 | `revisions/2026-10-08-r2` | Separate same-day revision 2: EasyEDA Pro project, Gerbers, BOM, and pick-and-place data | [Engineering review](revisions/2026-10-08-r2/REVIEW.md) |
 | `revisions/2026-10-08` | EasyEDA Pro project, Gerbers, BOM, and pick-and-place data | [Engineering review](revisions/2026-10-08/REVIEW.md) |
 | `revisions/2026-10-07` | EasyEDA Pro project, Gerbers, BOM, and pick-and-place data | [Engineering review](revisions/2026-10-07/REVIEW.md) |

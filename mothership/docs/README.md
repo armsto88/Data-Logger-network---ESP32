@@ -7,6 +7,7 @@ Design, bring-up, implementation, and review documents for the ESP32-WROOM mothe
 ## Firmware architecture and implementation
 
 - [FIELDMESH_OTA_FIRMWARE_UPDATE_PLAN.md](FIELDMESH_OTA_FIRMWARE_UPDATE_PLAN.md) - detailed signed OTA and backend-queued control plan, including local/dashboard state mirroring and mothership-to-node distribution (see §0 for build/proven status).
+- [MOTHERSHIP_OTA_PRODUCTION_KEY_STATUS_2026-10-11.md](MOTHERSHIP_OTA_PRODUCTION_KEY_STATUS_2026-10-11.md) - production release key embedded and verified, version A flashed to the bench hub, version B built and signed but not published (blocked upstream); what was and was not confirmed.
 - [MOTHERSHIP_STATUS_REPORTING_PLAN.md](MOTHERSHIP_STATUS_REPORTING_PLAN.md) - tiered plan to report firmware identity, OTA state, control revision, and per-node firmware/desired-vs-applied into the cloud upload payload.
 - [MOTHERSHIP_V1_FIRMWARE_PLAN.md](MOTHERSHIP_V1_FIRMWARE_PLAN.md) - wake-gated firmware architecture.
 - [MOTHERSHIP_V1_DEPLOYMENT_UI_PLAN.md](MOTHERSHIP_V1_DEPLOYMENT_UI_PLAN.md) - deployment UI behaviour and state plan.

@@ -124,6 +124,12 @@ class ModemDriver {
                             const String& contentType = "text/csv",
                             const String& authToken = "");
 
+  // httpsPost() writes the decoded response body to the serial log, which is
+  // what makes a failed upload diagnosable on the bench. Turn that off before
+  // an exchange whose response carries a credential (connection-key
+  // redemption): status and byte counts still log, the content does not.
+  void setResponseBodyLogging(bool enabled) { m_logResponseBody = enabled; }
+
   // HTTPS GET that streams the response body to a callback instead of
   // buffering it, so a large (~1 MB) firmware image never lives in RAM at
   // once. HTTPS only (uses the CCH* TLS path); a non-https:// URL is rejected.
@@ -168,6 +174,7 @@ class ModemDriver {
   ModemState m_state = ModemState::OFF;
   String m_imei;
   bool m_uartStarted = false;
+  bool m_logResponseBody = true;
 
   // APN + optional carrier credentials. Defaulted in the constructor to the
   // value that used to be compiled in, so an unconfigured hub is unchanged.

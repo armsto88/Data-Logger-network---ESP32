@@ -127,8 +127,9 @@ Outstanding hardware checks:
    abort and pages read "unavailable", never zeros.
 6. **Copy control.** Android Chrome and iOS Safari: genuinely copies, or honestly
    reports the fallback. With JS disabled the MAC still selects as one value.
-7. **Fragment entry.** `/provision#FM1.<payload>` opens step 2 in its
-   confirmation state, not step 1.
+7. **Fragment entry.** `/provision#FM1.<payload>` opens the code step in its
+   confirmation state, not step 1. (The code step is step 3 since the one-time
+   provisioning change below moved cellular ahead of it.)
 8. **iOS scanning.** In-page scan hidden; the camera-app route offered as a
    normal option (WebKit's Barcode Detection issue is open, not a permanent
    absence).
@@ -154,6 +155,91 @@ Outstanding hardware checks:
     itself (fleet `last_seen` advancing) was not independently re-verified
     against the dashboard's own display — only that the readings landed and
     rendered as expected.
+
+## Planned — one-time (FM2) provisioning codes (not yet accepted)
+
+Landed in source and building clean as of 2026-10-11. **Nothing below has been
+run on hardware.** The dashboard side is implemented in `FieldMeshDashboard`
+but not deployed: it must not go live until a hub running this firmware has
+passed the checks here, because a dashboard that only issues FM2 codes cannot
+provision older firmware.
+
+What changed:
+
+- A dashboard QR is now `http://192.168.4.1/provision#FM2.<base64url-json>` with
+  `{"v":2,"redemptionEndpoint":"…/functions/v1/redeem-device-provisioning",
+  "token":"fmp_…","hardwareMac":"AA:BB:CC:DD:EE:FF"}`. It carries a ten-minute,
+  single-use code, never the permanent `fm_…` key. A bare `fmp_…` code can be
+  pasted instead. `FM1` payloads are still accepted during the transition.
+- On confirm, the hub powers its modem, POSTs
+  `{"token":"fmp_…","hardwareMac":"<its own MAC>"}` to the redemption URL, and
+  stores the `credential.endpoint` / `credential.key` from a `201` reply.
+- The code is rejected locally, before any LTE session, unless the redemption
+  URL is exactly the approved one (host **and** path) and `hardwareMac` is this
+  hub's MAC. The reply is rejected unless the key is `fm_…`-shaped and its
+  endpoint passes the ingest allow-list. Redemption is HTTPS-only, including in
+  `FM_ALLOW_ANY_ENDPOINT` development builds.
+- `ModemDriver::setResponseBodyLogging(false)` is set for the exchange: the
+  driver normally prints the response body to serial, and this body is the key.
+- `/provision` is now register → **cellular** → code → saved, because the code
+  step needs a working APN.
+
+Host-verified (not acceptance evidence): the `mothership-v2-test-identity`
+suite runs to 94/94 against a g++ Arduino shim, including the exact fragment
+the dashboard's encoder emits; the page script was driven in jsdom.
+
+Outstanding hardware checks:
+
+1. **Suite on device.** `pio run -e mothership-v2-test-identity -t upload`
+   reports `PASS (failures=0)`.
+2. **End to end.** With a local or staging backend that issues FM2 codes, scan
+   the dashboard QR → Connect now → "Connection saved"; the next sync uploads
+   with the redeemed key and `last_seen` advances for that FieldHub.
+3. **No secret on serial.** Capture the whole session. The log shows
+   `entity body withheld` and `[PROVISION] applied (one-time code)`; it contains
+   neither the `fmp_…` code nor any `fm_…` key.
+4. **Replay.** Confirming the same code again after a reboot is refused with the
+   "invalid, expired or already used" message and leaves the stored key intact.
+5. **Wrong hub.** A code issued for another FieldHub is refused immediately with
+   "created for a different FieldHub" — the modem does not power on.
+6. **No network.** With the antenna removed or a wrong APN, the page reports
+   "No mobile network … the code was not used"; fix the APN via Back → cellular,
+   then **Try again** succeeds with the same code.
+7. **Lost phone.** Leave the AP during "Contacting FieldMesh…", rejoin, and tap
+   **Try again**: the page reports success (the hub remembers the code it just
+   redeemed) rather than "already used".
+8. **Request duration.** Time the confirm → result round trip on iOS Safari and
+   Android Chrome with cold registration. If a phone gives up before the hub
+   answers, check 7 is the recovery path; note the worst case seen.
+9. **No truncation.** `/provision` still ends with `<!--FM-PAGE-END-->`: the
+   page body grew by about 1.1 KB.
+10. **FM1 still works** until the dashboard switch-over is complete.
+11. **Code leaves the address bar.** After opening a scanned link the URL is
+    `/provision` with no fragment, before Connect now is pressed and after a
+    failed attempt; **Try again** still works.
+
+**Blocking for production — the modem does not authenticate the server.**
+Found in the 2026-10-11 review; it predates this change. `modem_driver.cpp`
+sets `AT+CSSLCFG="authmode",0,0` and `"ignorelocaltime",0,1` for uploads and
+for the OTA download, exactly as bring-up left it ("no cert verification" in
+`MOTHERSHIP_V1_BRINGUP_RESULTS_2026-06-19.md`). TLS therefore encrypts the link
+but does not prove the far end is FieldMesh. Anyone who can redirect a hub's
+traffic (a rogue base station, DNS) can read what it sends: today that is the
+permanent key on every upload, and with FM2 also the one-time code and the key
+it buys. FM2 does not make this worse, but it is the reason FM2's guarantees
+stop at the modem. Fixing it is bench work, not a code edit: load a CA bundle
+covering the host's issuers (`AT+CCERTDOWN`), switch to `authmode` 1, stop
+ignoring local time, and test valid, expired, wrong-host and wrong-CA
+certificates. Whether this modem firmware checks the hostname at all needs
+confirming first.
+
+Known gap, deliberately not addressed here: the setup AP still uses the shared
+`fieldmesh` WPA2 key and the portal has no authentication of its own, so anyone
+in Wi-Fi range of a hub in setup mode can reach every portal route. The
+dashboard repository's remediation plan asks for a per-device setup password; a
+compile-time password cannot be per-device once one signed OTA image serves the
+fleet, so that needs its own design (where the secret comes from, how the
+operator learns it, how it survives OTA).
 
 ## Acceptance evidence
 

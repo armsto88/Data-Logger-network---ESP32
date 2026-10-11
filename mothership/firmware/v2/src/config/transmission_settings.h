@@ -130,8 +130,8 @@ bool txRecoverAfterFailedSave();
 // false on every later boot. Without a separate durable marker the operator
 // warning would render once and then silently vanish.
 //
-// It is cleared in exactly one place: a successfully persisted, valid FM1
-// provisioning payload.
+// It is cleared in exactly one place: /provision-apply, after a valid
+// provisioning code (FM1 payload or redeemed FM2 code) has been persisted.
 
 // True while this hub is stuck pending re-provisioning.
 bool txReprovisionRequired();
@@ -153,7 +153,7 @@ void txSetReprovisionRequired(const char* reason,
                               const String& host,
                               const String& keyPrefix);
 
-// Clear the marker. Only call after a valid FM1 payload has been persisted.
+// Clear the marker. Only call after a valid provisioning code has been persisted.
 void txClearReprovisionRequired();
 
 #ifdef TX_TEST_NVS_FAILURE_HOOK
