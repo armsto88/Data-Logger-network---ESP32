@@ -19,6 +19,7 @@ Design notes, hardware checklists, sensor implementation records, and bring-up r
 
 - [NODE-LOCAL-STORAGE-CONTRACT-V1.md](NODE-LOCAL-STORAGE-CONTRACT-V1.md) - queue invariants, recovery, capacity, and tests.
 - [NODE_ROBUSTNESS_FIX_PROMPTS.md](NODE_ROBUSTNESS_FIX_PROMPTS.md) - historical task-level robustness instructions retained for traceability.
+- [NODE_NEXT_VERSION_NOTES.md](NODE_NEXT_VERSION_NOTES.md) - running list of observations to fold into the next node firmware version.
 
 ## Sensors
 
