@@ -879,13 +879,17 @@ bool ModemDriver::httpsPostSSL(const String& host, int port,
                   static_cast<unsigned long>(declaredResponseBytes),
                   static_cast<unsigned>(result.responseBody.length()),
                   result.success ? "YES" : "NO");
-    const size_t logLength =
-        result.responseBody.length() > 4096 ? 4096 : result.responseBody.length();
-    Serial.printf("[Modem] SSL HTTP entity body (%u/%u bytes): %s%s\n",
-                  static_cast<unsigned>(logLength),
-                  static_cast<unsigned>(result.responseBody.length()),
-                  result.responseBody.substring(0, logLength).c_str(),
-                  logLength < result.responseBody.length() ? "..." : "");
+    if (m_logResponseBody) {
+      const size_t logLength =
+          result.responseBody.length() > 4096 ? 4096 : result.responseBody.length();
+      Serial.printf("[Modem] SSL HTTP entity body (%u/%u bytes): %s%s\n",
+                    static_cast<unsigned>(logLength),
+                    static_cast<unsigned>(result.responseBody.length()),
+                    result.responseBody.substring(0, logLength).c_str(),
+                    logLength < result.responseBody.length() ? "..." : "");
+    } else {
+      Serial.println("[Modem] SSL HTTP entity body withheld from the log (credential exchange)");
+    }
   } else if (gotCchRecv && !peerClosed) {
     // Got data but couldn't parse status — assume success (conservative)
     result.responseBody = resp;
