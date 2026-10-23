@@ -1,0 +1,33 @@
+# board HUB-R6-01  test ads1015  env mothership-v2-bringup-ads1015
+# commit 8d5a6a5 (firmware tree dirty: no)  port /dev/serial/by-id/usb-1a86_USB_Serial-if00-port0  started 2026-10-23T15:24:19
+[    0.023] ## ads1015: ADS1015 config, AIN0-3 convert + noise
+[    0.023] ## type a line + Enter to send it to the board; Ctrl-C ends the session
+[    0.023] ## reset via DTR pulse (needs SW10 in USB service position)
+[    0.197] ets Jul 29 2019 12:21:46
+[    0.197] 
+[    0.197] rst:0x1 (POWERON_RESET),boot:0x13 (SPI_FAST_FLASH_BOOT)
+[    0.197] configsip: 0, SPIWP:0xee
+[    0.197] clk_drv:0x00,q_drv:0x00,d_drv:0x00,cs0_drv:0x00,hd_drv:0x00,wp_drv:0x00
+[    0.197] mode:DIO, clock div:2
+[    0.197] load:0x3fff0030,len:1184
+[    0.197] load:0x40078000,len:13232
+[    0.197] load:0x40080400,len:3028
+[    0.197] entry 0x400805e4
+[    0.648] 
+[    0.648] === FieldHub v2 r6 bring-up: ADS1015 analogue inputs ===
+[    0.648] build Oct 23 2026 15:24:10
+[    0.698] AIN0=CN15.4 AIN1=CN15.3 AIN2=CN16.3 AIN3=CN16.4, PGA +/-6.144 V, 3 mV/LSB
+[    0.698] Send Enter to start (auto-start in 15 s)...
+[    0.749] RESULT|ADS_ACK_0x48|PASS|endTransmission=0 (needs 5V_SYS for U29/U30)
+[    0.749]   config at start = 0x8583 (power-on default 0x8583)
+[    0.749] RESULT|ADS_CONFIG_RW|PASS|wrote 0x5383/0x6183, read 0xD383/0xE183
+[    0.899] RESULT|ADS_A0_CONVERT|PASS|CN15.4: ok, mean 14 mV (1..5 LSB)
+[    0.899] RESULT|ADS_A0_NOISE|PASS|CN15.4: 4 LSB p-p over 64 samples (12 mV, limit 4 LSB)
+[    1.050] RESULT|ADS_A1_CONVERT|PASS|CN15.3: ok, mean 14 mV (0..5 LSB)
+[    1.050] RESULT|ADS_A1_NOISE|FAIL|CN15.3: 5 LSB p-p over 64 samples (15 mV, limit 4 LSB)
+[    1.200] RESULT|ADS_A2_CONVERT|PASS|CN16.3: ok, mean 14 mV (0..5 LSB)
+[    1.200] RESULT|ADS_A2_NOISE|FAIL|CN16.3: 5 LSB p-p over 64 samples (15 mV, limit 4 LSB)
+[    1.300] RESULT|ADS_A3_CONVERT|PASS|CN16.4: ok, mean 14 mV (0..5 LSB)
+[    1.351] RESULT|ADS_A3_NOISE|FAIL|CN16.4: 5 LSB p-p over 64 samples (15 mV, limit 4 LSB)
+[    1.351] RESULT|SUMMARY|7/10|OVERALL:FAIL
+[    1.351] Commands: r = re-run | c = stream | p <ch> <mV> = reference point check

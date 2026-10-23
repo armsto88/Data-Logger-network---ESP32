@@ -1,0 +1,930 @@
+# board HUB-R6-01  test sd-nocard  env mothership-v2-bringup-sd-sweep
+# commit 8d5a6a5 (firmware tree dirty: yes)  port /dev/serial/by-id/usb-1a86_USB_Serial-if00-port0  started 2026-10-23T16:06:31
+# note: card removed; vendored SD lib
+[    0.023] ## sd-nocard: card removed: no mount, each attempt fails < 3 s
+[    0.024] ## type a line + Enter to send it to the board; Ctrl-C ends the session
+[    0.024] ## run 1/25
+[    0.024] ## reset via DTR pulse (needs SW10 in USB service position)
+[    0.197] ets Jul 29 2019 12:21:46
+[    0.197] 
+[    0.197] rst:0x1 (POWERON_RESET),boot:0x13 (SPI_FAST_FLASH_BOOT)
+[    0.197] configsip: 0, SPIWP:0xee
+[    0.197] clk_drv:0x00,q_drv:0x00,d_drv:0x00,cs0_drv:0x00,hd_drv:0x00,wp_drv:0x00
+[    0.197] mode:DIO, clock div:2
+[    0.197] load:0x3fff0030,len:1184
+[    0.197] load:0x40078000,len:13232
+[    0.197] load:0x40080400,len:3028
+[    0.197] entry 0x400805e4
+[    0.648] 
+[    0.698] === FieldHub v2 r6 bring-up: microSD speed sweep ===
+[    0.698] build Oct 23 2026 15:46:00
+[    0.698] CS=13 SCK=18 MISO=19 MOSI=23, VSPI, 128 KiB per speed, 3 mounts per speed
+[    0.698] Send Enter to start (auto-start in 15 s)...
+[    1.049] [   682][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[    1.049] [   688][E][sd_diskio.cpp:809] sdcard_mount(): f_mount failed: (3) The physical drive cannot work
+[    1.350] [  1000][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[    1.651] [  1310][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[    1.701] [  1316][E][sd_diskio.cpp:809] sdcard_mount(): f_mount failed: (3) The physical drive cannot work
+[    2.002] [  1625][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[    2.303] [  1935][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[    2.303] [  1941][E][sd_diskio.cpp:809] sdcard_mount(): f_mount failed: (3) The physical drive cannot work
+[    2.604] [  2250][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[    2.905] [  2560][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[    2.905] [  2566][E][sd_diskio.cpp:809] sdcard_mount(): f_mount failed: (3) The physical drive cannot work
+[    3.256] [  2875][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[    3.557] [  3185][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[    3.557] [  3191][E][sd_diskio.cpp:809] sdcard_mount(): f_mount failed: (3) The physical drive cannot work
+[    3.858] [  3500][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[    3.858] RESULT|SD_NO_CARD_DETECTED|PASS|0/5 speeds mounted with the card supposedly removed
+[    3.858] RESULT|SD_NO_CARD_FAST_FAIL|PASS|worst failed mount took 628 ms (limit 3000 ms)
+[    3.858] RESULT|SUMMARY|2/2|OVERALL:PASS
+[    3.908] Commands: r = re-run sweep | n = no-card check | p <kHz> = probe loop | ? = help
+[    4.861] ## run 1: PASS
+[    4.861] ## run 2/25
+[    4.861] ## reset via DTR pulse (needs SW10 in USB service position)
+[    5.034] ets Jul 29 2019 12:21:46
+[    5.034] 
+[    5.034] rst:0x1 (POWERON_RESET),boot:0x13 (SPI_FAST_FLASH_BOOT)
+[    5.034] configsip: 0, SPIWP:0xee
+[    5.034] clk_drv:0x00,q_drv:0x00,d_drv:0x00,cs0_drv:0x00,hd_drv:0x00,wp_drv:0x00
+[    5.034] mode:DIO, clock div:2
+[    5.034] load:0x3fff0030,len:1184
+[    5.034] load:0x40078000,len:13232
+[    5.034] load:0x40080400,len:3028
+[    5.034] entry 0x400805e4
+[    5.485] 
+[    5.536] === FieldHub v2 r6 bring-up: microSD speed sweep ===
+[    5.536] build Oct 23 2026 15:46:00
+[    5.536] CS=13 SCK=18 MISO=19 MOSI=23, VSPI, 128 KiB per speed, 3 mounts per speed
+[    5.536] Send Enter to start (auto-start in 15 s)...
+[    5.887] [   682][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[    5.887] [   688][E][sd_diskio.cpp:809] sdcard_mount(): f_mount failed: (3) The physical drive cannot work
+[    6.188] [  1000][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[    6.489] [  1310][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[    6.489] [  1316][E][sd_diskio.cpp:809] sdcard_mount(): f_mount failed: (3) The physical drive cannot work
+[    6.840] [  1625][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[    7.141] [  1935][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[    7.141] [  1941][E][sd_diskio.cpp:809] sdcard_mount(): f_mount failed: (3) The physical drive cannot work
+[    7.442] [  2250][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[    7.743] [  2560][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[    7.743] [  2566][E][sd_diskio.cpp:809] sdcard_mount(): f_mount failed: (3) The physical drive cannot work
+[    8.094] [  2875][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[    8.395] [  3185][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[    8.395] [  3191][E][sd_diskio.cpp:809] sdcard_mount(): f_mount failed: (3) The physical drive cannot work
+[    8.696] [  3500][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[    8.696] RESULT|SD_NO_CARD_DETECTED|PASS|0/5 speeds mounted with the card supposedly removed
+[    8.696] RESULT|SD_NO_CARD_FAST_FAIL|PASS|worst failed mount took 628 ms (limit 3000 ms)
+[    8.696] RESULT|SUMMARY|2/2|OVERALL:PASS
+[    8.696] Commands: r = re-run sweep | n = no-card check | p <kHz> = probe loop | ? = help
+[    9.699] ## run 2: PASS
+[    9.699] ## run 3/25
+[    9.699] ## reset via DTR pulse (needs SW10 in USB service position)
+[    9.871] ets Jul 29 2019 12:21:46
+[    9.872] 
+[    9.872] rst:0x1 (POWERON_RESET),boot:0x13 (SPI_FAST_FLASH_BOOT)
+[    9.872] configsip: 0, SPIWP:0xee
+[    9.872] clk_drv:0x00,q_drv:0x00,d_drv:0x00,cs0_drv:0x00,hd_drv:0x00,wp_drv:0x00
+[    9.872] mode:DIO, clock div:2
+[    9.872] load:0x3fff0030,len:1184
+[    9.872] load:0x40078000,len:13232
+[    9.872] load:0x40080400,len:3028
+[    9.872] entry 0x400805e4
+[   10.323] 
+[   10.323] === FieldHub v2 r6 bring-up: microSD speed sweep ===
+[   10.373] build Oct 23 2026 15:46:00
+[   10.374] CS=13 SCK=18 MISO=19 MOSI=23, VSPI, 128 KiB per speed, 3 mounts per speed
+[   10.374] Send Enter to start (auto-start in 15 s)...
+[   10.724] [   682][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[   10.725] [   688][E][sd_diskio.cpp:809] sdcard_mount(): f_mount failed: (3) The physical drive cannot work
+[   11.025] [  1000][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[   11.326] [  1310][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[   11.377] [  1316][E][sd_diskio.cpp:809] sdcard_mount(): f_mount failed: (3) The physical drive cannot work
+[   11.678] [  1625][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[   11.979] [  1935][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[   11.979] [  1941][E][sd_diskio.cpp:809] sdcard_mount(): f_mount failed: (3) The physical drive cannot work
+[   12.280] [  2250][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[   12.580] [  2560][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[   12.580] [  2566][E][sd_diskio.cpp:809] sdcard_mount(): f_mount failed: (3) The physical drive cannot work
+[   12.931] [  2875][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[   13.232] [  3185][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[   13.232] [  3191][E][sd_diskio.cpp:809] sdcard_mount(): f_mount failed: (3) The physical drive cannot work
+[   13.533] [  3500][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[   13.533] RESULT|SD_NO_CARD_DETECTED|PASS|0/5 speeds mounted with the card supposedly removed
+[   13.533] RESULT|SD_NO_CARD_FAST_FAIL|PASS|worst failed mount took 628 ms (limit 3000 ms)
+[   13.533] RESULT|SUMMARY|2/2|OVERALL:PASS
+[   13.534] Commands: r = re-run sweep | n = no-card check | p <kHz> = probe loop | ? = help
+[   14.537] ## run 3: PASS
+[   14.537] ## run 4/25
+[   14.537] ## reset via DTR pulse (needs SW10 in USB service position)
+[   14.708] ets Jul 29 2019 12:21:46
+[   14.708] 
+[   14.708] rst:0x1 (POWERON_RESET),boot:0x13 (SPI_FAST_FLASH_BOOT)
+[   14.708] configsip: 0, SPIWP:0xee
+[   14.708] clk_drv:0x00,q_drv:0x00,d_drv:0x00,cs0_drv:0x00,hd_drv:0x00,wp_drv:0x00
+[   14.708] mode:DIO, clock div:2
+[   14.708] load:0x3fff0030,len:1184
+[   14.708] load:0x40078000,len:13232
+[   14.708] load:0x40080400,len:3028
+[   14.708] entry 0x400805e4
+[   15.160] 
+[   15.210] === FieldHub v2 r6 bring-up: microSD speed sweep ===
+[   15.210] build Oct 23 2026 15:46:00
+[   15.210] CS=13 SCK=18 MISO=19 MOSI=23, VSPI, 128 KiB per speed, 3 mounts per speed
+[   15.210] Send Enter to start (auto-start in 15 s)...
+[   15.561] [   682][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[   15.561] [   688][E][sd_diskio.cpp:809] sdcard_mount(): f_mount failed: (3) The physical drive cannot work
+[   15.862] [  1000][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[   16.163] [  1310][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[   16.214] [  1316][E][sd_diskio.cpp:809] sdcard_mount(): f_mount failed: (3) The physical drive cannot work
+[   16.515] [  1625][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[   16.816] [  1935][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[   16.816] [  1941][E][sd_diskio.cpp:809] sdcard_mount(): f_mount failed: (3) The physical drive cannot work
+[   17.116] [  2250][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[   17.417] [  2560][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[   17.417] [  2566][E][sd_diskio.cpp:809] sdcard_mount(): f_mount failed: (3) The physical drive cannot work
+[   17.768] [  2875][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[   18.069] [  3185][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[   18.069] [  3191][E][sd_diskio.cpp:809] sdcard_mount(): f_mount failed: (3) The physical drive cannot work
+[   18.370] [  3500][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[   18.370] RESULT|SD_NO_CARD_DETECTED|PASS|0/5 speeds mounted with the card supposedly removed
+[   18.371] RESULT|SD_NO_CARD_FAST_FAIL|PASS|worst failed mount took 628 ms (limit 3000 ms)
+[   18.371] RESULT|SUMMARY|2/2|OVERALL:PASS
+[   18.371] Commands: r = re-run sweep | n = no-card check | p <kHz> = probe loop | ? = help
+[   19.373] ## run 4: PASS
+[   19.373] ## run 5/25
+[   19.373] ## reset via DTR pulse (needs SW10 in USB service position)
+[   19.545] ets Jul 29 2019 12:21:46
+[   19.545] 
+[   19.545] rst:0x1 (POWERON_RESET),boot:0x13 (SPI_FAST_FLASH_BOOT)
+[   19.545] configsip: 0, SPIWP:0xee
+[   19.545] clk_drv:0x00,q_drv:0x00,d_drv:0x00,cs0_drv:0x00,hd_drv:0x00,wp_drv:0x00
+[   19.545] mode:DIO, clock div:2
+[   19.545] load:0x3fff0030,len:1184
+[   19.545] load:0x40078000,len:13232
+[   19.545] load:0x40080400,len:3028
+[   19.545] entry 0x400805e4
+[   19.997] 
+[   20.047] === FieldHub v2 r6 bring-up: microSD speed sweep ===
+[   20.047] build Oct 23 2026 15:46:00
+[   20.047] CS=13 SCK=18 MISO=19 MOSI=23, VSPI, 128 KiB per speed, 3 mounts per speed
+[   20.047] Send Enter to start (auto-start in 15 s)...
+[   20.398] [   682][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[   20.398] [   688][E][sd_diskio.cpp:809] sdcard_mount(): f_mount failed: (3) The physical drive cannot work
+[   20.699] [  1000][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[   21.000] [  1310][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[   21.050] [  1316][E][sd_diskio.cpp:809] sdcard_mount(): f_mount failed: (3) The physical drive cannot work
+[   21.351] [  1625][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[   21.652] [  1935][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[   21.652] [  1941][E][sd_diskio.cpp:809] sdcard_mount(): f_mount failed: (3) The physical drive cannot work
+[   21.952] [  2250][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[   22.253] [  2560][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[   22.253] [  2566][E][sd_diskio.cpp:809] sdcard_mount(): f_mount failed: (3) The physical drive cannot work
+[   22.604] [  2875][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[   22.905] [  3185][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[   22.905] [  3191][E][sd_diskio.cpp:809] sdcard_mount(): f_mount failed: (3) The physical drive cannot work
+[   23.206] [  3500][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[   23.206] RESULT|SD_NO_CARD_DETECTED|PASS|0/5 speeds mounted with the card supposedly removed
+[   23.206] RESULT|SD_NO_CARD_FAST_FAIL|PASS|worst failed mount took 628 ms (limit 3000 ms)
+[   23.207] RESULT|SUMMARY|2/2|OVERALL:PASS
+[   23.257] Commands: r = re-run sweep | n = no-card check | p <kHz> = probe loop | ? = help
+[   24.209] ## run 5: PASS
+[   24.209] ## run 6/25
+[   24.209] ## reset via DTR pulse (needs SW10 in USB service position)
+[   24.381] ets Jul 29 2019 12:21:46
+[   24.381] 
+[   24.381] rst:0x1 (POWERON_RESET),boot:0x13 (SPI_FAST_FLASH_BOOT)
+[   24.381] configsip: 0, SPIWP:0xee
+[   24.381] clk_drv:0x00,q_drv:0x00,d_drv:0x00,cs0_drv:0x00,hd_drv:0x00,wp_drv:0x00
+[   24.381] mode:DIO, clock div:2
+[   24.381] load:0x3fff0030,len:1184
+[   24.381] load:0x40078000,len:13232
+[   24.381] load:0x40080400,len:3028
+[   24.381] entry 0x400805e4
+[   24.832] 
+[   24.883] === FieldHub v2 r6 bring-up: microSD speed sweep ===
+[   24.883] build Oct 23 2026 15:46:00
+[   24.883] CS=13 SCK=18 MISO=19 MOSI=23, VSPI, 128 KiB per speed, 3 mounts per speed
+[   24.883] Send Enter to start (auto-start in 15 s)...
+[   25.234] [   682][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[   25.234] [   688][E][sd_diskio.cpp:809] sdcard_mount(): f_mount failed: (3) The physical drive cannot work
+[   25.535] [  1000][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[   25.835] [  1310][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[   25.886] [  1316][E][sd_diskio.cpp:809] sdcard_mount(): f_mount failed: (3) The physical drive cannot work
+[   26.186] [  1625][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[   26.487] [  1935][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[   26.487] [  1941][E][sd_diskio.cpp:809] sdcard_mount(): f_mount failed: (3) The physical drive cannot work
+[   26.788] [  2250][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[   27.089] [  2560][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[   27.089] [  2566][E][sd_diskio.cpp:809] sdcard_mount(): f_mount failed: (3) The physical drive cannot work
+[   27.440] [  2875][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[   27.741] [  3185][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[   27.741] [  3191][E][sd_diskio.cpp:809] sdcard_mount(): f_mount failed: (3) The physical drive cannot work
+[   28.042] [  3500][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[   28.042] RESULT|SD_NO_CARD_DETECTED|PASS|0/5 speeds mounted with the card supposedly removed
+[   28.042] RESULT|SD_NO_CARD_FAST_FAIL|PASS|worst failed mount took 628 ms (limit 3000 ms)
+[   28.042] RESULT|SUMMARY|2/2|OVERALL:PASS
+[   28.093] Commands: r = re-run sweep | n = no-card check | p <kHz> = probe loop | ? = help
+[   29.045] ## run 6: PASS
+[   29.045] ## run 7/25
+[   29.045] ## reset via DTR pulse (needs SW10 in USB service position)
+[   29.217] ets Jul 29 2019 12:21:46
+[   29.217] 
+[   29.217] rst:0x1 (POWERON_RESET),boot:0x13 (SPI_FAST_FLASH_BOOT)
+[   29.217] configsip: 0, SPIWP:0xee
+[   29.217] clk_drv:0x00,q_drv:0x00,d_drv:0x00,cs0_drv:0x00,hd_drv:0x00,wp_drv:0x00
+[   29.217] mode:DIO, clock div:2
+[   29.217] load:0x3fff0030,len:1184
+[   29.217] load:0x40078000,len:13232
+[   29.217] load:0x40080400,len:3028
+[   29.217] entry 0x400805e4
+[   29.668] 
+[   29.718] === FieldHub v2 r6 bring-up: microSD speed sweep ===
+[   29.718] build Oct 23 2026 15:46:00
+[   29.718] CS=13 SCK=18 MISO=19 MOSI=23, VSPI, 128 KiB per speed, 3 mounts per speed
+[   29.719] Send Enter to start (auto-start in 15 s)...
+[   30.069] [   682][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[   30.070] [   688][E][sd_diskio.cpp:809] sdcard_mount(): f_mount failed: (3) The physical drive cannot work
+[   30.370] [  1000][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[   30.671] [  1310][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[   30.721] [  1316][E][sd_diskio.cpp:809] sdcard_mount(): f_mount failed: (3) The physical drive cannot work
+[   31.022] [  1625][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[   31.323] [  1935][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[   31.323] [  1941][E][sd_diskio.cpp:809] sdcard_mount(): f_mount failed: (3) The physical drive cannot work
+[   31.624] [  2250][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[   31.925] [  2560][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[   31.925] [  2566][E][sd_diskio.cpp:809] sdcard_mount(): f_mount failed: (3) The physical drive cannot work
+[   32.276] [  2875][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[   32.577] [  3185][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[   32.577] [  3191][E][sd_diskio.cpp:809] sdcard_mount(): f_mount failed: (3) The physical drive cannot work
+[   32.877] [  3500][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[   32.877] RESULT|SD_NO_CARD_DETECTED|PASS|0/5 speeds mounted with the card supposedly removed
+[   32.878] RESULT|SD_NO_CARD_FAST_FAIL|PASS|worst failed mount took 628 ms (limit 3000 ms)
+[   32.878] RESULT|SUMMARY|2/2|OVERALL:PASS
+[   32.928] Commands: r = re-run sweep | n = no-card check | p <kHz> = probe loop | ? = help
+[   33.880] ## run 7: PASS
+[   33.880] ## run 8/25
+[   33.880] ## reset via DTR pulse (needs SW10 in USB service position)
+[   34.052] ets Jul 29 2019 12:21:46
+[   34.052] 
+[   34.052] rst:0x1 (POWERON_RESET),boot:0x13 (SPI_FAST_FLASH_BOOT)
+[   34.052] configsip: 0, SPIWP:0xee
+[   34.052] clk_drv:0x00,q_drv:0x00,d_drv:0x00,cs0_drv:0x00,hd_drv:0x00,wp_drv:0x00
+[   34.052] mode:DIO, clock div:2
+[   34.052] load:0x3fff0030,len:1184
+[   34.052] load:0x40078000,len:13232
+[   34.052] load:0x40080400,len:3028
+[   34.052] entry 0x400805e4
+[   34.504] 
+[   34.504] === FieldHub v2 r6 bring-up: microSD speed sweep ===
+[   34.554] build Oct 23 2026 15:46:00
+[   34.554] CS=13 SCK=18 MISO=19 MOSI=23, VSPI, 128 KiB per speed, 3 mounts per speed
+[   34.554] Send Enter to start (auto-start in 15 s)...
+[   34.905] [   682][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[   34.906] [   688][E][sd_diskio.cpp:809] sdcard_mount(): f_mount failed: (3) The physical drive cannot work
+[   35.206] [  1000][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[   35.507] [  1310][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[   35.558] [  1316][E][sd_diskio.cpp:809] sdcard_mount(): f_mount failed: (3) The physical drive cannot work
+[   35.859] [  1625][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[   36.160] [  1935][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[   36.160] [  1941][E][sd_diskio.cpp:809] sdcard_mount(): f_mount failed: (3) The physical drive cannot work
+[   36.461] [  2250][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[   36.762] [  2560][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[   36.762] [  2566][E][sd_diskio.cpp:809] sdcard_mount(): f_mount failed: (3) The physical drive cannot work
+[   37.113] [  2875][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[   37.414] [  3185][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[   37.414] [  3191][E][sd_diskio.cpp:809] sdcard_mount(): f_mount failed: (3) The physical drive cannot work
+[   37.715] [  3500][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[   37.715] RESULT|SD_NO_CARD_DETECTED|PASS|0/5 speeds mounted with the card supposedly removed
+[   37.715] RESULT|SD_NO_CARD_FAST_FAIL|PASS|worst failed mount took 628 ms (limit 3000 ms)
+[   37.715] RESULT|SUMMARY|2/2|OVERALL:PASS
+[   37.715] Commands: r = re-run sweep | n = no-card check | p <kHz> = probe loop | ? = help
+[   38.718] ## run 8: PASS
+[   38.718] ## run 9/25
+[   38.718] ## reset via DTR pulse (needs SW10 in USB service position)
+[   38.890] ets Jul 29 2019 12:21:46
+[   38.890] 
+[   38.890] rst:0x1 (POWERON_RESET),boot:0x13 (SPI_FAST_FLASH_BOOT)
+[   38.890] configsip: 0, SPIWP:0xee
+[   38.890] clk_drv:0x00,q_drv:0x00,d_drv:0x00,cs0_drv:0x00,hd_drv:0x00,wp_drv:0x00
+[   38.890] mode:DIO, clock div:2
+[   38.890] load:0x3fff0030,len:1184
+[   38.890] load:0x40078000,len:13232
+[   38.890] load:0x40080400,len:3028
+[   38.890] entry 0x400805e4
+[   39.341] 
+[   39.391] === FieldHub v2 r6 bring-up: microSD speed sweep ===
+[   39.391] build Oct 23 2026 15:46:00
+[   39.391] CS=13 SCK=18 MISO=19 MOSI=23, VSPI, 128 KiB per speed, 3 mounts per speed
+[   39.391] Send Enter to start (auto-start in 15 s)...
+[   39.742] [   682][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[   39.742] [   688][E][sd_diskio.cpp:809] sdcard_mount(): f_mount failed: (3) The physical drive cannot work
+[   40.043] [  1000][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[   40.344] [  1310][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[   40.394] [  1316][E][sd_diskio.cpp:809] sdcard_mount(): f_mount failed: (3) The physical drive cannot work
+[   40.695] [  1625][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[   40.996] [  1935][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[   40.996] [  1941][E][sd_diskio.cpp:809] sdcard_mount(): f_mount failed: (3) The physical drive cannot work
+[   41.297] [  2250][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[   41.598] [  2560][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[   41.598] [  2566][E][sd_diskio.cpp:809] sdcard_mount(): f_mount failed: (3) The physical drive cannot work
+[   41.949] [  2875][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[   42.250] [  3185][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[   42.250] [  3191][E][sd_diskio.cpp:809] sdcard_mount(): f_mount failed: (3) The physical drive cannot work
+[   42.551] [  3500][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[   42.551] RESULT|SD_NO_CARD_DETECTED|PASS|0/5 speeds mounted with the card supposedly removed
+[   42.551] RESULT|SD_NO_CARD_FAST_FAIL|PASS|worst failed mount took 628 ms (limit 3000 ms)
+[   42.551] RESULT|SUMMARY|2/2|OVERALL:PASS
+[   42.551] Commands: r = re-run sweep | n = no-card check | p <kHz> = probe loop | ? = help
+[   43.554] ## run 9: PASS
+[   43.554] ## run 10/25
+[   43.554] ## reset via DTR pulse (needs SW10 in USB service position)
+[   43.727] ets Jul 29 2019 12:21:46
+[   43.727] 
+[   43.727] rst:0x1 (POWERON_RESET),boot:0x13 (SPI_FAST_FLASH_BOOT)
+[   43.727] configsip: 0, SPIWP:0xee
+[   43.727] clk_drv:0x00,q_drv:0x00,d_drv:0x00,cs0_drv:0x00,hd_drv:0x00,wp_drv:0x00
+[   43.727] mode:DIO, clock div:2
+[   43.727] load:0x3fff0030,len:1184
+[   43.727] load:0x40078000,len:13232
+[   43.727] load:0x40080400,len:3028
+[   43.727] entry 0x400805e4
+[   44.178] 
+[   44.228] === FieldHub v2 r6 bring-up: microSD speed sweep ===
+[   44.228] build Oct 23 2026 15:46:00
+[   44.228] CS=13 SCK=18 MISO=19 MOSI=23, VSPI, 128 KiB per speed, 3 mounts per speed
+[   44.228] Send Enter to start (auto-start in 15 s)...
+[   44.580] [   682][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[   44.580] [   688][E][sd_diskio.cpp:809] sdcard_mount(): f_mount failed: (3) The physical drive cannot work
+[   44.880] [  1000][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[   45.181] [  1310][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[   45.232] [  1316][E][sd_diskio.cpp:809] sdcard_mount(): f_mount failed: (3) The physical drive cannot work
+[   45.533] [  1625][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[   45.833] [  1935][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[   45.833] [  1941][E][sd_diskio.cpp:809] sdcard_mount(): f_mount failed: (3) The physical drive cannot work
+[   46.134] [  2250][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[   46.435] [  2560][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[   46.435] [  2566][E][sd_diskio.cpp:809] sdcard_mount(): f_mount failed: (3) The physical drive cannot work
+[   46.786] [  2875][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[   47.087] [  3185][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[   47.087] [  3191][E][sd_diskio.cpp:809] sdcard_mount(): f_mount failed: (3) The physical drive cannot work
+[   47.388] [  3500][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[   47.388] RESULT|SD_NO_CARD_DETECTED|PASS|0/5 speeds mounted with the card supposedly removed
+[   47.388] RESULT|SD_NO_CARD_FAST_FAIL|PASS|worst failed mount took 628 ms (limit 3000 ms)
+[   47.388] RESULT|SUMMARY|2/2|OVERALL:PASS
+[   47.388] Commands: r = re-run sweep | n = no-card check | p <kHz> = probe loop | ? = help
+[   48.391] ## run 10: PASS
+[   48.391] ## run 11/25
+[   48.391] ## reset via DTR pulse (needs SW10 in USB service position)
+[   48.562] ets Jul 29 2019 12:21:46
+[   48.563] 
+[   48.563] rst:0x1 (POWERON_RESET),boot:0x13 (SPI_FAST_FLASH_BOOT)
+[   48.563] configsip: 0, SPIWP:0xee
+[   48.563] clk_drv:0x00,q_drv:0x00,d_drv:0x00,cs0_drv:0x00,hd_drv:0x00,wp_drv:0x00
+[   48.563] mode:DIO, clock div:2
+[   48.563] load:0x3fff0030,len:1184
+[   48.563] load:0x40078000,len:13232
+[   48.563] load:0x40080400,len:3028
+[   48.563] entry 0x400805e4
+[   49.014] 
+[   49.064] === FieldHub v2 r6 bring-up: microSD speed sweep ===
+[   49.064] build Oct 23 2026 15:46:00
+[   49.064] CS=13 SCK=18 MISO=19 MOSI=23, VSPI, 128 KiB per speed, 3 mounts per speed
+[   49.064] Send Enter to start (auto-start in 15 s)...
+[   49.415] [   682][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[   49.415] [   688][E][sd_diskio.cpp:809] sdcard_mount(): f_mount failed: (3) The physical drive cannot work
+[   49.716] [  1000][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[   50.017] [  1310][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[   50.067] [  1316][E][sd_diskio.cpp:809] sdcard_mount(): f_mount failed: (3) The physical drive cannot work
+[   50.368] [  1625][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[   50.669] [  1935][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[   50.669] [  1941][E][sd_diskio.cpp:809] sdcard_mount(): f_mount failed: (3) The physical drive cannot work
+[   50.969] [  2250][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[   51.270] [  2560][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[   51.270] [  2566][E][sd_diskio.cpp:809] sdcard_mount(): f_mount failed: (3) The physical drive cannot work
+[   51.621] [  2875][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[   51.922] [  3185][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[   51.922] [  3191][E][sd_diskio.cpp:809] sdcard_mount(): f_mount failed: (3) The physical drive cannot work
+[   52.223] [  3500][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[   52.223] RESULT|SD_NO_CARD_DETECTED|PASS|0/5 speeds mounted with the card supposedly removed
+[   52.223] RESULT|SD_NO_CARD_FAST_FAIL|PASS|worst failed mount took 628 ms (limit 3000 ms)
+[   52.223] RESULT|SUMMARY|2/2|OVERALL:PASS
+[   52.273] Commands: r = re-run sweep | n = no-card check | p <kHz> = probe loop | ? = help
+[   53.226] ## run 11: PASS
+[   53.226] ## run 12/25
+[   53.226] ## reset via DTR pulse (needs SW10 in USB service position)
+[   53.397] ets Jul 29 2019 12:21:46
+[   53.397] 
+[   53.397] rst:0x1 (POWERON_RESET),boot:0x13 (SPI_FAST_FLASH_BOOT)
+[   53.397] configsip: 0, SPIWP:0xee
+[   53.397] clk_drv:0x00,q_drv:0x00,d_drv:0x00,cs0_drv:0x00,hd_drv:0x00,wp_drv:0x00
+[   53.397] mode:DIO, clock div:2
+[   53.397] load:0x3fff0030,len:1184
+[   53.397] load:0x40078000,len:13232
+[   53.397] load:0x40080400,len:3028
+[   53.397] entry 0x400805e4
+[   53.849] 
+[   53.899] === FieldHub v2 r6 bring-up: microSD speed sweep ===
+[   53.899] build Oct 23 2026 15:46:00
+[   53.899] CS=13 SCK=18 MISO=19 MOSI=23, VSPI, 128 KiB per speed, 3 mounts per speed
+[   53.899] Send Enter to start (auto-start in 15 s)...
+[   54.250] [   682][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[   54.250] [   688][E][sd_diskio.cpp:809] sdcard_mount(): f_mount failed: (3) The physical drive cannot work
+[   54.551] [  1000][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[   54.852] [  1310][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[   54.902] [  1316][E][sd_diskio.cpp:809] sdcard_mount(): f_mount failed: (3) The physical drive cannot work
+[   55.203] [  1625][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[   55.504] [  1935][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[   55.504] [  1941][E][sd_diskio.cpp:809] sdcard_mount(): f_mount failed: (3) The physical drive cannot work
+[   55.805] [  2250][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[   56.105] [  2560][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[   56.106] [  2566][E][sd_diskio.cpp:809] sdcard_mount(): f_mount failed: (3) The physical drive cannot work
+[   56.456] [  2875][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[   56.757] [  3185][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[   56.757] [  3191][E][sd_diskio.cpp:809] sdcard_mount(): f_mount failed: (3) The physical drive cannot work
+[   57.058] [  3500][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[   57.058] RESULT|SD_NO_CARD_DETECTED|PASS|0/5 speeds mounted with the card supposedly removed
+[   57.058] RESULT|SD_NO_CARD_FAST_FAIL|PASS|worst failed mount took 627 ms (limit 3000 ms)
+[   57.058] RESULT|SUMMARY|2/2|OVERALL:PASS
+[   57.108] Commands: r = re-run sweep | n = no-card check | p <kHz> = probe loop | ? = help
+[   58.061] ## run 12: PASS
+[   58.061] ## run 13/25
+[   58.061] ## reset via DTR pulse (needs SW10 in USB service position)
+[   58.233] ets Jul 29 2019 12:21:46
+[   58.233] 
+[   58.233] rst:0x1 (POWERON_RESET),boot:0x13 (SPI_FAST_FLASH_BOOT)
+[   58.233] configsip: 0, SPIWP:0xee
+[   58.233] clk_drv:0x00,q_drv:0x00,d_drv:0x00,cs0_drv:0x00,hd_drv:0x00,wp_drv:0x00
+[   58.233] mode:DIO, clock div:2
+[   58.233] load:0x3fff0030,len:1184
+[   58.233] load:0x40078000,len:13232
+[   58.233] load:0x40080400,len:3028
+[   58.233] entry 0x400805e4
+[   58.685] 
+[   58.735] === FieldHub v2 r6 bring-up: microSD speed sweep ===
+[   58.735] build Oct 23 2026 15:46:00
+[   58.735] CS=13 SCK=18 MISO=19 MOSI=23, VSPI, 128 KiB per speed, 3 mounts per speed
+[   58.735] Send Enter to start (auto-start in 15 s)...
+[   59.086] [   682][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[   59.086] [   688][E][sd_diskio.cpp:809] sdcard_mount(): f_mount failed: (3) The physical drive cannot work
+[   59.387] [  1000][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[   59.688] [  1310][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[   59.739] [  1316][E][sd_diskio.cpp:809] sdcard_mount(): f_mount failed: (3) The physical drive cannot work
+[   60.039] [  1625][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[   60.340] [  1935][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[   60.340] [  1941][E][sd_diskio.cpp:809] sdcard_mount(): f_mount failed: (3) The physical drive cannot work
+[   60.641] [  2250][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[   60.942] [  2560][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[   60.942] [  2566][E][sd_diskio.cpp:809] sdcard_mount(): f_mount failed: (3) The physical drive cannot work
+[   61.293] [  2875][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[   61.594] [  3185][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[   61.594] [  3191][E][sd_diskio.cpp:809] sdcard_mount(): f_mount failed: (3) The physical drive cannot work
+[   61.895] [  3500][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[   61.895] RESULT|SD_NO_CARD_DETECTED|PASS|0/5 speeds mounted with the card supposedly removed
+[   61.895] RESULT|SD_NO_CARD_FAST_FAIL|PASS|worst failed mount took 628 ms (limit 3000 ms)
+[   61.895] RESULT|SUMMARY|2/2|OVERALL:PASS
+[   61.945] Commands: r = re-run sweep | n = no-card check | p <kHz> = probe loop | ? = help
+[   62.898] ## run 13: PASS
+[   62.898] ## run 14/25
+[   62.898] ## reset via DTR pulse (needs SW10 in USB service position)
+[   63.069] ets Jul 29 2019 12:21:46
+[   63.069] 
+[   63.069] rst:0x1 (POWERON_RESET),boot:0x13 (SPI_FAST_FLASH_BOOT)
+[   63.069] configsip: 0, SPIWP:0xee
+[   63.069] clk_drv:0x00,q_drv:0x00,d_drv:0x00,cs0_drv:0x00,hd_drv:0x00,wp_drv:0x00
+[   63.069] mode:DIO, clock div:2
+[   63.069] load:0x3fff0030,len:1184
+[   63.069] load:0x40078000,len:13232
+[   63.069] load:0x40080400,len:3028
+[   63.069] entry 0x400805e4
+[   63.521] 
+[   63.571] === FieldHub v2 r6 bring-up: microSD speed sweep ===
+[   63.571] build Oct 23 2026 15:46:00
+[   63.571] CS=13 SCK=18 MISO=19 MOSI=23, VSPI, 128 KiB per speed, 3 mounts per speed
+[   63.571] Send Enter to start (auto-start in 15 s)...
+[   63.922] [   682][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[   63.922] [   688][E][sd_diskio.cpp:809] sdcard_mount(): f_mount failed: (3) The physical drive cannot work
+[   64.223] [  1000][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[   64.524] [  1310][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[   64.574] [  1316][E][sd_diskio.cpp:809] sdcard_mount(): f_mount failed: (3) The physical drive cannot work
+[   64.875] [  1625][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[   65.176] [  1935][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[   65.176] [  1941][E][sd_diskio.cpp:809] sdcard_mount(): f_mount failed: (3) The physical drive cannot work
+[   65.477] [  2250][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[   65.778] [  2560][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[   65.778] [  2566][E][sd_diskio.cpp:809] sdcard_mount(): f_mount failed: (3) The physical drive cannot work
+[   66.129] [  2875][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[   66.430] [  3185][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[   66.430] [  3191][E][sd_diskio.cpp:809] sdcard_mount(): f_mount failed: (3) The physical drive cannot work
+[   66.731] [  3500][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[   66.731] RESULT|SD_NO_CARD_DETECTED|PASS|0/5 speeds mounted with the card supposedly removed
+[   66.731] RESULT|SD_NO_CARD_FAST_FAIL|PASS|worst failed mount took 628 ms (limit 3000 ms)
+[   66.731] RESULT|SUMMARY|2/2|OVERALL:PASS
+[   66.731] Commands: r = re-run sweep | n = no-card check | p <kHz> = probe loop | ? = help
+[   67.734] ## run 14: PASS
+[   67.734] ## run 15/25
+[   67.734] ## reset via DTR pulse (needs SW10 in USB service position)
+[   67.906] ets Jul 29 2019 12:21:46
+[   67.906] 
+[   67.906] rst:0x1 (POWERON_RESET),boot:0x13 (SPI_FAST_FLASH_BOOT)
+[   67.906] configsip: 0, SPIWP:0xee
+[   67.906] clk_drv:0x00,q_drv:0x00,d_drv:0x00,cs0_drv:0x00,hd_drv:0x00,wp_drv:0x00
+[   67.906] mode:DIO, clock div:2
+[   67.906] load:0x3fff0030,len:1184
+[   67.906] load:0x40078000,len:13232
+[   67.906] load:0x40080400,len:3028
+[   67.906] entry 0x400805e4
+[   68.358] 
+[   68.408] === FieldHub v2 r6 bring-up: microSD speed sweep ===
+[   68.408] build Oct 23 2026 15:46:00
+[   68.408] CS=13 SCK=18 MISO=19 MOSI=23, VSPI, 128 KiB per speed, 3 mounts per speed
+[   68.408] Send Enter to start (auto-start in 15 s)...
+[   68.759] [   682][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[   68.759] [   688][E][sd_diskio.cpp:809] sdcard_mount(): f_mount failed: (3) The physical drive cannot work
+[   69.060] [  1000][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[   69.360] [  1310][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[   69.411] [  1316][E][sd_diskio.cpp:809] sdcard_mount(): f_mount failed: (3) The physical drive cannot work
+[   69.712] [  1625][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[   70.013] [  1935][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[   70.013] [  1941][E][sd_diskio.cpp:809] sdcard_mount(): f_mount failed: (3) The physical drive cannot work
+[   70.314] [  2250][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[   70.614] [  2560][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[   70.615] [  2566][E][sd_diskio.cpp:809] sdcard_mount(): f_mount failed: (3) The physical drive cannot work
+[   70.965] [  2875][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[   71.266] [  3185][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[   71.266] [  3191][E][sd_diskio.cpp:809] sdcard_mount(): f_mount failed: (3) The physical drive cannot work
+[   71.567] [  3500][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[   71.567] RESULT|SD_NO_CARD_DETECTED|PASS|0/5 speeds mounted with the card supposedly removed
+[   71.567] RESULT|SD_NO_CARD_FAST_FAIL|PASS|worst failed mount took 628 ms (limit 3000 ms)
+[   71.567] RESULT|SUMMARY|2/2|OVERALL:PASS
+[   71.617] Commands: r = re-run sweep | n = no-card check | p <kHz> = probe loop | ? = help
+[   72.570] ## run 15: PASS
+[   72.570] ## run 16/25
+[   72.570] ## reset via DTR pulse (needs SW10 in USB service position)
+[   72.742] ets Jul 29 2019 12:21:46
+[   72.742] 
+[   72.742] rst:0x1 (POWERON_RESET),boot:0x13 (SPI_FAST_FLASH_BOOT)
+[   72.742] configsip: 0, SPIWP:0xee
+[   72.742] clk_drv:0x00,q_drv:0x00,d_drv:0x00,cs0_drv:0x00,hd_drv:0x00,wp_drv:0x00
+[   72.742] mode:DIO, clock div:2
+[   72.742] load:0x3fff0030,len:1184
+[   72.742] load:0x40078000,len:13232
+[   72.742] load:0x40080400,len:3028
+[   72.742] entry 0x400805e4
+[   73.194] 
+[   73.244] === FieldHub v2 r6 bring-up: microSD speed sweep ===
+[   73.244] build Oct 23 2026 15:46:00
+[   73.244] CS=13 SCK=18 MISO=19 MOSI=23, VSPI, 128 KiB per speed, 3 mounts per speed
+[   73.244] Send Enter to start (auto-start in 15 s)...
+[   73.595] [   682][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[   73.595] [   688][E][sd_diskio.cpp:809] sdcard_mount(): f_mount failed: (3) The physical drive cannot work
+[   73.896] [  1000][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[   74.197] [  1310][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[   74.247] [  1316][E][sd_diskio.cpp:809] sdcard_mount(): f_mount failed: (3) The physical drive cannot work
+[   74.548] [  1625][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[   74.849] [  1935][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[   74.849] [  1941][E][sd_diskio.cpp:809] sdcard_mount(): f_mount failed: (3) The physical drive cannot work
+[   75.150] [  2250][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[   75.451] [  2560][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[   75.451] [  2566][E][sd_diskio.cpp:809] sdcard_mount(): f_mount failed: (3) The physical drive cannot work
+[   75.802] [  2875][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[   76.103] [  3185][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[   76.103] [  3191][E][sd_diskio.cpp:809] sdcard_mount(): f_mount failed: (3) The physical drive cannot work
+[   76.404] [  3500][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[   76.404] RESULT|SD_NO_CARD_DETECTED|PASS|0/5 speeds mounted with the card supposedly removed
+[   76.404] RESULT|SD_NO_CARD_FAST_FAIL|PASS|worst failed mount took 628 ms (limit 3000 ms)
+[   76.404] RESULT|SUMMARY|2/2|OVERALL:PASS
+[   76.404] Commands: r = re-run sweep | n = no-card check | p <kHz> = probe loop | ? = help
+[   77.407] ## run 16: PASS
+[   77.407] ## run 17/25
+[   77.407] ## reset via DTR pulse (needs SW10 in USB service position)
+[   77.579] ets Jul 29 2019 12:21:46
+[   77.579] 
+[   77.579] rst:0x1 (POWERON_RESET),boot:0x13 (SPI_FAST_FLASH_BOOT)
+[   77.579] configsip: 0, SPIWP:0xee
+[   77.579] clk_drv:0x00,q_drv:0x00,d_drv:0x00,cs0_drv:0x00,hd_drv:0x00,wp_drv:0x00
+[   77.579] mode:DIO, clock div:2
+[   77.579] load:0x3fff0030,len:1184
+[   77.579] load:0x40078000,len:13232
+[   77.579] load:0x40080400,len:3028
+[   77.579] entry 0x400805e4
+[   78.030] 
+[   78.081] === FieldHub v2 r6 bring-up: microSD speed sweep ===
+[   78.081] build Oct 23 2026 15:46:00
+[   78.081] CS=13 SCK=18 MISO=19 MOSI=23, VSPI, 128 KiB per speed, 3 mounts per speed
+[   78.081] Send Enter to start (auto-start in 15 s)...
+[   78.432] [   682][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[   78.432] [   688][E][sd_diskio.cpp:809] sdcard_mount(): f_mount failed: (3) The physical drive cannot work
+[   78.733] [  1000][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[   79.034] [  1310][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[   79.084] [  1316][E][sd_diskio.cpp:809] sdcard_mount(): f_mount failed: (3) The physical drive cannot work
+[   79.385] [  1625][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[   79.685] [  1935][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[   79.685] [  1941][E][sd_diskio.cpp:809] sdcard_mount(): f_mount failed: (3) The physical drive cannot work
+[   79.986] [  2250][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[   80.287] [  2560][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[   80.287] [  2566][E][sd_diskio.cpp:809] sdcard_mount(): f_mount failed: (3) The physical drive cannot work
+[   80.638] [  2875][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[   80.939] [  3185][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[   80.939] [  3191][E][sd_diskio.cpp:809] sdcard_mount(): f_mount failed: (3) The physical drive cannot work
+[   81.240] [  3500][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[   81.240] RESULT|SD_NO_CARD_DETECTED|PASS|0/5 speeds mounted with the card supposedly removed
+[   81.240] RESULT|SD_NO_CARD_FAST_FAIL|PASS|worst failed mount took 627 ms (limit 3000 ms)
+[   81.240] RESULT|SUMMARY|2/2|OVERALL:PASS
+[   81.290] Commands: r = re-run sweep | n = no-card check | p <kHz> = probe loop | ? = help
+[   82.243] ## run 17: PASS
+[   82.243] ## run 18/25
+[   82.243] ## reset via DTR pulse (needs SW10 in USB service position)
+[   82.415] ets Jul 29 2019 12:21:46
+[   82.415] 
+[   82.415] rst:0x1 (POWERON_RESET),boot:0x13 (SPI_FAST_FLASH_BOOT)
+[   82.415] configsip: 0, SPIWP:0xee
+[   82.415] clk_drv:0x00,q_drv:0x00,d_drv:0x00,cs0_drv:0x00,hd_drv:0x00,wp_drv:0x00
+[   82.415] mode:DIO, clock div:2
+[   82.415] load:0x3fff0030,len:1184
+[   82.415] load:0x40078000,len:13232
+[   82.415] load:0x40080400,len:3028
+[   82.415] entry 0x400805e4
+[   82.866] 
+[   82.916] === FieldHub v2 r6 bring-up: microSD speed sweep ===
+[   82.916] build Oct 23 2026 15:46:00
+[   82.916] CS=13 SCK=18 MISO=19 MOSI=23, VSPI, 128 KiB per speed, 3 mounts per speed
+[   82.916] Send Enter to start (auto-start in 15 s)...
+[   83.267] [   682][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[   83.267] [   688][E][sd_diskio.cpp:809] sdcard_mount(): f_mount failed: (3) The physical drive cannot work
+[   83.568] [  1000][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[   83.869] [  1310][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[   83.920] [  1316][E][sd_diskio.cpp:809] sdcard_mount(): f_mount failed: (3) The physical drive cannot work
+[   84.220] [  1625][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[   84.521] [  1935][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[   84.521] [  1941][E][sd_diskio.cpp:809] sdcard_mount(): f_mount failed: (3) The physical drive cannot work
+[   84.822] [  2250][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[   85.123] [  2560][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[   85.123] [  2566][E][sd_diskio.cpp:809] sdcard_mount(): f_mount failed: (3) The physical drive cannot work
+[   85.474] [  2875][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[   85.775] [  3185][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[   85.775] [  3191][E][sd_diskio.cpp:809] sdcard_mount(): f_mount failed: (3) The physical drive cannot work
+[   86.076] [  3500][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[   86.076] RESULT|SD_NO_CARD_DETECTED|PASS|0/5 speeds mounted with the card supposedly removed
+[   86.076] RESULT|SD_NO_CARD_FAST_FAIL|PASS|worst failed mount took 628 ms (limit 3000 ms)
+[   86.076] RESULT|SUMMARY|2/2|OVERALL:PASS
+[   86.076] Commands: r = re-run sweep | n = no-card check | p <kHz> = probe loop | ? = help
+[   87.079] ## run 18: PASS
+[   87.079] ## run 19/25
+[   87.079] ## reset via DTR pulse (needs SW10 in USB service position)
+[   87.250] ets Jul 29 2019 12:21:46
+[   87.251] 
+[   87.251] rst:0x1 (POWERON_RESET),boot:0x13 (SPI_FAST_FLASH_BOOT)
+[   87.251] configsip: 0, SPIWP:0xee
+[   87.251] clk_drv:0x00,q_drv:0x00,d_drv:0x00,cs0_drv:0x00,hd_drv:0x00,wp_drv:0x00
+[   87.251] mode:DIO, clock div:2
+[   87.251] load:0x3fff0030,len:1184
+[   87.251] load:0x40078000,len:13232
+[   87.251] load:0x40080400,len:3028
+[   87.251] entry 0x400805e4
+[   87.702] 
+[   87.752] === FieldHub v2 r6 bring-up: microSD speed sweep ===
+[   87.752] build Oct 23 2026 15:46:00
+[   87.752] CS=13 SCK=18 MISO=19 MOSI=23, VSPI, 128 KiB per speed, 3 mounts per speed
+[   87.752] Send Enter to start (auto-start in 15 s)...
+[   88.103] [   682][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[   88.104] [   688][E][sd_diskio.cpp:809] sdcard_mount(): f_mount failed: (3) The physical drive cannot work
+[   88.404] [  1000][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[   88.706] [  1310][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[   88.756] [  1316][E][sd_diskio.cpp:809] sdcard_mount(): f_mount failed: (3) The physical drive cannot work
+[   89.057] [  1625][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[   89.357] [  1935][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[   89.358] [  1941][E][sd_diskio.cpp:809] sdcard_mount(): f_mount failed: (3) The physical drive cannot work
+[   89.659] [  2250][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[   89.960] [  2560][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[   89.960] [  2566][E][sd_diskio.cpp:809] sdcard_mount(): f_mount failed: (3) The physical drive cannot work
+[   90.311] [  2875][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[   90.611] [  3185][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[   90.611] [  3191][E][sd_diskio.cpp:809] sdcard_mount(): f_mount failed: (3) The physical drive cannot work
+[   90.912] [  3500][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[   90.913] RESULT|SD_NO_CARD_DETECTED|PASS|0/5 speeds mounted with the card supposedly removed
+[   90.913] RESULT|SD_NO_CARD_FAST_FAIL|PASS|worst failed mount took 628 ms (limit 3000 ms)
+[   90.913] RESULT|SUMMARY|2/2|OVERALL:PASS
+[   90.913] Commands: r = re-run sweep | n = no-card check | p <kHz> = probe loop | ? = help
+[   91.915] ## run 19: PASS
+[   91.915] ## run 20/25
+[   91.915] ## reset via DTR pulse (needs SW10 in USB service position)
+[   92.086] ets Jul 29 2019 12:21:46
+[   92.086] 
+[   92.086] rst:0x1 (POWERON_RESET),boot:0x13 (SPI_FAST_FLASH_BOOT)
+[   92.087] configsip: 0, SPIWP:0xee
+[   92.087] clk_drv:0x00,q_drv:0x00,d_drv:0x00,cs0_drv:0x00,hd_drv:0x00,wp_drv:0x00
+[   92.087] mode:DIO, clock div:2
+[   92.087] load:0x3fff0030,len:1184
+[   92.087] load:0x40078000,len:13232
+[   92.087] load:0x40080400,len:3028
+[   92.087] entry 0x400805e4
+[   92.538] 
+[   92.588] === FieldHub v2 r6 bring-up: microSD speed sweep ===
+[   92.588] build Oct 23 2026 15:46:00
+[   92.588] CS=13 SCK=18 MISO=19 MOSI=23, VSPI, 128 KiB per speed, 3 mounts per speed
+[   92.588] Send Enter to start (auto-start in 15 s)...
+[   92.939] [   682][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[   92.939] [   688][E][sd_diskio.cpp:809] sdcard_mount(): f_mount failed: (3) The physical drive cannot work
+[   93.240] [  1000][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[   93.541] [  1310][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[   93.591] [  1316][E][sd_diskio.cpp:809] sdcard_mount(): f_mount failed: (3) The physical drive cannot work
+[   93.892] [  1625][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[   94.194] [  1935][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[   94.194] [  1941][E][sd_diskio.cpp:809] sdcard_mount(): f_mount failed: (3) The physical drive cannot work
+[   94.495] [  2250][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[   94.795] [  2560][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[   94.796] [  2566][E][sd_diskio.cpp:809] sdcard_mount(): f_mount failed: (3) The physical drive cannot work
+[   95.146] [  2875][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[   95.447] [  3185][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[   95.447] [  3191][E][sd_diskio.cpp:809] sdcard_mount(): f_mount failed: (3) The physical drive cannot work
+[   95.748] [  3500][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[   95.748] RESULT|SD_NO_CARD_DETECTED|PASS|0/5 speeds mounted with the card supposedly removed
+[   95.748] RESULT|SD_NO_CARD_FAST_FAIL|PASS|worst failed mount took 628 ms (limit 3000 ms)
+[   95.748] RESULT|SUMMARY|2/2|OVERALL:PASS
+[   95.748] Commands: r = re-run sweep | n = no-card check | p <kHz> = probe loop | ? = help
+[   96.751] ## run 20: PASS
+[   96.751] ## run 21/25
+[   96.751] ## reset via DTR pulse (needs SW10 in USB service position)
+[   96.923] ets Jul 29 2019 12:21:46
+[   96.923] 
+[   96.923] rst:0x1 (POWERON_RESET),boot:0x13 (SPI_FAST_FLASH_BOOT)
+[   96.923] configsip: 0, SPIWP:0xee
+[   96.923] clk_drv:0x00,q_drv:0x00,d_drv:0x00,cs0_drv:0x00,hd_drv:0x00,wp_drv:0x00
+[   96.923] mode:DIO, clock div:2
+[   96.923] load:0x3fff0030,len:1184
+[   96.923] load:0x40078000,len:13232
+[   96.923] load:0x40080400,len:3028
+[   96.923] entry 0x400805e4
+[   97.375] 
+[   97.425] === FieldHub v2 r6 bring-up: microSD speed sweep ===
+[   97.425] build Oct 23 2026 15:46:00
+[   97.425] CS=13 SCK=18 MISO=19 MOSI=23, VSPI, 128 KiB per speed, 3 mounts per speed
+[   97.425] Send Enter to start (auto-start in 15 s)...
+[   97.776] [   682][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[   97.776] [   688][E][sd_diskio.cpp:809] sdcard_mount(): f_mount failed: (3) The physical drive cannot work
+[   98.077] [  1000][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[   98.378] [  1310][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[   98.428] [  1316][E][sd_diskio.cpp:809] sdcard_mount(): f_mount failed: (3) The physical drive cannot work
+[   98.729] [  1625][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[   99.030] [  1935][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[   99.030] [  1941][E][sd_diskio.cpp:809] sdcard_mount(): f_mount failed: (3) The physical drive cannot work
+[   99.331] [  2250][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[   99.632] [  2560][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[   99.632] [  2566][E][sd_diskio.cpp:809] sdcard_mount(): f_mount failed: (3) The physical drive cannot work
+[   99.983] [  2875][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[  100.284] [  3185][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[  100.284] [  3191][E][sd_diskio.cpp:809] sdcard_mount(): f_mount failed: (3) The physical drive cannot work
+[  100.585] [  3500][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[  100.585] RESULT|SD_NO_CARD_DETECTED|PASS|0/5 speeds mounted with the card supposedly removed
+[  100.585] RESULT|SD_NO_CARD_FAST_FAIL|PASS|worst failed mount took 628 ms (limit 3000 ms)
+[  100.585] RESULT|SUMMARY|2/2|OVERALL:PASS
+[  100.585] Commands: r = re-run sweep | n = no-card check | p <kHz> = probe loop | ? = help
+[  101.588] ## run 21: PASS
+[  101.588] ## run 22/25
+[  101.588] ## reset via DTR pulse (needs SW10 in USB service position)
+[  101.760] ets Jul 29 2019 12:21:46
+[  101.760] 
+[  101.760] rst:0x1 (POWERON_RESET),boot:0x13 (SPI_FAST_FLASH_BOOT)
+[  101.760] configsip: 0, SPIWP:0xee
+[  101.760] clk_drv:0x00,q_drv:0x00,d_drv:0x00,cs0_drv:0x00,hd_drv:0x00,wp_drv:0x00
+[  101.760] mode:DIO, clock div:2
+[  101.761] load:0x3fff0030,len:1184
+[  101.761] load:0x40078000,len:13232
+[  101.761] load:0x40080400,len:3028
+[  101.761] entry 0x400805e4
+[  102.212] 
+[  102.262] === FieldHub v2 r6 bring-up: microSD speed sweep ===
+[  102.262] build Oct 23 2026 15:46:00
+[  102.262] CS=13 SCK=18 MISO=19 MOSI=23, VSPI, 128 KiB per speed, 3 mounts per speed
+[  102.262] Send Enter to start (auto-start in 15 s)...
+[  102.613] [   682][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[  102.613] [   688][E][sd_diskio.cpp:809] sdcard_mount(): f_mount failed: (3) The physical drive cannot work
+[  102.914] [  1000][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[  103.215] [  1310][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[  103.265] [  1316][E][sd_diskio.cpp:809] sdcard_mount(): f_mount failed: (3) The physical drive cannot work
+[  103.566] [  1625][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[  103.867] [  1935][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[  103.867] [  1941][E][sd_diskio.cpp:809] sdcard_mount(): f_mount failed: (3) The physical drive cannot work
+[  104.168] [  2250][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[  104.469] [  2560][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[  104.469] [  2566][E][sd_diskio.cpp:809] sdcard_mount(): f_mount failed: (3) The physical drive cannot work
+[  104.820] [  2875][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[  105.121] [  3185][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[  105.121] [  3191][E][sd_diskio.cpp:809] sdcard_mount(): f_mount failed: (3) The physical drive cannot work
+[  105.422] [  3500][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[  105.422] RESULT|SD_NO_CARD_DETECTED|PASS|0/5 speeds mounted with the card supposedly removed
+[  105.422] RESULT|SD_NO_CARD_FAST_FAIL|PASS|worst failed mount took 628 ms (limit 3000 ms)
+[  105.422] RESULT|SUMMARY|2/2|OVERALL:PASS
+[  105.422] Commands: r = re-run sweep | n = no-card check | p <kHz> = probe loop | ? = help
+[  106.425] ## run 22: PASS
+[  106.425] ## run 23/25
+[  106.425] ## reset via DTR pulse (needs SW10 in USB service position)
+[  106.597] ets Jul 29 2019 12:21:46
+[  106.597] 
+[  106.597] rst:0x1 (POWERON_RESET),boot:0x13 (SPI_FAST_FLASH_BOOT)
+[  106.597] configsip: 0, SPIWP:0xee
+[  106.597] clk_drv:0x00,q_drv:0x00,d_drv:0x00,cs0_drv:0x00,hd_drv:0x00,wp_drv:0x00
+[  106.597] mode:DIO, clock div:2
+[  106.597] load:0x3fff0030,len:1184
+[  106.597] load:0x40078000,len:13232
+[  106.597] load:0x40080400,len:3028
+[  106.597] entry 0x400805e4
+[  107.048] 
+[  107.099] === FieldHub v2 r6 bring-up: microSD speed sweep ===
+[  107.099] build Oct 23 2026 15:46:00
+[  107.099] CS=13 SCK=18 MISO=19 MOSI=23, VSPI, 128 KiB per speed, 3 mounts per speed
+[  107.099] Send Enter to start (auto-start in 15 s)...
+[  107.450] [   682][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[  107.450] [   688][E][sd_diskio.cpp:809] sdcard_mount(): f_mount failed: (3) The physical drive cannot work
+[  107.751] [  1000][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[  108.051] [  1310][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[  108.102] [  1316][E][sd_diskio.cpp:809] sdcard_mount(): f_mount failed: (3) The physical drive cannot work
+[  108.402] [  1625][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[  108.704] [  1935][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[  108.704] [  1941][E][sd_diskio.cpp:809] sdcard_mount(): f_mount failed: (3) The physical drive cannot work
+[  109.005] [  2250][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[  109.306] [  2560][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[  109.306] [  2566][E][sd_diskio.cpp:809] sdcard_mount(): f_mount failed: (3) The physical drive cannot work
+[  109.657] [  2875][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[  109.958] [  3185][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[  109.958] [  3191][E][sd_diskio.cpp:809] sdcard_mount(): f_mount failed: (3) The physical drive cannot work
+[  110.259] [  3500][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[  110.259] RESULT|SD_NO_CARD_DETECTED|PASS|0/5 speeds mounted with the card supposedly removed
+[  110.259] RESULT|SD_NO_CARD_FAST_FAIL|PASS|worst failed mount took 628 ms (limit 3000 ms)
+[  110.259] RESULT|SUMMARY|2/2|OVERALL:PASS
+[  110.259] Commands: r = re-run sweep | n = no-card check | p <kHz> = probe loop | ? = help
+[  111.262] ## run 23: PASS
+[  111.262] ## run 24/25
+[  111.262] ## reset via DTR pulse (needs SW10 in USB service position)
+[  111.434] ets Jul 29 2019 12:21:46
+[  111.434] 
+[  111.434] rst:0x1 (POWERON_RESET),boot:0x13 (SPI_FAST_FLASH_BOOT)
+[  111.434] configsip: 0, SPIWP:0xee
+[  111.434] clk_drv:0x00,q_drv:0x00,d_drv:0x00,cs0_drv:0x00,hd_drv:0x00,wp_drv:0x00
+[  111.434] mode:DIO, clock div:2
+[  111.434] load:0x3fff0030,len:1184
+[  111.434] load:0x40078000,len:13232
+[  111.434] load:0x40080400,len:3028
+[  111.434] entry 0x400805e4
+[  111.885] 
+[  111.936] === FieldHub v2 r6 bring-up: microSD speed sweep ===
+[  111.936] build Oct 23 2026 15:46:00
+[  111.936] CS=13 SCK=18 MISO=19 MOSI=23, VSPI, 128 KiB per speed, 3 mounts per speed
+[  111.936] Send Enter to start (auto-start in 15 s)...
+[  112.287] [   682][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[  112.287] [   688][E][sd_diskio.cpp:809] sdcard_mount(): f_mount failed: (3) The physical drive cannot work
+[  112.588] [  1000][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[  112.889] [  1310][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[  112.939] [  1316][E][sd_diskio.cpp:809] sdcard_mount(): f_mount failed: (3) The physical drive cannot work
+[  113.240] [  1625][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[  113.540] [  1935][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[  113.541] [  1941][E][sd_diskio.cpp:809] sdcard_mount(): f_mount failed: (3) The physical drive cannot work
+[  113.842] [  2250][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[  114.142] [  2560][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[  114.142] [  2566][E][sd_diskio.cpp:809] sdcard_mount(): f_mount failed: (3) The physical drive cannot work
+[  114.494] [  2875][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[  114.795] [  3185][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[  114.795] [  3191][E][sd_diskio.cpp:809] sdcard_mount(): f_mount failed: (3) The physical drive cannot work
+[  115.095] [  3500][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[  115.096] RESULT|SD_NO_CARD_DETECTED|PASS|0/5 speeds mounted with the card supposedly removed
+[  115.096] RESULT|SD_NO_CARD_FAST_FAIL|PASS|worst failed mount took 628 ms (limit 3000 ms)
+[  115.096] RESULT|SUMMARY|2/2|OVERALL:PASS
+[  115.096] Commands: r = re-run sweep | n = no-card check | p <kHz> = probe loop | ? = help
+[  116.098] ## run 24: PASS
+[  116.098] ## run 25/25
+[  116.098] ## reset via DTR pulse (needs SW10 in USB service position)
+[  116.270] ets Jul 29 2019 12:21:46
+[  116.270] 
+[  116.270] rst:0x1 (POWERON_RESET),boot:0x13 (SPI_FAST_FLASH_BOOT)
+[  116.270] configsip: 0, SPIWP:0xee
+[  116.270] clk_drv:0x00,q_drv:0x00,d_drv:0x00,cs0_drv:0x00,hd_drv:0x00,wp_drv:0x00
+[  116.270] mode:DIO, clock div:2
+[  116.270] load:0x3fff0030,len:1184
+[  116.270] load:0x40078000,len:13232
+[  116.270] load:0x40080400,len:3028
+[  116.270] entry 0x400805e4
+[  116.721] 
+[  116.771] === FieldHub v2 r6 bring-up: microSD speed sweep ===
+[  116.772] build Oct 23 2026 15:46:00
+[  116.772] CS=13 SCK=18 MISO=19 MOSI=23, VSPI, 128 KiB per speed, 3 mounts per speed
+[  116.772] Send Enter to start (auto-start in 15 s)...
+[  117.122] [   682][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[  117.123] [   688][E][sd_diskio.cpp:809] sdcard_mount(): f_mount failed: (3) The physical drive cannot work
+[  117.423] [  1000][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[  117.724] [  1310][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[  117.774] [  1316][E][sd_diskio.cpp:809] sdcard_mount(): f_mount failed: (3) The physical drive cannot work
+[  118.075] [  1625][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[  118.376] [  1935][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[  118.377] [  1941][E][sd_diskio.cpp:809] sdcard_mount(): f_mount failed: (3) The physical drive cannot work
+[  118.678] [  2250][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[  118.979] [  2560][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[  118.979] [  2566][E][sd_diskio.cpp:809] sdcard_mount(): f_mount failed: (3) The physical drive cannot work
+[  119.330] [  2875][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[  119.630] [  3185][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[  119.630] [  3191][E][sd_diskio.cpp:809] sdcard_mount(): f_mount failed: (3) The physical drive cannot work
+[  119.931] [  3500][E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x00
+[  119.932] RESULT|SD_NO_CARD_DETECTED|PASS|0/5 speeds mounted with the card supposedly removed
+[  119.932] RESULT|SD_NO_CARD_FAST_FAIL|PASS|worst failed mount took 628 ms (limit 3000 ms)
+[  119.932] RESULT|SUMMARY|2/2|OVERALL:PASS
+[  119.932] Commands: r = re-run sweep | n = no-card check | p <kHz> = probe loop | ? = help
+[  120.934] ## run 25: PASS

@@ -1,0 +1,36 @@
+# board HUB-R6-01  test sd-sweep  env mothership-v2-bringup-sd-sweep
+# commit 8d5a6a5 (firmware tree dirty: yes)  port /dev/serial/by-id/usb-1a86_USB_Serial-if00-port0  started 2026-10-23T15:34:53
+# note: DIAGNOSTIC build: SD lib patched (ACMD41 arg 0x40000000) via PLATFORMIO_LIB_EXTRA_DIRS; not production code
+[    0.024] ## sd-sweep: SD at 0.4/4/10/20/40 MHz, 128 KiB verify each
+[    0.024] ## type a line + Enter to send it to the board; Ctrl-C ends the session
+[    0.024] ## reset via DTR pulse (needs SW10 in USB service position)
+[    0.197] ets Jul 29 2019 12:21:46
+[    0.197] 
+[    0.197] rst:0x1 (POWERON_RESET),boot:0x13 (SPI_FAST_FLASH_BOOT)
+[    0.197] configsip: 0, SPIWP:0xee
+[    0.197] clk_drv:0x00,q_drv:0x00,d_drv:0x00,cs0_drv:0x00,hd_drv:0x00,wp_drv:0x00
+[    0.197] mode:DIO, clock div:2
+[    0.197] load:0x3fff0030,len:1184
+[    0.197] load:0x40078000,len:13232
+[    0.197] load:0x40080400,len:3028
+[    0.197] entry 0x400805e4
+[    0.649] 
+[    0.699] === FieldHub v2 r6 bring-up: microSD speed sweep ===
+[    0.699] build Oct 23 2026 15:34:33
+[    0.699] CS=13 SCK=18 MISO=19 MOSI=23, VSPI, 128 KiB per speed, 3 mounts per speed
+[    0.699] Send Enter to start (auto-start in 15 s)...
+[    0.749] RESULT|SD_MISO_IDLE_HIGH|PASS|SD_MISO=1 with CS high (R4 10k pull-up)
+[    0.799] RESULT|SD_CARD_PRESENT|PASS|SDHC/SDXC, 14768 MB card, 14748 MB FAT total, 0 MB used
+[    0.899] [   546][E][vfs_api.cpp:182] remove(): /hub_sd_sweep.bin does not exists or is directory
+[    6.965] RESULT|SD_400K|PASS|mount 3/3 (worst 38 ms), 128 KiB wr 40 KiB/s rd 47 KiB/s, 0 bad bytes
+[    6.966] [  6627][E][vfs_api.cpp:182] remove(): /hub_sd_sweep.bin does not exists or is directory
+[    7.918] RESULT|SD_4000K|PASS|mount 3/3 (worst 9 ms), 128 KiB wr 214 KiB/s rd 417 KiB/s, 0 bad bytes
+[    7.918] [  7580][E][vfs_api.cpp:182] remove(): /hub_sd_sweep.bin does not exists or is directory
+[    8.570] RESULT|SD_10000K|PASS|mount 3/3 (worst 7 ms), 128 KiB wr 293 KiB/s rd 871 KiB/s, 0 bad bytes
+[    8.570] [  8204][E][vfs_api.cpp:182] remove(): /hub_sd_sweep.bin does not exists or is directory
+[    9.021] RESULT|SD_20000K|PASS|mount 3/3 (worst 6 ms), 128 KiB wr 356 KiB/s rd 1391 KiB/s, 0 bad bytes
+[    9.072] [  8698][E][vfs_api.cpp:182] remove(): /hub_sd_sweep.bin does not exists or is directory
+[    9.574] RESULT|SD_40000K|PASS|mount 3/3 (worst 7 ms), 128 KiB wr 337 KiB/s rd 1391 KiB/s, 0 bad bytes
+[    9.574] RESULT|SD_MARGIN|WARN|all speeds pass; scope 40 MHz edges before calling it margin
+[    9.574] RESULT|SUMMARY|7/7|OVERALL:PASS
+[    9.574] Commands: r = re-run sweep | n = no-card check | p <kHz> = probe loop | ? = help

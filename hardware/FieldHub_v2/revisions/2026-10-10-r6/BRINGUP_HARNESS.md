@@ -85,6 +85,53 @@ pad nets) and the r6 BOM.
    ESP32 and drops the rail. The shared `[env]` now sets both to 1. The runner
    opens the port with both lines asserted, independent of the ini.
 
+## Findings from HUB-R6-01 (2026-10-23)
+
+Evidence is in `bringup/HUB-R6-01/`. These are behaviours of the design or the
+firmware stack, not one-board defects, so they apply to every board.
+
+1. **The stock SD library cannot mount some SDHC cards; the SD hardware is
+   good.** Arduino-ESP32 2.0.17 sends ACMD41 with `0x40100000`. The 16 GB SDHC
+   reference card stays idle for as long as bit 20 is set, so `SD.begin()`
+   fails with `APP_OP_COND failed: 1` / `f_mount failed: (3)`. Bit-banged and
+   hardware-SPI probes (`sd-raw`) show that CMD0, CMD8, ACMD41 with
+   `0x40000000`, and CMD58 all work. The project now vendors the library with
+   that one change (`mothership/firmware/v2/lib/SD/FIELDMESH_PATCH.md`). With
+   it: `sd-sweep` passes 7/7 up to 40 MHz, `sd-logger` passes 25/25,
+   `sd-logger --repeat 100` passes 100/100, and `sd-nocard --repeat 25` passes
+   25/25 (worst failed mount 628 ms).
+2. **An RTC alarm flag left set keeps the hub powered indefinitely, and the
+   ESP32 cannot see it.** Q3 holds the VSYS switch on while `INT_RTC` is
+   asserted, i.e. while A1F/A2F is set with its interrupt enabled. No ESP32 pin
+   reads `INT_RTC`; only the DS3231 status register over I2C shows it. After
+   `rtc-alarm`, A1F stayed set with A1IE on. That held VSYS for over an hour,
+   and made the first `pwr-hold` run look as though PWR_HOLD could not cut
+   power. `pwr-hold` now reports the flags and clears them first. Production
+   shutdown must confirm both flags are clear (or the next alarm is armed)
+   before releasing `PWR_HOLD`; otherwise a flag left set drains the battery.
+3. **The config button's set overrides clear while it is held.** U52's preset
+   (`CONFIG_SET_N`, the button) dominates `CONFIG_CLEAR`, so a clear issued
+   while the button is held does not take. Shutdown code should re-read
+   `CONFIG_WAKE` after the clear pulse and retry until it reads HIGH. This is
+   the "latch bounce unreliable" behaviour noted on V1. The latch output only
+   feeds the `CONFIG_WAKE` readback; it does not hold power.
+4. **The last log line before a power cut is lost**, because it is still
+   leaving the UART when the rail collapses (the rail drops within about 30 ms
+   of PWR_HOLD going low). Call `Serial.flush()` before releasing `PWR_HOLD`
+   wherever that line matters.
+5. **A card reset mid-transaction can keep driving DO.** It stays driven until
+   the card sees clocks with CS high. This only affects bring-up pin checks
+   (MISO is not shared), and `sd-raw`/`sd-sweep` now clock it out before
+   reading.
+6. **Open-input ADC noise is 5 LSB (15 mV) peak-to-peak, with a 14 mV offset,
+   identical on all four channels**, against the harness's 4 LSB limit. The
+   next check is whether it survives shorting an input to GND at the port.
+7. **The battery ADC reads 1.2 % high** (3.775 V against a DMM's 3.73 V), so
+   a 3.5 V firmware guard trips at about 3.46 V true.
+8. **The modem passes everything up to authentication.** HTTPS to the ingest
+   endpoint returns 401 "Invalid or revoked device credential", which is
+   correct for a hub without FM2 provisioning.
+
 ## Host setup
 
 ```sh
@@ -146,7 +193,11 @@ unexplained over-current, rail error, reset or bad write.
    `espnow-basic`, then `pwr-hold` (SW10 at run). Then the 25 wake/hold/shutdown
    cycles.
 5. **Stage E:** `rtc-alarm`, then `wake-reason` (SW10 at run; the runner follows
-   the board through each power cycle).
+   the board through each power cycle). `rtc-alarm` leaves Alarm 1 armed with
+   its flag set, which holds VSYS on (finding 2). `pwr-hold` clears it, and so
+   does the first `wake-reason` boot. `wake-reason` re-arms a 15 s alarm on
+   every wake, so leaving it running gives the 25 autonomous off-wake cycles
+   directly.
 6. **Stage F (SD):** with the card out, run `sd-nocard --repeat 25`: the R5
    plan's 25 boots without media. Then insert the reference card and run
    `sd-card`, `sd-sweep`, `sd-logger`, and `sd-logger --repeat 100` for the
@@ -175,6 +226,14 @@ highest contiguous pass. `sd-nocard` is the same sketch, started with `n`: no
 speed may mount, and each failed attempt must return within 3 s. Commands:
 `r` re-runs the sweep; `n` runs the no-card check; `p <kHz>` is a probe loop
 for scope captures.
+
+**`sd-raw`** (`bringup_hub_sd_raw.cpp`), for use when a mount fails. It first
+checks each ESP32-to-pull-up path. It then runs CMD0, CMD8, CMD55/ACMD41 and
+CMD58 twice: bit-banged at about 50 kHz, then on VSPI at 400 kHz. Finally it
+runs a matrix of CRC on/off against ACMD41 `0x40000000` / `0x40100000`. The
+`0x40000000` variants are checks; the `0x40100000` variants are WARN, because
+they describe the card, not the board. `s` holds static levels on the pins for
+DMM probing.
 
 **`i2c-mux`** (`bringup_hub_i2c_mux.cpp`). SDA1/SCL1 idle high and hold high
 against the internal pull-down, which proves F2 is fitted. The root bus holds

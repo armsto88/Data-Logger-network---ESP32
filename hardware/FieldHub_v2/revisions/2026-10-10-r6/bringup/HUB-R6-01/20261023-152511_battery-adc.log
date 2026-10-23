@@ -1,0 +1,33 @@
+# board HUB-R6-01  test battery-adc  env mothership-v1-battery-adc
+# commit 8d5a6a5 (firmware tree dirty: no)  port /dev/serial/by-id/usb-1a86_USB_Serial-if00-port0  started 2026-10-23T15:25:11
+# note: capture only; verdict pending DMM comparison
+[    0.023] ## battery-adc: VOLT_ESP divider vs DMM, ESP_PG idle LOW
+[    0.024] ## operator-judged test: Ctrl-C when finished, then enter the verdict
+[    0.024] ## type a line + Enter to send it to the board; Ctrl-C ends the session
+[    0.024] ## reset via DTR pulse (needs SW10 in USB service position)
+[    0.197] ets Jul 29 2019 12:21:46
+[    0.197] 
+[    0.197] rst:0x1 (POWERON_RESET),boot:0x13 (SPI_FAST_FLASH_BOOT)
+[    0.197] configsip: 0, SPIWP:0xee
+[    0.197] clk_drv:0x00,q_drv:0x00,d_drv:0x00,cs0_drv:0x00,hd_drv:0x00,wp_drv:0x00
+[    0.197] mode:DIO, clock div:2
+[    0.197] load:0x3fff0030,len:1184
+[    0.197] load:0x40078000,len:13232
+[    0.197] load:0x40080400,len:3028
+[    0.197] entry 0x400805e4
+[    1.150] 
+[    1.150] === FieldHub Battery ADC Bring-up ===
+[    1.150] BATTERY_ADC = GPIO34 (ADC1, 12-bit, 0–3.6 V)
+[    1.150] MODEM_PG    = GPIO35 (input-only, external pull-up)
+[    1.150] Divider: R1=220 kΩ, R2=100 kΩ, scale=0.00281 V/LSB
+[    1.150] Samples per reading: 16
+[    1.150] Reading battery voltage every 2 seconds...
+[    1.200] t=832 ms | V_bat=3.774 V (calibrated) | raw_avg=1271.4 (uncal 3.577 V) | ESP_PG=LOW (power-bad or rail off)
+[    3.204] t=2846 ms | V_bat=3.775 V (calibrated) | raw_avg=1272.6 (uncal 3.580 V) | ESP_PG=LOW (power-bad or rail off)
+[    5.210] t=4850 ms | V_bat=3.776 V (calibrated) | raw_avg=1271.8 (uncal 3.578 V) | ESP_PG=LOW (power-bad or rail off)
+[    7.215] t=6854 ms | V_bat=3.776 V (calibrated) | raw_avg=1272.0 (uncal 3.578 V) | ESP_PG=LOW (power-bad or rail off)
+[    9.220] t=8858 ms | V_bat=3.775 V (calibrated) | raw_avg=1272.8 (uncal 3.580 V) | ESP_PG=LOW (power-bad or rail off)
+[   11.226] t=10862 ms | V_bat=3.775 V (calibrated) | raw_avg=1271.7 (uncal 3.577 V) | ESP_PG=LOW (power-bad or rail off)
+[   13.231] t=12866 ms | V_bat=3.775 V (calibrated) | raw_avg=1271.8 (uncal 3.578 V) | ESP_PG=LOW (power-bad or rail off)
+[   15.186] t=14870 ms | V_bat=3.776 V (calibrated) | raw_avg=1272.0 (uncal 3.578 V) | ESP_PG=LOW (power-bad or rail off)
+[   15.944] ## session ended by operator

@@ -75,6 +75,8 @@ LADDER = [
       timeout=60),
     t("sd-sweep", "mothership-v2-bringup-sd-sweep", "F", "SD at 0.4/4/10/20/40 MHz, 128 KiB verify each",
       judge=SUMMARY, timeout=300),
+    t("sd-raw", "mothership-v2-bringup-sd-raw", "F", "bit-banged CMD0/CMD8 + pin paths, when mounts fail",
+      judge=SUMMARY, timeout=60),
     t("sd-nocard", "mothership-v2-bringup-sd-sweep", "F", "card removed: no mount, each attempt fails < 3 s",
       judge=SUMMARY, timeout=120, start="n\n"),
     t("sd-logger", "mothership-v2-test-sd-logger", "F", "production sd_logger.cpp archive regression",

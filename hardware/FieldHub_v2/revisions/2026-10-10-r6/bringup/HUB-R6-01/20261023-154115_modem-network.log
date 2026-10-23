@@ -1,0 +1,85 @@
+# board HUB-R6-01  test modem-network  env mothership-v1-modem-network
+# commit 8d5a6a5 (firmware tree dirty: yes)  port /dev/serial/by-id/usb-1a86_USB_Serial-if00-port0  started 2026-10-23T15:41:15
+[    0.024] ## modem-network: CSQ/CREG/CEREG/COPS (antenna fitted!)
+[    0.024] ## type a line + Enter to send it to the board; Ctrl-C ends the session
+[    0.024] ## reset via DTR pulse (needs SW10 in USB service position)
+[    0.197] ets Jul 29 2019 12:21:46
+[    0.197] 
+[    0.197] rst:0x1 (POWERON_RESET),boot:0x13 (SPI_FAST_FLASH_BOOT)
+[    0.197] configsip: 0, SPIWP:0xee
+[    0.197] clk_drv:0x00,q_drv:0x00,d_drv:0x00,cs0_drv:0x00,hd_drv:0x00,wp_drv:0x00
+[    0.197] mode:DIO, clock div:2
+[    0.197] load:0x3fff0030,len:1184
+[    0.197] load:0x40078000,len:13232
+[    0.197] load:0x40080400,len:3028
+[    0.198] entry 0x400805e4
+[    1.150] 
+[    1.150] === Mothership V1 Modem Network Status Bring-up ===
+[    1.150] Antenna connected. Polling for network registration (up to 180 seconds).
+[    1.150] 
+[    1.150] --- Power on: 4V rail + PWRKEY + boot ---
+[    1.652] PASS: 4V rail up (ESP_PG HIGH).
+[    9.823] PASS: Modem booted.
+[    9.823] 
+[    9.823] --- Setting operator auto-select (AT+COPS=0) ---
+[    9.823] 
+[    9.823] OK
+[    9.823] 
+[   11.829] 
+[   11.829] --- Polling for network registration ---
+[   11.829] [0s] AT+CSQ: 
+[   11.829] +CSQ: 27,99
+[   11.829] 
+[   11.829] OK
+[   11.879] [0s] AT+CREG?: 
+[   11.879] +CREG: 0,1
+[   11.879] 
+[   11.879] OK
+[   11.879] [0s] AT+CEREG?: 
+[   11.879] +CEREG: 0,1
+[   11.879] 
+[   11.879] OK
+[   11.879] 
+[   11.879] NETWORK REGISTERED
+[   11.879] 
+[   11.879] === Final network status summary ===
+[   11.879] 
+[   11.929] --- AT+CSQ (signal quality) ---
+[   11.930] PASS: AT+CSQ responded:
+[   11.930] 
+[   11.930] +CSQ: 27,99
+[   11.930] 
+[   11.930] OK
+[   11.930] 
+[   11.930] --- AT+CREG? (GSM registration) ---
+[   11.930] PASS: AT+CREG? responded:
+[   11.930] 
+[   11.930] +CREG: 0,1
+[   11.930] 
+[   11.930] OK
+[   11.930] 
+[   11.930] --- AT+CEREG? (EPS registration) ---
+[   11.930] PASS: AT+CEREG? responded:
+[   11.930] 
+[   11.930] +CEREG: 0,1
+[   11.930] 
+[   11.930] OK
+[   11.930] 
+[   11.930] --- AT+CGATT? (GPRS attach) ---
+[   11.930] PASS: AT+CGATT? responded:
+[   11.930] 
+[   11.930] +CGATT: 1
+[   11.930] 
+[   11.930] OK
+[   11.930] 
+[   11.930] --- AT+COPS? (operator) ---
+[   11.930] PASS: AT+COPS? responded:
+[   11.930] 
+[   11.930] +COPS: 0,2,"26203",7
+[   11.930] 
+[   11.930] OK
+[   11.930] 
+[   11.930] === Modem network status bring-up complete ===
+[   11.930] OVERALL PASS: Modem registered on network (GSM + EPS).
+[   11.930] 
+[   11.930] --- Graceful power off ---

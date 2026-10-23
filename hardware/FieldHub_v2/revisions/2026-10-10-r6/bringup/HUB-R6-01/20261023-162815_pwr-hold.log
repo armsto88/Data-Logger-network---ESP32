@@ -1,0 +1,27 @@
+# board HUB-R6-01  test pwr-hold  env mothership-v1-pwrhold
+# commit 8d5a6a5 (firmware tree dirty: yes)  port /dev/serial/by-id/usb-1a86_USB_Serial-if00-port0  started 2026-10-23T16:28:15
+[    0.023] ## pwr-hold: PWR_HOLD keeps and drops VSYS (15 s on/off)
+[    0.023] ## operator-judged test: Ctrl-C when finished, then enter the verdict
+[    0.023] ## type a line + Enter to send it to the board; Ctrl-C ends the session
+[    0.826] 
+[    0.826] === Mothership V1 PWR_HOLD Bring-up ===
+[    0.826] PWR_HOLD pin = GPIO26 (active HIGH)
+[    0.826] Pattern: ON 15000 ms, OFF 15000 ms
+[    0.826] Probe VSYS and 3V3_SYS rails while states toggle.
+[    0.826] Board should stay powered during ON phase and cut power during OFF phase.
+[    0.826] t=828 ms | PWR_HOLD=ON  (board should stay powered)
+[   15.869] t=15838 ms | PWR_HOLD=OFF (board will lose power in ~seconds)
+[   15.869] >>> If you can read this, the OFF phase did not cut power. Check P-FET gate.
+[   30.863] t=30848 ms | PWR_HOLD=ON  (board should stay powered)
+[   45.855] t=45848 ms | PWR_HOLD=OFF (board will lose power in ~seconds)
+[   45.855] >>> If you can read this, the OFF phase did not cut power. Check P-FET gate.
+[   60.847] t=60858 ms | PWR_HOLD=ON  (board should stay powered)
+[   75.887] t=75858 ms | PWR_HOLD=OFF (board will lose power in ~seconds)
+[   75.888] >>> If you can read this, the OFF phase did not cut power. Check P-FET gate.
+[   90.878] t=90868 ms | PWR_HOLD=ON  (board should stay powered)
+[  105.870] t=105868 ms | PWR_HOLD=OFF (board will lose power in ~seconds)
+[  105.870] >>> If you can read this, the OFF phase did not cut power. Check P-FET gate.
+[  120.911] t=120878 ms | PWR_HOLD=ON  (board should stay powered)
+[  135.903] t=135878 ms | PWR_HOLD=OFF (board will lose power in ~seconds)
+[  135.903] >>> If you can read this, the OFF phase did not cut power. Check P-FET gate.
+[  150.896] t=150888 ms | PWR_HOLD=ON  (board should stay powered)

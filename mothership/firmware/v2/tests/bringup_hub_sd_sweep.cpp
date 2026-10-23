@@ -87,7 +87,7 @@ static const char* cardTypeName(uint8_t t) {
 // Write SWEEP_BYTES, read back, compare. Returns mismatched byte count, or -1
 // on an open/short-write/short-read error.
 static long writeVerify(uint32_t seed0, float* wrKBs, float* rdKBs) {
-  SD.remove(kTestPath);
+  if (SD.exists(kTestPath)) SD.remove(kTestPath);
   File f = SD.open(kTestPath, FILE_WRITE);
   if (!f) return -1;
   uint32_t seed = seed0;
@@ -123,10 +123,20 @@ static long writeVerify(uint32_t seed0, float* wrKBs, float* rdKBs) {
 static void runSweep() {
   hubResetCounts();
 
-  // MISO idles high through R4 with CS deasserted, card or no card.
+  // MISO idles high through R4 with CS deasserted, card or no card. A card
+  // left selected by a reset mid-transaction drives DO until it sees clocks
+  // with CS high, so give it 16 before looking.
   sdRelease();
   pinMode(PIN_SD_CS, OUTPUT);
   digitalWrite(PIN_SD_CS, HIGH);
+  pinMode(PIN_SD_SCK, OUTPUT);
+  for (int i = 0; i < 16; i++) {
+    digitalWrite(PIN_SD_SCK, HIGH);
+    delayMicroseconds(5);
+    digitalWrite(PIN_SD_SCK, LOW);
+    delayMicroseconds(5);
+  }
+  pinMode(PIN_SD_SCK, INPUT);
   pinMode(PIN_SD_MISO, INPUT);
   delay(2);
   const int misoIdle = digitalRead(PIN_SD_MISO);

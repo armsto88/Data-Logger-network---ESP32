@@ -1,0 +1,22 @@
+# board HUB-R6-01  test sd-card  env mothership-v1-sd-card
+# commit 8d5a6a5 (firmware tree dirty: no)  port /dev/serial/by-id/usb-1a86_USB_Serial-if00-port0  started 2026-10-23T15:28:38
+[    0.024] ## sd-card: first SD mount + write/read at 400 kHz
+[    0.024] ## type a line + Enter to send it to the board; Ctrl-C ends the session
+[    0.024] ## reset via DTR pulse (needs SW10 in USB service position)
+[    0.197] ets Jul 29 2019 12:21:46
+[    0.197] 
+[    0.197] rst:0x1 (POWERON_RESET),boot:0x13 (SPI_FAST_FLASH_BOOT)
+[    0.197] configsip: 0, SPIWP:0xee
+[    0.197] clk_drv:0x00,q_drv:0x00,d_drv:0x00,cs0_drv:0x00,hd_drv:0x00,wp_drv:0x00
+[    0.197] mode:DIO, clock div:2
+[    0.197] load:0x3fff0030,len:1184
+[    0.197] load:0x40078000,len:13232
+[    0.197] load:0x40080400,len:3028
+[    0.197] entry 0x400805e4
+[    1.149] 
+[    1.149] === Mothership V1 SD Card Bring-up ===
+[    1.199] SD CS=13 SCK=18 MISO=19 MOSI=23
+[    1.199] [DBG] MISO idle state: 1 (expect 1/HIGH due to pull-up or card)
+[    1.200] [DBG] MISO with CS asserted: 1 (expect 0 if card responds)
+[    2.202] [  1832][E][sd_diskio.cpp:806] sdcard_mount(): f_mount failed: (3) The physical drive cannot work
+[    2.202] [SD] SD.begin() FAILED — check wiring and card presence
