@@ -14,6 +14,7 @@ Design, bring-up, implementation, and review documents for the ESP32-WROOM mothe
 - [MOTHERSHIP_V2_ON_DEVICE_UI_UPGRADE_PLAN.md](MOTHERSHIP_V2_ON_DEVICE_UI_UPGRADE_PLAN.md) - current on-device UI upgrade plan.
 - [MOTHERSHIP_V1_MODEM_UPLOAD_PLAN.md](MOTHERSHIP_V1_MODEM_UPLOAD_PLAN.md) - modem upload implementation plan.
 - [MOTHERSHIP_V1_ROBUSTNESS_FIX_PLAN.md](MOTHERSHIP_V1_ROBUSTNESS_FIX_PLAN.md) - reliability fixes, acceptance plan, and the dated 2026-06-22 execution record consolidated on 2026-07-17.
+- [MOTHERSHIP_SD_PRIMARY_STORAGE_PLAN.md](MOTHERSHIP_SD_PRIMARY_STORAGE_PLAN.md) - proposed plan to make the SD card the permanent system of record for readings and uploads, with oldest-first removal only when the card is full.
 
 ## Bring-up and LTE
 
