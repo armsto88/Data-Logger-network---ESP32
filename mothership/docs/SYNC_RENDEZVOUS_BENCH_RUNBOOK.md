@@ -34,15 +34,17 @@ note wants to change, is untouched. **Never flash this build for field use.**
 
 ## Setup
 
-1. **Hardware.** HUB-R6-01 on battery with SW9 and SW10 in RUN, USB to the
-   laptop, the SD card fitted (so boot time is realistic), and both nodes
-   powered a few metres away.
+1. **Hardware.** HUB-R6-01 on battery with SW9 in RUN, USB to the laptop, the
+   SD card fitted (so boot time is realistic), and both nodes powered a few
+   metres away. Put **SW10 in the service position** for the flash.
 2. **Flash and capture.**
    ```sh
    scripts/hub_bringup.py run HUB-R6-01 sync-sweep
    ```
    This builds and flashes the bench env, then logs every line with a timestamp
-   and reconnects each time the hub cuts its own power.
+   and reconnects each time the hub cuts its own power. When the flash has
+   finished, **slide SW10 back to RUN**, or the hub will never power itself off
+   between windows.
 3. **Commission** from the hub's own pages (press the config button, join the
    hub's Wi-Fi, open `192.168.4.1`):
    - set the hub clock;
