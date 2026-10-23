@@ -1,6 +1,6 @@
 # Node Documentation
 
-**Last reviewed:** 2026-07-17
+**Last reviewed:** 2026-10-22
 
 Design notes, hardware checklists, sensor implementation records, and bring-up results for the ESP32-WROOM sensor nodes.
 
@@ -14,6 +14,9 @@ Design notes, hardware checklists, sensor implementation records, and bring-up r
 - [NODE_V3_22V_BOOST_UPDATE.md](NODE_V3_22V_BOOST_UPDATE.md) - V3 22 V boost changes.
 - [NODE_V3_ULTRASONIC_CHANGES_BRINGUP_FIRMWARE_GUIDE_2026-06-12.md](NODE_V3_ULTRASONIC_CHANGES_BRINGUP_FIRMWARE_GUIDE_2026-06-12.md) - V3 design changes and production firmware guidance.
 - [NODE_V4_ULTRASONIC_REDESIGN_NOTES.md](NODE_V4_ULTRASONIC_REDESIGN_NOTES.md) - V4 shared bidirectional transducer redesign.
+- [NODE_V4_SOLAR_CHARGER_WIRING_GUIDE.md](NODE_V4_SOLAR_CHARGER_WIRING_GUIDE.md) - CN3791 solar charger and TMP390 hot/cold shutdown wiring.
+- [NODE_V4_FIRMWARE_UPDATES.md](NODE_V4_FIRMWARE_UPDATES.md) - required firmware constants, calibration and validation for the Node V4 hardware.
+- [Node V4 hardware release](../../hardware/NODE_v4/README.md) - controlling PCB package and consolidated engineering review.
 
 ## Storage and robustness
 

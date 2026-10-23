@@ -1,6 +1,6 @@
-# ESP32 Sensor Network � Mothership + Nodes
+# ESP32 Sensor Network — Mothership + Nodes
 
-An **ESP-NOW**�based environmental sensor network: field-deployed nodes collect data, a mothership hub aggregates and logs it, and an optional LTE backhaul uploads to the cloud.
+An **ESP-NOW**-based environmental sensor network: field-deployed nodes collect data, a mothership hub aggregates and logs it, and an optional LTE backhaul uploads to the cloud.
 
 ---
 
@@ -26,6 +26,10 @@ docs/                 Shared/cross-system documentation
   archive/              Manuscript drafts and reference files
 
 hardware/             PCB, CAD, simulation, and manufacturing assets
+  FieldHub_v2/          Hub PCB releases
+  NODE_v3/              Historical node PCB releases
+  NODE_v4/              Current node prototype release
+  sensor_housings/      Printable sensor enclosures and adapters
   ultrasonic_anemometer/  Ultrasonic wind sensor subproject
 
 platformio.ini       Build configuration (all targets)
@@ -38,6 +42,7 @@ CONTRIBUTING.md      Repo organization and contribution rules
 
 - **Mothership docs:** [mothership/docs/README.md](mothership/docs/README.md)
 - **Node docs:** [node/docs/README.md](node/docs/README.md)
+- **Hardware index:** [hardware/README.md](hardware/README.md)
 - **Shared docs index:** [docs/README.md](docs/README.md)
 - **Contribution guide:** [CONTRIBUTING.md](CONTRIBUTING.md)
 
@@ -105,6 +110,8 @@ pio run -e esp32wroom-sht40-as7343-mux
 | LTE Backhaul Concept | [mothership/docs/MOTHERSHIP_LTE_BACKHAUL_CONCEPT.md](mothership/docs/MOTHERSHIP_LTE_BACKHAUL_CONCEPT.md) | A7670G modem integration and upload workflow |
 | Node Hardware Checklist | [node/docs/NODE_HARDWARE_V2_CHECKLIST.md](node/docs/NODE_HARDWARE_V2_CHECKLIST.md) | V2 hardware bring-up and validation |
 | Node PCB Overview | [node/docs/NODE-PCB-OVERVIEW.md](node/docs/NODE-PCB-OVERVIEW.md) | Node PCB design summary and pin mapping |
+| Node V4 prototype | [hardware/NODE_v4/README.md](hardware/NODE_v4/README.md) | Current PCB release, review record and supporting files |
+| Node V4 firmware changes | [node/docs/NODE_V4_FIRMWARE_UPDATES.md](node/docs/NODE_V4_FIRMWARE_UPDATES.md) | Firmware work required for the V4 hardware |
 | Local Storage Contract | [node/docs/NODE-LOCAL-STORAGE-CONTRACT-V1.md](node/docs/NODE-LOCAL-STORAGE-CONTRACT-V1.md) | Queue storage and data format specification |
 | Concept Overview | [docs/concept_overview.md](docs/concept_overview.md) | High-level system architecture |
 

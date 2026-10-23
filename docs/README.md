@@ -1,12 +1,17 @@
 # Documentation Index
 
-**Last reviewed:** 2026-07-17
+**Last reviewed:** 2026-10-22
 
-**Repository-wide Markdown audit:** 2026-07-17
+**Repository-wide documentation/link audit:** 2026-10-22
 
 This folder contains cross-system FieldMesh documentation. Hardware- and firmware-specific documents also live in [mothership/docs/](../mothership/docs/), [node/docs/](../node/docs/), [sensors/](../sensors/), and [hardware/](../hardware/).
 
-The 2026-07-17 audit scanned every Markdown file outside generated build/dependency folders. Distinct hardware results, protocol contracts, calibration evidence, and dated implementation records were retained. Repetitive legacy agent files were merged into one dated archive, byte-identical OpenFOAM case READMEs were removed in favour of their shared instructions, and a broken V2 bring-up pointer was replaced by a direct index link.
+The 2026-10-22 audit scanned the documentation tree outside generated build
+and dependency folders and verified all relative Markdown links. Distinct
+hardware results, protocol contracts, calibration evidence and dated
+implementation records remain intentionally separate. Obsolete duplicate agent
+configuration was removed, the Node V4 intermediate reviews were condensed
+into one final disposition record, and raw generated captures were removed.
 
 ## Start here
 
@@ -17,6 +22,8 @@ The 2026-07-17 audit scanned every Markdown file outside generated build/depende
 - [ADDING_A_NEW_SENSOR_CHECKLIST.md](ADDING_A_NEW_SENSOR_CHECKLIST.md) - mandatory sensor-package integration checklist.
 - [mothership OTA plan](../mothership/docs/FIELDMESH_OTA_FIRMWARE_UPDATE_PLAN.md) - staged mothership and node firmware update design (see §0 for build/proven status).
 - [FIELDMESH_FIRMWARE_DASHBOARD_INTEGRATION_BRIEF.md](FIELDMESH_FIRMWARE_DASHBOARD_INTEGRATION_BRIEF.md) - front/backend handoff: displaying firmware info, config controls (interval/pause/undeploy), and dashboard-initiated mothership OTA, with data shapes + an LLM prompt.
+- [hardware index](../hardware/README.md) - PCB releases, review records,
+  mechanical assets and connector-documentation rules.
 
 ## Protocols and data contracts
 
