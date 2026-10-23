@@ -1,5 +1,7 @@
 # Hub Local Sensor Collection — Plan
 
+> **2026-10-23:** the firmware phases below (1–6) still stand. Phase 7 and the choice not to add the hub to `status.nodes[]` for the first release are replaced by [HUB_LOCAL_DATA_INTEGRATION_PLAN.md](HUB_LOCAL_DATA_INTEGRATION_PLAN.md), which makes the hub a station created in commissioning and covers the backend and dashboard. Pin and port questions in this plan were answered by the r6 bring-up (`hardware/FieldHub_v2/revisions/2026-10-10-r6/BRINGUP_HARNESS.md`).
+
 **Date:** 2026-09-27 (rev. 4)
 **Status:** Planning — two rounds of cross-review incorporated; remaining items are hardware/policy decisions plus a defined implementation checklist
 **Scope:** Mothership firmware only (`mothership/firmware/v2`). Reuses Node firmware modules (`node/firmware/shared`, `node/firmware/src/sensors`, `node/firmware/src/drivers`). No backend/schema changes.
