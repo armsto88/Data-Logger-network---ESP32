@@ -123,12 +123,42 @@ firmware stack, not one-board defects, so they apply to every board.
    the card sees clocks with CS high. This only affects bring-up pin checks
    (MISO is not shared), and `sd-raw`/`sd-sweep` now clock it out before
    reading.
-6. **Open-input ADC noise is 5 LSB (15 mV) peak-to-peak, with a 14 mV offset,
-   identical on all four channels**, against the harness's 4 LSB limit. The
-   next check is whether it survives shorting an input to GND at the port.
-7. **The battery ADC reads 1.2 % high** (3.775 V against a DMM's 3.73 V), so
+6. **ADC noise depends on whether the input is held.** With nothing connected,
+   each channel reads a 14 mV mean with 4-5 LSB (12-15 mV) peak-to-peak noise.
+   That sits on the harness's 4 LSB limit, so which channel fails changes from
+   run to run. With the input shorted to GND at the port, all four channels read
+   a 3 mV mean (1 LSB offset) with 1-2 LSB (3-6 mV) peak-to-peak noise, so the
+   ADC, its supply and ground are quiet with the 5 V boost running. The open-input
+   figures are pickup and leakage on a high-impedance node (1 MOhm pull-down).
+   Measure board noise with the input held low, and treat a floating-input
+   failure as a prompt to short the input, not as a board fault.
+7. **The ADS1015 reads about 0.6 % below a handheld meter, identically on all
+   four channels, and the 5 V rail is healthy.** At 5.07 V all four channels
+   read 5039-5040 mV (-30 mV). At 3.34 V channel A0 reads 3316 mV (-0.7 %), and
+   shorted inputs read 3 mV. There is no clipping with the input level with the
+   ADC's own 5.07 V supply, and no crosstalk: with A0 held at 5 V, A1-A3 stayed
+   at 2-5 mV. The remaining error is steady and could belong to the ADC or to the
+   meter; a second meter would settle it. `5V_SYS` and `5V_SEN` both measure
+   5.07 V with nothing connected, so the sensor-rail switch drops nothing.
+   A first 5 V point read 76 mV low, and it was a poor jumper contact: the node
+   measured 4.85 V instead of 5.07 V. Before trusting a failing point, measure
+   the source and the input pin back to back.
+8. **The battery ADC reads 1.2 % high** (3.775 V against a DMM's 3.73 V), so
    a 3.5 V firmware guard trips at about 3.46 V true.
-8. **The modem passes everything up to authentication.** HTTPS to the ingest
+9. **GPIO36 (reed) sees false closures when the radio or ADC1 is active.**
+   Hands off and with the contact open, `reed` counted 4, 4 and 2 false falling
+   edges over 5 Wi-Fi on/off cycles (4 in the first run), and 1 false edge
+   during 4000 battery-ADC reads in each of three repeat runs (0 in the first
+   run after boot). Idle level, close/release detection and a tapped count
+   (58 counted from 153 raw edges) all pass. This is the GPIO36/39 limitation
+   from the 2026-10-01 review, now confirmed on r6. With the node reed code
+   (a 2 s probe; two or more edges start a 10 s window), a calm hub whose radio
+   changes state during the probe could report a phantom 0.13-0.27 m/s, and in
+   a real count each stray edge adds one pulse (2 % of a 50-pulse window).
+   Firmware: take the reed window with the radio in a steady state, discard
+   edges for a short time after any Wi-Fi or ESP-NOW start or stop, and do not
+   read the battery ADC during it. Hardware: see `NEXT_REVISION_NOTES.md`.
+10. **The modem passes everything up to authentication.** HTTPS to the ingest
    endpoint returns 401 "Invalid or revoked device credential", which is
    correct for a hub without FM2 provisioning.
 

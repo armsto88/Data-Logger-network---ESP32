@@ -1,0 +1,67 @@
+# board HUB-R6-01  test reed  env mothership-v2-bringup-reed
+# commit 25a9838 (firmware tree dirty: no)  port /dev/serial/by-id/usb-1a86_USB_Serial-if00-port0  started 2026-10-23T20:18:00
+[    0.024] ## reed: GPIO36 idle, ADC1/Wi-Fi immunity, close/spin
+[    0.024] ## type a line + Enter to send it to the board; Ctrl-C ends the session
+[    0.025] ## reset via DTR pulse (needs SW10 in USB service position)
+[    0.197] ets Jul 29 2019 12:21:46
+[    0.197] 
+[    0.197] rst:0x1 (POWERON_RESET),boot:0x13 (SPI_FAST_FLASH_BOOT)
+[    0.197] configsip: 0, SPIWP:0xee
+[    0.197] clk_drv:0x00,q_drv:0x00,d_drv:0x00,cs0_drv:0x00,hd_drv:0x00,wp_drv:0x00
+[    0.197] mode:DIO, clock div:2
+[    0.197] load:0x3fff0030,len:1184
+[    0.197] load:0x40078000,len:13232
+[    0.198] load:0x40080400,len:3028
+[    0.198] entry 0x400805e4
+[    0.799] 
+[    0.850] === FieldHub v2 r6 bring-up: reed / anemometer input ===
+[    0.850] build Oct 23 2026 18:09:16
+[    0.850] REED=GPIO36 (R8 1k, R9 10k pull-up, C2 100nF), debounce 5000 us
+[    0.850] Send Enter to start (auto-start in 15 s)...
+[    1.401] RESULT|REED_IDLE_HIGH|PASS|GPIO36=1 over 500 ms (R9 pull-up; contact must be open)
+[    1.803] RESULT|REED_ADC1_IMMUNITY|PASS|0 false edges during 4000 ADC1 reads on GPIO34 (checksum 42)
+[    3.958] RESULT|REED_WIFI_IMMUNITY|FAIL|4 false edges over 5 Wi-Fi on/off cycles
+[    3.958] ACTION: short reed pin 2 to pin 1 (GND), or turn the cups until the contact closes (30 s)
+[   14.437] RESULT|REED_CLOSE_DETECT|PASS|GPIO36 read LOW for 20 ms: yes
+[   14.437] ACTION: release the contact (30 s)
+[   14.487] RESULT|REED_RELEASE_DETECT|PASS|GPIO36 back HIGH for 20 ms: yes
+[   14.537] ACTION: spin the cups now (10 s window)
+[   26.022] RESULT|REED_SPIN|PASS|58 counted (153 raw edges, 95 bounce), 5.80 Hz = 3.87 m/s, min raw gap 6 us
+[   26.022] RESULT|SUMMARY|5/6|OVERALL:FAIL
+[   26.022] Commands: r = full suite | a = automatic only | n <N> = exact count | c = continuous
+[  122.793] >> a
+[  123.345] RESULT|REED_IDLE_HIGH|PASS|GPIO36=1 over 500 ms (R9 pull-up; contact must be open)
+[  123.747] RESULT|REED_ADC1_IMMUNITY|FAIL|1 false edges during 4000 ADC1 reads on GPIO34 (checksum 111)
+[  125.803] RESULT|REED_WIFI_IMMUNITY|FAIL|1 false edges over 5 Wi-Fi on/off cycles
+[  125.803] RESULT|SUMMARY|1/3|OVERALL:FAIL
+[  129.638] >> a
+[  130.189] RESULT|REED_IDLE_HIGH|PASS|GPIO36=1 over 500 ms (R9 pull-up; contact must be open)
+[  130.590] RESULT|REED_ADC1_IMMUNITY|FAIL|1 false edges during 4000 ADC1 reads on GPIO34 (checksum 81)
+[  132.647] RESULT|REED_WIFI_IMMUNITY|FAIL|4 false edges over 5 Wi-Fi on/off cycles
+[  132.647] RESULT|SUMMARY|1/3|OVERALL:FAIL
+[  134.277] >> a
+[  134.829] RESULT|REED_IDLE_HIGH|PASS|GPIO36=1 over 500 ms (R9 pull-up; contact must be open)
+[  135.230] RESULT|REED_ADC1_IMMUNITY|FAIL|1 false edges during 4000 ADC1 reads on GPIO34 (checksum 79)
+[  137.287] RESULT|REED_WIFI_IMMUNITY|FAIL|4 false edges over 5 Wi-Fi on/off cycles
+[  137.287] RESULT|SUMMARY|1/3|OVERALL:FAIL
+[  175.350] >> a
+[  175.901] RESULT|REED_IDLE_HIGH|PASS|GPIO36=1 over 500 ms (R9 pull-up; contact must be open)
+[  176.303] RESULT|REED_ADC1_IMMUNITY|FAIL|1 false edges during 4000 ADC1 reads on GPIO34 (checksum 158)
+[  178.359] RESULT|REED_WIFI_IMMUNITY|FAIL|2 false edges over 5 Wi-Fi on/off cycles
+[  178.359] RESULT|SUMMARY|1/3|OVERALL:FAIL
+[  302.918] >> n20
+[  302.968] ACTION: make exactly 20 closures, then send Enter
+[  324.760] >> 
+[  324.810] RESULT|REED_COUNT_20|FAIL|counted 67 of 20 (186 raw edges)
+[  324.810] RESULT|SUMMARY|0/1|OVERALL:FAIL
+[  336.881] >> n20
+[  336.932] ACTION: make exactly 20 closures, then send Enter
+[  357.327] >> 
+[  357.378] RESULT|REED_COUNT_20|FAIL|counted 37 of 20 (67 raw edges)
+[  357.378] RESULT|SUMMARY|0/1|OVERALL:FAIL
+[  364.059] >> n20
+[  364.109] ACTION: make exactly 20 closures, then send Enter
+[  387.225] >> 
+[  387.275] RESULT|REED_COUNT_20|FAIL|counted 43 of 20 (95 raw edges)
+[  387.275] RESULT|SUMMARY|0/1|OVERALL:FAIL
+[  528.586] ## port lost (board powered off or USB unplugged); waiting for it to return

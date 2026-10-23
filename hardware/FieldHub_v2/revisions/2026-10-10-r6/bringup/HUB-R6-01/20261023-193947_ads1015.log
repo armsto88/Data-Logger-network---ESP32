@@ -1,0 +1,372 @@
+# board HUB-R6-01  test ads1015  env mothership-v2-bringup-ads1015
+# commit 25a9838 (firmware tree dirty: no)  port /dev/serial/by-id/usb-1a86_USB_Serial-if00-port0  started 2026-10-23T19:39:47
+[    0.024] ## ads1015: ADS1015 config, AIN0-3 convert + noise
+[    0.024] ## type a line + Enter to send it to the board; Ctrl-C ends the session
+[    0.024] ## reset via DTR pulse (needs SW10 in USB service position)
+[    0.197] ets Jul 29 2019 12:21:46
+[    0.197] 
+[    0.197] rst:0x1 (POWERON_RESET),boot:0x13 (SPI_FAST_FLASH_BOOT)
+[    0.197] configsip: 0, SPIWP:0xee
+[    0.198] clk_drv:0x00,q_drv:0x00,d_drv:0x00,cs0_drv:0x00,hd_drv:0x00,wp_drv:0x00
+[    0.198] mode:DIO, clock div:2
+[    0.198] load:0x3fff0030,len:1184
+[    0.198] load:0x40078000,len:13232
+[    0.198] load:0x40080400,len:3028
+[    0.198] entry 0x400805e4
+[    0.649] 
+[    0.649] === FieldHub v2 r6 bring-up: ADS1015 analogue inputs ===
+[    0.649] build Oct 23 2026 19:36:33
+[    0.699] AIN0=CN15.4 AIN1=CN15.3 AIN2=CN16.3 AIN3=CN16.4, PGA +/-6.144 V, 3 mV/LSB
+[    0.699] Send Enter to start (auto-start in 15 s)...
+[    0.749] RESULT|ADS_ACK_0x48|PASS|endTransmission=0 (needs 5V_SYS for U29/U30)
+[    0.749]   config at start = 0xF183 (power-on default 0x8583)
+[    0.749] RESULT|ADS_CONFIG_RW|PASS|wrote 0x5383/0x6183, read 0xD383/0xE183
+[    0.900] RESULT|ADS_A0_CONVERT|PASS|CN15.4: ok, mean 14 mV (0..5 LSB)
+[    0.900] RESULT|ADS_A0_NOISE|FAIL|CN15.4: 5 LSB p-p over 64 samples (15 mV, limit 4 LSB)
+[    1.050] RESULT|ADS_A1_CONVERT|PASS|CN15.3: ok, mean 14 mV (1..5 LSB)
+[    1.050] RESULT|ADS_A1_NOISE|PASS|CN15.3: 4 LSB p-p over 64 samples (12 mV, limit 4 LSB)
+[    1.151] RESULT|ADS_A2_CONVERT|PASS|CN16.3: ok, mean 14 mV (1..5 LSB)
+[    1.201] RESULT|ADS_A2_NOISE|PASS|CN16.3: 4 LSB p-p over 64 samples (12 mV, limit 4 LSB)
+[    1.301] RESULT|ADS_A3_CONVERT|PASS|CN16.4: ok, mean 14 mV (1..5 LSB)
+[    1.352] RESULT|ADS_A3_NOISE|PASS|CN16.4: 4 LSB p-p over 64 samples (12 mV, limit 4 LSB)
+[    1.352] RESULT|SUMMARY|9/10|OVERALL:FAIL
+[    1.352] Commands: r = re-run | c = stream | p <ch> <mV> = reference point check
+[   14.878] >> r
+[   14.928] RESULT|ADS_ACK_0x48|PASS|endTransmission=0 (needs 5V_SYS for U29/U30)
+[   14.928]   config at start = 0xF183 (power-on default 0x8583)
+[   14.929] RESULT|ADS_CONFIG_RW|PASS|wrote 0x5383/0x6183, read 0xD383/0xE183
+[   15.079] RESULT|ADS_A0_CONVERT|PASS|CN15.4: ok, mean 14 mV (1..5 LSB)
+[   15.079] RESULT|ADS_A0_NOISE|PASS|CN15.4: 4 LSB p-p over 64 samples (12 mV, limit 4 LSB)
+[   15.179] RESULT|ADS_A1_CONVERT|PASS|CN15.3: ok, mean 14 mV (0..5 LSB)
+[   15.229] RESULT|ADS_A1_NOISE|FAIL|CN15.3: 5 LSB p-p over 64 samples (15 mV, limit 4 LSB)
+[   15.330] RESULT|ADS_A2_CONVERT|PASS|CN16.3: ok, mean 14 mV (0..5 LSB)
+[   15.380] RESULT|ADS_A2_NOISE|FAIL|CN16.3: 5 LSB p-p over 64 samples (15 mV, limit 4 LSB)
+[   15.480] RESULT|ADS_A3_CONVERT|PASS|CN16.4: ok, mean 14 mV (1..5 LSB)
+[   15.480] RESULT|ADS_A3_NOISE|PASS|CN16.4: 4 LSB p-p over 64 samples (12 mV, limit 4 LSB)
+[   15.480] RESULT|SUMMARY|8/10|OVERALL:FAIL
+[  167.889] >> r
+[  167.939] RESULT|ADS_ACK_0x48|PASS|endTransmission=0 (needs 5V_SYS for U29/U30)
+[  167.939]   config at start = 0xF183 (power-on default 0x8583)
+[  167.939] RESULT|ADS_CONFIG_RW|PASS|wrote 0x5383/0x6183, read 0xD383/0xE183
+[  168.090] RESULT|ADS_A0_CONVERT|PASS|CN15.4: ok, mean 14 mV (0..5 LSB)
+[  168.090] RESULT|ADS_A0_NOISE|FAIL|CN15.4: 5 LSB p-p over 64 samples (15 mV, limit 4 LSB)
+[  168.241] RESULT|ADS_A1_CONVERT|PASS|CN15.3: ok, mean 4 mV (0..2 LSB)
+[  168.241] RESULT|ADS_A1_NOISE|PASS|CN15.3: 2 LSB p-p over 64 samples (6 mV, limit 4 LSB)
+[  168.391] RESULT|ADS_A2_CONVERT|PASS|CN16.3: ok, mean 4 mV (1..2 LSB)
+[  168.391] RESULT|ADS_A2_NOISE|PASS|CN16.3: 1 LSB p-p over 64 samples (3 mV, limit 4 LSB)
+[  168.491] RESULT|ADS_A3_CONVERT|PASS|CN16.4: ok, mean 4 mV (0..2 LSB)
+[  168.542] RESULT|ADS_A3_NOISE|PASS|CN16.4: 2 LSB p-p over 64 samples (6 mV, limit 4 LSB)
+[  168.542] RESULT|SUMMARY|9/10|OVERALL:FAIL
+[  254.373] >> r
+[  254.423] RESULT|ADS_ACK_0x48|PASS|endTransmission=0 (needs 5V_SYS for U29/U30)
+[  254.423]   config at start = 0xF183 (power-on default 0x8583)
+[  254.423] RESULT|ADS_CONFIG_RW|PASS|wrote 0x5383/0x6183, read 0xD383/0xE183
+[  254.574] RESULT|ADS_A0_CONVERT|PASS|CN15.4: ok, mean 3 mV (0..2 LSB)
+[  254.574] RESULT|ADS_A0_NOISE|PASS|CN15.4: 2 LSB p-p over 64 samples (6 mV, limit 4 LSB)
+[  254.724] RESULT|ADS_A1_CONVERT|PASS|CN15.3: ok, mean 3 mV (0..2 LSB)
+[  254.725] RESULT|ADS_A1_NOISE|PASS|CN15.3: 2 LSB p-p over 64 samples (6 mV, limit 4 LSB)
+[  254.825] RESULT|ADS_A2_CONVERT|PASS|CN16.3: ok, mean 3 mV (0..2 LSB)
+[  254.875] RESULT|ADS_A2_NOISE|PASS|CN16.3: 2 LSB p-p over 64 samples (6 mV, limit 4 LSB)
+[  254.976] RESULT|ADS_A3_CONVERT|PASS|CN16.4: ok, mean 3 mV (1..2 LSB)
+[  254.976] RESULT|ADS_A3_NOISE|PASS|CN16.4: 1 LSB p-p over 64 samples (3 mV, limit 4 LSB)
+[  255.027] RESULT|SUMMARY|10/10|OVERALL:PASS
+[  517.472] >> p 0 4850
+[  517.672] RESULT|ADS_A0_POINT_4850mV|FAIL|CN15.4: read 4774.4 mV vs DMM 4850 mV (err -75.6 mV, tol 54.5 mV)
+[  517.672] RESULT|SUMMARY|0/1|OVERALL:FAIL
+[  618.523] >> c
+[  618.573] Streaming A0..A3 in mV (Enter stops)
+[  618.624]   t=618s A0    666  A1   -182  A2   -176  A3   -177 mV
+[  619.175]   t=618s A0    692  A1   -184  A2   -179  A3   -179 mV
+[  619.777]   t=619s A0    705  A1   -186  A2   -182  A3   -183 mV
+[  620.329]   t=619s A0    684  A1   -186  A2   -187  A3   -192 mV
+[  620.880]   t=620s A0    796  A1   -193  A2   -189  A3   -190 mV
+[  621.482]   t=621s A0    787  A1   -189  A2   -185  A3   -185 mV
+[  622.034]   t=621s A0    740  A1   -186  A2   -180  A3   -179 mV
+[  622.586]   t=622s A0    718  A1   -186  A2   -182  A3   -180 mV
+[  623.188]   t=622s A0    719  A1   -184  A2   -180  A3   -181 mV
+[  623.739]   t=623s A0    718  A1   -186  A2   -182  A3   -180 mV
+[  624.291]   t=623s A0    740  A1   -188  A2   -184  A3   -184 mV
+[  624.893]   t=624s A0    828  A1   -194  A2   -189  A3   -188 mV
+[  625.444]   t=625s A0    783  A1   -190  A2   -187  A3   -189 mV
+[  625.996]   t=625s A0   1135  A1   -217  A2   -210  A3   -212 mV
+[  626.598]   t=626s A0   1161  A1   -220  A2   -213  A3   -214 mV
+[  627.150]   t=626s A0   1044  A1   -216  A2   -215  A3   -214 mV
+[  627.701]   t=627s A0   1078  A1   -217  A2   -214  A3   -215 mV
+[  628.303]   t=627s A0    956  A1   -212  A2   -206  A3   -205 mV
+[  628.854]   t=628s A0    854  A1   -205  A2   -201  A3   -196 mV
+[  629.406]   t=629s A0    661  A1   -185  A2   -182  A3   -182 mV
+[  629.958]   t=629s A0    679  A1   -189  A2   -186  A3   -186 mV
+[  630.560]   t=630s A0    668  A1   -187  A2   -183  A3   -183 mV
+[  631.112]   t=630s A0    668  A1   -189  A2   -183  A3   -183 mV
+[  631.663]   t=631s A0    686  A1   -189  A2   -186  A3   -187 mV
+[  632.265]   t=631s A0    736  A1   -184  A2   -183  A3   -182 mV
+[  632.817]   t=632s A0    717  A1   -188  A2   -183  A3   -183 mV
+[  633.368]   t=633s A0    724  A1   -184  A2   -182  A3   -182 mV
+[  633.970]   t=633s A0    724  A1   -185  A2   -181  A3   -180 mV
+[  634.522]   t=634s A0    718  A1   -185  A2   -182  A3   -182 mV
+[  635.074]   t=634s A0    667  A1   -187  A2   -183  A3   -184 mV
+[  635.676]   t=635s A0    665  A1   -187  A2   -183  A3   -184 mV
+[  636.227]   t=635s A0    647  A1   -184  A2   -181  A3   -180 mV
+[  636.779]   t=636s A0    632  A1   -181  A2   -178  A3   -178 mV
+[  637.381]   t=637s A0    673  A1   -180  A2   -177  A3   -176 mV
+[  637.933]   t=637s A0    653  A1   -177  A2   -174  A3   -174 mV
+[  638.485]   t=638s A0    666  A1   -178  A2   -174  A3   -174 mV
+[  639.036]   t=638s A0    656  A1   -180  A2   -176  A3   -175 mV
+[  639.638]   t=639s A0    664  A1   -177  A2   -174  A3   -175 mV
+[  640.190]   t=639s A0    649  A1   -177  A2   -172  A3   -172 mV
+[  640.741]   t=640s A0    633  A1   -182  A2   -180  A3   -179 mV
+[  641.343]   t=640s A0    609  A1   -178  A2   -174  A3   -174 mV
+[  641.895]   t=641s A0    620  A1   -181  A2   -178  A3   -177 mV
+[  642.447]   t=642s A0    656  A1   -182  A2   -180  A3   -181 mV
+[  643.048]   t=642s A0    653  A1   -185  A2   -178  A3   -177 mV
+[  643.600]   t=643s A0    648  A1   -186  A2   -184  A3   -186 mV
+[  644.152]   t=643s A0    672  A1   -186  A2   -180  A3   -177 mV
+[  644.754]   t=644s A0    688  A1   -187  A2   -186  A3   -183 mV
+[  645.306]   t=644s A0    652  A1   -188  A2   -186  A3   -182 mV
+[  645.858]   t=645s A0    688  A1   -183  A2   -183  A3   -181 mV
+[  646.460]   t=646s A0    726  A1   -184  A2   -184  A3   -183 mV
+[  647.011]   t=646s A0    666  A1   -178  A2   -177  A3   -177 mV
+[  647.563]   t=647s A0    683  A1   -180  A2   -175  A3   -175 mV
+[  648.165]   t=647s A0    640  A1   -176  A2   -174  A3   -173 mV
+[  648.716]   t=648s A0    651  A1   -177  A2   -172  A3   -173 mV
+[  649.268]   t=648s A0    656  A1   -178  A2   -176  A3   -174 mV
+[  649.820]   t=649s A0    664  A1   -179  A2   -176  A3   -178 mV
+[  650.422]   t=650s A0    681  A1   -181  A2   -178  A3   -176 mV
+[  650.974]   t=650s A0    692  A1   -181  A2   -176  A3   -174 mV
+[  651.526]   t=651s A0    711  A1   -184  A2   -180  A3   -181 mV
+[  652.128]   t=651s A0    652  A1   -187  A2   -183  A3   -183 mV
+[  652.680]   t=652s A0    647  A1   -183  A2   -180  A3   -181 mV
+[  653.232]   t=652s A0    654  A1   -186  A2   -183  A3   -186 mV
+[  653.834]   t=653s A0    650  A1   -186  A2   -184  A3   -182 mV
+[  654.386]   t=654s A0    720  A1   -186  A2   -185  A3   -184 mV
+[  654.938]   t=654s A0    742  A1   -186  A2   -184  A3   -183 mV
+[  655.539]   t=655s A0    755  A1   -188  A2   -184  A3   -186 mV
+[  656.091]   t=655s A0    759  A1   -186  A2   -182  A3   -186 mV
+[  656.643]   t=656s A0    729  A1   -188  A2   -185  A3   -189 mV
+[  657.245]   t=656s A0    788  A1   -191  A2   -185  A3   -187 mV
+[  657.796]   t=657s A0    758  A1   -191  A2   -188  A3   -187 mV
+[  658.348]   t=658s A0    765  A1   -194  A2   -190  A3   -190 mV
+[  658.900]   t=658s A0    800  A1   -192  A2   -188  A3   -188 mV
+[  659.501]   t=659s A0    749  A1   -189  A2   -185  A3   -183 mV
+[  660.053]   t=659s A0    755  A1   -190  A2   -188  A3   -185 mV
+[  660.605]   t=660s A0    738  A1   -188  A2   -183  A3   -183 mV
+[  661.207]   t=660s A0    773  A1   -190  A2   -187  A3   -187 mV
+[  661.759]   t=661s A0    774  A1   -190  A2   -184  A3   -183 mV
+[  662.310]   t=661s A0    766  A1   -190  A2   -189  A3   -187 mV
+[  662.912]   t=662s A0    810  A1   -194  A2   -189  A3   -190 mV
+[  663.465]   t=663s A0    792  A1   -192  A2   -188  A3   -187 mV
+[  664.016]   t=663s A0    802  A1   -192  A2   -190  A3   -192 mV
+[  664.618]   t=664s A0    827  A1   -198  A2   -194  A3   -195 mV
+[  665.170]   t=664s A0    966  A1   -208  A2   -206  A3   -203 mV
+[  665.721]   t=665s A0    965  A1   -206  A2   -204  A3   -204 mV
+[  666.323]   t=665s A0    814  A1   -195  A2   -190  A3   -193 mV
+[  666.875]   t=666s A0    843  A1   -195  A2   -192  A3   -199 mV
+[  667.427]   t=667s A0    812  A1   -201  A2   -195  A3   -194 mV
+[  668.028]   t=667s A0    885  A1   -206  A2   -201  A3   -201 mV
+[  668.580]   t=668s A0    874  A1   -206  A2   -203  A3   -204 mV
+[  669.132]   t=668s A0    870  A1   -208  A2   -206  A3   -205 mV
+[  669.684]   t=669s A0    824  A1   -204  A2   -198  A3   -198 mV
+[  670.286]   t=669s A0    812  A1   -202  A2   -199  A3   -198 mV
+[  670.837]   t=670s A0    872  A1   -206  A2   -204  A3   -202 mV
+[  671.389]   t=671s A0    855  A1   -202  A2   -200  A3   -200 mV
+[  671.991]   t=671s A0    885  A1   -208  A2   -202  A3   -204 mV
+[  672.542]   t=672s A0    942  A1   -208  A2   -206  A3   -205 mV
+[  673.094]   t=672s A0    951  A1   -210  A2   -210  A3   -207 mV
+[  673.696]   t=673s A0    899  A1   -209  A2   -205  A3   -204 mV
+[  674.248]   t=673s A0    908  A1   -208  A2   -208  A3   -207 mV
+[  674.799]   t=674s A0    848  A1   -205  A2   -203  A3   -205 mV
+[  675.401]   t=675s A0    864  A1   -207  A2   -205  A3   -203 mV
+[  675.953]   t=675s A0    879  A1   -207  A2   -202  A3   -202 mV
+[  676.504]   t=676s A0    861  A1   -205  A2   -201  A3   -202 mV
+[  677.106]   t=676s A0    851  A1   -205  A2   -202  A3   -202 mV
+[  677.658]   t=677s A0    849  A1   -204  A2   -201  A3   -202 mV
+[  678.209]   t=677s A0    855  A1   -206  A2   -204  A3   -201 mV
+[  678.811]   t=678s A0    894  A1   -209  A2   -204  A3   -208 mV
+[  679.363]   t=679s A0    846  A1   -205  A2   -200  A3   -198 mV
+[  679.914]   t=679s A0    864  A1   -205  A2   -204  A3   -203 mV
+[  680.466]   t=680s A0    858  A1   -204  A2   -203  A3   -203 mV
+[  681.068]   t=680s A0    898  A1   -207  A2   -202  A3   -201 mV
+[  681.620]   t=681s A0    875  A1   -207  A2   -204  A3   -203 mV
+[  682.172]   t=681s A0    826  A1   -203  A2   -199  A3   -198 mV
+[  682.774]   t=682s A0    832  A1   -204  A2   -200  A3   -200 mV
+[  683.325]   t=682s A0    814  A1   -201  A2   -197  A3   -198 mV
+[  683.877]   t=683s A0    819  A1   -202  A2   -199  A3   -197 mV
+[  684.479]   t=684s A0    834  A1   -202  A2   -199  A3   -198 mV
+[  685.031]   t=684s A0    837  A1   -203  A2   -200  A3   -199 mV
+[  685.583]   t=685s A0    786  A1   -200  A2   -198  A3   -198 mV
+[  686.184]   t=685s A0    858  A1   -203  A2   -200  A3   -202 mV
+[  686.736]   t=686s A0    870  A1   -204  A2   -198  A3   -200 mV
+[  687.288]   t=686s A0    811  A1   -202  A2   -198  A3   -198 mV
+[  687.840]   t=687s A0    891  A1   -209  A2   -201  A3   -196 mV
+[  688.442]   t=688s A0    799  A1   -203  A2   -198  A3   -197 mV
+[  688.993]   t=688s A0    831  A1   -204  A2   -204  A3   -201 mV
+[  689.545]   t=689s A0    933  A1   -210  A2   -206  A3   -201 mV
+[  690.147]   t=689s A0    874  A1   -202  A2   -196  A3   -197 mV
+[  690.698]   t=690s A0    880  A1   -201  A2   -198  A3   -198 mV
+[  691.250]   t=690s A0    908  A1   -205  A2   -201  A3   -200 mV
+[  691.852]   t=691s A0    945  A1   -207  A2   -203  A3   -198 mV
+[  692.404]   t=692s A0    993  A1   -211  A2   -207  A3   -205 mV
+[  692.956]   t=692s A0    931  A1   -203  A2   -200  A3   -196 mV
+[  693.558]   t=693s A0    870  A1   -201  A2   -197  A3   -196 mV
+[  694.109]   t=693s A0    880  A1   -200  A2   -195  A3   -194 mV
+[  694.661]   t=694s A0    839  A1   -197  A2   -194  A3   -196 mV
+[  695.263]   t=694s A0    867  A1   -198  A2   -195  A3   -193 mV
+[  695.815]   t=695s A0    830  A1   -196  A2   -192  A3   -192 mV
+[  696.367]   t=696s A0    815  A1   -198  A2   -193  A3   -195 mV
+[  696.918]   t=696s A0    904  A1   -207  A2   -206  A3   -201 mV
+[  697.520]   t=697s A0    900  A1   -209  A2   -204  A3   -205 mV
+[  698.072]   t=697s A0    788  A1   -201  A2   -200  A3   -200 mV
+[  698.623]   t=698s A0    831  A1   -201  A2   -199  A3   -197 mV
+[  699.225]   t=698s A0   2408  A1   -258  A2   -255  A3   -255 mV
+[  699.777]   t=699s A0   3055  A1   -259  A2   -260  A3   -257 mV
+[  700.329]   t=700s A0   2943  A1   -262  A2   -259  A3   -261 mV
+[  700.931]   t=700s A0   2307  A1   -230  A2   -232  A3   -250 mV
+[  701.483]   t=701s A0   2871  A1   -264  A2   -261  A3   -263 mV
+[  702.034]   t=701s A0   3122  A1   -264  A2   -263  A3   -262 mV
+[  702.636]   t=702s A0   3723  A1   -272  A2   -269  A3   -269 mV
+[  703.188]   t=702s A0   3597  A1   -267  A2   -268  A3   -267 mV
+[  703.740]   t=703s A0   3463  A1   -268  A2   -266  A3   -266 mV
+[  704.342]   t=703s A0   3727  A1   -271  A2   -270  A3   -268 mV
+[  704.894]   t=704s A0   2980  A1   -229  A2   -240  A3   -238 mV
+[  705.445]   t=705s A0   4783  A1   -275  A2   -274  A3   -274 mV
+[  706.047]   t=705s A0   4780  A1   -276  A2   -274  A3   -274 mV
+[  706.599]   t=706s A0   4775  A1   -276  A2   -274  A3   -276 mV
+[  707.150]   t=706s A0   4772  A1   -275  A2   -273  A3   -274 mV
+[  707.752]   t=707s A0   4772  A1   -274  A2   -274  A3   -274 mV
+[  708.304]   t=707s A0   4781  A1   -275  A2   -274  A3   -274 mV
+[  708.856]   t=708s A0   4776  A1   -276  A2   -274  A3   -274 mV
+[  709.407]   t=709s A0   4771  A1   -275  A2   -274  A3   -276 mV
+[  710.010]   t=709s A0   4764  A1   -274  A2   -274  A3   -274 mV
+[  710.561]   t=710s A0   4771  A1   -275  A2   -274  A3   -274 mV
+[  711.113]   t=710s A0   4778  A1   -276  A2   -274  A3   -273 mV
+[  711.715]   t=711s A0   4778  A1   -274  A2   -274  A3   -274 mV
+[  712.266]   t=711s A0   4776  A1   -275  A2   -274  A3   -274 mV
+[  712.818]   t=712s A0   4770  A1   -276  A2   -273  A3   -275 mV
+[  713.420]   t=713s A0   2354  A1   -250  A2   -246  A3   -244 mV
+[  713.972]   t=713s A0   2703  A1   -252  A2   -250  A3   -253 mV
+[  714.524]   t=714s A0   2369  A1   -251  A2   -248  A3   -249 mV
+[  715.125]   t=714s A0   2763  A1   -261  A2   -259  A3   -262 mV
+[  715.677]   t=715s A0   3158  A1   -261  A2   -259  A3   -260 mV
+[  716.229]   t=715s A0   3212  A1   -264  A2   -261  A3   -262 mV
+[  716.830]   t=716s A0   2092  A1   -244  A2   -242  A3   -243 mV
+[  717.382]   t=717s A0   2220  A1   -246  A2   -244  A3   -243 mV
+[  717.934]   t=717s A0   2709  A1   -252  A2   -252  A3   -250 mV
+[  718.485]   t=718s A0   2566  A1   -255  A2   -252  A3   -252 mV
+[  719.087]   t=718s A0   2769  A1   -255  A2   -254  A3   -255 mV
+[  719.639]   t=719s A0   2730  A1   -255  A2   -254  A3   -253 mV
+[  720.191]   t=719s A0   2734  A1   -255  A2   -252  A3   -252 mV
+[  720.793]   t=720s A0   2734  A1   -256  A2   -253  A3   -253 mV
+[  721.344]   t=721s A0   2783  A1   -256  A2   -255  A3   -252 mV
+[  721.896]   t=721s A0   2873  A1   -256  A2   -254  A3   -252 mV
+[  722.498]   t=722s A0   2704  A1   -258  A2   -256  A3   -255 mV
+[  723.049]   t=722s A0   2862  A1   -257  A2   -255  A3   -252 mV
+[  723.601]   t=723s A0   2817  A1   -254  A2   -253  A3   -254 mV
+[  724.203]   t=723s A0   2876  A1   -255  A2   -253  A3   -252 mV
+[  724.755]   t=724s A0   2661  A1   -254  A2   -253  A3   -251 mV
+[  725.307]   t=724s A0   2682  A1   -255  A2   -252  A3   -253 mV
+[  725.909]   t=725s A0   2816  A1   -255  A2   -254  A3   -254 mV
+[  726.461]   t=726s A0   2998  A1   -256  A2   -255  A3   -255 mV
+[  727.012]   t=726s A0   2960  A1   -255  A2   -254  A3   -254 mV
+[  727.614]   t=727s A0   2946  A1   -258  A2   -256  A3   -256 mV
+[  728.167]   t=727s A0   2830  A1   -255  A2   -252  A3   -253 mV
+[  728.718]   t=728s A0   2759  A1   -255  A2   -253  A3   -252 mV
+[  729.269]   t=728s A0   2871  A1   -257  A2   -254  A3   -253 mV
+[  729.871]   t=729s A0   2943  A1   -256  A2   -255  A3   -255 mV
+[  730.423]   t=730s A0   3024  A1   -257  A2   -256  A3   -255 mV
+[  730.975]   t=730s A0   2751  A1   -256  A2   -254  A3   -254 mV
+[  731.577]   t=731s A0   2769  A1   -255  A2   -253  A3   -252 mV
+[  732.128]   t=731s A0   2824  A1   -256  A2   -255  A3   -254 mV
+[  732.680]   t=732s A0   2778  A1   -255  A2   -253  A3   -254 mV
+[  733.282]   t=732s A0   2778  A1   -255  A2   -254  A3   -253 mV
+[  733.833]   t=733s A0   2908  A1   -256  A2   -255  A3   -254 mV
+[  734.385]   t=734s A0   2889  A1   -257  A2   -254  A3   -254 mV
+[  734.987]   t=734s A0   2814  A1   -256  A2   -253  A3   -253 mV
+[  735.538]   t=735s A0   2843  A1   -256  A2   -254  A3   -252 mV
+[  736.090]   t=735s A0   2878  A1   -256  A2   -255  A3   -253 mV
+[  736.692]   t=736s A0   2862  A1   -258  A2   -253  A3   -255 mV
+[  737.243]   t=736s A0   2863  A1   -256  A2   -253  A3   -254 mV
+[  737.795]   t=737s A0   2838  A1   -256  A2   -252  A3   -254 mV
+[  738.396]   t=738s A0   2820  A1   -255  A2   -253  A3   -253 mV
+[  738.948]   t=738s A0   2910  A1   -256  A2   -254  A3   -254 mV
+[  739.500]   t=739s A0   2866  A1   -256  A2   -253  A3   -254 mV
+[  740.051]   t=739s A0   2792  A1   -255  A2   -252  A3   -253 mV
+[  740.653]   t=740s A0   2835  A1   -254  A2   -254  A3   -253 mV
+[  741.205]   t=740s A0   2774  A1   -254  A2   -252  A3   -254 mV
+[  741.756]   t=741s A0   2845  A1   -255  A2   -252  A3   -253 mV
+[  742.358]   t=742s A0   2861  A1   -256  A2   -255  A3   -254 mV
+[  742.910]   t=742s A0   2833  A1   -256  A2   -253  A3   -254 mV
+[  743.462]   t=743s A0   2759  A1   -255  A2   -252  A3   -252 mV
+[  744.063]   t=743s A0   2795  A1   -256  A2   -251  A3   -252 mV
+[  744.615]   t=744s A0   2715  A1   -255  A2   -252  A3   -250 mV
+[  745.167]   t=744s A0   2848  A1   -255  A2   -252  A3   -253 mV
+[  745.769]   t=745s A0   2808  A1   -256  A2   -252  A3   -254 mV
+[  746.320]   t=745s A0   2654  A1   -255  A2   -250  A3   -252 mV
+[  746.871]   t=746s A0   2687  A1   -254  A2   -251  A3   -252 mV
+[  747.473]   t=747s A0   2689  A1   -256  A2   -250  A3   -251 mV
+[  748.025]   t=747s A0   2753  A1   -254  A2   -251  A3   -252 mV
+[  748.576]   t=748s A0   2763  A1   -254  A2   -251  A3   -252 mV
+[  749.178]   t=748s A0   2707  A1   -254  A2   -251  A3   -251 mV
+[  749.730]   t=749s A0   2826  A1   -256  A2   -253  A3   -254 mV
+[  750.281]   t=749s A0   2853  A1   -255  A2   -253  A3   -253 mV
+[  750.883]   t=750s A0   2827  A1   -255  A2   -252  A3   -252 mV
+[  751.435]   t=751s A0   2880  A1   -255  A2   -254  A3   -254 mV
+[  751.987]   t=751s A0   2780  A1   -255  A2   -252  A3   -252 mV
+[  752.589]   t=752s A0   2750  A1   -255  A2   -252  A3   -251 mV
+[  753.140]   t=752s A0   2726  A1   -254  A2   -251  A3   -252 mV
+[  753.153] >> 
+[  992.241] >> p 0 3340
+[  992.442] RESULT|ADS_A0_POINT_3340mV|PASS|CN15.4: read 3316.4 mV vs DMM 3340 mV (err -23.6 mV, tol 39.4 mV)
+[  992.442] RESULT|SUMMARY|1/1|OVERALL:PASS
+[ 1547.145] >> p 0 5070
+[ 1547.346] RESULT|ADS_A0_POINT_5070mV|PASS|CN15.4: read 5039.4 mV vs DMM 5070 mV (err -30.6 mV, tol 56.7 mV)
+[ 1547.346] RESULT|SUMMARY|1/1|OVERALL:PASS
+[ 1600.712] >> c
+[ 1600.763] Streaming A0..A3 in mV (Enter stops)
+[ 1600.813]   t=1600s A0   5039  A1      3  A2      4  A3      5 mV
+[ 1601.364]   t=1601s A0   5040  A1      2  A2      4  A3      5 mV
+[ 1601.966]   t=1601s A0   5040  A1      3  A2      5  A3      5 mV
+[ 1602.518]   t=1602s A0   5040  A1      2  A2      4  A3      4 mV
+[ 1603.070]   t=1602s A0   5040  A1      3  A2      4  A3      4 mV
+[ 1603.671]   t=1603s A0   5040  A1      3  A2      5  A3      5 mV
+[ 1604.223]   t=1603s A0   5038  A1      3  A2      4  A3      4 mV
+[ 1604.775]   t=1604s A0   5042  A1      3  A2      5  A3      4 mV
+[ 1605.377]   t=1604s A0   5040  A1      3  A2      4  A3      5 mV
+[ 1605.928]   t=1605s A0   5040  A1      3  A2      4  A3      4 mV
+[ 1606.480]   t=1606s A0   5040  A1      3  A2      5  A3      5 mV
+[ 1607.082]   t=1606s A0   5040  A1      3  A2      4  A3      5 mV
+[ 1607.634]   t=1607s A0   5040  A1      3  A2      4  A3      4 mV
+[ 1608.185]   t=1607s A0   5040  A1      3  A2      4  A3      5 mV
+[ 1608.737]   t=1608s A0   5040  A1      2  A2      4  A3      4 mV
+[ 1609.339]   t=1608s A0   5041  A1      2  A2      4  A3      4 mV
+[ 1609.890]   t=1609s A0   5040  A1      3  A2      4  A3      5 mV
+[ 1610.442]   t=1610s A0   5040  A1      3  A2      4  A3      5 mV
+[ 1611.044]   t=1610s A0   5040  A1      3  A2      5  A3      4 mV
+[ 1611.595]   t=1611s A0   5040  A1      3  A2      4  A3      5 mV
+[ 1612.147]   t=1611s A0   5040  A1      3  A2      4  A3      4 mV
+[ 1612.748]   t=1612s A0   5040  A1      3  A2      5  A3      5 mV
+[ 1613.300]   t=1612s A0   5040  A1      3  A2      4  A3      5 mV
+[ 1613.852]   t=1613s A0   5040  A1      3  A2      4  A3      4 mV
+[ 1614.454]   t=1614s A0   5040  A1      3  A2      5  A3      5 mV
+[ 1615.005]   t=1614s A0   5040  A1      2  A2      4  A3      5 mV
+[ 1615.557]   t=1615s A0   5040  A1      3  A2      4  A3      4 mV
+[ 1616.158]   t=1615s A0   5040  A1      3  A2      5  A3      5 mV
+[ 1616.710]   t=1616s A0   5040  A1      3  A2      4  A3      4 mV
+[ 1617.261]   t=1616s A0   5040  A1      2  A2      5  A3      4 mV
+[ 1617.813]   t=1617s A0   5040  A1      3  A2      4  A3      5 mV
+[ 1618.415]   t=1618s A0   5040  A1      3  A2      4  A3      4 mV
+[ 1618.936] >> 
+[ 1618.986]   t=1618s A0   5040  A1      3  A2      5  A3      4 mV
+[ 1706.221] >> 
+[ 1710.497] >> p 1 5070
+[ 1710.697] RESULT|ADS_A1_POINT_5070mV|PASS|CN15.3: read 5040.0 mV vs DMM 5070 mV (err -30.0 mV, tol 56.7 mV)
+[ 1710.697] RESULT|SUMMARY|1/1|OVERALL:PASS
+[ 1820.869] >> p 2 5070
+[ 1821.069] RESULT|ADS_A2_POINT_5070mV|FAIL|CN16.3: read 13.8 mV vs DMM 5070 mV (err -5056.2 mV, tol 56.7 mV)
+[ 1821.070] RESULT|SUMMARY|0/1|OVERALL:FAIL
+[ 1972.148] >> p 2 5070
+[ 1972.349] RESULT|ADS_A2_POINT_5070mV|PASS|CN16.3: read 5040.0 mV vs DMM 5070 mV (err -30.0 mV, tol 56.7 mV)
+[ 1972.349] RESULT|SUMMARY|1/1|OVERALL:PASS
+[ 2012.972] >> p 3 5070
+[ 2013.122] RESULT|ADS_A3_POINT_5070mV|PASS|CN16.4: read 5040.0 mV vs DMM 5070 mV (err -30.0 mV, tol 56.7 mV)
+[ 2013.123] RESULT|SUMMARY|1/1|OVERALL:PASS
+[ 2073.326] ## session ended by operator

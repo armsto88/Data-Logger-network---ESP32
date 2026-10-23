@@ -18,5 +18,8 @@ copied without modification; the engineering review was added in the repository.
 The date-based directories keep each release separate and give future revisions
 an unambiguous home.
 
+Changes wanted for the revision after r6 are collected in
+[NEXT_REVISION_NOTES.md](NEXT_REVISION_NOTES.md).
+
 Do not treat the presence of Gerbers as manufacturing approval. Read the release
 review and close its blocking/high-priority findings before ordering boards.
