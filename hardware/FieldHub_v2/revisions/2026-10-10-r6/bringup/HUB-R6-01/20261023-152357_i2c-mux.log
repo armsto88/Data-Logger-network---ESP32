@@ -1,0 +1,42 @@
+# board HUB-R6-01  test i2c-mux  env mothership-v2-bringup-i2c-mux
+# commit 8d5a6a5 (firmware tree dirty: no)  port /dev/serial/by-id/usb-1a86_USB_Serial-if00-port0  started 2026-10-23T15:23:57
+[    0.024] ## i2c-mux: root bus set, TCA9546A, CN17-CN20, 400 kHz
+[    0.024] ## type a line + Enter to send it to the board; Ctrl-C ends the session
+[    0.024] ## reset via DTR pulse (needs SW10 in USB service position)
+[    0.197] ets Jul 29 2019 12:21:46
+[    0.197] 
+[    0.197] rst:0x1 (POWERON_RESET),boot:0x13 (SPI_FAST_FLASH_BOOT)
+[    0.197] configsip: 0, SPIWP:0xee
+[    0.197] clk_drv:0x00,q_drv:0x00,d_drv:0x00,cs0_drv:0x00,hd_drv:0x00,wp_drv:0x00
+[    0.197] mode:DIO, clock div:2
+[    0.197] load:0x3fff0030,len:1184
+[    0.197] load:0x40078000,len:13232
+[    0.197] load:0x40080400,len:3028
+[    0.197] entry 0x400805e4
+[    0.649] 
+[    0.649] === FieldHub v2 r6 bring-up: I2C root bus, TCA9546A mux, sensor ports ===
+[    0.649] build Oct 23 2026 15:23:48
+[    0.649] SDA=21 SCL=22 mux=0x71; ch0..3 = CN19 CN20 CN17 CN18
+[    0.649] Send Enter to start (auto-start in 15 s)...
+[    0.699] RESULT|I2C_IDLE_HIGH|PASS|SDA1=1 SCL1=1 (0 = held low)
+[    0.699] RESULT|I2C_PULLUPS|PASS|against internal pull-down: SDA1=1 SCL1=1 (F2 4.7k)
+[    0.699] RESULT|ROOT_BUS_OK|PASS|0 bus errors (last code 0); found: 0x48 0x68 0x71
+[    0.699] RESULT|ROOT_DS3231_0x68|PASS|RTC U49
+[    0.699] RESULT|ROOT_TCA9546A_0x71|PASS|mux U33
+[    0.699] RESULT|ROOT_ADS1015_0x48|PASS|ADC U30 through PCA9306 U29 (needs 5V_SYS)
+[    0.749] RESULT|ROOT_EXACT_SET|PASS|expected exactly 0x48 0x68 0x71, got 0x48 0x68 0x71
+[    0.749] RESULT|RTC_REGISTERS|PASS|status=0x88 die temp 16.75 C
+[    0.749] RESULT|RTC_OSF|WARN|oscillator-stop flag set: time invalid until set (expected on a new board)
+[    0.749] RESULT|MUX_REGISTER|PASS|readback ch0=0x01 ch1=0x02 ch2=0x04 ch3=0x08 off=0x00
+[    0.749] RESULT|CH0_BUS_OK|PASS|CN19: 0 bus errors (last code 0), downstream: none
+[    0.749] RESULT|CH0_EMPTY|WARN|CN19: nothing connected, port not exercised
+[    0.800] RESULT|CH1_BUS_OK|PASS|CN20: 0 bus errors (last code 0), downstream: none
+[    0.800] RESULT|CH1_EMPTY|WARN|CN20: nothing connected, port not exercised
+[    0.800] RESULT|CH2_BUS_OK|PASS|CN17: 0 bus errors (last code 0), downstream: none
+[    0.800] RESULT|CH2_EMPTY|WARN|CN17: nothing connected, port not exercised
+[    0.850] RESULT|CH3_BUS_OK|PASS|CN18: 0 bus errors (last code 0), downstream: none
+[    0.850] RESULT|CH3_EMPTY|WARN|CN18: nothing connected, port not exercised
+[    0.850] RESULT|MUX_DESELECT|PASS|root bus identical after channel 0x00 (no channel stuck on)
+[    0.900] RESULT|I2C_400KHZ|PASS|root and all four channels give the same device sets at 400 kHz
+[    0.900] RESULT|SUMMARY|15/15|OVERALL:PASS
+[    0.900] Commands: r = re-run | w = hot-plug watch

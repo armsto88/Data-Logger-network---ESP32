@@ -1,0 +1,96 @@
+# board HUB-R6-01  test modem-https  env mothership-v1-sim-test
+# commit 8d5a6a5 (firmware tree dirty: yes)  port /dev/serial/by-id/usb-1a86_USB_Serial-if00-port0  started 2026-10-23T15:41:54
+# note: capture; judged from log; ingest ?dry_run=true
+[    0.024] ## modem-https: registration + ingest ?dry_run=true POST via ModemDriver
+[    0.024] ## operator-judged test: Ctrl-C when finished, then enter the verdict
+[    0.024] ## type a line + Enter to send it to the board; Ctrl-C ends the session
+[    0.024] ## reset via DTR pulse (needs SW10 in USB service position)
+[    0.197] ets Jul 29 2019 12:21:46
+[    0.197] 
+[    0.197] rst:0x1 (POWERON_RESET),boot:0x13 (SPI_FAST_FLASH_BOOT)
+[    0.197] configsip: 0, SPIWP:0xee
+[    0.197] clk_drv:0x00,q_drv:0x00,d_drv:0x00,cs0_drv:0x00,hd_drv:0x00,wp_drv:0x00
+[    0.197] mode:DIO, clock div:2
+[    0.197] load:0x3fff0030,len:1184
+[    0.197] load:0x40078000,len:13232
+[    0.197] load:0x40080400,len:3028
+[    0.197] entry 0x400805e4
+[    2.353] 
+[    2.353] === SIM + DATA TEST (Think Mobile) ===
+[    2.353] 
+[    2.353] [1/7] Initialising modem pins...
+[    2.353] === ModemDriver::init() ===
+[    2.353] [Modem] pins configured, state=OFF
+[    2.354]   OK
+[    2.354] [2/7] Powering on modem (rail + PWRKEY + boot)...
+[    2.354] === ModemDriver::powerOn() ===
+[    2.404] [Modem] railOn() — PWM soft-start 4V_EN
+[    2.905] [Modem] PG HIGH — rail stable
+[    2.905] [Modem] pulsePwrkey() — HIGH for MODEM_PWRKEY_ON_MS
+[    4.058] [Modem] startUart() — Serial2 @ 115200
+[    4.058] [Modem] waitBoot(15000 ms)
+[    8.521] [Modem] STATUS HIGH — modem powered
+[   11.528] [Modem] AT handshake OK — UART ready
+[   11.579] [Modem] powerOn() OK — UART_READY
+[   11.579]   OK — modem is responsive
+[   11.579] [3/7] Reading IMEI...
+[   11.579] [Modem] IMEI: 861815081775925
+[   11.579]   IMEI: 861815081775925
+[   11.579] [4/7] Checking SIM card (AT+CPIN?)...
+[   14.587]   AT+CPIN?
+[   14.587]   +CPIN: READY
+[   14.587]   OK
+[   14.587]   SMS DONE
+[   14.587]   +CGEV: EPS PDN ACT 1
+[   14.587]   +CGEV: ME PDN ACT 8,1
+[   14.587]   SIM is READY
+[   14.587] [5/7] Waiting for network registration (60s timeout)...
+[   14.587] === ModemDriver::waitForNetwork(60000 ms) ===
+[   14.587] [Modem] network registered (CREG)
+[   14.587]   OK — registered on network
+[   14.587] [Modem] CSQ rssi=24
+[   14.587]   Signal quality: 24 (0=worst, 31=best, 99=no signal)
+[   14.587] 
+[   14.587] [6/7] Data test: HTTPS POST to Supabase (dry_run)...
+[   14.587]   Using production ModemDriver::httpsPost() — same path as real firmware
+[   14.637]   URL: https://unhzttnuayrgqrzeqetz.supabase.co/functions/v1/ingest-fieldmesh?dry_run=true
+[   14.637]   Payload: 79 bytes
+[   14.637] === ModemDriver::httpsPost() ===
+[   14.637] [Modem] URL: https://unhzttnuayrgqrzeqetz.supabase.co/functions/v1/ingest-fieldmesh?dry_run=true
+[   14.637] [Modem] payload: 79 bytes, content-type: application/json
+[   14.637] [Modem] Parsed: host=unhzttnuayrgqrzeqetz.supabase.co port=443 path=/functions/v1/ingest-fieldmesh?dry_run=true ssl=1
+[   19.500] [Modem] === SSL POST via CCH* API ===
+[   19.500] [Modem] NTP sync...
+[   22.558] [Modem] CCLK: AT+CCLK?
+[   22.558] +CCLK: "26/10/23,21:42:16+32"
+[   22.558] 
+[   22.558] OK
+[   22.558] 
+[   22.658] [Modem] CCHOPEN: AT+CCHOPEN=0,"unhzttnuayrgqrzeqetz.supabase.co",443,2
+[   25.867] [Modem] SSL connection opened!
+[   26.919] [Modem] CCHSEND chunk: 323/323 bytes sent
+[   26.969] [Modem] CCHSEND complete: 323 bytes in chunks
+[   28.974] [Modem] Waiting for SSL response...
+[   29.125] [Modem] SSL response analysis: gotData=1 gotCchRecv=1 peerClosed=1 respLen=1360
+[   29.125] [Modem] HTTP/1. found at index 25, surrounding: [HTTP/1.1 401 Unauthorized
+[   29.125] Dat]
+[   29.125] [Modem] SSL HTTP status=401 complete=1 wireBytes=1360 framedBytes=1290 bodyBytes=64 success=NO
+[   29.125] [Modem] SSL HTTP entity body (64/64 bytes): {"success":false,"error":"Invalid or revoked device credential"}
+[   29.125] [Modem] HTTPS failed (HTTP 401); plaintext fallback disabled
+[   29.125] === httpsPost() complete ===
+[   29.125]   Result: success=0 HTTP=401
+[   29.175]   Response body: {"success":false,"error":"Invalid or revoked device credential"}
+[   29.175]   Error detail: HTTP status 401
+[   29.175]   ⚠️ POST did not return 200 — check error detail above
+[   29.175]   (This could be auth/payload issues, not data connectivity)
+[   29.175] [7/7] Shutting down modem...
+[   29.175] === ModemDriver::gracefulShutdown() ===
+[   34.188] [Modem] AT+CPOF responded:
+[   34.188] AT+CPOF
+[   34.188] OK
+[   34.188] 
+[   34.188] +CGEV: ME DETACH
+[   34.188] [Modem] railOff() — 4V_EN LOW
+[   34.188] [Modem] gracefulShutdown() complete — OFF
+[   34.188]   Done. Test complete.
+[   93.475] ## session ended by operator

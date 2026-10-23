@@ -1,0 +1,56 @@
+# board HUB-R6-01  test modem-identify  env mothership-v1-modem-identify
+# commit 8d5a6a5 (firmware tree dirty: yes)  port /dev/serial/by-id/usb-1a86_USB_Serial-if00-port0  started 2026-10-23T15:40:25
+[    0.023] ## modem-identify: ATI / IMEI / firmware revision
+[    0.023] ## type a line + Enter to send it to the board; Ctrl-C ends the session
+[    0.023] ## reset via DTR pulse (needs SW10 in USB service position)
+[    0.197] ets Jul 29 2019 12:21:46
+[    0.197] 
+[    0.197] rst:0x1 (POWERON_RESET),boot:0x13 (SPI_FAST_FLASH_BOOT)
+[    0.197] configsip: 0, SPIWP:0xee
+[    0.197] clk_drv:0x00,q_drv:0x00,d_drv:0x00,cs0_drv:0x00,hd_drv:0x00,wp_drv:0x00
+[    0.197] mode:DIO, clock div:2
+[    0.197] load:0x3fff0030,len:1184
+[    0.197] load:0x40078000,len:13232
+[    0.197] load:0x40080400,len:3028
+[    0.197] entry 0x400805e4
+[    1.149] 
+[    1.149] === Mothership V1 Modem Identification Bring-up ===
+[    1.149] 
+[    1.149] --- Power on: 4V rail + PWRKEY + boot ---
+[    1.651] PASS: 4V rail up (ESP_PG HIGH).
+[    9.822] PASS: Modem booted.
+[    9.822] 
+[    9.822] --- ATI (module identification) ---
+[    9.872] PASS: ATI responded:
+[    9.872] 
+[    9.872] Manufacturer: SIMCOM INCORPORATED
+[    9.872] Model: A7670G-LABE
+[    9.872] Revision: V1.11.2
+[    9.872] IMEI: 861815081775925
+[    9.872] 
+[    9.872] OK
+[    9.873] 
+[    9.873] --- AT+GMM (model name) ---
+[    9.873] PASS: AT+GMM responded:
+[    9.873] 
+[    9.873] OK
+[    9.873] 
+[    9.873] --- AT+CGSN (IMEI) ---
+[    9.873] Response: 
+[    9.873] 861815081775925
+[    9.873] 
+[    9.873] OK
+[    9.873] 
+[    9.873] PASS: IMEI = 861815081775925 (15 digits)
+[    9.873] 
+[    9.873] --- AT+CGMR (firmware revision) ---
+[    9.873] PASS: AT+CGMR responded:
+[    9.873] 
+[    9.873] +CGMR: A110B06A7670M7
+[    9.873] 
+[    9.873] OK
+[    9.873] 
+[    9.873] === Modem identification bring-up complete ===
+[    9.873] OVERALL PASS: IMEI valid (15 digits).
+[    9.873] 
+[    9.923] --- Graceful power off ---

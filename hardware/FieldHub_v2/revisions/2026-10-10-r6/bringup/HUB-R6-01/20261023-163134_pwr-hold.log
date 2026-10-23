@@ -1,0 +1,29 @@
+# board HUB-R6-01  test pwr-hold  env mothership-v1-pwrhold
+# commit 8d5a6a5 (firmware tree dirty: yes)  port /dev/serial/by-id/usb-1a86_USB_Serial-if00-port0  started 2026-10-23T16:31:34
+[    0.024] ## pwr-hold: PWR_HOLD keeps and drops VSYS (15 s on/off)
+[    0.024] ## operator-judged test: Ctrl-C when finished, then enter the verdict
+[    0.024] ## type a line + Enter to send it to the board; Ctrl-C ends the session
+[    0.826] 
+[    0.826] === Mothership V1 PWR_HOLD Bring-up ===
+[    0.826] PWR_HOLD pin = GPIO26 (active HIGH)
+[    0.826] Pattern: ON 15000 ms, OFF 15000 ms
+[    0.826] Probe VSYS and 3V3_SYS rails while states toggle.
+[    0.826] Board should stay powered during ON phase and cut power during OFF phase.
+[    0.876] SW10 must be in RUN and the config button released.
+[    0.876] [RTC] before: control=0x1D (INTCN=1 A2IE=0 A1IE=1) status=0x09 (A2F=0 A1F=1) -> INT ASSERTED (was holding VSYS on)
+[    0.876] [RTC] after:  control=0x1C status=0x08 -> INT released
+[    0.876] t=853 ms | PWR_HOLD=ON  (board should stay powered)
+[   15.869] ## port lost (board powered off or USB unplugged); waiting for it to return
+[   64.182] ## port back
+[   64.583] 
+[   64.583] === Mothership V1 PWR_HOLD Bring-up ===
+[   64.583] PWR_HOLD pin = GPIO26 (active HIGH)
+[   64.583] Pattern: ON 15000 ms, OFF 15000 ms
+[   64.583] Probe VSYS and 3V3_SYS rails while states toggle.
+[   64.583] Board should stay powered during ON phase and cut power during OFF phase.
+[   64.583] SW10 must be in RUN and the config button released.
+[   64.583] [RTC] before: control=0x1C (INTCN=1 A2IE=0 A1IE=0) status=0x08 (A2F=0 A1F=0) -> INT idle
+[   64.634] [RTC] after:  control=0x1C status=0x08 -> INT released
+[   64.634] t=853 ms | PWR_HOLD=ON  (board should stay powered)
+[   79.627] ## port lost (board powered off or USB unplugged); waiting for it to return
+[  107.808] ## session ended by operator

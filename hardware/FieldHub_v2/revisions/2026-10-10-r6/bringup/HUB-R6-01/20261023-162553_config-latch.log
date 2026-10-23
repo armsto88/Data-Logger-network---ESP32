@@ -1,0 +1,50 @@
+# board HUB-R6-01  test config-latch  env mothership-v1-config-latch
+# commit 8d5a6a5 (firmware tree dirty: yes)  port /dev/serial/by-id/usb-1a86_USB_Serial-if00-port0  started 2026-10-23T16:25:53
+[    0.024] ## config-latch: U52 config latch read + CONFIG_CLEAR
+[    0.024] ## operator-judged test: Ctrl-C when finished, then enter the verdict
+[    0.024] ## type a line + Enter to send it to the board; Ctrl-C ends the session
+[    0.024] ## reset via DTR pulse (needs SW10 in USB service position)
+[    0.198] ets Jul 29 2019 12:21:46
+[    0.198] 
+[    0.198] rst:0x1 (POWERON_RESET),boot:0x13 (SPI_FAST_FLASH_BOOT)
+[    0.198] configsip: 0, SPIWP:0xee
+[    0.198] clk_drv:0x00,q_drv:0x00,d_drv:0x00,cs0_drv:0x00,hd_drv:0x00,wp_drv:0x00
+[    0.198] mode:DIO, clock div:2
+[    0.198] load:0x3fff0030,len:1184
+[    0.198] load:0x40078000,len:13232
+[    0.198] load:0x40080400,len:3028
+[    0.198] entry 0x400805e4
+[    1.151] 
+[    1.151] === Mothership V1 Config Latch Bring-up ===
+[    1.151] CONFIG_WAKE  = GPIO32 (INPUT, active LOW)
+[    1.151] CONFIG_CLEAR = GPIO25 (OUTPUT, pulse HIGH 20ms)
+[    1.151] CFG_LED      = GPIO27
+[    1.151] Initial CONFIG_WAKE = HIGH (no config wake)
+[    1.151] No config wake pending. Press config button to set latch, then reset to test.
+[    1.151] 
+[    1.151] Toggling CFG_LED to show life...
+[   12.184] t=11839 ms | CONFIG_WAKE=LOW — latch is SET
+[   12.184] Clearing latch...
+[   12.184] After clear: CONFIG_WAKE = HIGH (OK)
+[   18.201] t=17864 ms | CONFIG_WAKE=LOW — latch is SET
+[   18.201] Clearing latch...
+[   18.201] After clear: CONFIG_WAKE = LOW (FAILED)
+[   19.204] t=18889 ms | CONFIG_WAKE=LOW — latch is SET
+[   19.204] Clearing latch...
+[   19.254] After clear: CONFIG_WAKE = HIGH (OK)
+[   20.257] t=19914 ms | CONFIG_WAKE=LOW — latch is SET
+[   20.257] Clearing latch...
+[   20.257] After clear: CONFIG_WAKE = LOW (FAILED)
+[   21.259] t=20939 ms | CONFIG_WAKE=LOW — latch is SET
+[   21.260] Clearing latch...
+[   21.310] After clear: CONFIG_WAKE = HIGH (OK)
+[   25.271] t=24964 ms | CONFIG_WAKE=LOW — latch is SET
+[   25.321] Clearing latch...
+[   25.321] After clear: CONFIG_WAKE = HIGH (OK)
+[   32.341] t=31989 ms | CONFIG_WAKE=LOW — latch is SET
+[   32.341] Clearing latch...
+[   32.341] After clear: CONFIG_WAKE = LOW (FAILED)
+[   33.344] t=33014 ms | CONFIG_WAKE=LOW — latch is SET
+[   33.344] Clearing latch...
+[   33.395] After clear: CONFIG_WAKE = HIGH (OK)
+[  123.303] ## session ended by operator

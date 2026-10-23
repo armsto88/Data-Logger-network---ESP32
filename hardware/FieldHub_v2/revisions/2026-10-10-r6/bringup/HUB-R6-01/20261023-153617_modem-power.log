@@ -1,0 +1,43 @@
+# board HUB-R6-01  test modem-power  env mothership-v1-modem-power
+# commit 8d5a6a5 (firmware tree dirty: yes)  port /dev/serial/by-id/usb-1a86_USB_Serial-if00-port0  started 2026-10-23T15:36:17
+# note: capture; judged from log
+[    0.024] ## modem-power: TPS63020 soft-start, ESP_PG follows 4V_EN
+[    0.024] ## operator-judged test: Ctrl-C when finished, then enter the verdict
+[    0.024] ## type a line + Enter to send it to the board; Ctrl-C ends the session
+[    0.024] ## reset via DTR pulse (needs SW10 in USB service position)
+[    0.197] ets Jul 29 2019 12:21:46
+[    0.197] 
+[    0.197] rst:0x1 (POWERON_RESET),boot:0x13 (SPI_FAST_FLASH_BOOT)
+[    0.198] configsip: 0, SPIWP:0xee
+[    0.198] clk_drv:0x00,q_drv:0x00,d_drv:0x00,cs0_drv:0x00,hd_drv:0x00,wp_drv:0x00
+[    0.198] mode:DIO, clock div:2
+[    0.198] load:0x3fff0030,len:1184
+[    0.198] load:0x40078000,len:13232
+[    0.198] load:0x40080400,len:3028
+[    0.198] entry 0x400805e4
+[    1.150] 
+[    1.150] === Mothership V1 Modem Power Rail Bring-up ===
+[    1.150] 4V_EN   = GPIO33 (OUTPUT, active HIGH)
+[    1.150] ESP_PG  = GPIO35 (INPUT, external pull-up)
+[    1.150] PG timeout = 5000 ms
+[    1.150] Rail-on time = 15000 ms
+[    1.150] 
+[    1.150] --- Phase 1: Initial state (4V_EN=LOW) ---
+[    1.251] ESP_PG = LOW (expected LOW when rail off)
+[    1.251] 
+[    1.301] --- Phase 2: Enabling 4V_EN (rail ON, soft-start) ---
+[    1.301] [SS] Soft-start ramping 4V_EN 0% -> 100% over 500 ms...
+[    1.802] 4V_EN = HIGH (full) at t=1448 ms
+[    1.802] ESP_PG = HIGH after 0 ms — power rail is GOOD
+[    1.803] 
+[    1.803] --- Phase 3: Holding rail ON for 15000 ms ---
+[    1.803] Probe MODEM_VBAT_3V9 rail with multimeter. Expected ~3.9 V.
+[   16.792] 
+[   16.792] --- Phase 4: Disabling 4V_EN (rail OFF) ---
+[   16.792] 4V_EN = LOW at t=16459 ms
+[   17.294] ESP_PG = LOW (expected LOW after rail off)
+[   17.294] 
+[   17.294] === Modem power rail bring-up complete ===
+[   17.294] Board stays powered via PWR_HOLD. Reset to re-test.
+[   22.307] t=21970 ms | 4V_EN=LOW, ESP_PG=0
+[   24.944] ## session ended by operator

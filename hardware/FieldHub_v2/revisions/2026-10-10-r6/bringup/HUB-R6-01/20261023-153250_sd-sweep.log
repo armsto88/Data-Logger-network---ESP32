@@ -1,0 +1,28 @@
+# board HUB-R6-01  test sd-sweep  env mothership-v2-bringup-sd-sweep
+# commit 8d5a6a5 (firmware tree dirty: yes)  port /dev/serial/by-id/usb-1a86_USB_Serial-if00-port0  started 2026-10-23T15:32:50
+# note: DIAGNOSTIC build: CORE_DEBUG_LEVEL=4 via PLATFORMIO_BUILD_FLAGS
+[    0.024] ## sd-sweep: SD at 0.4/4/10/20/40 MHz, 128 KiB verify each
+[    0.024] ## type a line + Enter to send it to the board; Ctrl-C ends the session
+[    0.024] ## reset via DTR pulse (needs SW10 in USB service position)
+[    0.197] ets Jul 29 2019 12:21:46
+[    0.197] 
+[    0.197] rst:0x1 (POWERON_RESET),boot:0x13 (SPI_FAST_FLASH_BOOT)
+[    0.197] configsip: 0, SPIWP:0xee
+[    0.197] clk_drv:0x00,q_drv:0x00,d_drv:0x00,cs0_drv:0x00,hd_drv:0x00,wp_drv:0x00
+[    0.197] mode:DIO, clock div:2
+[    0.197] load:0x3fff0030,len:1184
+[    0.197] load:0x40078000,len:13232
+[    0.197] load:0x40080400,len:3028
+[    0.197] entry 0x400805e4
+[    0.348] [     7][D][esp32-hal-cpu.c:244] setCpuFrequencyMhz(): PLL: 480 / 2 = 240 Mhz, APB: 80000000 Hz
+[    0.699] 
+[    0.699] === FieldHub v2 r6 bring-up: microSD speed sweep ===
+[    0.699] build Oct 23 2026 15:32:41
+[    0.699] CS=13 SCK=18 MISO=19 MOSI=23, VSPI, 128 KiB per speed, 3 mounts per speed
+[    0.699] Send Enter to start (auto-start in 15 s)...
+[    0.749] RESULT|SD_MISO_IDLE_HIGH|PASS|SD_MISO=1 with CS high (R4 10k pull-up)
+[    1.752] [  1382][W][sd_diskio.cpp:547] ff_sd_initialize(): APP_OP_COND failed: 1
+[    1.752] [  1388][E][sd_diskio.cpp:806] sdcard_mount(): f_mount failed: (3) The physical drive cannot work
+[    1.752] RESULT|SD_CARD_PRESENT|FAIL|no response at 400 kHz after 1019 ms: card missing, or wiring fault
+[    1.752] RESULT|SUMMARY|1/2|OVERALL:FAIL
+[    1.752] Commands: r = re-run sweep | n = no-card check | p <kHz> = probe loop | ? = help

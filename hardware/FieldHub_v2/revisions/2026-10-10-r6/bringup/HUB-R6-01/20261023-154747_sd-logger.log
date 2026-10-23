@@ -1,0 +1,67 @@
+# board HUB-R6-01  test sd-logger  env mothership-v2-test-sd-logger
+# commit 8d5a6a5 (firmware tree dirty: yes)  port /dev/serial/by-id/usb-1a86_USB_Serial-if00-port0  started 2026-10-23T15:47:47
+# note: vendored SD lib (lib/SD, ACMD41 0x40000000)
+[    0.024] ## sd-logger: production sd_logger.cpp archive regression
+[    0.024] ## type a line + Enter to send it to the board; Ctrl-C ends the session
+[    0.024] ## reset via DTR pulse (needs SW10 in USB service position)
+[    0.197] ets Jul 29 2019 12:21:46
+[    0.197] 
+[    0.197] rst:0x1 (POWERON_RESET),boot:0x13 (SPI_FAST_FLASH_BOOT)
+[    0.197] configsip: 0, SPIWP:0xee
+[    0.197] clk_drv:0x00,q_drv:0x00,d_drv:0x00,cs0_drv:0x00,hd_drv:0x00,wp_drv:0x00
+[    0.197] mode:DIO, clock div:2
+[    0.197] load:0x3fff0030,len:1184
+[    0.197] load:0x40078000,len:13232
+[    0.197] load:0x40080400,len:3028
+[    0.197] entry 0x400805e4
+[    2.353] 
+[    2.353] === test_sd_logger (SD archive pathway) ===
+[    2.403] [SD] Card detected: 14748.0 MB total
+[    2.403] [  2027][E][esp32-hal-cpu.c:110] addApbChangeCallback(): duplicate func=0x400d67e0 arg=0x3ffbdbdc
+[    2.403] [SD] Archive ready: 14748.0 MB total, 0.0 MB used
+[    2.453] [PASS] initSD() succeeds with a card present
+[    2.453] [PASS] sdIsReady() true after mount
+[    2.453] [PASS] sdHadWriteError() false on a clean mount
+[    2.453] [PASS] readings file created
+[    2.453] [PASS] readings header matches kCurrentCSVHeader35
+[    2.453] [PASS] deployments file created
+[    2.453] [PASS] readings path accessor matches
+[    2.453] [PASS] deployments path accessor matches
+[    2.453] [PASS] sdLogCSVRow row 1 succeeds
+[    2.453] [PASS] sdLogCSVRow row 2 succeeds
+[    2.453] [PASS] file size grew by exactly the two appended rows
+[    2.504] [PASS] readings round-trip byte-for-byte, in order
+[    2.504] [PASS] sdHadWriteError() still false after normal writes
+[    2.504] [PASS] first append of a new event succeeds
+[    2.504] [PASS] first append adds exactly one line
+[    2.504] [PASS] replayed append of the same eventId still reports success
+[    2.504] [PASS] replayed append does not duplicate the row
+[    2.504] [PASS] an open (unended) deployment is not archived
+[    2.504] [PASS] archive line count unchanged by the open-deployment attempt
+[    2.554] [PASS] foreign canonical-named file staged
+[    2.554] [SD] Preserved incompatible /fieldmesh_readings.csv as /fieldmesh_readings.csv.legacy-1
+[    2.554] [SD] Archive ready: 14748.0 MB total, 0.1 MB used
+[    2.554] [PASS] re-running initSD() still reports success
+[    2.554] [PASS] sdHadWriteError() false — foreign file was preserved, not fatal
+[    2.554] [PASS] foreign file moved aside as .legacy-1
+[    2.554] [PASS] preserved legacy file content is byte-for-byte intact
+[    2.604] [PASS] a fresh canonical file with the current header replaces it
+[    3.607] [SD] Original archive (if any) restored; test files removed
+[    3.607] 
+[    3.607] RESULT|SUMMARY|25/25|OVERALL:PASS
+[    3.607] 
+[    3.607] --- Still required by hand (physical, not automatable) ---
+[    3.657] 1. Pull the card, boot, confirm sdIsReady()=false and the hub
+[    3.657]    still logs to LittleFS with no crash (check Data page).
+[    3.657] 2. Re-insert mid-session, confirm the archive resumes without
+[    3.657]    re-copying rows already written to LittleFS-only.
+[    3.657] 3. Cut power mid-write to fieldmesh_readings.csv (during a real
+[    3.657]    snapshot on -main firmware) and confirm the file still opens
+[    3.657]    with only the interrupted row possibly short, header intact.
+[    3.657] 4. Cut power between a real End-deployment's LittleFS commit and
+[    3.657]    its SD mirror write, reboot, force a retry, confirm exactly
+[    3.708]    one archived row for that event (this suite proved the dedup
+[    3.708]    logic; this step proves it survives a real power cut).
+[    3.708] 5. Fill the card near-full and confirm writes fail loudly
+[    3.708]    (sdHadWriteError()=true, surfaced on the Data page) rather
+[    3.708]    than silently dropping rows.

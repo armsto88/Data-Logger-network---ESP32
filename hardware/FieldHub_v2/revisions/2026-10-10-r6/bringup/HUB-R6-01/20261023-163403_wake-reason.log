@@ -1,0 +1,55 @@
+# board HUB-R6-01  test wake-reason  env mothership-v1-wake-reason
+# commit 8d5a6a5 (firmware tree dirty: yes)  port /dev/serial/by-id/usb-1a86_USB_Serial-if00-port0  started 2026-10-23T16:34:03
+[    0.024] ## wake-reason: config / RTC / USB wake classification, off-wake
+[    0.024] ## operator-judged test: Ctrl-C when finished, then enter the verdict
+[    0.024] ## type a line + Enter to send it to the board; Ctrl-C ends the session
+[    0.826] 
+[    0.826] === Mothership V1 Wake-Reason Detection Bring-up ===
+[    0.826] [RTC] DS3231 found
+[    0.876] Wake reason: CONFIG_BUTTON
+[    0.876] >>> Config button wake — clearing latch
+[    0.876] After clear: CONFIG_WAKE = HIGH (OK)
+[    2.883] Shutting down in 10000 ms (releasing PWR_HOLD)...
+[    2.883] Press reset to re-test. Connect USB to keep board alive.
+[    2.883] Power-down in 10 s
+[   12.861] [RTC] Arming Alarm 1 for 15 seconds from now...
+[   12.861] [RTC] Alarm 1 armed — board will wake via RTC alarm after shutdown.
+[   12.961] ## port lost (board powered off or USB unplugged); waiting for it to return
+[   28.248] ## port back
+[   28.750] 
+[   28.750] === Mothership V1 Wake-Reason Detection Bring-up ===
+[   28.750] [RTC] DS3231 found
+[   28.750] Wake reason: RTC_ALARM
+[   28.750] >>> RTC alarm wake — clearing alarm flag
+[   28.750] [RTC] Alarm flag cleared
+[   33.767] Shutting down in 10000 ms (releasing PWR_HOLD)...
+[   33.767] Press reset to re-test. Connect USB to keep board alive.
+[   33.767] Power-down in 10 s
+[   43.746] [RTC] Arming Alarm 1 for 15 seconds from now...
+[   43.746] [RTC] Alarm 1 armed — board will wake via RTC alarm after shutdown.
+[   43.846] Releasing PWR_HOLD — board will power off.
+[   43.846] If you can read this, PWR_HOLD release did not cut power.
+[   43.897] ## port lost (board powered off or USB unplugged); waiting for it to return
+[   58.431] ## port back
+[   58.733] 
+[   58.733] === Mothership V1 Wake-Reason Detection Bring-up ===
+[   58.733] [RTC] DS3231 found
+[   58.733] Wake reason: RTC_ALARM
+[   58.733] >>> RTC alarm wake — clearing alarm flag
+[   58.733] [RTC] Alarm flag cleared
+[   63.748] Shutting down in 10000 ms (releasing PWR_HOLD)...
+[   63.748] Press reset to re-test. Connect USB to keep board alive.
+[   63.748] Power-down in 10 s
+[   73.776] [RTC] Arming Alarm 1 for 15 seconds from now...
+[   73.776] [RTC] Alarm 1 armed — board will wake via RTC alarm after shutdown.
+[   73.876] ## port lost (board powered off or USB unplugged); waiting for it to return
+[   88.411] ## port back
+[   88.762] 
+[   88.762] === Mothership V1 Wake-Reason Detection Bring-up ===
+[   88.762] [RTC] DS3231 found
+[   88.762] Wake reason: RTC_ALARM
+[   88.762] >>> RTC alarm wake — clearing alarm flag
+[   88.762] [RTC] Alarm flag cleared
+[   93.777] Shutting down in 10000 ms (releasing PWR_HOLD)...
+[   93.777] Press reset to re-test. Connect USB to keep board alive.
+[   93.777] Power-down in 10 s
