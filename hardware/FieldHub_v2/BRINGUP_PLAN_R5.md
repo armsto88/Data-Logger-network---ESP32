@@ -83,6 +83,13 @@ socket with a different contact or anchor pattern.
 
 ### Firmware readiness
 
+> **2026-10-23:** implemented for the printed revision-6 batch. See
+> [`revisions/2026-10-10-r6/BRINGUP_HARNESS.md`](revisions/2026-10-10-r6/BRINGUP_HARNESS.md)
+> and `scripts/hub_bringup.py`. The V1 subsystem sketches are restored, so
+> `mothership-v1-sd-card` builds again. The SD speed sweep and the sensor tests
+> exist. The monitor command below is unsafe with the old `monitor_dtr/rts = 0`
+> setting; the ini now sets both to 1.
+
 The usable physical SD regression target is:
 
 ```sh
