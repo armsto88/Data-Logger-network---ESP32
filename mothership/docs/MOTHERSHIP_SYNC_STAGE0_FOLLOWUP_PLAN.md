@@ -1,7 +1,7 @@
 # Rendezvous Stage 0: follow-up plan after two code reviews
 
 **Date:** 2026-10-24
-**Status:** Approved by the owner, 2026-10-24, except section 3.5 (still open).
+**Status:** Approved by the owner, 2026-10-24, including option (a) in section 3.5.
 Section 3.1 ships on its own first (branch `fix/stage0-purge-order`); sections
 3.2 to 3.5 are not written yet.
 **Context:** Stage 0 (`MOTHERSHIP_SYNC_RENDEZVOUS_DESIGN_NOTE.md` section 8) is
@@ -39,8 +39,9 @@ it: the demo hub is on the pre-Stage 0 build and HUB-R6-01 is a bench board.
 
 - **Daily sync mode is removed from the firmware** (owner, 2026-10-24). Interval
   mode is the only schedule. This removes D8 and the daily alarm path.
-- **Open, owner to decide:** the release policy past the session deadline
-  (section 3.5).
+- **Releases stay mandatory past the session deadline** (section 3.5, option
+  (a); owner, 2026-10-24). The extra awake time in that rare case is covered by
+  the new hub charging and battery design.
 
 ## 3. Changes
 
@@ -114,7 +115,7 @@ Design:
   leaves room. A missed alarm with power held on is noted in section 5 rather
   than engineered around.
 
-### 3.5 Session deadline and releases (D5), owner decision
+### 3.5 Session deadline and releases (D5): option (a) chosen
 
 A release is what gives a node its clock and schedule, so skipping it risks
 the node drifting. Two options:
