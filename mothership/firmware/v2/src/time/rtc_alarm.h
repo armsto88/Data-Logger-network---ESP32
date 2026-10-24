@@ -7,6 +7,14 @@
 // Manages I2C communication with the DS3231 and provides
 // alarm programming for scheduled sync wakes.
 
+// Seconds before a sync slot that the hub wakes. Hub boot (storage init,
+// upload-queue scan, purge) used to finish after the 10 s lead and eat the
+// rendezvous; 45 s absorbs it in front of the slot (rendezvous design note,
+// section 6.2 / Stage 0a). Clamped to half the sync period when armed.
+#ifndef HUB_SYNC_PREWAKE_SEC
+#define HUB_SYNC_PREWAKE_SEC 45
+#endif
+
 enum RtcInitStatus {
   RTC_OK,
   RTC_PRESENT_TIME_INVALID,

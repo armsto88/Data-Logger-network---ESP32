@@ -65,7 +65,12 @@ SET_LOOP_TASK_STACK_SIZE(16 * 1024);
 // Total sync-wake budget (ESP-NOW listen window + modem upload). Raised from
 // 180 s so that when a node is missing and the ESP-NOW window runs its full
 // 120 s, the modem still has ~180 s to power on, register and upload.
-static constexpr uint32_t kSyncSessionLimitMs = 300000UL;  // 5 min
+// The window now starts HUB_SYNC_PREWAKE_SEC before the slot instead of 10 s
+// and holds the join phase to slot + 25 s instead of slot + 15 s, so it ends
+// later by the same amount; grow the budget with it to keep the modem's share.
+static constexpr uint32_t kSyncSessionLimitMs = 300000UL
+    + (HUB_SYNC_PREWAKE_SEC > 10 ? (uint32_t)(HUB_SYNC_PREWAKE_SEC - 10) * 1000UL : 0UL)
+    + 10000UL;
 
 // ---------------------------------------------------------------------------
 // Upload subsystem globals
@@ -520,10 +525,25 @@ static void runCoordinatedSyncWindow(
   // together (HELLO jitter + a couple of retries + ESP-NOW contention). The old
   // fixed 12 s window closed ~2 s after the slot — just before nodes could answer
   // — which is why responders was always 0.
-  static constexpr uint32_t kJoinPostSlotSec = 15;      // hold rendezvous this long past the slot
+  // Stage 0b: hold the join to slot + 25 s, matching the node's
+  // SYNC_MARKER_GRACE_SEC, the last second a node still listening can hear us.
+  // With a 45 s pre-wake the computed join is ~69 s, so the cap must clear it.
+  static constexpr uint32_t kJoinPostSlotSec = 25;      // hold rendezvous this long past the slot
   static constexpr uint32_t kJoinFloorMs     = 15000UL; // min (if we wake at/after the slot)
-  static constexpr uint32_t kJoinCapMs       = 45000UL; // hard ceiling
+  static constexpr uint32_t kJoinCapMs       = 75000UL; // hard ceiling
   static constexpr uint32_t kCoordinatedWindowMs = 105000UL;
+  // The drain phase used to get whatever was left of kCoordinatedWindowMs after
+  // a ~24 s on-time join. The join is now longer and starts earlier, so the
+  // drain is budgeted from the end of the join instead, at the same length.
+  static constexpr uint32_t kNominalJoinMs   = 24000UL;
+  // Stage 0c: keep beaconing and accepting HELLOs this long after the join
+  // closes while the roster is short. Nodes stop listening at slot + 25 s, so
+  // only HELLOs already in flight (jitter, retries) can still arrive.
+  static constexpr uint32_t kLateJoinGraceMs = 20000UL;
+  static constexpr uint32_t kGrantBeaconMs   = 2000UL;
+  // Once every deployed node has joined, close the join this long after the
+  // last one so its FW_CAPS (sent right after HELLO) is collected too.
+  static constexpr uint32_t kRosterSettleMs  = 1500UL;
   static constexpr uint16_t kGrantWindowMs = 9000U;
   static constexpr uint8_t kGrantQuota = 4;
 
@@ -535,7 +555,9 @@ static void runCoordinatedSyncWindow(
   const uint32_t syncStartMs = millis();
   const uint32_t syncBudgetMs = (uint32_t)SYNC_WINDOW_MS < kCoordinatedWindowMs
       ? (uint32_t)SYNC_WINDOW_MS : kCoordinatedWindowMs;
-  const uint32_t syncDeadlineMs = syncStartMs + syncBudgetMs;
+  // Drain budget, counted from whenever the join actually closes.
+  const uint32_t grantPhaseMs = syncBudgetMs > kNominalJoinMs
+      ? syncBudgetMs - kNominalJoinMs : syncBudgetMs;
   uint32_t sessionId = getRTCTime() ^ esp_random();
   if (sessionId == 0) sessionId = 1;
 
@@ -543,14 +565,19 @@ static void runCoordinatedSyncWindow(
   // phase-aligned boundary, then hold the rendezvous open until slot +
   // kJoinPostSlotSec. Falls back to the floor when no anchor is known.
   uint32_t joinWindowMs = kJoinFloorMs;
+  // Kept for the instrumentation (Stage 0e): where the slot fell relative to
+  // syncStartMs, so every HELLO can be stamped as an offset from the slot.
+  bool slotKnown = false;
+  int32_t toSlotSec = 0;
   {
     const uint32_t nowUnix = getRTCTime();
     if (activeSyncMin > 0 && activeSyncPhase > 0 && nowUnix >= activeSyncPhase) {
       const uint32_t period = (uint32_t)activeSyncMin * 60UL;
       const uint32_t rem = (nowUnix - activeSyncPhase) % period;
-      const int32_t toSlotSec = (rem <= period - rem)
+      toSlotSec = (rem <= period - rem)
           ? -(int32_t)rem                 // nearest slot is behind us (woke late)
           : (int32_t)(period - rem);      // nearest slot is ahead (normal pre-roll)
+      slotKnown = true;
       int32_t ms = (toSlotSec + (int32_t)kJoinPostSlotSec) * 1000;
       if (ms < (int32_t)kJoinFloorMs) ms = (int32_t)kJoinFloorMs;
       if (ms > (int32_t)kJoinCapMs)   ms = (int32_t)kJoinCapMs;
@@ -563,10 +590,14 @@ static void runCoordinatedSyncWindow(
   sync_session_open_message_t sessionOpen{};
   strncpy(sessionOpen.command, "SYNC_SESSION", sizeof(sessionOpen.command) - 1);
   sessionOpen.sessionId = sessionId;
-  sessionOpen.joinWindowMs = (uint16_t)joinWindowMs;
-  // Nodes start their local timer when they hear a beacon, possibly near the
-  // end of rendezvous. Leave a 15 s release margin beyond our grant deadline.
-  sessionOpen.sessionWindowSec = (uint16_t)((syncBudgetMs + 15000UL) / 1000UL);
+  // The wire field is 16-bit and the join can now exceed 65.5 s. Nodes only log
+  // it today, but never send a wrapped value.
+  sessionOpen.joinWindowMs = (uint16_t)(joinWindowMs > 65535UL ? 65535UL : joinWindowMs);
+  // Nodes start their local timer when they hear a beacon, which can now be
+  // ~45 s before the slot. Cover the whole join plus the drain that follows it,
+  // with a 15 s release margin beyond our grant deadline.
+  sessionOpen.sessionWindowSec =
+      (uint16_t)((joinWindowMs + grantPhaseMs + 15000UL) / 1000UL);
   strncpy(sessionOpen.mothership_id, "M001", sizeof(sessionOpen.mothership_id) - 1);
 
   std::vector<ActiveSyncNode> responders;
@@ -632,8 +663,15 @@ static void runCoordinatedSyncWindow(
                   sizeof(responder.nodeId) - 1);
           responder.queueDepth = hellos[i].hello.queueDepth;
           responders.push_back(responder);
-          Serial.printf("[SYNC] roster +%.15s queue=%u\n", responder.nodeId,
-                        (unsigned)responder.queueDepth);
+          if (slotKnown) {
+            const int32_t atMs = (int32_t)(millis() - syncStartMs) - toSlotSec * 1000;
+            Serial.printf("[SYNC] roster +%.15s queue=%u at=slot%+ldms\n",
+                          responder.nodeId, (unsigned)responder.queueDepth,
+                          (long)atMs);
+          } else {
+            Serial.printf("[SYNC] roster +%.15s queue=%u\n", responder.nodeId,
+                          (unsigned)responder.queueDepth);
+          }
         } else {
           responders[(size_t)existing].queueDepth = hellos[i].hello.queueDepth;
         }
@@ -748,6 +786,14 @@ static void runCoordinatedSyncWindow(
   // callback; no node receives permission to dump during this collection phase.
   uint32_t lastBeaconMs = 0;
   uint32_t lastConfigBurstMs = 0;
+  uint32_t rosterCompleteMs = 0;
+  auto sendConfigBurst = [&]() {
+    for (const auto& cfg : nodeCfgs) broadcastNodeConfigNow(cfg);
+    // Repeat the active schedule at every rendezvous. A node waking on an old
+    // grace slot therefore gets another migration opportunity.
+    broadcastSyncScheduleNow(activeSyncMin, activeSyncPhase);
+    lastConfigBurstMs = millis();
+  };
   while ((uint32_t)(millis() - syncStartMs) < joinWindowMs) {
     const uint32_t nowMs = millis();
     if (lastBeaconMs == 0 || (uint32_t)(nowMs - lastBeaconMs) >= 1000UL) {
@@ -756,20 +802,31 @@ static void runCoordinatedSyncWindow(
       lastBeaconMs = millis();
     }
     if (lastConfigBurstMs == 0 || (uint32_t)(nowMs - lastConfigBurstMs) >= 6000UL) {
-      for (const auto& cfg : nodeCfgs) broadcastNodeConfigNow(cfg);
-      // Repeat the active schedule at every rendezvous. A node waking on an old
-      // grace slot therefore gets another migration opportunity.
-      broadcastSyncScheduleNow(activeSyncMin, activeSyncPhase);
-      lastConfigBurstMs = millis();
+      sendConfigBurst();
     }
     collectHellos();
     drainAndPersistSnapshots();
+    // Stage 0c, the roster "checklist": once every deployed node has joined
+    // there is nobody left to wait for, so start draining instead of idling to
+    // slot + 25 s. A node that joined between config bursts gets one more
+    // before the join closes.
+    if (deployedCount > 0 && (int)responders.size() >= deployedCount) {
+      if (rosterCompleteMs == 0) {
+        rosterCompleteMs = millis();
+        sendConfigBurst();
+      }
+      if ((uint32_t)(millis() - rosterCompleteMs) >= kRosterSettleMs) break;
+    }
     delay(5);
   }
 
   collectHellos();
-  Serial.printf("[SYNC] rendezvous closed: responders=%u deployed=%d\n",
-                (unsigned)responders.size(), deployedCount);
+  const uint32_t joinEndMs = millis();
+  const uint32_t syncDeadlineMs = joinEndMs + grantPhaseMs;
+  Serial.printf("[SYNC] rendezvous closed: responders=%u deployed=%d join_ms=%lu%s\n",
+                (unsigned)responders.size(), deployedCount,
+                (unsigned long)(joinEndMs - syncStartMs),
+                rosterCompleteMs ? " (roster complete)" : "");
 
   auto releaseNode = [&](ActiveSyncNode& responder) {
     if (responder.released) return;
@@ -808,20 +865,67 @@ static void runCoordinatedSyncWindow(
     esp_now_del_peer(responder.mac);
   };
 
+  // From here on, responders is walked by index and collectHellos() (which
+  // appends to it, invalidating references and iterators) runs only at the top
+  // of an iteration, before a reference into the vector is taken.
+
   // Empty nodes can be clock/schedule synchronized and released immediately.
-  for (auto& responder : responders) {
-    if (responder.queueDepth == 0) releaseNode(responder);
+  for (size_t i = 0; i < responders.size(); ++i) {
+    if (responders[i].queueDepth == 0) releaseNode(responders[i]);
   }
 
-  uint32_t releaseReserveMs = 3000UL + (uint32_t)responders.size() * 1600UL;
+  // Reserve release time for everyone who could still be on the roster.
+  const size_t rosterBound = responders.size() > (size_t)deployedCount
+      ? responders.size() : (size_t)deployedCount;
+  uint32_t releaseReserveMs = 3000UL + (uint32_t)rosterBound * 1600UL;
   if (releaseReserveMs > 30000UL) releaseReserveMs = 30000UL;
   const uint32_t grantStopMs = syncDeadlineMs - releaseReserveMs;
 
+  // Stage 0c: while the roster is short of the deployed count, keep beaconing
+  // (at a slower cadence than the join, so it does not contend with dumps) and
+  // keep admitting HELLOs for kLateJoinGraceMs after the join closed.
+  const uint32_t lateJoinUntilMs = joinEndMs + kLateJoinGraceMs;
+  uint32_t lastGrantBeaconMs = 0;
+  auto lateJoinOpen = [&]() {
+    return deployedCount > 0 && (int)responders.size() < deployedCount &&
+           (int32_t)(lateJoinUntilMs - millis()) > 0;
+  };
+  auto admitLateJoiners = [&]() {
+    if (!lateJoinOpen()) return;
+    if (lastGrantBeaconMs == 0 ||
+        (uint32_t)(millis() - lastGrantBeaconMs) >= kGrantBeaconMs) {
+      broadcastSyncWindowOpen();
+      broadcastSyncSessionOpen(sessionOpen);
+      lastGrantBeaconMs = millis();
+    }
+    const size_t before = responders.size();
+    collectHellos();
+    for (size_t i = before; i < responders.size(); ++i) {
+      Serial.printf("[SYNC] late join %.15s +%lums after join closed\n",
+                    responders[i].nodeId, (unsigned long)(millis() - joinEndMs));
+      if (responders[i].queueDepth == 0) releaseNode(responders[i]);
+    }
+  };
+
   uint16_t nextGrantId = 1;
   bool madeProgress = true;
-  while (madeProgress && (int32_t)(grantStopMs - millis()) > 0) {
+  while ((int32_t)(grantStopMs - millis()) > 0) {
+    if (!madeProgress) {
+      // A full pass drained nothing more. Stay only while a late joiner can
+      // still turn up, and go round again as soon as one does.
+      if (!lateJoinOpen()) break;
+      const size_t before = responders.size();
+      admitLateJoiners();
+      drainAndPersistSnapshots();
+      if (responders.size() == before) {
+        delay(20);
+        continue;
+      }
+    }
     madeProgress = false;
-    for (auto& responder : responders) {
+    for (size_t ri = 0; ri < responders.size(); ++ri) {
+      admitLateJoiners();
+      ActiveSyncNode& responder = responders[ri];
       if (responder.released || responder.queueDepth == 0 ||
           responder.failedGrants >= 2 ||
           (int32_t)(grantStopMs - millis()) <= (int32_t)kGrantWindowMs) {
@@ -882,13 +986,40 @@ static void runCoordinatedSyncWindow(
 
   // Release every responder individually, even with backlog remaining. The
   // node keeps unsent records but still receives time and the active schedule.
-  for (auto& responder : responders) {
-    releaseNode(responder);
+  for (size_t i = 0; i < responders.size(); ++i) {
+    releaseNode(responders[i]);
   }
 
   drainAndPersistSnapshots();
   Serial.printf("[SYNC] coordinated window complete: responders=%u drops=%lu\n",
                 (unsigned)responders.size(), (unsigned long)getSnapDropCount());
+
+  // Stage 0e: one line per window with everything the aperture equation needs,
+  // so a live hub's own logs say how late it was and who was missing. t_boot_ms
+  // is wake to rendezvous start (the hub cold-boots on every sync alarm).
+  uint32_t leftRecords = 0;
+  for (size_t i = 0; i < responders.size(); ++i) leftRecords += responders[i].queueDepth;
+  String absent;
+  for (const auto& node : registeredNodes) {
+    if (node.state != DEPLOYED) continue;
+    bool present = false;
+    for (size_t i = 0; i < responders.size(); ++i) {
+      if (node.nodeId == String(responders[i].nodeId)) { present = true; break; }
+    }
+    if (!present) {
+      if (absent.length()) absent += ',';
+      absent += node.nodeId;
+    }
+  }
+  Serial.printf("[SYNC-STAT] t_boot_ms=%lu lead_s=%u to_slot_s=%s%ld join_ms=%lu "
+                "roster=%u/%d left=%lu window_ms=%lu absent=%s\n",
+                (unsigned long)syncStartMs, (unsigned)HUB_SYNC_PREWAKE_SEC,
+                slotKnown ? "" : "?", (long)toSlotSec,
+                (unsigned long)(joinEndMs - syncStartMs),
+                (unsigned)responders.size(), deployedCount,
+                (unsigned long)leftRecords,
+                (unsigned long)(millis() - syncStartMs),
+                absent.length() ? absent.c_str() : "-");
 }
 
 // ---------------------------------------------------------------------------
@@ -1680,14 +1811,16 @@ void handleSyncWake() {
     Serial.println("[STORAGE] LittleFS upload cache and fallback ready");
   }
 
-  // Init upload queue (after flash is ready) and enforce retention before
-  // logging new data so there is always space for incoming node snapshots.
-  // A failed init leaves a zero cursor. Running retention against that would
-  // evict history the hub has not actually uploaded, so nothing cursor-dependent
-  // runs unless init succeeded.
+  // Init upload queue (after flash is ready). A failed init leaves a zero
+  // cursor. Running retention against that would evict history the hub has not
+  // actually uploaded, so nothing cursor-dependent runs unless init succeeded.
+  // The retention purge itself runs after the sync window (Stage 0d): it can
+  // take many seconds and used to delay the rendezvous. Purging at the 65 %
+  // high-water mark leaves far more headroom than one window's snapshots need.
+  bool retentionPurgeDue = false;
   if (flashIsReady()) {
     if (uploadQueue.init()) {
-      uploadQueue.emergencyPurgeIfFull(kLittleFsRetentionHighWaterPct);
+      retentionPurgeDue = true;
     } else {
       Serial.println("[WARN] Upload queue init failed — skipping retention purge "
                      "and all cursor-dependent work this wake");
@@ -1825,6 +1958,11 @@ void handleSyncWake() {
       processSnapshot(finalSlots[i].snap, finalSlots[i].mac);
     }
   } while (finalDrained > 0);
+
+  // Deferred from before the window (Stage 0d); see retentionPurgeDue.
+  if (retentionPurgeDue) {
+    uploadQueue.emergencyPurgeIfFull(kLittleFsRetentionHighWaterPct);
+  }
 
   // Persist paired-node state (battery voltages, last-contact time and the
   // configured-sensor fault/debounce state) to NVS so it survives the power-off
