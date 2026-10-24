@@ -1,6 +1,6 @@
 # Hub Local Sensor Collection — Plan
 
-> **2026-10-23:** the firmware phases below (1–6) still stand. Phase 7 and the choice not to add the hub to `status.nodes[]` for the first release are replaced by [HUB_LOCAL_DATA_INTEGRATION_PLAN.md](HUB_LOCAL_DATA_INTEGRATION_PLAN.md), which makes the hub a station created in commissioning and covers the backend and dashboard. Pin and port questions in this plan were answered by the r6 bring-up (`hardware/FieldHub_v2/revisions/2026-10-10-r6/BRINGUP_HARNESS.md`).
+> **2026-10-24:** the firmware phases below (1–6) still stand. Phase 7 and the question of how hub-local readings appear in the backend and dashboard are replaced by [HUB_LOCAL_DATA_INTEGRATION_PLAN.md](HUB_LOCAL_DATA_INTEGRATION_PLAN.md): the hub stays a hub, its own data is shown on the FieldHub's card and never becomes a node, and it is switched on by an optional step in commissioning. Pin and port questions in this plan were answered by the r6 bring-up (`hardware/FieldHub_v2/revisions/2026-10-10-r6/BRINGUP_HARNESS.md`).
 
 **Date:** 2026-09-27 (rev. 4)
 **Status:** Planning — two rounds of cross-review incorporated; remaining items are hardware/policy decisions plus a defined implementation checklist
