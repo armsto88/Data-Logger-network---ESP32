@@ -56,7 +56,13 @@ const char* FW_BUILD   = FW_GIT;
 Preferences gPrefs;
 
 int gWakeIntervalMin = 0;
+#ifdef HUB_BENCH_SYNC_FILL_K
+// Bench only (env mothership-v2-bench-sync-sweep): a shorter sync period so a
+// rendezvous sweep takes minutes per window, not 18. Production keeps 18.
+static constexpr int kSyncFillK = HUB_BENCH_SYNC_FILL_K;
+#else
 static constexpr int kSyncFillK = 18;
+#endif
 int computeAutoSyncMin(int wakeMin) {
   return (wakeMin > 0) ? (wakeMin * kSyncFillK) : 0;
 }

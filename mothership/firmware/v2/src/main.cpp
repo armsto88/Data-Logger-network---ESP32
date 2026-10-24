@@ -465,6 +465,48 @@ static bool buildRecoveryDeploy(const NodeInfo& node, uint16_t activeSyncMin,
   return true;
 }
 
+#ifdef HUB_BENCH_SYNC_SWEEP
+// Bench only (env mothership-v2-bench-sync-sweep): delay the start of the
+// rendezvous by a stepped amount, to measure node attendance against hub boot
+// latency (MOTHERSHIP_SYNC_RENDEZVOUS_DESIGN_NOTE.md section 10.4). Each sync wake
+// takes the next step 0, 1, 2 ... HUB_BENCH_DELAY_STEPS-1, then wraps; the step
+// counter lives in NVS and restarts at 0 on a new build. Not for production.
+#ifndef HUB_BENCH_DELAY_STEP_MS
+#define HUB_BENCH_DELAY_STEP_MS 5000
+#endif
+#ifndef HUB_BENCH_DELAY_STEPS
+#define HUB_BENCH_DELAY_STEPS 10
+#endif
+static void benchInjectBootDelay(uint16_t activeSyncMin, uint32_t activeSyncPhase) {
+  static const char kBuildId[] = __DATE__ " " __TIME__;
+  Preferences bench;
+  bench.begin("bench", false);
+  if (bench.getString("build", "") != kBuildId) {
+    bench.putString("build", kBuildId);
+    bench.putUInt("win", 0);
+  }
+  const uint32_t win = bench.getUInt("win", 0);
+  bench.putUInt("win", win + 1);
+  bench.end();
+
+  const uint32_t injectMs =
+      (win % (uint32_t)HUB_BENCH_DELAY_STEPS) * (uint32_t)HUB_BENCH_DELAY_STEP_MS;
+
+  // Seconds to the nearest sync slot: positive while the slot is still ahead.
+  int32_t toSlotSec = 0;
+  const uint32_t nowUnix = getRTCTime();
+  if (activeSyncMin > 0 && activeSyncPhase > 0 && nowUnix >= activeSyncPhase) {
+    const uint32_t period = (uint32_t)activeSyncMin * 60UL;
+    const uint32_t rem = (nowUnix - activeSyncPhase) % period;
+    toSlotSec = (rem <= period - rem) ? -(int32_t)rem : (int32_t)(period - rem);
+  }
+  Serial.printf("[BENCH] window=%lu inject_ms=%lu boot_ms=%lu to_slot_s=%ld\n",
+                (unsigned long)win, (unsigned long)injectMs,
+                (unsigned long)millis(), (long)toSlotSec);
+  if (injectMs > 0) delay(injectMs);
+}
+#endif  // HUB_BENCH_SYNC_SWEEP
+
 static void runCoordinatedSyncWindow(
     uint32_t sessionStartMs, bool& sessionTimedOut,
     const std::vector<node_config_message_t>& nodeCfgs,
@@ -1765,6 +1807,9 @@ void handleSyncWake() {
   }
   const uint8_t releaseGraceCycles = scheduleTransitionPending
       ? 3U : legacyRendezvous.remainingCycles;
+#ifdef HUB_BENCH_SYNC_SWEEP
+  benchInjectBootDelay(activeSyncMin, activeSyncPhase);
+#endif
   runCoordinatedSyncWindow(sessionStartMs, sessionTimedOut, nodeCfgs,
                            activeSyncMin, activeSyncPhase,
                            releaseGraceCycles);

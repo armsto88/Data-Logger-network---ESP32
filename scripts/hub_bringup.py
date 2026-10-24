@@ -94,6 +94,9 @@ LADDER = [
     t("modem-network", "mothership-v1-modem-network", "J", "CSQ/CREG/CEREG/COPS (antenna fitted!)", judge=MODEM, timeout=240),
     t("modem-https", "mothership-v1-sim-test", "J", "registration + ingest ?dry_run=true POST via ModemDriver"),
     t("modem-powercycle", "mothership-v1-modem-powercycle", "J", "3 clean on/AT/CPOF/off cycles", judge=MODEM, timeout=180),
+    t("sync-sweep", "mothership-v2-bench-sync-sweep", "K",
+      "rendezvous attendance vs injected hub boot delay (BENCH build; see SYNC_RENDEZVOUS_BENCH_RUNBOOK.md)",
+      reset=False),
     t("production", "mothership-v1-main", "K", "production firmware boot + config UI"),
     t("monitor", None, "-", "safe serial console only (no flash, no reset)", reset=False),
 ]
