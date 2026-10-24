@@ -156,9 +156,11 @@ bool armNextSyncAlarm(int intervalMin) {
   DateTime now = gRTC.now();
   uint32_t nowUnix = now.unixtime();
   uint32_t periodSec = static_cast<uint32_t>(intervalMin) * 60UL;
-  // Wake 10 seconds before the sync time so the mothership is already
-  // listening when the node wakes and sends its snapshot.
-  DateTime next = now + TimeSpan(0, 0, intervalMin, 0) - TimeSpan(0, 0, 0, 10);
+  // Wake HUB_SYNC_PREWAKE_SEC before the sync time so the mothership is
+  // already listening when the node wakes and sends its snapshot.
+  const uint32_t leadSec = (HUB_SYNC_PREWAKE_SEC < periodSec / 2)
+      ? (uint32_t)HUB_SYNC_PREWAKE_SEC : periodSec / 2;
+  DateTime next = now + TimeSpan(0, 0, intervalMin, 0) - TimeSpan((int32_t)leadSec);
   uint32_t nextSyncUnix = next.unixtime();
   if (nextSyncUnix <= nowUnix + 5) {
     nextSyncUnix += periodSec;
@@ -221,8 +223,11 @@ bool armNextSyncAlarmPhase(int intervalMin, uint32_t phaseUnix) {
     nextSyncUnix = nowUnix + (uint32_t)intervalMin * 60UL;
   }
 
-  // Pre-wake 10 seconds before sync time
-  if (nextSyncUnix > 10) nextSyncUnix -= 10;
+  // Pre-wake HUB_SYNC_PREWAKE_SEC before sync time. A shutdown inside that
+  // lead skips to the next slot, so the dead zone before a slot is the lead.
+  const uint32_t leadSec = (HUB_SYNC_PREWAKE_SEC < periodSec / 2)
+      ? (uint32_t)HUB_SYNC_PREWAKE_SEC : periodSec / 2;
+  if (nextSyncUnix > leadSec) nextSyncUnix -= leadSec;
   if (nextSyncUnix <= nowUnix + 5) {
     nextSyncUnix += periodSec;
   }
