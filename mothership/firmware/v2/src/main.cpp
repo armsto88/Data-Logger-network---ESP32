@@ -1811,16 +1811,19 @@ void handleSyncWake() {
     Serial.println("[STORAGE] LittleFS upload cache and fallback ready");
   }
 
-  // Init upload queue (after flash is ready). A failed init leaves a zero
-  // cursor. Running retention against that would evict history the hub has not
-  // actually uploaded, so nothing cursor-dependent runs unless init succeeded.
-  // The retention purge itself runs after the sync window (Stage 0d): it can
-  // take many seconds and used to delay the rendezvous. Purging at the 65 %
-  // high-water mark leaves far more headroom than one window's snapshots need.
-  bool retentionPurgeDue = false;
+  // Init upload queue (after flash is ready) and enforce retention before
+  // logging new data so there is always space for incoming node snapshots.
+  // A failed init leaves a zero cursor. Running retention against that would
+  // evict history the hub has not actually uploaded, so nothing cursor-dependent
+  // runs unless init succeeded.
+  // Stage 0d moved this purge after the window to shorten boot, and was
+  // reverted: the purge copies the kept rows to a temporary file before
+  // swapping it in, so it needs free space, and a window's snapshots arriving
+  // first can leave too little for it to succeed. It only runs above the
+  // high-water mark, and the 45 s pre-wake absorbs its time.
   if (flashIsReady()) {
     if (uploadQueue.init()) {
-      retentionPurgeDue = true;
+      uploadQueue.emergencyPurgeIfFull(kLittleFsRetentionHighWaterPct);
     } else {
       Serial.println("[WARN] Upload queue init failed — skipping retention purge "
                      "and all cursor-dependent work this wake");
@@ -1958,11 +1961,6 @@ void handleSyncWake() {
       processSnapshot(finalSlots[i].snap, finalSlots[i].mac);
     }
   } while (finalDrained > 0);
-
-  // Deferred from before the window (Stage 0d); see retentionPurgeDue.
-  if (retentionPurgeDue) {
-    uploadQueue.emergencyPurgeIfFull(kLittleFsRetentionHighWaterPct);
-  }
 
   // Persist paired-node state (battery voltages, last-contact time and the
   // configured-sensor fault/debounce state) to NVS so it survives the power-off

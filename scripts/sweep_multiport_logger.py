@@ -18,9 +18,10 @@ import serial
 
 HUB_LOG, NODE_LOG = sys.argv[1], sys.argv[2]
 NODE_MARKS = ("role=node", "FieldMesh Node:", "[A1] Next alarm", "[BAT-V2]", "[FINALIZE]")
+# Only markers the node firmware never prints: both firmwares emit [CONFIG] and
+# [DEPLOY], so those would misfile a node session whose banner was missed.
 HUB_MARKS = ("role=mothership", "[BENCH]", "[SYNC] Loaded", "[SYNC-STAT]", "[PWR]",
-             "[SYNC] join window", "[RTC] DS3231", "[STORAGE]", "[WAIT] Board still alive",
-             "[CONFIG]", "[DEPLOY]")
+             "[SYNC] join window", "[RTC] DS3231", "[STORAGE]", "[WAIT] Board still alive")
 T0 = time.time()
 
 
@@ -62,6 +63,10 @@ def main():
             p.ser.close()
         except Exception:
             pass
+        if p.buf:
+            # Power dropped mid-line: keep the fragment, marked as partial.
+            emit(p, p.buf.decode("utf-8", "replace").rstrip("\r") + "  [partial line, port lost]")
+            p.buf = b""
         if p.kind is None and p.pending:
             for ln in p.pending:
                 other.write(f"{ln} <{p.path}>\n")
